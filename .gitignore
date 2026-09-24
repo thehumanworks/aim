@@ -1,0 +1,14 @@
+/target/
+**/target/
+*.profraw
+*.profdata
+.DS_Store
+# local-only state
+/.aim-local/
+*.local.toml
+.env
+.env.*
+# editor
+.idea/
+.vscode/
+*.swp
