@@ -1,50 +1,127 @@
-//! Codex subscription provider for aim.
+//! `aim-llm-codex`: the `ChatGPT` Codex subscription backend as an [`aim_llm::ModelProvider`]
+//! (docs/adr/0010, docs/research/codex-backend.md, docs/research/live-probes.md).
+//!
+//! Endpoints, the catalog client version and every timeout are data ([`CodexConfig`]), so tests
+//! drive the provider against a local fake server and deployments can point it elsewhere.
+//! Credentials come from [`auth`]: aim's own store first, then the Codex CLI's file, read-only.
 
 pub mod auth;
+mod errors;
+mod limits;
+mod stream;
+mod turn_state;
 mod wire;
 
-use std::collections::HashMap;
+#[cfg(test)]
+mod fake;
+#[cfg(test)]
+mod offline;
+
 use std::sync::Arc;
+use std::time::Duration;
 
 use aim_llm::{BoxFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, ServiceTier, StreamEvent};
-use aim_proto::conversation::{Item, RateLimitWindow, RateLimits};
-use async_stream::try_stream;
+use aim_proto::conversation::Item;
 use futures_util::StreamExt as _;
-use reqwest::header::{ETAG, HeaderMap, IF_NONE_MATCH, RETRY_AFTER};
+use reqwest::header::{ACCEPT, ETAG, HeaderMap, IF_NONE_MATCH, USER_AGENT};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::auth::{AuthManager, FileCredentialStore};
-use crate::wire::{SseParser, event, request_body};
+use crate::auth::{AuthManager, Credentials, FileCredentialStore};
+use crate::stream::{DriveOptions, drive, idle_timeout, unix_now};
+use crate::turn_state::TurnStates;
+use crate::wire::{BodyOptions, request_body};
 
-const BASE: &str = "https://chatgpt.com/backend-api/codex";
-const CLIENT_VERSION: &str = "0.158.0";
+/// The `originator` header value identifying aim to the backend.
+const ORIGINATOR: &str = "aim";
+/// Sessions whose turn-state token is remembered at once.
+const TURN_STATE_SESSIONS: usize = 128;
+
+/// Where the provider connects and how patient it is. Every field is data with a default.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CodexConfig {
+    /// Responses and models base URL.
+    pub base_url: String,
+    /// OAuth issuer.
+    pub issuer: String,
+    /// `client_version` sent to the catalog; older versions do not list the newest models
+    /// (research §8).
+    pub client_version: String,
+    /// TCP and TLS connect timeout.
+    pub connect_timeout: Duration,
+    /// Longest silence tolerated while waiting for response headers or the next stream chunk.
+    /// There is no total deadline on a streamed response.
+    pub idle_timeout: Duration,
+    /// Total deadline of short calls: catalog, OAuth token requests, device polls, error bodies.
+    pub request_timeout: Duration,
+    /// Largest SSE event accepted, in bytes.
+    pub max_event_bytes: usize,
+    /// Loopback ports tried in order for the browser-login callback.
+    pub callback_ports: Vec<u16>,
+    /// How long a browser or device login waits for the user.
+    pub login_timeout: Duration,
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://chatgpt.com/backend-api/codex".into(),
+            issuer: "https://auth.openai.com".into(),
+            client_version: "0.158.0".into(),
+            connect_timeout: Duration::from_secs(15),
+            // codex's default stream idle timeout (refs:model-provider-info/src/lib.rs:63).
+            idle_timeout: Duration::from_secs(300),
+            request_timeout: Duration::from_secs(60),
+            max_event_bytes: 16 * 1024 * 1024,
+            // refs:login/src/server.rs:76-79,193-201.
+            callback_ports: vec![1455, 1457],
+            login_timeout: Duration::from_mins(15),
+        }
+    }
+}
+
+impl CodexConfig {
+    /// The HTTP client aim uses for this backend: a connect timeout, and deliberately **no**
+    /// total timeout (it would cut every streamed turn longer than it). Idle and per-call
+    /// deadlines are applied per request.
+    ///
+    /// # Errors
+    /// `Transport` if the TLS stack cannot be initialised.
+    pub fn http_client(&self) -> Result<reqwest::Client, LlmError> {
+        self.http_client_builder().build().map_err(|_| LlmError::new(LlmErrorKind::Transport, "cannot create the Codex HTTP client"))
+    }
+
+    pub(crate) fn http_client_builder(&self) -> reqwest::ClientBuilder {
+        reqwest::Client::builder().connect_timeout(self.connect_timeout)
+    }
+
+    fn drive_options(&self) -> DriveOptions {
+        DriveOptions { idle_timeout: self.idle_timeout, max_event_bytes: self.max_event_bytes }
+    }
+}
 
 fn error(kind: LlmErrorKind, message: &str) -> LlmError {
     LlmError::new(kind, message)
 }
 
-fn http_error(status: reqwest::StatusCode, headers: &HeaderMap, body: Option<&Value>) -> LlmError {
-    let code =
-        body.and_then(|body| body.pointer("/error/code").and_then(Value::as_str).or_else(|| body.get("code").and_then(Value::as_str)));
-    let kind = if matches!(code, Some("context_length_exceeded" | "context_window_exceeded" | "input_too_large")) {
-        LlmErrorKind::ContextOverflow
+/// A send failure, without the underlying error text (it may carry the URL).
+fn send_error(error: &reqwest::Error, what: &str) -> LlmError {
+    let why = if error.is_connect() {
+        "cannot connect"
+    } else if error.is_timeout() {
+        "timed out"
     } else {
-        match status.as_u16() {
-            401 | 403 => LlmErrorKind::Auth,
-            429 => LlmErrorKind::RateLimited,
-            400..=499 => LlmErrorKind::InvalidRequest,
-            _ => LlmErrorKind::Unavailable,
-        }
+        "transport failed"
     };
-    let mut result = LlmError::new(kind, format!("Codex request failed with HTTP {status}"));
-    result.status = Some(status.as_u16());
-    result.retry_after_ms = headers
-        .get(RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|seconds| seconds.saturating_mul(1000));
-    result
+    LlmError::new(LlmErrorKind::Transport, format!("{what}: {why}"))
+}
+
+fn header_string(headers: &HeaderMap, key: &str) -> Option<String> {
+    headers.get(key).and_then(|v| v.to_str().ok()).map(str::to_owned)
+}
+
+fn user_agent() -> String {
+    format!("aim/{}", env!("CARGO_PKG_VERSION"))
 }
 
 fn catalog_entry(value: &Value) -> Option<ModelInfo> {
@@ -78,229 +155,203 @@ fn catalog_entry(value: &Value) -> Option<ModelInfo> {
         tiers,
         tools: value.get("tool_mode").and_then(Value::as_str) != Some("none"),
         images: value.get("input_modalities").and_then(Value::as_array).is_none_or(|m| m.iter().any(|v| v.as_str() == Some("image"))),
-        hidden: value.get("visibility").and_then(Value::as_str) == Some("hide"),
+        // codex `ModelVisibility` is `list | hide | none` (refs:protocol/src/openai_models.rs:285-295).
+        hidden: matches!(value.get("visibility").and_then(Value::as_str), Some("hide" | "none")),
         native: Some(value.clone()),
         id,
     })
 }
 
-fn header_string(headers: &HeaderMap, key: &str) -> Option<String> {
-    headers.get(key).and_then(|v| v.to_str().ok()).map(str::to_owned)
+/// The last catalog, per account (entitlements differ between accounts).
+struct CatalogCache {
+    account_id: String,
+    etag: Option<String>,
+    models: Vec<ModelInfo>,
 }
 
-fn rate_limits(headers: &HeaderMap) -> RateLimits {
-    let mut windows = Vec::new();
-    for id in ["primary", "secondary"] {
-        let prefix = format!("x-codex-{id}-");
-        if let Some(used_percent) = header_string(headers, &format!("{prefix}used-percent")).and_then(|v| v.parse().ok()) {
-            windows.push(RateLimitWindow {
-                id: id.to_owned(),
-                used_percent,
-                window_minutes: header_string(headers, &format!("{prefix}window-minutes")).and_then(|v| v.parse().ok()),
-                resets_at: header_string(headers, &format!("{prefix}reset-at")).and_then(|v| v.parse().ok()),
-            });
-        }
-    }
-    let mut native = serde_json::Map::new();
-    for (name, value) in headers {
-        let key = name.as_str();
-        if key.starts_with("x-codex-")
-            && let Ok(value) = value.to_str()
-        {
-            native.insert(key.to_owned(), json!(value));
-        }
-    }
-    RateLimits { windows, native: (!native.is_empty()).then_some(Value::Object(native)) }
-}
-
-/// Codex provider with in-memory catalog and session affinity caches.
+/// The Codex provider. Share one instance (or one [`AuthManager`]) per process.
 pub struct CodexProvider {
     client: reqwest::Client,
+    config: CodexConfig,
     auth: Arc<AuthManager>,
-    catalog_cache: Mutex<Option<(String, Vec<ModelInfo>)>>,
-    turn_states: Mutex<HashMap<String, String>>,
+    catalog_cache: Mutex<Option<CatalogCache>>,
+    turn_states: Mutex<TurnStates>,
 }
 
 impl CodexProvider {
-    /// Create with the default aim-owned 0600 credential store.
+    /// The provider with default endpoints and aim's own credential store
+    /// (`~/.aim/auth/codex.json`, falling back to the Codex CLI's file, read-only).
     ///
     /// # Errors
-    /// Returns an error if the HTTP client or credential path cannot be prepared.
+    /// If the HTTP client or the credential path cannot be prepared.
     pub fn new() -> Result<Self, LlmError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .map_err(|_| error(LlmErrorKind::Transport, "cannot create Codex HTTP client"))?;
-        let store = Arc::new(FileCredentialStore::new(FileCredentialStore::default_path()?));
-        Ok(Self::with_auth(client.clone(), Arc::new(AuthManager::new(client, store))))
+        Self::with_config(CodexConfig::default())
     }
 
-    /// Create with a caller-provided auth manager, for controlled integration tests.
+    /// The provider with custom endpoints and aim's own credential store.
+    ///
+    /// # Errors
+    /// If the HTTP client or the credential path cannot be prepared.
+    pub fn with_config(config: CodexConfig) -> Result<Self, LlmError> {
+        let client = config.http_client()?;
+        let store = Arc::new(FileCredentialStore::new(FileCredentialStore::default_path()?));
+        let auth = Arc::new(AuthManager::with_config(client.clone(), store, &config));
+        Ok(Self::with_auth(config, client, auth))
+    }
+
+    /// The provider with a caller-provided client and auth manager.
     #[must_use]
-    pub fn with_auth(client: reqwest::Client, auth: Arc<AuthManager>) -> Self {
-        Self { client, auth, catalog_cache: Mutex::new(None), turn_states: Mutex::new(HashMap::new()) }
+    pub fn with_auth(config: CodexConfig, client: reqwest::Client, auth: Arc<AuthManager>) -> Self {
+        Self { client, config, auth, catalog_cache: Mutex::new(None), turn_states: Mutex::new(TurnStates::new(TURN_STATE_SESSIONS)) }
+    }
+
+    /// The auth manager (for login flows and credential status).
+    #[must_use]
+    pub fn auth(&self) -> &Arc<AuthManager> {
+        &self.auth
+    }
+
+    /// Catalog data for `model` when the catalog has been fetched: whether it accepts
+    /// `reasoning.summary` (codex sends it only then, refs:core/src/client.rs:883-885).
+    async fn body_options(&self, model: &str) -> BodyOptions {
+        let cache = self.catalog_cache.lock().await;
+        let flag = cache
+            .as_ref()
+            .and_then(|cache| cache.models.iter().find(|m| m.id == model))
+            .and_then(|m| m.native.as_ref())
+            .and_then(|native| native.get("supports_reasoning_summary_parameter"))
+            .and_then(Value::as_bool);
+        BodyOptions { reasoning_summary: flag.unwrap_or(true) }
+    }
+
+    fn authorized(builder: reqwest::RequestBuilder, credentials: &Credentials) -> reqwest::RequestBuilder {
+        builder
+            .bearer_auth(credentials.access_token.expose())
+            .header("ChatGPT-Account-Id", &credentials.account_id)
+            .header("originator", ORIGINATOR)
+            .header(USER_AGENT, user_agent())
+    }
+
+    async fn failed(&self, response: reqwest::Response, context: &str) -> LlmError {
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            // The token was rejected: re-read the sources on the next call.
+            self.auth.invalidate().await;
+        }
+        errors::from_response(response, self.config.request_timeout, context, unix_now()).await
     }
 
     async fn start(&self, request: Request, trigger_compaction: bool) -> Result<EventStream, LlmError> {
         let credentials = self.auth.credentials().await?;
-        let mut body = request_body(&request);
+        let mut body = request_body(&request, &self.body_options(&request.model).await);
         if trigger_compaction {
             let input = body
                 .get_mut("input")
                 .and_then(Value::as_array_mut)
                 .ok_or_else(|| error(LlmErrorKind::Protocol, "invalid compaction input"))?;
-            input.push(json!({"type":"compaction_trigger"}));
+            input.push(json!({"type": "compaction_trigger"}));
         }
-        let mut builder = self
-            .client
-            .post(format!("{BASE}/responses"))
-            .bearer_auth(&credentials.access_token)
-            .header("ChatGPT-Account-Id", &credentials.account_id)
-            .header("originator", "aim")
-            .header("User-Agent", format!("aim/{}", env!("CARGO_PKG_VERSION")))
-            .header("Accept", "text/event-stream")
+        let mut builder = Self::authorized(self.client.post(format!("{}/responses", self.config.base_url)), &credentials)
+            .header(ACCEPT, "text/event-stream")
             .json(&body);
+        // Turn state is scoped to (session, turn); without both it is neither sent nor kept.
+        let turn = request.session_id.as_deref().zip(request.turn_id.as_deref());
         if let Some(session) = &request.session_id {
             builder = builder.header("session-id", session);
-            if let Some(turn_state) = self.turn_states.lock().await.get(session).cloned() {
-                builder = builder.header("x-codex-turn-state", turn_state);
-            }
         }
-        let response = builder.send().await.map_err(|_| error(LlmErrorKind::Transport, "Codex transport failed"))?;
+        if let Some((session, turn)) = turn
+            && let Some(state) = self.turn_states.lock().await.get(session, turn)
+        {
+            builder = builder.header("x-codex-turn-state", state);
+        }
+        let response = tokio::time::timeout(self.config.idle_timeout, builder.send())
+            .await
+            .map_err(|_| idle_timeout(self.config.idle_timeout))?
+            .map_err(|e| send_error(&e, "Codex request"))?;
         if !response.status().is_success() {
-            let status = response.status();
-            let headers = response.headers().clone();
-            let body = response.json::<Value>().await.ok();
-            return Err(http_error(status, &headers, body.as_ref()));
+            return Err(self.failed(response, "Codex request").await);
         }
-        let limits = rate_limits(response.headers());
-        if let (Some(session), Some(state)) = (request.session_id, header_string(response.headers(), "x-codex-turn-state")) {
-            self.turn_states.lock().await.insert(session, state);
+        let limits = limits::from_headers(response.headers(), unix_now());
+        if let (Some((session, turn)), Some(state)) = (turn, header_string(response.headers(), "x-codex-turn-state")) {
+            self.turn_states.lock().await.record(session, turn, state);
         }
-        let stream = try_stream! {
-            let mut bytes = response.bytes_stream();
-            let mut parser = SseParser::new();
-            let mut saw_created = false;
-            let mut completed = false;
-            let mut saw_tool = false;
-            let mut pending_calls: HashMap<u64, (String, String)> = HashMap::new();
-            while let Some(chunk) = bytes.next().await {
-                let chunk = chunk.map_err(|_| error(LlmErrorKind::Transport, "Codex stream interrupted"))?;
-                for value in parser.push(&chunk)? {
-                    if value.get("type").and_then(Value::as_str) == Some("response.output_item.added")
-                        && let (Some(index), Some(call_id), Some(name)) = (
-                            value.get("output_index").and_then(Value::as_u64),
-                            value.pointer("/item/call_id").and_then(Value::as_str),
-                            value.pointer("/item/name").and_then(Value::as_str),
-                        ) { pending_calls.insert(index, (call_id.to_owned(), name.to_owned())); }
-                    if let Some(mut next) = event(&value)? {
-                        if let StreamEvent::ToolCallDelta { call_id, name, .. } = &mut next
-                            && call_id.is_empty()
-                            && let Some((known_id, known_name)) = value.get("output_index").and_then(Value::as_u64)
-                                .and_then(|index| pending_calls.get(&index)) {
-                            call_id.clone_from(known_id);
-                            *name = Some(known_name.clone());
-                        }
-                        if matches!(next, StreamEvent::ItemDone { item: Item::ToolCall { .. } }) { saw_tool = true; }
-                        if let StreamEvent::Completed { stop, .. } = &mut next && saw_tool {
-                            *stop = aim_proto::conversation::StopReason::ToolUse;
-                        }
-                        if matches!(next, StreamEvent::Created { .. }) {
-                            saw_created = true;
-                            yield next;
-                            yield StreamEvent::RateLimits { limits: limits.clone() };
-                        } else if matches!(next, StreamEvent::Completed { .. }) {
-                            if !saw_created { Err(error(LlmErrorKind::Protocol, "Codex completed without creation"))?; }
-                            completed = true;
-                            yield next;
-                            break;
-                        } else {
-                            yield next;
-                        }
-                    }
-                }
-                if completed { break; }
-            }
-            if !completed { Err(error(LlmErrorKind::Protocol, "Codex stream closed without completion"))?; }
-        };
-        Ok(Box::pin(stream))
+        Ok(drive(response.bytes_stream(), limits, self.config.drive_options()))
     }
 
-    /// Request V2 compaction and return exactly one opaque encrypted item.
+    /// V2 remote compaction: sends the history with a trailing `compaction_trigger` item and
+    /// returns the single encrypted `compaction` item (research §7).
     ///
     /// # Errors
-    /// Returns an error if the request, stream, or compaction result is invalid.
+    /// If the request or stream fails, or the response has no, several, or an empty compaction item.
     pub async fn compact(&self, request: Request) -> Result<Item, LlmError> {
         let mut stream = self.start(request, true).await?;
         let mut compacted = None;
         let mut completed = false;
         while let Some(next) = stream.next().await {
             match next? {
-                StreamEvent::ItemDone { item: item @ Item::Compaction { .. } } if compacted.is_none() => {
+                StreamEvent::ItemDone { item: item @ Item::Compaction { .. } } => {
+                    if compacted.is_some() {
+                        return Err(error(LlmErrorKind::Protocol, "Codex returned several compaction items"));
+                    }
                     if let Item::Compaction { native } = &item
                         && native.value.get("encrypted_content").and_then(Value::as_str).is_none_or(str::is_empty)
                     {
-                        return Err(error(LlmErrorKind::Protocol, "compaction has no encrypted content"));
+                        return Err(error(LlmErrorKind::Protocol, "Codex compaction item has no encrypted content"));
                     }
                     compacted = Some(item);
-                }
-                StreamEvent::ItemDone { item: Item::Compaction { .. } } => {
-                    return Err(error(LlmErrorKind::Protocol, "multiple compaction items"));
                 }
                 StreamEvent::Completed { .. } => completed = true,
                 _ => {}
             }
         }
         if !completed {
-            return Err(error(LlmErrorKind::Protocol, "compaction did not complete"));
+            return Err(error(LlmErrorKind::Protocol, "Codex compaction did not complete"));
         }
-        compacted.ok_or_else(|| error(LlmErrorKind::Protocol, "compaction item missing"))
+        compacted.ok_or_else(|| error(LlmErrorKind::Protocol, "Codex compaction returned no compaction item"))
+    }
+
+    async fn fetch_catalog(&self) -> Result<Vec<ModelInfo>, LlmError> {
+        let credentials = self.auth.credentials().await?;
+        let cached_etag = {
+            let cache = self.catalog_cache.lock().await;
+            cache.as_ref().filter(|c| c.account_id == credentials.account_id).and_then(|c| c.etag.clone())
+        };
+        let mut url = url::Url::parse(&format!("{}/models", self.config.base_url))
+            .map_err(|_| error(LlmErrorKind::InvalidRequest, "invalid Codex base URL"))?;
+        url.query_pairs_mut().append_pair("client_version", &self.config.client_version);
+        let mut request = Self::authorized(self.client.get(url), &credentials).timeout(self.config.request_timeout);
+        if let Some(etag) = &cached_etag {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+        let response = request.send().await.map_err(|e| send_error(&e, "Codex catalog"))?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            let cache = self.catalog_cache.lock().await;
+            return cache
+                .as_ref()
+                .filter(|c| c.account_id == credentials.account_id)
+                .map(|c| c.models.clone())
+                .ok_or_else(|| error(LlmErrorKind::Protocol, "Codex catalog returned 304 without a cached copy"));
+        }
+        if !response.status().is_success() {
+            return Err(self.failed(response, "Codex catalog").await);
+        }
+        let etag = header_string(response.headers(), ETAG.as_str());
+        let bytes = response.bytes().await.map_err(|_| error(LlmErrorKind::Transport, "Codex catalog transfer failed"))?;
+        let body: Value = serde_json::from_slice(&bytes).map_err(|_| error(LlmErrorKind::Protocol, "Codex catalog is not JSON"))?;
+        let entries =
+            body.get("models").and_then(Value::as_array).ok_or_else(|| error(LlmErrorKind::Protocol, "Codex catalog has no models"))?;
+        let models: Vec<ModelInfo> = entries.iter().filter_map(catalog_entry).collect();
+        *self.catalog_cache.lock().await = Some(CatalogCache { account_id: credentials.account_id, etag, models: models.clone() });
+        Ok(models)
     }
 }
 
 impl ModelProvider for CodexProvider {
     fn id(&self) -> &'static str {
-        "codex"
+        wire::PROVIDER
     }
 
     fn catalog(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
-        Box::pin(async {
-            let credentials = self.auth.credentials().await?;
-            let mut request = self
-                .client
-                .get(format!("{BASE}/models?client_version={CLIENT_VERSION}"))
-                .bearer_auth(&credentials.access_token)
-                .header("ChatGPT-Account-Id", &credentials.account_id)
-                .header("originator", "aim");
-            if let Some((etag, _)) = self.catalog_cache.lock().await.as_ref() {
-                request = request.header(IF_NONE_MATCH, etag);
-            }
-            let response = request.send().await.map_err(|_| error(LlmErrorKind::Transport, "Codex catalog transport failed"))?;
-            if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-                return self
-                    .catalog_cache
-                    .lock()
-                    .await
-                    .as_ref()
-                    .map(|(_, models)| models.clone())
-                    .ok_or_else(|| error(LlmErrorKind::Protocol, "Codex catalog returned 304 without cache"));
-            }
-            if !response.status().is_success() {
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body = response.json::<Value>().await.ok();
-                return Err(http_error(status, &headers, body.as_ref()));
-            }
-            let etag = header_string(response.headers(), ETAG.as_str());
-            let body: Value = response.json().await.map_err(|_| error(LlmErrorKind::Protocol, "invalid Codex catalog"))?;
-            let entries =
-                body.get("models").and_then(Value::as_array).ok_or_else(|| error(LlmErrorKind::Protocol, "Codex catalog has no models"))?;
-            let models: Vec<_> = entries.iter().filter_map(catalog_entry).collect();
-            if let Some(etag) = etag {
-                *self.catalog_cache.lock().await = Some((etag, models.clone()));
-            }
-            Ok(models)
-        })
+        Box::pin(self.fetch_catalog())
     }
 
     fn stream(&self, request: Request) -> BoxFuture<'_, Result<EventStream, LlmError>> {
@@ -311,198 +362,30 @@ impl ModelProvider for CodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aim_proto::conversation::Part;
 
     #[test]
-    fn parses_catalog_and_headers() -> Result<(), LlmError> {
+    fn catalog_entries() {
         let entry = json!({"slug":"gpt-6-luna","display_name":"Luna","context_window":272_000,
             "supported_reasoning_levels":[{"effort":"low"},{"effort":"xhigh"}],"default_reasoning_level":"low",
-            "visibility":"hide","service_tiers":[{"id":"priority","name":"Fast"}]});
-        let model = catalog_entry(&entry).ok_or_else(|| error(LlmErrorKind::Protocol, "fixture catalog entry failed"))?;
+            "visibility":"list","service_tiers":[{"id":"priority","name":"Fast"}],"input_modalities":["text"]});
+        let model = catalog_entry(&entry).unwrap();
         assert_eq!(model.efforts, ["low", "xhigh"]);
-        assert!(model.hidden);
-        let mut headers = HeaderMap::new();
-        headers.insert("x-codex-primary-used-percent", reqwest::header::HeaderValue::from_static("21.5"));
-        headers.insert("x-codex-primary-window-minutes", reqwest::header::HeaderValue::from_static("300"));
-        headers.insert("x-codex-turn-state", reqwest::header::HeaderValue::from_static("opaque"));
-        let limits = rate_limits(&headers);
-        assert_eq!(limits.windows.len(), 1);
-        assert_eq!(limits.windows[0].window_minutes, Some(300));
-        assert!(limits.native.is_some());
-        Ok(())
+        assert_eq!((model.context_window, model.default_effort.as_deref()), (Some(272_000), Some("low")));
+        assert_eq!(model.tiers[0].name, "Fast");
+        assert!(!model.hidden && !model.images && model.tools);
+        for visibility in ["hide", "none"] {
+            let hidden = json!({"slug":"x","visibility":visibility});
+            assert!(catalog_entry(&hidden).unwrap().hidden, "{visibility}");
+        }
+        assert!(catalog_entry(&json!({"display_name":"no slug"})).is_none());
     }
 
     #[test]
-    fn classifies_http_errors() {
-        let headers = HeaderMap::new();
-        assert_eq!(http_error(reqwest::StatusCode::UNAUTHORIZED, &headers, None).kind, LlmErrorKind::Auth);
-        assert_eq!(http_error(reqwest::StatusCode::TOO_MANY_REQUESTS, &headers, None).kind, LlmErrorKind::RateLimited);
-        assert_eq!(
-            http_error(reqwest::StatusCode::BAD_REQUEST, &headers, Some(&json!({"error":{"code":"context_length_exceeded"}}))).kind,
-            LlmErrorKind::ContextOverflow
-        );
-    }
-
-    #[test]
-    fn request_replays_native_and_omits_output_cap() {
-        let native = aim_proto::conversation::NativeItem {
-            provider: "codex".into(),
-            value: json!({"type":"reasoning","encrypted_content":"opaque"}),
-        };
-        let request = Request {
-            model: "gpt-6-luna".into(),
-            instructions: "Be brief".into(),
-            items: vec![
-                Item::User { parts: vec![Part::Text { text: "Hi".into() }] },
-                Item::Reasoning { id: None, summary: vec![], native: Some(native) },
-            ],
-            tools: vec![],
-            effort: Some("low".into()),
-            tier: None,
-            cache_key: None,
-            session_id: None,
-            parallel_tool_calls: false,
-            max_output_tokens: Some(1),
-        };
-        let body = request_body(&request);
-        assert_eq!(body["input"][1]["encrypted_content"], "opaque");
-        assert!(body.get("max_output_tokens").is_none());
-    }
-}
-
-#[cfg(test)]
-mod live_tests {
-    use super::*;
-    use aim_proto::conversation::Part;
-    use aim_proto::tool::{ToolAnnotations, ToolContent, ToolResult, ToolSpec};
-    use std::time::Instant;
-
-    fn request(text: &str) -> Request {
-        Request {
-            model: "gpt-6-luna".into(),
-            instructions: "Reply briefly and exactly as requested.".into(),
-            items: vec![Item::User { parts: vec![Part::Text { text: text.into() }] }],
-            tools: vec![],
-            effort: Some("low".into()),
-            tier: None,
-            cache_key: None,
-            session_id: Some("aim-live-codex".into()),
-            parallel_tool_calls: false,
-            max_output_tokens: None,
-        }
-    }
-
-    async fn collect(provider: &CodexProvider, request: Request) -> Result<(Vec<StreamEvent>, u128, u128), LlmError> {
-        let start = Instant::now();
-        let mut stream = provider.stream(request).await?;
-        let mut events = Vec::new();
-        let mut ttft = None;
-        while let Some(next) = stream.next().await {
-            let event = next?;
-            if ttft.is_none() && matches!(event, StreamEvent::TextDelta { .. } | StreamEvent::ToolCallDelta { .. }) {
-                ttft = Some(start.elapsed().as_millis());
-            }
-            events.push(event);
-        }
-        Ok((events, ttft.unwrap_or(0), start.elapsed().as_millis()))
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live ChatGPT credentials and quota"]
-    async fn live_catalog() -> Result<(), LlmError> {
-        let start = Instant::now();
-        let models = CodexProvider::new()?.catalog().await?;
-        assert!(models.iter().any(|m| m.id.starts_with("gpt-6-") && m.efforts.iter().any(|e| e == "xhigh")));
-        eprintln!("catalog models={} total_ms={}", models.len(), start.elapsed().as_millis());
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live ChatGPT credentials and quota"]
-    async fn live_text_turn() -> Result<(), LlmError> {
-        let (events, ttft, total) = collect(&CodexProvider::new()?, request("Reply OK")).await?;
-        let text: String =
-            events.iter().filter_map(|e| if let StreamEvent::TextDelta { delta, .. } = e { Some(delta.as_str()) } else { None }).collect();
-        assert!(text.contains("OK"));
-        let usage = events
-            .iter()
-            .find_map(|e| if let StreamEvent::Completed { usage, .. } = e { Some(usage) } else { None })
-            .ok_or_else(|| error(LlmErrorKind::Protocol, "no completion"))?;
-        assert!(usage.native.as_ref().and_then(|v| v.get("attribution")).is_some());
-        eprintln!(
-            "text ttft_ms={ttft} total_ms={total} input={} output={} cached={} reasoning={}",
-            usage.input_tokens, usage.output_tokens, usage.cached_input_tokens, usage.reasoning_tokens
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live ChatGPT credentials and quota"]
-    async fn live_tool_turn_replay() -> Result<(), LlmError> {
-        let provider = CodexProvider::new()?;
-        let mut first = request("Call the lookup tool with key blue. After its result, reply OK.");
-        first.tools.push(ToolSpec {
-            name: "lookup".into(),
-            description: "Look up a key".into(),
-            input_schema: json!({"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}),
-            annotations: ToolAnnotations::default(),
-        });
-        let (events, first_ttft, first_total) = collect(&provider, first.clone()).await?;
-        let call = events
-            .iter()
-            .find(|e| matches!(e, StreamEvent::ItemDone { item: Item::ToolCall { .. } }))
-            .ok_or_else(|| error(LlmErrorKind::Protocol, "model did not call lookup"))?;
-        let (call_id, name, arguments, native) =
-            if let StreamEvent::ItemDone { item: Item::ToolCall { call_id, name, arguments, native } } = call {
-                (call_id.clone(), name.clone(), arguments.clone(), native.clone())
-            } else {
-                return Err(error(LlmErrorKind::Protocol, "tool call missing"));
-            };
-        for event in &events {
-            if let StreamEvent::ItemDone { item } = event
-                && !matches!(item, Item::ToolCall { .. })
-            {
-                first.items.push(item.clone());
-            }
-        }
-        first.items.push(Item::ToolCall { call_id: call_id.clone(), name, arguments, native });
-        first.items.push(Item::ToolResult {
-            call_id,
-            result: ToolResult { content: vec![ToolContent::Text { text: "blue".into() }], ..ToolResult::default() },
-        });
-        let (events, second_ttft, second_total) = collect(&provider, first).await?;
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta { .. })));
-        let usage = events
-            .iter()
-            .find_map(|e| if let StreamEvent::Completed { usage, .. } = e { Some(usage) } else { None })
-            .ok_or_else(|| error(LlmErrorKind::Protocol, "no replay completion"))?;
-        eprintln!(
-            "tool first_ttft_ms={first_ttft} first_total_ms={first_total} second_ttft_ms={second_ttft} second_total_ms={second_total} second_input={} second_output={}",
-            usage.input_tokens, usage.output_tokens
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live ChatGPT credentials and quota"]
-    async fn live_rate_limits() -> Result<(), LlmError> {
-        let (events, ttft, total) = collect(&CodexProvider::new()?, request("Reply OK")).await?;
-        let limits = events
-            .iter()
-            .find_map(|e| if let StreamEvent::RateLimits { limits } = e { Some(limits) } else { None })
-            .ok_or_else(|| error(LlmErrorKind::Protocol, "no rate limit event"))?;
-        assert!(!limits.windows.is_empty());
-        eprintln!("rate_limits windows={} ttft_ms={ttft} total_ms={total}", limits.windows.len());
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live ChatGPT credentials and quota"]
-    async fn live_compaction_v2() -> Result<(), LlmError> {
-        let start = Instant::now();
-        let result = CodexProvider::new()?.compact(request("Reply OK")).await;
-        eprintln!("compaction total_ms={} success={}", start.elapsed().as_millis(), result.is_ok());
-        assert!(matches!(result?, Item::Compaction { .. }));
-        Ok(())
+    fn default_config_matches_the_reference_client() {
+        let config = CodexConfig::default();
+        assert_eq!(config.base_url, "https://chatgpt.com/backend-api/codex");
+        assert_eq!(config.issuer, "https://auth.openai.com");
+        assert_eq!(config.idle_timeout, Duration::from_secs(300));
+        assert_eq!(config.callback_ports, [1455, 1457]);
     }
 }
