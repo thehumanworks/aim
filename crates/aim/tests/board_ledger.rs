@@ -1,16 +1,12 @@
 //! Board ledger persistence and transaction boundary tests.
 //!
-//! Import the new module directly until the integration branch exports it from `aim::lib`.
-#![expect(dead_code, reason = "the module is imported before the integration branch exports its full public API")]
+//! Exercises the exported `aim::board` service against real SQLite files.
 
-#[path = "../src/board/mod.rs"]
-mod board;
-
+use aim::board::{Board, Error};
 use aim::store::{SessionStore as _, SqliteStore};
 use aim_proto::board::{ArtifactInput, ClaimParams, CompleteParams, JobSpec, JobState, PostParams, RetryParams, ReviewParams};
 use aim_proto::content::Base64Bytes;
 use aim_proto::event::{EVENT_SCHEMA, EventBody, SessionEvent, SessionMeta};
-use board::{Board, Error};
 
 fn spec(title: &str, depends_on: Vec<String>, max_retries: u32) -> JobSpec {
     JobSpec {

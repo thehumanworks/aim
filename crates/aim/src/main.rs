@@ -4,6 +4,7 @@
 //! - `aim sessions` — recent sessions.
 //! - `aim daemon` — serve local sessions over `aim-daemon/1`.
 //! - `aim search`, `aim image`, `aim transcribe` — Codex media services.
+//! - `aim board` — inspect and mutate the durable blackboard through the daemon.
 #![expect(clippy::print_stderr, reason = "the CLI reports errors on stderr")]
 #![expect(clippy::print_stdout, reason = "daemon status reports to stdout")]
 
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use aim::board::cli as board_cli;
 use aim::cli::{self, RunOptions};
 use aim::daemon::{client::DaemonClient, server, socket_path};
 use aim::host::{HostConfig, SessionClient, SessionHost};
@@ -114,6 +116,12 @@ enum Command {
         #[arg(short, long, default_value_t = 20)]
         limit: u32,
     },
+    /// Post and inspect durable blackboard jobs through the local daemon.
+    Board {
+        /// Board action.
+        #[command(subcommand)]
+        action: board_cli::BoardAction,
+    },
     /// Serve or inspect the local session daemon.
     Daemon {
         /// Unix socket path (default: `$AIM_HOME/run/daemon.sock`).
@@ -204,6 +212,7 @@ async fn main_async(args: Args) -> Result<i32, String> {
             }
             Ok(0)
         }
+        Command::Board { action } => board_cli::run(&cli::aim_home(), action).await,
         Command::Daemon { socket, idle_exit, action } => {
             let home = cli::aim_home();
             let socket = socket.unwrap_or_else(|| socket_path(&home));

@@ -3,6 +3,7 @@
 //! The board owns one actor thread on the daemon's SQLite file. Its mutation methods run the
 //! verified kernel transition before writing a projection and an event in one transaction.
 
+pub mod cli;
 mod service;
 mod sqlite;
 

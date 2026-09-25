@@ -12,8 +12,10 @@
 //! - [`acp`] — Claude Code (and other ACP agents) as a session backend.
 //! - [`login`] — `aim login codex | claude`.
 //! - [`daemon`] — the local daemon server, client and auto-spawn.
+//! - [`board`] — the durable job ledger and board CLI.
 pub mod acp;
 pub mod agent;
+pub mod board;
 pub mod cli;
 pub mod context;
 pub mod daemon;
