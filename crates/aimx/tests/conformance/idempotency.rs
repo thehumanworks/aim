@@ -20,6 +20,7 @@ fn write_params(ws: &aim_proto::ids::WorkspaceId, body: &str, key: &IdempotencyK
         precondition: Precondition::Any,
         create_dirs: false,
         idempotency_key: key.clone(),
+        scope: None,
     }
 }
 
@@ -33,6 +34,7 @@ fn spawn_params(ws: &aim_proto::ids::WorkspaceId, script: &str, key: &Idempotenc
         stdin: false,
         timeout_ms: None,
         idempotency_key: key.clone(),
+        scope: None,
     }
 }
 
@@ -84,11 +86,12 @@ async fn bash_capacity_rejection_does_not_cache_the_key() {
         name: "Bash".into(),
         arguments: json!({"command": "echo ran >> bash-log"}),
         idempotency_key: Some(key()),
+        scope: None,
     };
     let refused = client.peer.call::<ToolsCall>(params.clone()).await.unwrap();
     assert!(refused.is_error, "{refused:?}");
     assert!(!env.path("bash-log").exists());
-    client.peer.call::<ExecRelease>(ExecReleaseParams { proc: occupied }).await.unwrap();
+    client.peer.call::<ExecRelease>(ExecReleaseParams { proc: occupied, scope: None }).await.unwrap();
     let accepted = client.peer.call::<ToolsCall>(params.clone()).await.unwrap();
     assert!(!accepted.is_error, "{accepted:?}");
     let replay = client.peer.call::<ToolsCall>(params).await.unwrap();
@@ -149,6 +152,7 @@ async fn mutating_tools_run_once_and_need_a_key() {
         name: "Bash".into(),
         arguments: json!({"command": "echo tool >> log; cat log"}),
         idempotency_key: Some(k.clone()),
+        scope: None,
     };
     let first = client.peer.call::<ToolsCall>(call()).await.unwrap();
     let retry = client.peer.call::<ToolsCall>(call()).await.unwrap();
@@ -195,17 +199,17 @@ async fn retried_stdin_writes_send_their_bytes_once() {
     params.stdin = true;
     let proc = client.peer.call::<ExecSpawn>(params).await.unwrap().proc;
     let k = key();
-    let write = ExecWriteStdinParams { proc: proc.clone(), data: text("once\n"), eof: false, idempotency_key: k };
+    let write = ExecWriteStdinParams { proc: proc.clone(), data: text("once\n"), eof: false, idempotency_key: k, scope: None };
     client.peer.call::<ExecWriteStdin>(write.clone()).await.unwrap();
     client.peer.call::<ExecWriteStdin>(write).await.unwrap();
-    let close = ExecWriteStdinParams { proc: proc.clone(), data: text(""), eof: true, idempotency_key: key() };
+    let close = ExecWriteStdinParams { proc: proc.clone(), data: text(""), eof: true, idempotency_key: key(), scope: None };
     client.peer.call::<ExecWriteStdin>(close).await.unwrap();
     let mut out = String::new();
     let mut cursor = 0;
     loop {
         let read = client
             .peer
-            .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: cursor, max_bytes: None, wait_ms: 5000 })
+            .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: cursor, max_bytes: None, wait_ms: 5000, scope: None })
             .await
             .unwrap();
         for chunk in read.chunks {
@@ -235,12 +239,13 @@ async fn a_process_is_replayed_only_to_its_own_session() {
         name: "Bash".into(),
         arguments: json!({"command": "sleep 30", "run_in_background": true}),
         idempotency_key: Some(bash.clone()),
+        scope: None,
     };
     let (first, token, first_tool) = {
         let (client, init, ws) = session(&env).await;
         let proc = client.peer.call::<ExecSpawn>(spawn_params(&ws, "sleep 30", &key())).await.unwrap().proc;
         let first = client.peer.call::<ExecSpawn>(spawn_params(&ws, "sleep 30", &k)).await.unwrap().proc;
-        client.peer.call::<ExecRelease>(ExecReleaseParams { proc }).await.unwrap();
+        client.peer.call::<ExecRelease>(ExecReleaseParams { proc, scope: None }).await.unwrap();
         let tool = client.peer.call::<ToolsCall>(background(&ws)).await.unwrap();
         client.peer.close();
         (first, init.resume_token, tool)
@@ -254,10 +259,10 @@ async fn a_process_is_replayed_only_to_its_own_session() {
         Err(err) => assert_eq!(err.code, ErrorCode::UnknownOutcome, "{err:?}"),
         Ok(retry) => {
             // Whatever it returns must be usable by this session.
-            let read = ExecReadParams { proc: retry.proc.clone(), after_seq: 0, max_bytes: None, wait_ms: 0 };
+            let read = ExecReadParams { proc: retry.proc.clone(), after_seq: 0, max_bytes: None, wait_ms: 0, scope: None };
             fresh.peer.call::<ExecRead>(read).await.unwrap();
-            fresh.peer.call::<ExecWait>(ExecWaitParams { proc: retry.proc.clone(), timeout_ms: Some(10) }).await.unwrap();
-            fresh.peer.call::<ExecRelease>(ExecReleaseParams { proc: retry.proc }).await.unwrap();
+            fresh.peer.call::<ExecWait>(ExecWaitParams { proc: retry.proc.clone(), timeout_ms: Some(10), scope: None }).await.unwrap();
+            fresh.peer.call::<ExecRelease>(ExecReleaseParams { proc: retry.proc, scope: None }).await.unwrap();
         }
     }
     let err = fresh.peer.call::<ToolsCall>(background(&ws)).await.unwrap_err();
@@ -271,7 +276,7 @@ async fn a_process_is_replayed_only_to_its_own_session() {
     let again = resumed.peer.call::<ExecSpawn>(spawn_params(&ws, "sleep 30", &k)).await.unwrap().proc;
     assert_eq!(again, first);
     assert_eq!(resumed.peer.call::<ToolsCall>(background(&ws)).await.unwrap(), first_tool);
-    resumed.peer.call::<ExecRelease>(ExecReleaseParams { proc: again }).await.unwrap();
+    resumed.peer.call::<ExecRelease>(ExecReleaseParams { proc: again, scope: None }).await.unwrap();
 }
 
 /// Milliseconds since the Unix epoch.

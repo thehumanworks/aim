@@ -82,17 +82,24 @@ async fn reads_never_see_outside_the_root_while_it_is_swapped() {
     let deadline = Instant::now() + RACE;
     let mut answered = 0u32;
     while Instant::now() < deadline {
-        let read = client.peer.call::<FsRead>(FsReadParams { workspace: ws.clone(), path: "d/secret".into(), range: None }).await;
+        let read = client
+            .peer
+            .call::<FsRead>(FsReadParams { workspace: ws.clone(), path: "d/secret".into(), range: None, hash: true, scope: None })
+            .await;
         if let Ok(read) = read {
             answered += 1;
             let body = String::from_utf8(read.content.into_bytes()).unwrap();
             assert!(!leaked(&body, &race.sentinel), "fs.read returned outside bytes");
         }
-        let list = FsListParams { workspace: ws.clone(), path: "d".into(), limit: None, page_token: None, include_hidden: true };
+        let list =
+            FsListParams { workspace: ws.clone(), path: "d".into(), limit: None, page_token: None, include_hidden: true, scope: None };
         if let Ok(list) = client.peer.call::<FsList>(list).await {
             assert!(list.entries.iter().all(|e| e.name != "outside-only"), "fs.list listed outside entries");
         }
-        let stat = client.peer.call::<FsStat>(FsStatParams { workspace: ws.clone(), path: "d/outside-only".into(), hash: true }).await;
+        let stat = client
+            .peer
+            .call::<FsStat>(FsStatParams { workspace: ws.clone(), path: "d/outside-only".into(), hash: true, scope: None })
+            .await;
         assert!(stat.is_err(), "fs.stat reached an outside entry: {stat:?}");
         let grep = GrepParams {
             workspace: ws.clone(),
@@ -103,6 +110,7 @@ async fn reads_never_see_outside_the_root_while_it_is_swapped() {
             fixed_strings: true,
             context: 0,
             max_matches: None,
+            scope: None,
         };
         if let Ok(found) = client.peer.call::<Grep>(grep).await {
             assert!(found.matches.is_empty(), "grep matched outside content: {:?}", found.matches);
@@ -128,6 +136,7 @@ async fn mutations_and_processes_never_act_outside_the_root_while_it_is_swapped(
             precondition: Precondition::Any,
             create_dirs: true,
             idempotency_key: key(),
+            scope: None,
         };
         drop(client.peer.call::<FsWrite>(write).await);
         let write = FsWriteParams {
@@ -137,10 +146,14 @@ async fn mutations_and_processes_never_act_outside_the_root_while_it_is_swapped(
             precondition: Precondition::Any,
             create_dirs: false,
             idempotency_key: key(),
+            scope: None,
         };
         drop(client.peer.call::<FsWrite>(write).await);
         drop(
-            client.peer.call::<FsMkdir>(FsMkdirParams { workspace: ws.clone(), path: format!("d/dir-{i}"), idempotency_key: key() }).await,
+            client
+                .peer
+                .call::<FsMkdir>(FsMkdirParams { workspace: ws.clone(), path: format!("d/dir-{i}"), idempotency_key: key(), scope: None })
+                .await,
         );
         let copy = FsCopyParams {
             workspace: ws.clone(),
@@ -149,6 +162,7 @@ async fn mutations_and_processes_never_act_outside_the_root_while_it_is_swapped(
             overwrite: false,
             recursive: false,
             idempotency_key: key(),
+            scope: None,
         };
         drop(client.peer.call::<FsCopy>(copy).await);
         if i.is_multiple_of(8) {
@@ -161,9 +175,10 @@ async fn mutations_and_processes_never_act_outside_the_root_while_it_is_swapped(
                 stdin: false,
                 timeout_ms: None,
                 idempotency_key: key(),
+                scope: None,
             };
             if let Ok(spawned) = client.peer.call::<ExecSpawn>(spawn).await {
-                drop(client.peer.call::<ExecWait>(ExecWaitParams { proc: spawned.proc, timeout_ms: Some(5000) }).await);
+                drop(client.peer.call::<ExecWait>(ExecWaitParams { proc: spawned.proc, timeout_ms: Some(5000), scope: None }).await);
             }
         }
     }

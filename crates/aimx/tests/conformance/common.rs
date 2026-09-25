@@ -115,7 +115,8 @@ pub async fn session(env: &Env) -> (Client, InitializeResult, WorkspaceId) {
 }
 
 pub async fn open(client: &Client, root: &Path) -> WorkspaceId {
-    let params = WorkspaceOpenParams { root: root.to_str().unwrap().to_owned(), backend: aim_proto::harness::BackendSpec::default() };
+    let params =
+        WorkspaceOpenParams { ceiling: None, root: root.to_str().unwrap().to_owned(), backend: aim_proto::harness::BackendSpec::default() };
     client.peer.call::<WorkspaceOpen>(params).await.unwrap().id
 }
 

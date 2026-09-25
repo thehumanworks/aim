@@ -60,6 +60,7 @@ async fn serve_unix_binary_end_to_end() {
     let wrote = client
         .peer
         .call::<ToolsCall>(ToolsCallParams {
+            scope: None,
             workspace: ws.clone(),
             name: "Bash".into(),
             arguments: json!({"command": "echo from-binary > out.txt && cat out.txt"}),
@@ -91,6 +92,7 @@ async fn serve_unix_binary_end_to_end() {
     assert!(init.principal.read_only);
     let ws = open(&client, &root).await;
     let params = FsWriteParams {
+        scope: None,
         workspace: ws,
         path: "out.txt".into(),
         content: text("x"),
@@ -125,6 +127,7 @@ async fn serve_stdio_binary_end_to_end() {
     initialize(&client, None).await;
     let ws = open(&client, dir.path()).await;
     let params = FsWriteParams {
+        scope: None,
         workspace: ws.clone(),
         path: "f".into(),
         content: text("over stdio"),
@@ -133,7 +136,8 @@ async fn serve_stdio_binary_end_to_end() {
         idempotency_key: key(),
     };
     client.peer.call::<FsWrite>(params).await.unwrap();
-    let read = client.peer.call::<FsRead>(FsReadParams { workspace: ws, path: "f".into(), range: None }).await.unwrap();
+    let read =
+        client.peer.call::<FsRead>(FsReadParams { scope: None, hash: true, workspace: ws, path: "f".into(), range: None }).await.unwrap();
     assert_eq!(read.content.into_bytes(), b"over stdio");
     // Closing stdin ends the server cleanly.
     client.peer.close();
@@ -173,8 +177,11 @@ async fn live_binary_on_this_repository() {
     let mut reads = Vec::new();
     for _ in 0..200 {
         let t = Instant::now();
-        let read =
-            client.peer.call::<FsRead>(FsReadParams { workspace: ws.clone(), path: "Cargo.toml".into(), range: None }).await.unwrap();
+        let read = client
+            .peer
+            .call::<FsRead>(FsReadParams { scope: None, hash: true, workspace: ws.clone(), path: "Cargo.toml".into(), range: None })
+            .await
+            .unwrap();
         reads.push(t.elapsed());
         assert!(read.size > 0);
     }
@@ -182,6 +189,7 @@ async fn live_binary_on_this_repository() {
     let grep = client
         .peer
         .call::<Grep>(GrepParams {
+            scope: None,
             workspace: ws.clone(),
             pattern: "pub fn confine".into(),
             path: None,
@@ -199,7 +207,13 @@ async fn live_binary_on_this_repository() {
     let t = Instant::now();
     let glob = client
         .peer
-        .call::<Glob>(GlobParams { workspace: ws.clone(), patterns: vec!["**/*.rs".into()], path: None, max_results: Some(100_000) })
+        .call::<Glob>(GlobParams {
+            scope: None,
+            workspace: ws.clone(),
+            patterns: vec!["**/*.rs".into()],
+            path: None,
+            max_results: Some(100_000),
+        })
         .await
         .unwrap();
     let glob_time = t.elapsed();
@@ -207,6 +221,7 @@ async fn live_binary_on_this_repository() {
     let tool = client
         .peer
         .call::<ToolsCall>(ToolsCallParams {
+            scope: None,
             workspace: ws.clone(),
             name: "Grep".into(),
             arguments: json!({"pattern": "LOCKED\\(ADR-0005\\)", "output_mode": "files_with_matches"}),
@@ -216,6 +231,7 @@ async fn live_binary_on_this_repository() {
         .unwrap();
     assert!(!tool.is_error);
     let spawn = ExecSpawnParams {
+        scope: None,
         workspace: ws,
         command: Command::Shell { script: "true".into() },
         cwd: None,
@@ -243,6 +259,7 @@ async fn live_binary_on_this_repository() {
         let proc = client
             .peer
             .call::<ExecSpawn>(ExecSpawnParams {
+                scope: None,
                 workspace: ws.clone(),
                 command: Command::Argv { argv: vec!["true".into()] },
                 cwd: None,
@@ -258,7 +275,7 @@ async fn live_binary_on_this_repository() {
         loop {
             let read = client
                 .peer
-                .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: 0, max_bytes: None, wait_ms: 5000 })
+                .call::<ExecRead>(ExecReadParams { scope: None, proc: proc.clone(), after_seq: 0, max_bytes: None, wait_ms: 5000 })
                 .await
                 .unwrap();
             if read.exit.is_some() {
@@ -273,6 +290,7 @@ async fn live_binary_on_this_repository() {
         client
             .peer
             .call::<FsWrite>(FsWriteParams {
+                scope: None,
                 workspace: ws.clone(),
                 path: format!("f{i}"),
                 content: text("payload"),

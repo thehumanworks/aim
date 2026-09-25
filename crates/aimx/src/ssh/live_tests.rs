@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use aim_proto::content::Content;
 use aim_proto::error::ErrorCode;
 use aim_proto::harness::{
-    BackendSpec, ExecRead, ExecReadParams, ExecRelease, ExecReleaseParams, ExecSpawn, ExecSpawnParams, FsRead, FsReadParams, FsWrite,
-    FsWriteParams, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams, WorkspaceOpen,
-    WorkspaceOpenParams,
+    BackendSpec, CallScope, ExecRead, ExecReadParams, ExecRelease, ExecReleaseParams, ExecSpawn, ExecSpawnParams, FsRead, FsReadParams,
+    FsWrite, FsWriteParams, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams,
+    WorkspaceOpen, WorkspaceOpenParams,
 };
 use aim_proto::harness::{CaseMode, Command as RemoteCommand, ExactEdit, ExitStatus, Precondition};
 use aim_proto::ids::IdempotencyKey;
@@ -109,6 +109,7 @@ fn tool_text(result: &ToolResult) -> &str {
 async fn tool(peer: &Peer, workspace: &WorkspaceId, name: &str, arguments: serde_json::Value, key: &str) -> ToolResult {
     let result = peer
         .call::<ToolsCall>(ToolsCallParams {
+            scope: None,
             workspace: workspace.clone(),
             name: name.to_owned(),
             arguments,
@@ -467,7 +468,7 @@ async fn linux_exit(workspace: &AgentlessWorkspace, proc: &ProcId) -> ExitStatus
 }
 
 async fn assert_linux_sleep_stopped(connection: &Connection, workspace: &AgentlessWorkspace, marker: &str) {
-    let pid = workspace.fs().read(marker, None, 100).await.expect("read Linux sleep PID").content.into_bytes();
+    let pid = workspace.fs().read(marker, None, 100, true).await.expect("read Linux sleep PID").content.into_bytes();
     let pid = String::from_utf8(pid).expect("decimal PID");
     assert!(!pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()));
     let check = format!("if [ -r /proc/{pid}/stat ]; then awk '{{print $3}}' /proc/{pid}/stat; else printf gone; fi");
@@ -490,6 +491,46 @@ async fn linux_master_recovery(sshd: &LinuxSshd) {
     assert!(!short.check_master().await, "Linux master did not expire");
     assert_eq!(short.run("printf recovered", &[]).await.expect("recover Linux master"), b"recovered");
     assert!(short.check_master().await, "Linux recovery bypassed multiplexing");
+}
+
+async fn linux_concurrent_release(connection: &Connection, workspace: &Arc<AgentlessWorkspace>, root: &str) {
+    // N3: process slots plus transient reads fill sshd's ten-session limit. Concurrent release
+    // must still kill every process, report failures, and leave capacity for the reads.
+    let mut processes = Vec::new();
+    for index in 0..6 {
+        let marker = format!("{root}/sleep-{index}.pid");
+        let script = format!("sleep 30 & printf '%s' \"$!\" > {marker}; wait");
+        let proc = linux_spawn(workspace, root, script, None).await;
+        processes.push((proc, marker));
+    }
+    for (_, marker) in &processes {
+        for _ in 0..40 {
+            if workspace.fs().read(marker, None, 100, true).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(workspace.fs().read(marker, None, 100, true).await.is_ok(), "Linux sleep PID marker missing");
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for (proc, _) in &processes {
+        let workspace = Arc::clone(workspace);
+        let proc = proc.clone();
+        tasks.spawn(async move { workspace.exec().expect("exec").release(&proc).await.expect("concurrent Linux release") });
+    }
+    for _ in 0..3 {
+        let workspace = Arc::clone(workspace);
+        let root = root.to_owned();
+        tasks.spawn(async move {
+            workspace.fs().stat(&root, false).await.expect("concurrent Linux stat");
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.expect("Linux concurrent operation panicked");
+    }
+    for (_, marker) in &processes {
+        assert_linux_sleep_stopped(connection, workspace, marker).await;
+    }
 }
 
 async fn linux_regressions(distribution: &str) {
@@ -530,7 +571,7 @@ async fn linux_regressions(distribution: &str) {
         .edit(EditRequest { path: &file, edits: &edit, precondition: &Precondition::Any, key: &key() })
         .await
         .expect("edit Linux file");
-    assert_eq!(workspace.fs().read(&file, None, 100).await.expect("read Linux edit").content.into_bytes(), b"after\n");
+    assert_eq!(workspace.fs().read(&file, None, 100, true).await.expect("read Linux edit").content.into_bytes(), b"after\n");
     assert_eq!(connection.run("stat -c %a /tmp/aim-work/script.sh", &[]).await.expect("Linux mode"), b"755\n");
     connection.run("touch /tmp/aim-work/empty.txt", &[]).await.expect("empty fixture");
     let listing =
@@ -545,7 +586,10 @@ async fn linux_regressions(distribution: &str) {
     let script = format!("cat > /tmp/aim-work/large.txt <<'AIM_EOF'\n{payload}\nAIM_EOF");
     let proc = linux_spawn(&workspace, root, script, None).await;
     assert_eq!(linux_exit(&workspace, &proc).await, ExitStatus::Exited { code: 0 });
-    assert_eq!(workspace.fs().read(&format!("{root}/large.txt"), None, 70_000).await.expect("large script result").content.len(), 65_537);
+    assert_eq!(
+        workspace.fs().read(&format!("{root}/large.txt"), None, 70_000, true).await.expect("large script result").content.len(),
+        65_537
+    );
 
     // N5 and N6: Alpine has busybox realpath/ps and no perl; exit codes and group kills must work.
     if distribution == "alpine" {
@@ -565,42 +609,7 @@ async fn linux_regressions(distribution: &str) {
     assert_eq!(linux_exit(&workspace, &proc).await, ExitStatus::TimedOut);
     assert_linux_sleep_stopped(&connection, &workspace, &marker).await;
 
-    // N3: process slots plus transient reads fill sshd's ten-session limit. Concurrent release
-    // must still kill every process, report failures, and leave capacity for the reads.
-    let mut processes = Vec::new();
-    for index in 0..6 {
-        let marker = format!("{root}/sleep-{index}.pid");
-        let script = format!("sleep 30 & printf '%s' \"$!\" > {marker}; wait");
-        let proc = linux_spawn(&workspace, root, script, None).await;
-        processes.push((proc, marker));
-    }
-    for (_, marker) in &processes {
-        for _ in 0..40 {
-            if workspace.fs().read(marker, None, 100).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(workspace.fs().read(marker, None, 100).await.is_ok(), "Linux sleep PID marker missing");
-    }
-    let mut tasks = tokio::task::JoinSet::new();
-    for (proc, _) in &processes {
-        let workspace = Arc::clone(&workspace);
-        let proc = proc.clone();
-        tasks.spawn(async move { workspace.exec().expect("exec").release(&proc).await.expect("concurrent Linux release") });
-    }
-    for _ in 0..3 {
-        let workspace = Arc::clone(&workspace);
-        tasks.spawn(async move {
-            workspace.fs().stat(root, false).await.expect("concurrent Linux stat");
-        });
-    }
-    while let Some(result) = tasks.join_next().await {
-        result.expect("Linux concurrent operation panicked");
-    }
-    for (_, marker) in &processes {
-        assert_linux_sleep_stopped(&connection, &workspace, marker).await;
-    }
+    linux_concurrent_release(&connection, &workspace, root).await;
 }
 
 fn linux_target_enabled(distribution: &str) -> bool {
@@ -749,7 +758,7 @@ async fn live_ssh_transport_failure_is_unavailable_and_conflicts_are_conflicts()
     let workspace = open_agentless(&sshd, &root).await;
     assert_eq!(workspace.fs().mkdir(&file.to_string_lossy(), &key()).await.expect_err("mkdir over file").code, ErrorCode::Conflict);
     assert_eq!(workspace.fs().remove(&full.to_string_lossy(), false, &key()).await.expect_err("nonempty rmdir").code, ErrorCode::Conflict);
-    assert_eq!(workspace.fs().read(&full.to_string_lossy(), None, 10).await.expect_err("read directory").code, ErrorCode::Conflict);
+    assert_eq!(workspace.fs().read(&full.to_string_lossy(), None, 10, true).await.expect_err("read directory").code, ErrorCode::Conflict);
     let connection = sshd.connect().await;
     drop(
         Command::new("ssh")
@@ -770,7 +779,7 @@ async fn live_ssh_transport_failure_is_unavailable_and_conflicts_are_conflicts()
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let path = file.to_string_lossy();
-    assert_eq!(workspace.fs().read(&path, None, 10).await.expect_err("offline read").code, ErrorCode::Unavailable);
+    assert_eq!(workspace.fs().read(&path, None, 10, true).await.expect_err("offline read").code, ErrorCode::Unavailable);
     assert_eq!(workspace.fs().stat(&path, false).await.expect_err("offline stat").code, ErrorCode::Unavailable);
     let new_path = root.join("new.txt").to_string_lossy().into_owned();
     let content = Content::Utf8 { text: "new".to_owned() };
@@ -1164,7 +1173,7 @@ async fn live_ssh_large_read_and_listing_have_bounded_localhost_latency() {
     }
     let workspace = open_agentless(&sshd, &root).await;
     let started = Instant::now();
-    let read = workspace.fs().read(&large.to_string_lossy(), None, 4 << 20).await.expect("large read");
+    let read = workspace.fs().read(&large.to_string_lossy(), None, 4 << 20, true).await.expect("large read");
     let read_duration = started.elapsed();
     assert_eq!(read.content.len(), 4 << 20);
     let started = Instant::now();
@@ -1201,7 +1210,7 @@ async fn live_ssh_hashes_filenames_with_backslashes_via_stdin() {
         })
         .await
         .expect("write unusual filename");
-    let read = workspace.fs().read(&path, None, 100).await.expect("read unusual filename");
+    let read = workspace.fs().read(&path, None, 100, true).await.expect("read unusual filename");
     assert_eq!(read.content.into_bytes(), b"before");
     let edit = [ExactEdit { old: "before".to_owned(), new: "after".to_owned(), replace_all: false }];
     workspace
@@ -1498,13 +1507,18 @@ async fn live_ssh_resident_resume_two_proxies_and_idle_exit() {
     let init = initialize(&peer, None).await;
     assert!(!init.resumed);
     let workspace = peer
-        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_string_lossy().into_owned(), backend: BackendSpec::Local })
+        .call::<WorkspaceOpen>(WorkspaceOpenParams {
+            ceiling: None,
+            root: root.to_string_lossy().into_owned(),
+            backend: BackendSpec::Local,
+        })
         .await
         .expect("resident workspace");
     assert!(workspace.caps.resumable);
     eprintln!("resident_handshake_ms={}", started.elapsed().as_millis());
     let path = root.join("different.txt").to_string_lossy().into_owned();
     peer.call::<FsWrite>(FsWriteParams {
+        scope: None,
         workspace: workspace.id.clone(),
         path: path.clone(),
         content: Content::Utf8 { text: "remote".to_owned() },
@@ -1514,6 +1528,38 @@ async fn live_ssh_resident_resume_two_proxies_and_idle_exit() {
     })
     .await
     .expect("resident write");
+    let read_only = CallScope {
+        roots: vec![root.to_string_lossy().into_owned()],
+        ops: vec!["read".into()],
+        deny_write: Vec::new(),
+        max_processes: None,
+        max_output_bytes: None,
+    };
+    let scoped_read = peer
+        .call::<FsRead>(FsReadParams {
+            workspace: workspace.id.clone(),
+            path: path.clone(),
+            range: None,
+            scope: Some(read_only.clone()),
+            hash: false,
+        })
+        .await
+        .expect("read-only scope permits SSH read");
+    assert_eq!(scoped_read.content.into_bytes(), b"remote");
+    assert!(scoped_read.hash.is_none());
+    let denied = peer
+        .call::<FsWrite>(FsWriteParams {
+            workspace: workspace.id.clone(),
+            path: path.clone(),
+            content: Content::Utf8 { text: "blocked".to_owned() },
+            precondition: Precondition::Any,
+            create_dirs: false,
+            idempotency_key: IdempotencyKey::new("resident-scoped-write"),
+            scope: Some(read_only),
+        })
+        .await
+        .expect_err("read-only scope denies SSH write");
+    assert_eq!(denied.code, ErrorCode::Denied);
     assert_eq!(std::fs::read_to_string(&path).expect("remote file"), "remote");
     sshd.assert_local_denied(&root.join("different.txt"));
     assert_eq!(std::fs::read_to_string(local.join("different.txt")).expect("local file"), "local");
@@ -1541,6 +1587,7 @@ async fn resume_two_proxies(
 
     let process = peer
         .call::<ExecSpawn>(ExecSpawnParams {
+            scope: None,
             workspace: workspace.clone(),
             command: RemoteCommand::Shell { script: "printf 'first'; sleep 1; printf 'second'".to_owned() },
             cwd: Some(root.to_string_lossy().into_owned()),
@@ -1556,7 +1603,7 @@ async fn resume_two_proxies(
     let mut first_seq = 0;
     for _ in 0..8 {
         let read = peer
-            .call::<ExecRead>(ExecReadParams { proc: process.clone(), after_seq: 0, max_bytes: Some(1024), wait_ms: 500 })
+            .call::<ExecRead>(ExecReadParams { scope: None, proc: process.clone(), after_seq: 0, max_bytes: Some(1024), wait_ms: 500 })
             .await
             .expect("read first output");
         if let Some(chunk) = read.chunks.first() {
@@ -1574,7 +1621,7 @@ async fn resume_two_proxies(
     let mut cursor = first_seq;
     for _ in 0..8 {
         let read = resumed_peer
-            .call::<ExecRead>(ExecReadParams { proc: process.clone(), after_seq: cursor, max_bytes: Some(1024), wait_ms: 500 })
+            .call::<ExecRead>(ExecReadParams { scope: None, proc: process.clone(), after_seq: cursor, max_bytes: Some(1024), wait_ms: 500 })
             .await
             .expect("read resumed output");
         for chunk in read.chunks {
@@ -1586,7 +1633,7 @@ async fn resume_two_proxies(
         }
     }
     assert_eq!(remaining, b"second");
-    resumed_peer.call::<ExecRelease>(ExecReleaseParams { proc: process }).await.expect("release");
+    resumed_peer.call::<ExecRelease>(ExecReleaseParams { scope: None, proc: process }).await.expect("release");
     resumed_peer.close();
     peer_two.close();
     resumed_child.kill().await.expect("stop resumed proxy");
@@ -1616,12 +1663,17 @@ async fn live_ssh_agentless_stdio_fallback() {
     let (peer, mut child) = spawn_forward(&sshd, &root, "never");
     initialize(&peer, None).await;
     let workspace = peer
-        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_string_lossy().into_owned(), backend: BackendSpec::Local })
+        .call::<WorkspaceOpen>(WorkspaceOpenParams {
+            ceiling: None,
+            root: root.to_string_lossy().into_owned(),
+            backend: BackendSpec::Local,
+        })
         .await
         .expect("agentless workspace");
     assert!(!workspace.caps.resumable);
     let path = root.join("fallback.txt").to_string_lossy().into_owned();
     peer.call::<FsWrite>(FsWriteParams {
+        scope: None,
         workspace: workspace.id.clone(),
         path: path.clone(),
         content: Content::Utf8 { text: "remote-only".to_owned() },
@@ -1631,7 +1683,10 @@ async fn live_ssh_agentless_stdio_fallback() {
     })
     .await
     .expect("agentless write");
-    let read = peer.call::<FsRead>(FsReadParams { workspace: workspace.id.clone(), path, range: None }).await.expect("agentless read");
+    let read = peer
+        .call::<FsRead>(FsReadParams { scope: None, hash: true, workspace: workspace.id.clone(), path, range: None })
+        .await
+        .expect("agentless read");
     assert_eq!(read.content.into_bytes(), b"remote-only");
     sshd.assert_local_denied(&root.join("fallback.txt"));
     assert_eq!(std::fs::read_to_string(local.join("fallback.txt")).expect("local sentinel"), "local sentinel");
@@ -1648,11 +1703,16 @@ async fn live_ssh_transparent_reconnect_after_channel_killed() {
     let (peer, mut child) = spawn_forward(&sshd, &root, "auto");
     initialize(&peer, None).await;
     let workspace = peer
-        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_string_lossy().into_owned(), backend: BackendSpec::Local })
+        .call::<WorkspaceOpen>(WorkspaceOpenParams {
+            ceiling: None,
+            root: root.to_string_lossy().into_owned(),
+            backend: BackendSpec::Local,
+        })
         .await
         .expect("open");
     let proc = peer
         .call::<ExecSpawn>(ExecSpawnParams {
+            scope: None,
             workspace: workspace.id,
             command: RemoteCommand::Shell { script: "printf first; sleep 2; printf second".to_owned() },
             cwd: Some(root.to_string_lossy().into_owned()),
@@ -1666,7 +1726,7 @@ async fn live_ssh_transparent_reconnect_after_channel_killed() {
         .expect("spawn")
         .proc;
     let first = peer
-        .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: 0, max_bytes: Some(1024), wait_ms: 1000 })
+        .call::<ExecRead>(ExecReadParams { scope: None, proc: proc.clone(), after_seq: 0, max_bytes: Some(1024), wait_ms: 1000 })
         .await
         .expect("first output");
     let first_seq = first.chunks.first().expect("first chunk").seq;
@@ -1677,7 +1737,7 @@ async fn live_ssh_transparent_reconnect_after_channel_killed() {
     let mut rest = Vec::new();
     for _ in 0..8 {
         let read = peer
-            .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: cursor, max_bytes: Some(1024), wait_ms: 1000 })
+            .call::<ExecRead>(ExecReadParams { scope: None, proc: proc.clone(), after_seq: cursor, max_bytes: Some(1024), wait_ms: 1000 })
             .await
             .expect("read through reconnection");
         for chunk in read.chunks {
@@ -1691,7 +1751,7 @@ async fn live_ssh_transparent_reconnect_after_channel_killed() {
     assert_eq!(rest, b"second");
     assert!(child.try_wait().expect("forwarder status").is_none(), "local aimx stream must stay alive");
     eprintln!("transparent_reconnect_ms={}", started.elapsed().as_millis());
-    peer.call::<ExecRelease>(ExecReleaseParams { proc }).await.expect("release");
+    peer.call::<ExecRelease>(ExecReleaseParams { scope: None, proc }).await.expect("release");
     peer.close();
     child.kill().await.expect("stop forwarder");
 }
@@ -1727,6 +1787,21 @@ async fn live_ssh_aim_run_openrouter_edits_and_executes_remote_file() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("ssh-ok"), "agent should report execution output");
 }
 
+async fn assert_agentless_prefix_read(workspace: &AgentlessWorkspace, file: &str, full_size: u64) {
+    let prefix = workspace.fs().read(file, None, 4, false).await.expect("prefix read");
+    assert_eq!(prefix.content.into_bytes(), b"firs");
+    assert_eq!(prefix.size, full_size);
+    assert!(prefix.hash.is_none());
+    assert!(prefix.truncated);
+    let past_end = workspace
+        .fs()
+        .read(file, Some(aim_proto::harness::ByteRange { start: u64::MAX, len: 4 }), 4, false)
+        .await
+        .expect("out-of-range prefix read");
+    assert!(past_end.content.into_bytes().is_empty());
+    assert!(!past_end.truncated);
+}
+
 async fn exercise_agentless(sshd: &Sshd, connection: Connection) {
     let remote_root = sshd.remote_root("agentless");
     let local_root = sshd.local_root("agentless");
@@ -1750,15 +1825,16 @@ async fn exercise_agentless(sshd: &Sshd, connection: Connection) {
     assert!(write.created);
     assert_eq!(std::fs::read_to_string(local_root.join("sample.txt")).expect("local sentinel"), "local sentinel");
     assert!(timed("stat", workspace.fs().stat(&file, true)).await.expect("stat").hash.is_some());
-    let read = timed("read", workspace.fs().read(&file, None, 100)).await.expect("read");
+    let read = timed("read", workspace.fs().read(&file, None, 100, true)).await.expect("read");
     assert_eq!(read.content, content);
+    assert_agentless_prefix_read(&workspace, &file, content.len() as u64).await;
     let edit = ExactEdit { old: "before".to_owned(), new: "after".to_owned(), replace_all: false };
     timed(
         "edit",
         workspace.fs().edit(EditRequest {
             path: &file,
             edits: &[edit],
-            precondition: &Precondition::IfHash { hash: read.hash },
+            precondition: &Precondition::IfHash { hash: read.hash.expect("requested hash") },
             key: &key(),
         }),
     )
@@ -1840,12 +1916,13 @@ async fn exercise_edge_cases(workspace: &AgentlessWorkspace, remote_root: &Path,
         })
         .await
         .expect("binary write");
-    let range = workspace.fs().read(&binary_path, Some(aim_proto::harness::ByteRange { start: 1, len: 2 }), 2).await.expect("range read");
+    let range =
+        workspace.fs().read(&binary_path, Some(aim_proto::harness::ByteRange { start: 1, len: 2 }), 2, true).await.expect("range read");
     assert_eq!(range.content.into_bytes(), vec![255, 65]);
     let inside = remote_root.join("inside-link");
     std::os::unix::fs::symlink(&binary_path, &inside).expect("inside symlink fixture");
     assert_eq!(
-        workspace.fs().read(&inside.to_string_lossy(), None, 10).await.expect("read inside symlink").content.into_bytes(),
+        workspace.fs().read(&inside.to_string_lossy(), None, 10, true).await.expect("read inside symlink").content.into_bytes(),
         binary.clone().into_bytes()
     );
     let stale = Precondition::IfHash { hash: aim_proto::harness::ContentHash(format!("sha256:{}", "0".repeat(64))) };

@@ -129,7 +129,7 @@ pub(super) async fn read(ctx: &ToolCtx, arguments: Value) -> Outcome<ToolResult>
         Ok(_) => {}
         Err(err) => return model_error(err),
     }
-    let read = match fs.read(&path, None, ctx.max_read_bytes).await {
+    let read = match fs.read(&path, None, ctx.max_read_bytes, true).await {
         Ok(read) => read,
         Err(err) => return model_error(err),
     };

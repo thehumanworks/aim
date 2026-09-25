@@ -83,6 +83,7 @@ impl GitHarness {
         let peer = client.peer();
         let spawned = peer
             .call::<ExecSpawn>(ExecSpawnParams {
+                scope: None,
                 workspace: client.workspace().id.clone(),
                 command,
                 cwd: None,
@@ -98,7 +99,13 @@ impl GitHarness {
         let mut truncated = false;
         let exit = loop {
             let read = peer
-                .call::<ExecRead>(ExecReadParams { proc: spawned.proc.clone(), after_seq, max_bytes: Some(64 * 1024), wait_ms: 1_000 })
+                .call::<ExecRead>(ExecReadParams {
+                    scope: None,
+                    proc: spawned.proc.clone(),
+                    after_seq,
+                    max_bytes: Some(64 * 1024),
+                    wait_ms: 1_000,
+                })
                 .await?;
             truncated |= read.dropped_before.is_some();
             for chunk in read.chunks {
@@ -112,7 +119,7 @@ impl GitHarness {
                 break exit;
             }
         };
-        peer.call::<ExecRelease>(ExecReleaseParams { proc: spawned.proc }).await?;
+        peer.call::<ExecRelease>(ExecReleaseParams { scope: None, proc: spawned.proc }).await?;
         let text = String::from_utf8(output).map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "command output is not UTF-8"))?;
         Ok(CommandOutput { text, truncated, exit })
     }

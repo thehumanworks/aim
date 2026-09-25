@@ -44,6 +44,8 @@ pub struct ToolCtx {
     pub max_read_bytes: u64,
     /// Cancels detached tool work when the caller cancels its request.
     pub cancelled: CancellationToken,
+    /// Effective maximum concurrent processes for this call.
+    pub max_processes: usize,
 }
 
 impl std::fmt::Debug for ToolCtx {
@@ -72,6 +74,8 @@ pub struct ProcTable {
     procs: Mutex<HashMap<ProcId, ProcEntry>>,
     session: Arc<Semaphore>,
     global: Arc<Semaphore>,
+    capacity: usize,
+    reservation_gate: Mutex<()>,
 }
 
 impl Default for ProcTable {
@@ -84,6 +88,7 @@ impl Default for ProcTable {
 #[derive(Debug)]
 struct ProcEntry {
     workspace: WorkspaceId,
+    cwd: Option<String>,
     cursor: u64,
     _slot: ProcSlot,
 }
@@ -100,7 +105,14 @@ impl ProcTable {
     /// by every session of the server) has room.
     #[must_use]
     pub fn new(per_session: usize, global: Arc<Semaphore>) -> Self {
-        Self { procs: Mutex::new(HashMap::new()), session: Arc::new(Semaphore::new(per_session.min(Semaphore::MAX_PERMITS))), global }
+        let capacity = per_session.min(Semaphore::MAX_PERMITS);
+        Self {
+            procs: Mutex::new(HashMap::new()),
+            session: Arc::new(Semaphore::new(capacity)),
+            global,
+            capacity,
+            reservation_gate: Mutex::new(()),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ProcId, ProcEntry>> {
@@ -113,9 +125,21 @@ impl ProcTable {
     /// `limit_exceeded` when the session or the server holds as many live processes as it may
     /// (release one first).
     pub fn reserve(&self) -> Outcome<ProcSlot> {
+        self.reserve_bounded(self.capacity)
+    }
+
+    /// Reserves a process under an additional per-call or session process ceiling.
+    ///
+    /// # Errors
+    /// `limit_exceeded` when the effective ceiling or existing admission caps are full.
+    pub fn reserve_bounded(&self, limit: usize) -> Outcome<ProcSlot> {
+        let _gate = self.reservation_gate.lock().unwrap_or_else(PoisonError::into_inner);
         let full = |whose: &str| {
             ProtoError::new(ErrorCode::LimitExceeded, format!("{whose} holds as many live processes as it may; release one first"))
         };
+        if self.capacity.saturating_sub(self.session.available_permits()) >= limit {
+            return Err(full("this call's authority"));
+        }
         let session = Arc::clone(&self.session).try_acquire_owned().map_err(|_| full("this session"))?;
         let global = Arc::clone(&self.global).try_acquire_owned().map_err(|_| full("the server"))?;
         Ok(ProcSlot { _session: session, _global: global })
@@ -123,13 +147,24 @@ impl ProcTable {
 
     /// Records a process spawned in `workspace` with the slot reserved for it.
     pub fn insert(&self, proc: ProcId, workspace: WorkspaceId, slot: ProcSlot) {
-        self.lock().insert(proc, ProcEntry { workspace, cursor: 0, _slot: slot });
+        self.lock().insert(proc, ProcEntry { workspace, cwd: None, cursor: 0, _slot: slot });
+    }
+
+    /// Records a process and the cwd where its execution authority was admitted.
+    pub fn insert_at(&self, proc: ProcId, workspace: WorkspaceId, cwd: String, slot: ProcSlot) {
+        self.lock().insert(proc, ProcEntry { workspace, cwd: Some(cwd), cursor: 0, _slot: slot });
     }
 
     /// The workspace a process runs in, when the session owns it.
     #[must_use]
     pub fn workspace(&self, proc: &ProcId) -> Option<WorkspaceId> {
         self.lock().get(proc).map(|entry| entry.workspace.clone())
+    }
+
+    /// The cwd used to authorize a process, when recorded at spawn.
+    #[must_use]
+    pub fn cwd(&self, proc: &ProcId) -> Option<String> {
+        self.lock().get(proc).and_then(|entry| entry.cwd.clone())
     }
 
     /// Forgets a process (freeing its slot); whether it was known.

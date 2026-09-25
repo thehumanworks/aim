@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use aim_proto::error::ProtoError;
 use aim_proto::harness::{
-    BackendSpec, GenerationRange, Initialize, InitializeParams, PeerInfo, ToolsCall, ToolsCallParams, ToolsList, ToolsListParams,
-    WorkspaceOpen, WorkspaceOpenParams,
+    BackendSpec, CallScope, GenerationRange, Initialize, InitializeParams, PeerInfo, ToolsCall, ToolsCallParams, ToolsList,
+    ToolsListParams, WorkspaceOpen, WorkspaceOpenParams,
 };
 use aim_proto::ids::{IdempotencyKey, WorkspaceId};
 use aim_proto::tool::{ToolContent, ToolSpec};
@@ -44,7 +44,8 @@ impl Mcp {
             resume: None,
         })
         .await?;
-        let opened = peer.call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_owned(), backend: BackendSpec::Local }).await?;
+        let opened =
+            peer.call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_owned(), backend: BackendSpec::Local, ceiling: None }).await?;
         let tools = peer.call::<ToolsList>(ToolsListParams::default()).await?.tools;
         Ok(Self { peer, workspace: opened.id, tools })
     }
@@ -189,6 +190,7 @@ impl Mcp {
                 };
                 let canonical = canonical(name);
                 let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let Ok(scope) = requested_scope(&params) else { return Some(error(&id, -32602, "invalid call scope")) };
                 let key = IdempotencyKey::new(format!("mcp-{}", random_key()));
                 match self
                     .peer
@@ -197,6 +199,7 @@ impl Mcp {
                         name: canonical.to_owned(),
                         arguments,
                         idempotency_key: Some(key),
+                        scope,
                     })
                     .await
                 {
@@ -350,6 +353,10 @@ fn random_key() -> String {
     crate::id::random_hex()
 }
 
+fn requested_scope(params: &Value) -> Result<Option<CallScope>, ()> {
+    params.get("scope").map(|value| serde_json::from_value(value.clone()).map_err(|_| ())).transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -404,6 +411,21 @@ mod tests {
             .expect("reply");
         assert_eq!(read["result"]["isError"], false);
         assert!(read["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("through MCP")));
+        let scoped_write = mcp
+            .dispatch(&json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{
+                "name":"write","arguments":{"file_path":"sample.txt","content":"blocked"},
+                "scope":{"roots":[root],"ops":["read"]}
+            }}))
+            .await
+            .expect("reply");
+        assert_eq!(scoped_write["result"]["isError"], true);
+        let after = mcp
+            .dispatch(
+                &json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read","arguments":{"file_path":"sample.txt"}}}),
+            )
+            .await
+            .expect("reply");
+        assert!(after["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("through MCP")));
         server.shutdown().await;
     }
 

@@ -46,6 +46,7 @@ fn refused(outcome: Result<(), ProtoError>, aliased: bool, what: &str) {
 
 async fn write(client: &Client, ws: &WorkspaceId, path: &str, create_dirs: bool) -> Result<(), ProtoError> {
     let params = FsWriteParams {
+        scope: None,
         workspace: ws.clone(),
         path: path.into(),
         content: text("PWNED"),
@@ -57,26 +58,37 @@ async fn write(client: &Client, ws: &WorkspaceId, path: &str, create_dirs: bool)
 }
 
 async fn rename(client: &Client, ws: &WorkspaceId, from: &str, to: &str) -> Result<(), ProtoError> {
-    let params = FsRenameParams { workspace: ws.clone(), from: from.into(), to: to.into(), overwrite: true, idempotency_key: key() };
+    let params =
+        FsRenameParams { scope: None, workspace: ws.clone(), from: from.into(), to: to.into(), overwrite: true, idempotency_key: key() };
     client.peer.call::<FsRename>(params).await
 }
 
 async fn remove(client: &Client, ws: &WorkspaceId, path: &str) -> Result<(), ProtoError> {
-    client.peer.call::<FsRemove>(FsRemoveParams { workspace: ws.clone(), path: path.into(), recursive: true, idempotency_key: key() }).await
+    client
+        .peer
+        .call::<FsRemove>(FsRemoveParams { scope: None, workspace: ws.clone(), path: path.into(), recursive: true, idempotency_key: key() })
+        .await
 }
 
 async fn copy(client: &Client, ws: &WorkspaceId, from: &str, to: &str) -> Result<(), ProtoError> {
-    let params =
-        FsCopyParams { workspace: ws.clone(), from: from.into(), to: to.into(), overwrite: true, recursive: true, idempotency_key: key() };
+    let params = FsCopyParams {
+        scope: None,
+        workspace: ws.clone(),
+        from: from.into(),
+        to: to.into(),
+        overwrite: true,
+        recursive: true,
+        idempotency_key: key(),
+    };
     client.peer.call::<FsCopy>(params).await
 }
 
 async fn mkdir(client: &Client, ws: &WorkspaceId, path: &str) -> Result<(), ProtoError> {
-    client.peer.call::<FsMkdir>(FsMkdirParams { workspace: ws.clone(), path: path.into(), idempotency_key: key() }).await
+    client.peer.call::<FsMkdir>(FsMkdirParams { scope: None, workspace: ws.clone(), path: path.into(), idempotency_key: key() }).await
 }
 
 async fn tool(client: &Client, ws: &WorkspaceId, name: &str, arguments: serde_json::Value) -> Result<(), ProtoError> {
-    let call = ToolsCallParams { workspace: ws.clone(), name: name.into(), arguments, idempotency_key: Some(key()) };
+    let call = ToolsCallParams { scope: None, workspace: ws.clone(), name: name.into(), arguments, idempotency_key: Some(key()) };
     client.peer.call::<ToolsCall>(call).await.map(|_| ())
 }
 
@@ -122,6 +134,7 @@ async fn case_aliases_of_an_existing_protected_path_are_denied() {
         refused(write(&client, &ws, spelling, false).await, ci, &format!("fs.write {spelling}"));
     }
     let edit = FsEditParams {
+        scope: None,
         workspace: ws.clone(),
         path: ".AIM/GATE/POLICY".into(),
         edits: vec![ExactEdit { old: "GATE".into(), new: "PWNED".into(), replace_all: false }],
@@ -183,6 +196,7 @@ async fn the_protected_path_policy_file_is_protected() {
     refused(write(&client, &ws, ".aim/protected", false).await, true, "fs.write of the policy");
     refused(write(&client, &ws, ".AIM/PROTECTED", false).await, ci, "fs.write of an alias of the policy");
     let edit = FsEditParams {
+        scope: None,
         workspace: ws.clone(),
         path: ".aim/protected".into(),
         edits: vec![ExactEdit { old: "~/secret\n".into(), new: String::new(), replace_all: false }],

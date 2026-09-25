@@ -40,7 +40,7 @@ use self::protect::Protector;
 use self::search::LocalSearch;
 use self::walk::{Follow, Loc, Root, WalkError};
 use super::{Exec, Fs, Outcome, Search, Workspace};
-use crate::authz::ProtectedPaths;
+use crate::authz::{Access, Grant, ProtectedPaths};
 
 /// Recognizes the local PTY permit refusal, which occurs before process creation.
 pub(crate) fn spawn_admission_refused(err: &ProtoError) -> bool {
@@ -140,7 +140,9 @@ impl LocalWorkspace {
     pub(crate) async fn from_open_root(opened: OpenRoot, config: LocalConfig) -> Outcome<Self> {
         let OpenRoot { canonical, root } = opened;
         let protected = config.protected;
-        let base = blocking(move || Ok(Base { protector: Protector::new(protected, &root.path), root })).await?;
+        let base =
+            blocking(move || Ok(Base { protector: Arc::new(Protector::new(protected, &root.path)), root: Arc::new(root), grant: None }))
+                .await?;
         let base = Arc::new(base);
         Ok(Self {
             caps: Caps { max_concurrency: config.max_concurrency, ..local_caps() },
@@ -188,7 +190,7 @@ mod root_race_tests {
         if let Ok(workspace) = opened {
             assert_eq!(workspace.root(), canonical);
             let path = format!("{canonical}/secret");
-            match workspace.fs().read(&path, None, 1024).await {
+            match workspace.fs().read(&path, None, 1024, true).await {
                 Ok(read) => assert_eq!(read.content.into_bytes(), b"inside", "the held root descriptor reached the outside sentinel"),
                 Err(err) => assert!(matches!(err.code, ErrorCode::Denied | ErrorCode::NotFound | ErrorCode::Conflict)),
             }
@@ -203,6 +205,148 @@ mod root_race_tests {
     #[tokio::test]
     async fn ancestor_swap_after_authorization_cannot_rebind_backend() {
         raced_root(true).await;
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::symlink;
+    use std::sync::Arc;
+
+    use aim_kernel::policy::Limits as PolicyLimits;
+    use aim_proto::content::Content;
+    use aim_proto::error::ErrorCode;
+    use aim_proto::harness::{CallScope, CaseMode, Command, Precondition};
+    use aim_proto::ids::IdempotencyKey;
+
+    use super::{LocalConfig, LocalWorkspace, Workspace};
+    use crate::authz::{Grant, Principal, ProtectedPaths};
+    use crate::workspace::{GlobQuery, GrepQuery, SpawnSpec, WriteRequest};
+
+    #[tokio::test]
+    async fn scoped_backend_checks_resolved_target_for_every_entry_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(root.join("allowed")).unwrap();
+        std::fs::create_dir_all(root.join("private")).unwrap();
+        std::fs::write(root.join("private/secret"), "PRIVATE-SENTINEL").unwrap();
+        symlink("../private", root.join("allowed/link")).unwrap();
+        let workspace = LocalWorkspace::open(root.to_str().unwrap(), LocalConfig::default()).await.unwrap();
+        let root = workspace.root().to_owned();
+        let principal = Arc::new(Principal { id: "test".into(), roots: vec![root.clone()], read_only: false });
+        let grant = Grant::new(principal, Arc::new(ProtectedPaths::default()), root.clone(), None)
+            .scoped(
+                None,
+                Some(&CallScope {
+                    roots: vec!["allowed".into()],
+                    ops: vec!["read".into(), "write".into(), "exec".into()],
+                    deny_write: Vec::new(),
+                    max_processes: None,
+                    max_output_bytes: None,
+                }),
+                PolicyLimits { max_processes: 10, max_output_bytes: 1024 },
+            )
+            .unwrap();
+        let scoped = workspace.scoped(grant).unwrap();
+        let link = format!("{root}/allowed/link");
+        let target = format!("{link}/secret");
+        let allowed = format!("{root}/allowed");
+        let key = IdempotencyKey::new("scope-test");
+
+        assert_eq!(scoped.fs().read(&target, None, 1024, false).await.unwrap_err().code, ErrorCode::Denied);
+        assert_eq!(
+            scoped
+                .fs()
+                .write(WriteRequest {
+                    path: &target,
+                    content: &Content::from_bytes(b"overwrite".to_vec()),
+                    precondition: &Precondition::Any,
+                    create_dirs: false,
+                    key: &key,
+                })
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            scoped
+                .search()
+                .grep(GrepQuery {
+                    pattern: "PRIVATE-SENTINEL",
+                    path: &link,
+                    globs: &[],
+                    case: CaseMode::Sensitive,
+                    fixed_strings: true,
+                    context: 0,
+                    max_matches: 10,
+                })
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            scoped.search().glob(GlobQuery { patterns: &["*".into()], path: &link, max_results: 10 }).await.unwrap_err().code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            scoped
+                .exec()
+                .unwrap()
+                .spawn(SpawnSpec {
+                    command: &Command::Shell { script: "true".into() },
+                    cwd: &link,
+                    env: &BTreeMap::new(),
+                    pty: None,
+                    stdin: false,
+                    timeout: None,
+                    key: &key,
+                })
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(std::fs::read(std::path::Path::new(&root).join("private/secret")).unwrap(), b"PRIVATE-SENTINEL");
+        assert!(
+            scoped
+                .fs()
+                .list(crate::workspace::ListRequest { path: &allowed, limit: 10, page_token: None, include_hidden: false })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_scoped_view_keeps_its_process_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = LocalWorkspace::open(dir.path().to_str().unwrap(), LocalConfig::default()).await.unwrap();
+        let root = workspace.root().to_owned();
+        let principal = Arc::new(Principal { id: "test".into(), roots: vec![root.clone()], read_only: false });
+        let grant = Grant::new(principal, Arc::new(ProtectedPaths::default()), root.clone(), None);
+        let scoped = workspace.scoped(grant).unwrap();
+        let key = IdempotencyKey::new("scope-process-test");
+        let proc = scoped
+            .exec()
+            .unwrap()
+            .spawn(SpawnSpec {
+                command: &Command::Shell { script: "printf shared".into() },
+                cwd: &root,
+                env: &BTreeMap::new(),
+                pty: None,
+                stdin: false,
+                timeout: None,
+                key: &key,
+            })
+            .await
+            .unwrap();
+        drop(scoped);
+        let read = workspace.exec().unwrap().read(&proc, 0, 1024, std::time::Duration::from_secs(2)).await.unwrap();
+        let output: Vec<u8> = read.chunks.into_iter().flat_map(|chunk| chunk.data.into_bytes()).collect();
+        assert_eq!(output, b"shared");
+        workspace.exec().unwrap().release(&proc).await.unwrap();
     }
 }
 
@@ -232,6 +376,26 @@ pub fn local_caps() -> Caps {
 }
 
 impl Workspace for LocalWorkspace {
+    fn scoped(&self, grant: Grant) -> Option<Arc<dyn Workspace>> {
+        if grant.root() != self.root {
+            return None;
+        }
+        let protector = if grant.write_denies().is_empty() {
+            Arc::clone(&self.fs.base.protector)
+        } else {
+            let protected = Arc::new(grant.protected().as_ref().clone().with(grant.write_denies().iter().cloned()));
+            Arc::new(Protector::new(protected, &self.fs.base.root.path))
+        };
+        let base = Arc::new(Base { root: Arc::clone(&self.fs.base.root), protector, grant: Some(grant) });
+        Some(Arc::new(Self {
+            root: self.root.clone(),
+            caps: self.caps.clone(),
+            fs: self.fs.scoped(Arc::clone(&base)),
+            exec: self.exec.scoped(Arc::clone(&base)),
+            search: LocalSearch::new(base),
+        }))
+    }
+
     fn caps(&self) -> &Caps {
         &self.caps
     }
@@ -256,8 +420,15 @@ impl Workspace for LocalWorkspace {
 /// What every part of the backend shares: the root (held open) and the protected-path check.
 #[derive(Debug)]
 struct Base {
-    root: Root,
-    protector: Protector,
+    root: Arc<Root>,
+    protector: Arc<Protector>,
+    grant: Option<Grant>,
+}
+
+#[derive(Clone, Copy)]
+enum Authority {
+    Path(Access),
+    Exec,
 }
 
 impl Base {
@@ -265,9 +436,9 @@ impl Base {
     /// symlinks inside the root are followed (the final one only with [`Follow::Final`]), anything
     /// leading out of it or dangling is `denied`, and missing trailing components are allowed for
     /// creation.
-    fn resolve(&self, path: &str, follow: Follow) -> Outcome<Loc> {
-        let rel = Path::new(path).strip_prefix(&self.root.path).map_err(|_| outside(path))?;
-        walk::walk(&self.root, rel, follow).map_err(|err| match err {
+    fn resolve(&self, path: &str, follow: Follow, authority: Authority) -> Outcome<Loc> {
+        let relative_path = Path::new(path).strip_prefix(&self.root.path).map_err(|_| outside(path))?;
+        let loc = walk::walk(&self.root, relative_path, follow).map_err(|err| match err {
             WalkError::Outside => outside(path),
             WalkError::Dangling => ProtoError::new(ErrorCode::Denied, format!("`{path}` passes through a dangling symlink")),
             WalkError::TooManyLinks => {
@@ -277,7 +448,19 @@ impl Base {
                 ProtoError::new(ErrorCode::Conflict, format!("`{path}`: `{}` is not a directory", name.to_string_lossy()))
             }
             WalkError::Io(err) => io_error(&err, path),
-        })
+        })?;
+        if let Some(grant) = &self.grant {
+            let resolved_path = path_string(&self.real(&loc))?;
+            match authority {
+                Authority::Path(access) => {
+                    grant.path(&resolved_path, access)?;
+                }
+                Authority::Exec => {
+                    grant.exec_path(&resolved_path)?;
+                }
+            }
+        }
+        Ok(loc)
     }
 
     /// The real path a resolution arrived at.

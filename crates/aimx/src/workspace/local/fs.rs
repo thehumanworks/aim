@@ -15,7 +15,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _, SeekFrom, Write as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -31,7 +31,8 @@ use rustix::io::Errno;
 use sha2::{Digest as _, Sha256};
 
 use super::walk::{Follow, Loc, kind, open_dir, open_entry, stat_entry};
-use super::{Base, blocking, io_error};
+use super::{Authority, Base, blocking, io_error};
+use crate::authz::Access;
 use crate::edit::apply_edits;
 use crate::id::{hex, random_hex};
 use crate::page::Page;
@@ -49,13 +50,17 @@ const NEW_DIR: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
 /// The local filesystem, confined to a root.
 #[derive(Debug)]
 pub(super) struct LocalFs {
-    base: Arc<Base>,
+    pub(super) base: Arc<Base>,
     mutations: Arc<Mutex<()>>,
 }
 
 impl LocalFs {
     pub(super) fn new(base: Arc<Base>) -> Self {
         Self { base, mutations: Arc::new(Mutex::new(())) }
+    }
+
+    pub(super) fn scoped(&self, base: Arc<Base>) -> Self {
+        Self { base, mutations: Arc::clone(&self.mutations) }
     }
 }
 
@@ -81,6 +86,16 @@ fn hash_file(file: &mut File) -> io::Result<ContentHash> {
         hasher.update(block.get(..n).unwrap_or_default());
     }
     Ok(content_hash(hasher))
+}
+
+fn bounded_bytes(file: &mut (impl io::Read + io::Seek), start: u64, count: u64) -> io::Result<Vec<u8>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    file.seek(SeekFrom::Start(start))?;
+    let mut out = Vec::new();
+    file.take(count).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 fn entry_kind(file_type: FileType) -> EntryKind {
@@ -174,7 +189,7 @@ fn make_dirs(loc: &Loc) -> io::Result<OwnedFd> {
 }
 
 fn stat(base: &Base, path: &str, hash: bool) -> Outcome<Meta> {
-    let loc = base.resolve(path, Follow::NoFinal)?;
+    let loc = base.resolve(path, Follow::NoFinal, Authority::Path(Access::Read))?;
     let (stat, file) = if loc.name.is_some() {
         let (dir, name) = entry(&loc, path)?;
         let stat = existing(dir, name, path)?.ok_or_else(|| not_found(path))?;
@@ -192,14 +207,22 @@ fn stat(base: &Base, path: &str, hash: bool) -> Outcome<Meta> {
     Ok(Meta { kind, size: size_of(&stat), mtime_ms: mtime_ms(&stat), hash })
 }
 
-fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64) -> Outcome<FsReadResult> {
-    let loc = base.resolve(path, Follow::Final)?;
+fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64, hash: bool) -> Outcome<FsReadResult> {
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Read))?;
     if loc.target_dir().is_some() {
         return Err(is_a_directory(path));
     }
     let (dir, name) = entry(&loc, path)?;
     let mut file = open_file(dir, name, path)?;
     let (start, wanted) = range.map_or((0, u64::MAX), |r| (r.start, r.len));
+    if !hash {
+        let size = file.metadata().map_err(|err| io_error(&err, path))?.len();
+        let count = wanted.min(max_bytes).min(size.saturating_sub(start));
+        let out = bounded_bytes(&mut file, start, count).map_err(|err| io_error(&err, path))?;
+        let requested = wanted.min(size.saturating_sub(start));
+        let truncated = (out.len() as u64) < requested;
+        return Ok(FsReadResult { content: Content::from_bytes(out), size, hash: None, truncated });
+    }
     let end = start.saturating_add(wanted.min(max_bytes));
     let mut out = Vec::new();
     let mut hasher = Sha256::new();
@@ -225,7 +248,7 @@ fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64) -> Ou
     let size = pos;
     let requested = wanted.min(size.saturating_sub(start));
     let truncated = (out.len() as u64) < requested;
-    Ok(FsReadResult { content: Content::from_bytes(out), size, hash: content_hash(hasher), truncated })
+    Ok(FsReadResult { content: Content::from_bytes(out), size, hash: Some(content_hash(hasher)), truncated })
 }
 
 fn check_precondition(dir: &OwnedFd, name: &OsStr, exists: bool, precondition: &Precondition, display: &str) -> Outcome<()> {
@@ -298,7 +321,7 @@ fn write(
     precondition: &Precondition,
     create_dirs: bool,
 ) -> Outcome<WriteOutcome> {
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Write))?;
     base.check_protected(&loc, false)?;
     let Some(name) = loc.name.as_deref().filter(|_| loc.opened.is_none()) else {
         return Err(is_a_directory(path));
@@ -326,7 +349,7 @@ fn write(
 }
 
 fn edit(base: &Base, mutations: &Mutex<()>, path: &str, edits: &[ExactEdit], precondition: &Precondition) -> Outcome<EditOutcome> {
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Write))?;
     base.check_protected(&loc, false)?;
     if loc.target_dir().is_some() {
         return Err(is_a_directory(path));
@@ -360,7 +383,7 @@ fn edit(base: &Base, mutations: &Mutex<()>, path: &str, edits: &[ExactEdit], pre
 }
 
 fn list(base: &Base, path: &str, limit: u32, page_token: Option<&str>, include_hidden: bool) -> Outcome<FsListResult> {
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Read))?;
     let Some(dir) = loc.target_dir() else {
         let (parent, name) = entry(&loc, path)?;
         return match existing(parent, name, path)? {
@@ -399,7 +422,7 @@ fn list(base: &Base, path: &str, limit: u32, page_token: Option<&str>, include_h
 }
 
 fn mkdir(base: &Base, mutations: &Mutex<()>, path: &str) -> Outcome<()> {
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Write))?;
     if loc.target_dir().is_some() {
         return Ok(());
     }
@@ -458,7 +481,7 @@ fn remove_tree(parent: &OwnedFd, name: &OsStr, depth: usize) -> io::Result<()> {
 }
 
 fn remove(base: &Base, mutations: &Mutex<()>, path: &str, recursive: bool) -> Outcome<()> {
-    let loc = base.resolve(path, Follow::NoFinal)?;
+    let loc = base.resolve(path, Follow::NoFinal, Authority::Path(Access::Tree))?;
     if loc.name.is_none() {
         return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be removed"));
     }
@@ -484,8 +507,8 @@ fn remove(base: &Base, mutations: &Mutex<()>, path: &str, recursive: bool) -> Ou
 }
 
 fn rename(base: &Base, mutations: &Mutex<()>, from: &str, to: &str, overwrite: bool) -> Outcome<()> {
-    let source = base.resolve(from, Follow::NoFinal)?;
-    let target = base.resolve(to, Follow::NoFinal)?;
+    let source = base.resolve(from, Follow::NoFinal, Authority::Path(Access::Tree))?;
+    let target = base.resolve(to, Follow::NoFinal, Authority::Path(Access::Tree))?;
     if source.name.is_none() || target.name.is_none() {
         return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be moved or replaced"));
     }
@@ -558,8 +581,8 @@ fn identity(fd: &OwnedFd) -> io::Result<(i128, i128)> {
 }
 
 fn copy(base: &Base, mutations: &Mutex<()>, from: &str, to: &str, overwrite: bool, recursive: bool) -> Outcome<()> {
-    let source = base.resolve(from, Follow::Final)?;
-    let target = base.resolve(to, Follow::NoFinal)?;
+    let source = base.resolve(from, Follow::Final, Authority::Path(Access::Read))?;
+    let target = base.resolve(to, Follow::NoFinal, Authority::Path(Access::Tree))?;
     if target.name.is_none() {
         return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be replaced"));
     }
@@ -631,10 +654,10 @@ impl Fs for LocalFs {
         Box::pin(blocking(move || stat(&base, &path, hash)))
     }
 
-    fn read<'a>(&'a self, path: &'a str, range: Option<ByteRange>, max_bytes: u64) -> BoxFuture<'a, Outcome<FsReadResult>> {
+    fn read<'a>(&'a self, path: &'a str, range: Option<ByteRange>, max_bytes: u64, hash: bool) -> BoxFuture<'a, Outcome<FsReadResult>> {
         let base = Arc::clone(&self.base);
         let path = path.to_owned();
-        Box::pin(blocking(move || read(&base, &path, range, max_bytes)))
+        Box::pin(blocking(move || read(&base, &path, range, max_bytes, hash)))
     }
 
     fn write<'a>(&'a self, req: WriteRequest<'a>) -> BoxFuture<'a, Outcome<WriteOutcome>> {
@@ -691,5 +714,52 @@ impl Fs for LocalFs {
         let mutations = Arc::clone(&self.mutations);
         let (from, to) = (from.to_owned(), to.to_owned());
         Box::pin(blocking(move || rename(&base, &mutations, &from, &to, overwrite)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Read, Seek, SeekFrom};
+
+    use super::bounded_bytes;
+
+    struct CountedReader {
+        len: u64,
+        pos: u64,
+        bytes_read: u64,
+    }
+
+    impl Read for CountedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let count = usize::try_from(self.len.saturating_sub(self.pos).min(buf.len() as u64)).unwrap_or(0);
+            buf.get_mut(..count).unwrap_or_default().fill(b'x');
+            self.pos += count as u64;
+            self.bytes_read += count as u64;
+            Ok(count)
+        }
+    }
+
+    impl Seek for CountedReader {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            match pos {
+                SeekFrom::Start(offset) => {
+                    self.pos = offset;
+                    Ok(offset)
+                }
+                _ => Err(io::Error::other("unexpected seek")),
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_read_stops_at_limit() {
+        let mut source = CountedReader { len: 1 << 30, pos: 0, bytes_read: 0 };
+        assert_eq!(bounded_bytes(&mut source, 1 << 20, 17).unwrap(), vec![b'x'; 17]);
+        assert_eq!(source.bytes_read, 17);
+        assert_eq!(source.pos, (1 << 20) + 17);
+
+        assert!(bounded_bytes(&mut source, u64::MAX, 0).unwrap().is_empty());
+        assert_eq!(source.bytes_read, 17);
+        assert_eq!(source.pos, (1 << 20) + 17);
     }
 }

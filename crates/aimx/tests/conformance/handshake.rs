@@ -43,11 +43,14 @@ async fn disjoint_generations_are_refused() {
 async fn requests_before_initialize_are_unauthenticated() {
     let env = env().await;
     let client = connect(&env.socket).await;
-    let params = WorkspaceOpenParams { root: env.root.to_str().unwrap().into(), backend: BackendSpec::Local };
+    let params = WorkspaceOpenParams { root: env.root.to_str().unwrap().into(), backend: BackendSpec::Local, ceiling: None };
     let err = client.peer.call::<WorkspaceOpen>(params).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Unauthenticated);
-    let err =
-        client.peer.call::<aim_proto::harness::WatchStop>(aim_proto::harness::WatchStopParams { watch: "w".into() }).await.unwrap_err();
+    let err = client
+        .peer
+        .call::<aim_proto::harness::WatchStop>(aim_proto::harness::WatchStopParams { watch: "w".into(), scope: None })
+        .await
+        .unwrap_err();
     assert_eq!(err.code, ErrorCode::Unauthenticated);
 }
 
@@ -58,7 +61,11 @@ async fn workspace_open_confines_to_granted_roots() {
     initialize(&client, None).await;
 
     let root = env.root.to_str().unwrap().to_owned();
-    let info = client.peer.call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.clone(), backend: BackendSpec::Local }).await.unwrap();
+    let info = client
+        .peer
+        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.clone(), backend: BackendSpec::Local, ceiling: None })
+        .await
+        .unwrap();
     let canonical = std::fs::canonicalize(&env.root).unwrap();
     assert_eq!(info.root, canonical.to_str().unwrap());
     assert!(info.caps.exec && info.caps.pty && info.caps.native_search && info.caps.resumable);
@@ -70,20 +77,24 @@ async fn workspace_open_confines_to_granted_roots() {
     open(&client, &env.path("sub")).await;
     let err = client
         .peer
-        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: env.dir.path().to_str().unwrap().into(), backend: BackendSpec::Local })
+        .call::<WorkspaceOpen>(WorkspaceOpenParams {
+            root: env.dir.path().to_str().unwrap().into(),
+            backend: BackendSpec::Local,
+            ceiling: None,
+        })
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::Denied);
 
     let err = client
         .peer
-        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: format!("{root}/missing"), backend: BackendSpec::Local })
+        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: format!("{root}/missing"), backend: BackendSpec::Local, ceiling: None })
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
 
     let ssh = BackendSpec::Ssh { destination: "host".into(), bootstrap: BootstrapPolicy::Auto };
-    let err = client.peer.call::<WorkspaceOpen>(WorkspaceOpenParams { root, backend: ssh }).await.unwrap_err();
+    let err = client.peer.call::<WorkspaceOpen>(WorkspaceOpenParams { root, backend: ssh, ceiling: None }).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable);
 }
 
@@ -96,11 +107,11 @@ async fn workspaces_are_scoped_to_their_session() {
 
     let second = connect(&env.socket).await;
     initialize(&second, None).await;
-    let err = second.peer.call::<FsStat>(FsStatParams { workspace: ws, path: ".".into(), hash: false }).await.unwrap_err();
+    let err = second.peer.call::<FsStat>(FsStatParams { workspace: ws, path: ".".into(), hash: false, scope: None }).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
     let err = second
         .peer
-        .call::<FsStat>(FsStatParams { workspace: WorkspaceId::new("w-made-up"), path: ".".into(), hash: false })
+        .call::<FsStat>(FsStatParams { workspace: WorkspaceId::new("w-made-up"), path: ".".into(), hash: false, scope: None })
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
@@ -114,8 +125,8 @@ async fn watch_is_reported_unavailable() {
     let client = connect(&env.socket).await;
     initialize(&client, None).await;
     let ws = open(&client, &env.root).await;
-    let err = client.peer.call::<WatchStart>(WatchStartParams { workspace: ws, path: ".".into() }).await.unwrap_err();
+    let err = client.peer.call::<WatchStart>(WatchStartParams { workspace: ws, path: ".".into(), scope: None }).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Unavailable);
-    let err = client.peer.call::<WatchStop>(WatchStopParams { watch: "w".into() }).await.unwrap_err();
+    let err = client.peer.call::<WatchStop>(WatchStopParams { watch: "w".into(), scope: None }).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
 }

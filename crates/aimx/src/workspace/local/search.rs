@@ -27,7 +27,8 @@ use ignore::overrides::OverrideBuilder;
 use rustix::fs::{Mode, OFlags};
 
 use super::walk::{Follow, Loc, open_dir, open_entry, stat_entry};
-use super::{Base, blocking};
+use super::{Authority, Base, blocking};
+use crate::authz::Access;
 use crate::workspace::{BoxFuture, GlobQuery, GrepQuery, Outcome, Search};
 
 /// Longest line (in bytes) returned in a match or context line; longer lines are cut.
@@ -226,7 +227,7 @@ struct GrepJob {
 fn grep(base: &Base, job: &GrepJob) -> Outcome<GrepResult> {
     let GrepJob { pattern, path, globs, case, fixed, context, max } = job;
     let (case, fixed, context, max) = (*case, *fixed, *context, *max);
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Read))?;
     let mut beneath = Beneath::new(&loc).ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("`{path}` does not exist")))?;
     let start = base.real(&loc);
     if matches!(beneath.start, Start::File(..)) && beneath.open(Path::new("")).is_err() {
@@ -292,7 +293,7 @@ fn grep(base: &Base, job: &GrepJob) -> Outcome<GrepResult> {
 }
 
 fn glob(base: &Base, patterns: &[String], path: &str, max: u32) -> Outcome<GlobResult> {
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Read))?;
     if loc.target_dir().is_none() {
         return Err(ProtoError::new(ErrorCode::NotFound, format!("`{path}` is not a directory")));
     }

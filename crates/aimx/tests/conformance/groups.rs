@@ -15,6 +15,7 @@ use crate::common::{Client, connect, env, env_with, initialize, key, open, sessi
 
 fn spawn_params(ws: &WorkspaceId, script: &str, pty: bool) -> ExecSpawnParams {
     ExecSpawnParams {
+        scope: None,
         workspace: ws.clone(),
         command: Command::Shell { script: script.into() },
         cwd: None,
@@ -51,10 +52,13 @@ async fn orphaning_leader(client: &Client, ws: &WorkspaceId, pty: bool) -> (Proc
     // The leader waits until the child ignores SIGHUP, then exits.
     let script = "(trap '' HUP; : > .ready-$$; exec sleep 30) & echo \"pid=$!\"; while [ ! -e .ready-$$ ]; do sleep 0.01; done";
     let proc = client.peer.call::<ExecSpawn>(spawn_params(ws, script, pty)).await.unwrap().proc;
-    let wait = client.peer.call::<ExecWait>(ExecWaitParams { proc: proc.clone(), timeout_ms: Some(10_000) }).await.unwrap();
+    let wait = client.peer.call::<ExecWait>(ExecWaitParams { scope: None, proc: proc.clone(), timeout_ms: Some(10_000) }).await.unwrap();
     assert!(wait.exit.is_some(), "the leader exited");
-    let read =
-        client.peer.call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: 0, max_bytes: None, wait_ms: 0 }).await.unwrap();
+    let read = client
+        .peer
+        .call::<ExecRead>(ExecReadParams { scope: None, proc: proc.clone(), after_seq: 0, max_bytes: None, wait_ms: 0 })
+        .await
+        .unwrap();
     let out: String = read.chunks.into_iter().map(|c| String::from_utf8(c.data.into_bytes()).unwrap()).collect();
     let pid = out.split("pid=").nth(1).and_then(|rest| rest.split_whitespace().next()).and_then(|p| p.parse().ok()).unwrap();
     assert!(exists(pid), "the background child outlived its leader");
@@ -67,7 +71,7 @@ async fn release_kills_what_the_leader_left_behind() {
     let (client, _, ws) = session(&env).await;
     for pty in [false, true] {
         let (proc, child) = orphaning_leader(&client, &ws, pty).await;
-        client.peer.call::<ExecRelease>(ExecReleaseParams { proc }).await.unwrap();
+        client.peer.call::<ExecRelease>(ExecReleaseParams { scope: None, proc }).await.unwrap();
         assert!(dies(child), "release killed the orphaned child (pty: {pty})");
     }
 }
@@ -78,9 +82,9 @@ async fn signals_still_reach_the_group_after_the_leader_exits() {
     let (client, _, ws) = session(&env).await;
     for pty in [false, true] {
         let (proc, child) = orphaning_leader(&client, &ws, pty).await;
-        client.peer.call::<ExecSignal>(ExecSignalParams { proc: proc.clone(), signal: Signal::Kill }).await.unwrap();
+        client.peer.call::<ExecSignal>(ExecSignalParams { scope: None, proc: proc.clone(), signal: Signal::Kill }).await.unwrap();
         assert!(dies(child), "the signal reached the orphaned child (pty: {pty})");
-        client.peer.call::<ExecRelease>(ExecReleaseParams { proc }).await.unwrap();
+        client.peer.call::<ExecRelease>(ExecReleaseParams { scope: None, proc }).await.unwrap();
     }
 }
 
@@ -89,6 +93,7 @@ async fn kill_shell_kills_what_a_background_command_left_behind() {
     let env = env().await;
     let (client, _, ws) = session(&env).await;
     let call = |arguments: serde_json::Value| ToolsCallParams {
+        scope: None,
         workspace: ws.clone(),
         name: if arguments.get("command").is_some() { "Bash" } else { "KillShell" }.into(),
         arguments,

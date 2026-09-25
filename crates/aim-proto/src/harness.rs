@@ -183,6 +183,25 @@ pub struct Caps {
     pub shell: Option<String>,
 }
 
+/// A requested authority ceiling for one harness call or an opened session.
+/// Paths are normalized prefixes, relative to the workspace root or absolute on the target.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct CallScope {
+    /// Allowed root prefixes; an empty list denies all paths.
+    pub roots: Vec<String>,
+    /// Allowed operations: `read`, `write`, and `exec`; an empty list denies all operations.
+    pub ops: Vec<String>,
+    /// Prefixes where writes are denied, even beneath an allowed root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_write: Vec<String>,
+    /// Maximum concurrent processes, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_processes: Option<u32>,
+    /// Maximum retained output bytes, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_bytes: Option<u64>,
+}
+
 /// `workspace.open` parameters.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceOpenParams {
@@ -191,6 +210,9 @@ pub struct WorkspaceOpenParams {
     /// Backend to use.
     #[serde(default)]
     pub backend: BackendSpec,
+    /// A ceiling bound to this workspace session; later calls cannot widen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<CallScope>,
 }
 
 /// An opened workspace.
@@ -282,12 +304,19 @@ pub struct FsStatParams {
     /// Also compute the content hash of a file.
     #[serde(default)]
     pub hash: bool,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
     /// `fs.stat` — metadata of one entry.
     FsStat = "fs.stat" (FsStatParams) -> Meta
 );
+
+const fn default_true() -> bool {
+    true
+}
 
 /// `fs.read` parameters.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
@@ -299,6 +328,12 @@ pub struct FsReadParams {
     /// Only this byte range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<ByteRange>,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
+    /// Compute a hash of the whole file; defaults to true for existing callers.
+    #[serde(default = "default_true")]
+    pub hash: bool,
 }
 
 /// `fs.read` result.
@@ -308,8 +343,9 @@ pub struct FsReadResult {
     pub content: Content,
     /// Total file size.
     pub size: u64,
-    /// Hash of the whole file (use it as an `IfHash` precondition when writing back).
-    pub hash: ContentHash,
+    /// Hash of the whole file, when requested; use as an `IfHash` precondition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<ContentHash>,
     /// Fewer bytes than requested were returned because of `max_read_bytes`.
     pub truncated: bool,
 }
@@ -336,6 +372,9 @@ pub struct FsWriteParams {
     pub create_dirs: bool,
     /// Retry safety.
     pub idempotency_key: IdempotencyKey,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 /// Outcome of a successful write or edit.
@@ -380,6 +419,9 @@ pub struct FsEditParams {
     pub precondition: Precondition,
     /// Retry safety.
     pub idempotency_key: IdempotencyKey,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 /// `fs.edit` result.
@@ -412,6 +454,9 @@ pub struct FsListParams {
     /// Include entries whose name starts with `.`.
     #[serde(default)]
     pub include_hidden: bool,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 /// One directory entry.
@@ -449,6 +494,9 @@ pub struct FsMkdirParams {
     pub path: String,
     /// Retry safety.
     pub idempotency_key: IdempotencyKey,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
@@ -468,6 +516,9 @@ pub struct FsRemoveParams {
     pub recursive: bool,
     /// Retry safety.
     pub idempotency_key: IdempotencyKey,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
@@ -489,6 +540,9 @@ pub struct FsRenameParams {
     pub overwrite: bool,
     /// Retry safety.
     pub idempotency_key: IdempotencyKey,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
@@ -506,6 +560,12 @@ pub struct FsReadManyParams {
     /// Most bytes returned per file (clamped to the harness's `max_read_bytes`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes_per_file: Option<u64>,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
+    /// Read only each bounded prefix and omit whole-file hashes.
+    #[serde(default)]
+    pub prefix_only: bool,
 }
 
 /// The outcome for one file of `fs.read_many`.
@@ -559,6 +619,9 @@ pub struct FsCopyParams {
     pub recursive: bool,
     /// Retry safety.
     pub idempotency_key: IdempotencyKey,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
@@ -573,6 +636,9 @@ pub struct WatchStartParams {
     pub workspace: WorkspaceId,
     /// Directory or file to watch (recursively for directories; `.gitignore` respected).
     pub path: String,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 /// `watch.start` result.
@@ -592,6 +658,9 @@ method!(
 pub struct WatchStopParams {
     /// The watch to stop.
     pub watch: String,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
@@ -684,6 +753,9 @@ pub struct ExecSpawnParams {
     pub timeout_ms: Option<u64>,
     /// Retry safety: a retried spawn returns the same process.
     pub idempotency_key: IdempotencyKey,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 /// `exec.spawn` result.
@@ -753,6 +825,9 @@ pub struct ExecReadParams {
     /// Wait up to this long for new output or exit before answering.
     #[serde(default)]
     pub wait_ms: u64,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 /// `exec.read` result.
@@ -815,6 +890,9 @@ pub struct ExecWriteStdinParams {
     pub eof: bool,
     /// Retry safety: a retried write does not send its bytes twice.
     pub idempotency_key: IdempotencyKey,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
@@ -829,6 +907,9 @@ pub struct ExecResizeParams {
     pub proc: ProcId,
     /// New size.
     pub size: PtySize,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
@@ -855,6 +936,9 @@ pub struct ExecSignalParams {
     pub proc: ProcId,
     /// Signal to send (to the process group).
     pub signal: Signal,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
@@ -870,6 +954,9 @@ pub struct ExecWaitParams {
     /// Give up after this long (the process keeps running).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 /// `exec.wait` result.
@@ -890,6 +977,9 @@ method!(
 pub struct ExecReleaseParams {
     /// Process (killed if still running) whose retained output is freed.
     pub proc: ProcId,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
@@ -939,6 +1029,9 @@ pub struct GrepParams {
     /// Maximum matches to return.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_matches: Option<u32>,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 /// One matching line.
@@ -985,6 +1078,9 @@ pub struct GlobParams {
     /// Maximum paths to return.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_results: Option<u32>,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 /// `search.glob` result.
@@ -1033,9 +1129,45 @@ pub struct ToolsCallParams {
     /// Required for mutating tools (see their annotations).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<IdempotencyKey>,
+    /// Additional authority requested for this call; absence adds no ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CallScope>,
 }
 
 method!(
     /// `tools.call` — run a high-level tool.
     ToolsCall = "tools.call" (ToolsCallParams) -> ToolResult
 );
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{CallScope, FsReadManyParams, FsReadParams, WorkspaceOpenParams};
+
+    #[test]
+    fn legacy_read_requests_keep_hashing_and_have_no_scope() {
+        let read: FsReadParams = serde_json::from_value(json!({"workspace":"w", "path":"a"})).unwrap();
+        assert!(read.hash);
+        assert!(read.scope.is_none());
+
+        let many: FsReadManyParams = serde_json::from_value(json!({"workspace":"w", "paths":["a"]})).unwrap();
+        assert!(!many.prefix_only);
+        assert!(many.scope.is_none());
+
+        let opened: WorkspaceOpenParams = serde_json::from_value(json!({"root":"/tmp"})).unwrap();
+        assert!(opened.ceiling.is_none());
+    }
+
+    #[test]
+    fn scope_requires_roots_and_ops_but_defaults_optional_fields() {
+        assert!(serde_json::from_value::<CallScope>(json!({"ops":["read"]})).is_err());
+        assert!(serde_json::from_value::<CallScope>(json!({"roots":["."]})).is_err());
+        let empty: CallScope = serde_json::from_value(json!({"roots":[],"ops":[]})).unwrap();
+        assert!(empty.roots.is_empty() && empty.ops.is_empty());
+        assert!(empty.deny_write.is_empty());
+        assert!(empty.max_processes.is_none() && empty.max_output_bytes.is_none());
+        let wire: Value = serde_json::to_value(empty).unwrap();
+        assert_eq!(wire, json!({"roots":[],"ops":[]}));
+    }
+}

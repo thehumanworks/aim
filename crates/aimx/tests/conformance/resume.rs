@@ -21,6 +21,7 @@ fn spawn_params(ws: &aim_proto::ids::WorkspaceId, script: &str) -> ExecSpawnPara
         stdin: false,
         timeout_ms: None,
         idempotency_key: key(),
+        scope: None,
     }
 }
 
@@ -29,8 +30,11 @@ async fn reconnect_with_the_token_keeps_processes_and_output() {
     let env = env().await;
     let (client, init, ws) = session(&env).await;
     let proc = client.peer.call::<ExecSpawn>(spawn_params(&ws, "echo before; sleep 0.5; echo after")).await.unwrap().proc;
-    let first =
-        client.peer.call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: 0, max_bytes: None, wait_ms: 5000 }).await.unwrap();
+    let first = client
+        .peer
+        .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: 0, max_bytes: None, wait_ms: 5000, scope: None })
+        .await
+        .unwrap();
     let seen = first.chunks.last().unwrap().seq;
     // The transport drops mid-process.
     client.peer.close();
@@ -41,13 +45,13 @@ async fn reconnect_with_the_token_keeps_processes_and_output() {
     assert!(resumed.resumed);
     assert_eq!(resumed.resume_token, init.resume_token);
     // Workspace ids and processes survive; catch up from the last seq seen.
-    again.peer.call::<FsStat>(FsStatParams { workspace: ws.clone(), path: ".".into(), hash: false }).await.unwrap();
+    again.peer.call::<FsStat>(FsStatParams { workspace: ws.clone(), path: ".".into(), hash: false, scope: None }).await.unwrap();
     let mut text = String::new();
     let mut cursor = seen;
     let exit = loop {
         let read = again
             .peer
-            .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: cursor, max_bytes: None, wait_ms: 5000 })
+            .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: cursor, max_bytes: None, wait_ms: 5000, scope: None })
             .await
             .unwrap();
         for chunk in read.chunks {
@@ -73,7 +77,7 @@ async fn a_bad_token_starts_a_fresh_session() {
     let fresh = connect(&env.socket).await;
     let init = initialize(&fresh, Some(ResumeToken::new("not-a-token"))).await;
     assert!(!init.resumed);
-    let err = fresh.peer.call::<FsStat>(FsStatParams { workspace: ws, path: ".".into(), hash: false }).await.unwrap_err();
+    let err = fresh.peer.call::<FsStat>(FsStatParams { workspace: ws, path: ".".into(), hash: false, scope: None }).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
     drop(client);
 }
@@ -85,7 +89,7 @@ async fn resuming_takes_the_session_over_from_a_live_connection() {
     let new = connect(&env.socket).await;
     assert!(initialize(&new, Some(init.resume_token)).await.resumed);
     tokio::time::timeout(Duration::from_secs(5), old.peer.closed()).await.unwrap();
-    new.peer.call::<FsStat>(FsStatParams { workspace: ws, path: ".".into(), hash: false }).await.unwrap();
+    new.peer.call::<FsStat>(FsStatParams { workspace: ws, path: ".".into(), hash: false, scope: None }).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -93,7 +97,8 @@ async fn sessions_expire_after_the_resume_ttl() {
     let env = env_with(|config, _| config.resume_ttl = Duration::from_millis(200)).await;
     let (client, init, ws) = session(&env).await;
     let proc = client.peer.call::<ExecSpawn>(spawn_params(&ws, "echo $$; sleep 30")).await.unwrap().proc;
-    let first = client.peer.call::<ExecRead>(ExecReadParams { proc, after_seq: 0, max_bytes: None, wait_ms: 5000 }).await.unwrap();
+    let first =
+        client.peer.call::<ExecRead>(ExecReadParams { proc, after_seq: 0, max_bytes: None, wait_ms: 5000, scope: None }).await.unwrap();
     let pid = String::from_utf8(first.chunks[0].data.clone().into_bytes()).unwrap().trim().to_owned();
     client.peer.close();
     drop(client);
