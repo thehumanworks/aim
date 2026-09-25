@@ -22,7 +22,8 @@ or add a job to one. The job contract includes a deliverable, acceptance criteri
 accepted dependencies, retry budget and optional workspace. A claim returns a fenced attempt and
 one-time claim token; ordinary snapshots, events and messages never repeat that secret. Attempt
 mutations present the attempt ID and token, while job-level mutations use observed job versions.
-Execution state and review state remain separate.
+Execution state and review state remain separate. Job snapshots include content-hashed artifact
+summaries so a reviewer can name exact evidence IDs without receiving the raw bytes.
 
 `board.watch` first returns an authoritative snapshot and cursor, then delivers bounded
 `board.event` hints on that daemon connection. `board.poll` returns current snapshots and ordered
