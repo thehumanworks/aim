@@ -244,3 +244,31 @@ fn ctrl_c_cancels_the_running_turn() {
     assert!(rows.iter().any(|r| r == "(interrupted)"), "{rows:?}");
     assert!(!rows.iter().any(|r| r.contains("word399")), "the stream stopped");
 }
+
+/// SIGTERM ends the TUI through its normal exit: the block is erased and the transcript stays.
+#[test]
+fn sigterm_restores_the_terminal() {
+    let script = json!({"responses": [[text("Before the signal.", 1, 0)]]});
+    let mut tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    tui.type_text("hi");
+    tui.send("\r");
+    tui.wait_for("Before the signal.");
+    tui.wait_for("idle");
+    let pid = tui.pid().unwrap();
+    let killed = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().unwrap();
+    assert!(killed.success());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = tui.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "aim did not exit on SIGTERM");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.exit_code(), 143);
+    std::thread::sleep(Duration::from_millis(50));
+    let rows = tui.history();
+    assert!(rows.iter().any(|r| r == "Before the signal."), "{rows:?}");
+    assert!(!rows.iter().any(|r| r.contains("ask anything") || r.contains("idle ·")), "the block is gone: {rows:?}");
+}

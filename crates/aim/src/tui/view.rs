@@ -92,7 +92,11 @@ pub fn status(app: &App, width: usize) -> Line<'static> {
     spans.push(Span::styled(state, style));
     let mut rest: Vec<String> = Vec::new();
     if let Some(s) = &app.session {
-        let effort = s.effort.as_deref().map(|e| format!(" · {e}")).unwrap_or_default();
+        let effort = match (&app.jev_effort, s.effort.as_deref()) {
+            (Some(jev), _) => format!(" · {jev} (jev)"),
+            (None, Some(e)) => format!(" · {e}"),
+            (None, None) => String::new(),
+        };
         spans.push(Span::styled(" · ", theme.status));
         spans.push(Span::styled(format!("{}{effort}", s.model), theme.accent));
         if s.persistence == Persistence::Ephemeral {

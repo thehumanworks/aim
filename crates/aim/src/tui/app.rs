@@ -67,6 +67,8 @@ pub enum Input {
     Failed(String),
     /// Time passed (a running turn's clock).
     Tick,
+    /// A request succeeded with nothing to show.
+    Noop,
 }
 
 /// What the app asks the shell to do.
@@ -284,6 +286,8 @@ pub struct App {
     pub limits: Option<RateLimits>,
     /// Model request number within the running turn.
     pub request: u32,
+    /// The effort Jev chose for the latest request, when it decides (ADR 0028).
+    pub jev_effort: Option<String>,
     /// Seconds the running turn has taken (advanced by ticks).
     pub turn_seconds: u64,
     /// The completion popup.
@@ -333,6 +337,7 @@ impl App {
             tokens: Tokens::default(),
             limits: None,
             request: 0,
+            jev_effort: None,
             turn_seconds: 0,
             popup: Popup::default(),
             picker: None,
@@ -456,6 +461,7 @@ impl App {
                 }
                 Vec::new()
             }
+            Input::Noop => Vec::new(),
         }
     }
 
@@ -584,6 +590,10 @@ impl App {
                 // The model's context was folded; the transcript shown keeps every item.
                 let (before, after) = (super::view::short_count(tokens_before), super::view::short_count(tokens_after));
                 self.notice(Level::Info, format!("context compacted ({method}): ~{before} → ~{after} tokens"));
+            }
+            SessionUpdate::Decision { decision } => {
+                // One per request: shown in the status line, not the transcript.
+                self.jev_effort = decision.ladder.get(usize::try_from(decision.output).unwrap_or(usize::MAX)).cloned();
             }
             SessionUpdate::TurnEnded { stop } => self.on_turn_ended(&stop),
             SessionUpdate::TurnFailed { message } => {

@@ -304,13 +304,13 @@ impl Runner {
             }
             Effect::Cancel(session) => self.spawn(async move {
                 match client.cancel(session).await {
-                    Ok(()) => Input::Tick,
+                    Ok(()) => Input::Noop,
                     Err(e) => Input::Failed(format!("cancel: {}", e.message)),
                 }
             }),
             Effect::SetConfig(params) => self.spawn(async move {
                 match client.set_config(params).await {
-                    Ok(()) => Input::Tick,
+                    Ok(()) => Input::Noop,
                     Err(e) => Input::Failed(format!("could not change the configuration: {}", e.message)),
                 }
             }),
@@ -440,6 +440,9 @@ async fn event_loop(
     completed: &mut UnboundedReceiver<Completed>,
     clock: &mut tokio::time::Interval,
 ) -> Result<i32, String> {
+    let signal = |kind| tokio::signal::unix::signal(kind).map_err(|e| format!("signals: {e}"));
+    let mut terminate = signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut hangup = signal(tokio::signal::unix::SignalKind::hangup())?;
     loop {
         let deadline = scheduler.deadline().map(tokio::time::Instant::from_std);
         let running = app.running();
@@ -481,6 +484,9 @@ async fn event_loop(
                 app.handle(Input::Tick);
                 scheduler.stream(Instant::now());
             }
+            // Leave through the normal path so the terminal is restored and sessions closed.
+            Some(()) = terminate.recv() => return Ok(143),
+            Some(()) = hangup.recv() => return Ok(129),
         }
         let now = Instant::now();
         if let Some(frame) = scheduler.poll(now) {

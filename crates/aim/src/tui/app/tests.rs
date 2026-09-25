@@ -456,3 +456,40 @@ fn compaction_is_a_notice_and_the_transcript_keeps_everything() {
     assert!(app.transcript.entries().contains(&Entry::User { text: "early prompt".into() }));
     assert_eq!(notices(&app), ["context compacted (remote): ~180.0k → ~12.5k tokens"]);
 }
+
+#[test]
+fn jev_decisions_show_the_effort_in_force_without_touching_the_transcript() {
+    let mut app = running();
+    let decision = aim_proto::event::DecisionRecord {
+        model: "m1".into(),
+        ladder: vec!["low".into(), "medium".into(), "high".into()],
+        current: 0,
+        lo: 0,
+        hi: 2,
+        since_change: 3,
+        hysteresis: 2,
+        raw_score: 1.7,
+        raw_confidence: 0.8,
+        raw_probabilities: vec![0.1, 0.2, 0.7],
+        raw_noul: [0.1, 0.8, 0.1],
+        proposed_bp: 8_500,
+        noul_bp: [1_000, 8_000, 1_000],
+        output: 2,
+        latency_ms: 40,
+        input_tokens: None,
+        cost_micro_usd: None,
+    };
+    let entries = app.transcript.entries().len();
+    update(&mut app, SessionUpdate::Decision { decision });
+    assert_eq!(app.jev_effort.as_deref(), Some("high"));
+    assert_eq!(app.transcript.entries().len(), entries);
+    assert!(view::status(&app, 120).to_string().contains("m1 · high (jev)"));
+}
+
+#[test]
+fn a_successful_request_does_not_advance_the_turn_clock() {
+    let mut app = running();
+    app.handle(Input::Tick);
+    app.handle(Input::Noop);
+    assert_eq!(app.turn_seconds, 1);
+}
