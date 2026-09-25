@@ -155,11 +155,17 @@ async fn wait_socket(path: &Path) {
     panic!("daemon socket did not appear");
 }
 
+fn private_tempdir() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
 async fn started(
     deltas: usize,
     delay: Duration,
 ) -> (TempDir, Arc<dyn SessionClient>, Arc<Scripted>, tokio::task::JoinHandle<Result<(), ProtoError>>) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let (host, provider) = host(deltas, delay);
     let socket = socket_path(dir.path());
     let background = tokio::spawn({
@@ -311,7 +317,7 @@ async fn close_delivers_terminal_state_then_ends_stream() {
 
 #[tokio::test]
 async fn host_broadcast_lag_sends_detached_reason() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let socket = socket_path(dir.path());
     let (host, _) = host(1, Duration::ZERO);
     let lagged: Arc<dyn SessionClient> = Arc::new(EndsOnAttach(host));
@@ -448,7 +454,7 @@ async fn disconnect_mid_turn_ends_stream_and_late_client_recovers() {
 
 #[tokio::test]
 async fn idle_exit_waits_for_connections_then_removes_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let (host, _) = host(1, Duration::ZERO);
     let socket = socket_path(dir.path());
     let task = tokio::spawn({
@@ -467,7 +473,7 @@ async fn idle_exit_waits_for_connections_then_removes_socket() {
 
 #[tokio::test]
 async fn dropping_last_client_releases_idle_connection() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let (host, _) = host(1, Duration::ZERO);
     let socket = socket_path(dir.path());
     let task = tokio::spawn({
@@ -487,7 +493,7 @@ async fn dropping_last_client_releases_idle_connection() {
 
 #[tokio::test]
 async fn daemon_lock_is_held_through_workspace_shutdown() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let socket = socket_path(dir.path());
     let (host, _) = host(1, Duration::ZERO);
     let (entered, wait_for_shutdown) = tokio::sync::oneshot::channel();
@@ -515,7 +521,7 @@ async fn daemon_lock_is_held_through_workspace_shutdown() {
 
 #[tokio::test]
 async fn stale_socket_is_recovered() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     std::fs::create_dir(dir.path().join("run")).unwrap();
     let socket = socket_path(dir.path());
     let stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -538,8 +544,7 @@ async fn stale_socket_is_recovered() {
 
 #[tokio::test]
 async fn binary_auto_spawn_status_stop_leaves_no_socket() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let binary = env!("CARGO_BIN_EXE_aim");
     let client = spawn::connect_or_spawn_executable(dir.path(), Path::new(binary)).await.unwrap();
     let socket = socket_path(dir.path());
@@ -576,8 +581,7 @@ async fn binary_auto_spawn_status_stop_leaves_no_socket() {
 
 #[tokio::test]
 async fn concurrent_auto_spawn_gets_one_process() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let binary = Path::new(env!("CARGO_BIN_EXE_aim"));
     let (first, second) =
         tokio::join!(spawn::connect_or_spawn_executable(dir.path(), binary), spawn::connect_or_spawn_executable(dir.path(), binary),);
@@ -593,8 +597,8 @@ async fn concurrent_auto_spawn_gets_one_process() {
 #[tokio::test]
 #[ignore = "requires a real codex provider and aimx credentials"]
 async fn live_daemon_codex_turn() {
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
+    let workspace = private_tempdir();
     let socket = socket_path(dir.path());
     let host = Arc::new(SessionHost::new(HostConfig {
         store: Arc::new(MemoryStore::default()),

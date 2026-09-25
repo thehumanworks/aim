@@ -59,9 +59,7 @@ async fn started() -> (TempDir, tokio::task::JoinHandle<Result<(), ProtoError>>)
         if socket_path(dir.path()).exists() {
             return (dir, task);
         }
-        if task.is_finished() {
-            panic!("board daemon exited before binding: {:?}", task.await);
-        }
+        assert!(!task.is_finished(), "board daemon exited before binding");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("board daemon socket did not appear");
