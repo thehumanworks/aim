@@ -1,0 +1,11 @@
+name = "kv_counter"
+version = "0.1.0"
+api = "0.1"
+component = "../build/aim_example_kv_counter.wasm"
+capabilities = ["tools.provide", "kv"]
+
+[[tools]]
+name = "increment"
+description = "Increase a named durable counter by one and return its new value."
+input_schema = '{"type":"object","properties":{"key":{"type":"string"}},"additionalProperties":false}'
+sensitive = false

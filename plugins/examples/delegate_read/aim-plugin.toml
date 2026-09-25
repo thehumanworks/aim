@@ -1,0 +1,11 @@
+name = "delegate_read"
+version = "0.1.0"
+api = "0.1"
+component = "../build/aim_example_delegate_read.wasm"
+capabilities = ["tools.provide", "tools.call:read"]
+
+[[tools]]
+name = "delegate_read"
+description = "Read a workspace file through the session's permissioned read tool."
+input_schema = '{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"],"additionalProperties":false}'
+sensitive = false

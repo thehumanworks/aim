@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["kv_counter", "delegate_read"]
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = true
