@@ -13,9 +13,10 @@ use crate::wire;
 pub enum PermissionKind {
     /// Allow this call only.
     AllowOnce,
-    /// Allow and remember. `claude-agent-acp` implements this by writing an allow rule into the
-    /// project's `.claude/settings.local.json` (`src/permissions/effects.ts`), a side effect
-    /// outside aim's policy.
+    /// Allow and remember. `claude-agent-acp` (`allow-with-updates`) applies Claude's suggested
+    /// durable permission update: an allow rule in the project's `.claude/settings.local.json`
+    /// (`Bash`, `WebFetch`, `Skill`) or a session mode switch (edits), `src/permissions/effects.ts`. A
+    /// side effect outside aim's policy.
     AllowAlways,
     /// Reject this call.
     RejectOnce,
@@ -117,8 +118,8 @@ pub trait PermissionHandler: Send + Sync + 'static {
 
 /// The maintainer's default (docs/adr/0021): approve without asking. Picks the first
 /// `allow_once` option, else the first `allow_always`, else cancels. `allow_once` is preferred
-/// because `allow_always` makes `claude-agent-acp` persist an allow rule in the project's
-/// settings; aim's own policy, not the agent's settings, is the authority.
+/// because `allow_always` makes `claude-agent-acp` apply a durable permission update (a settings
+/// rule or a mode switch); aim's own policy, not the agent's settings, is the authority.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct YoloPermissions;
 

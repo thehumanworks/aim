@@ -151,8 +151,12 @@ pub struct AuthStatus {
 }
 
 enum Route {
+    /// A registered session.
     Live(mpsc::UnboundedSender<Routed>),
+    /// Updates for a session id not registered yet (they can precede the `session/new` response).
     Early(Vec<Routed>),
+    /// A session aim no longer routes (dropped, closed, deleted): late messages are discarded.
+    Retired,
 }
 
 /// Delivers routed messages to sessions; shared with the connection's handlers.
@@ -169,7 +173,7 @@ impl Router {
         match sessions.get_mut(session_id) {
             Some(Route::Live(tx)) => {
                 if tx.send(message).is_err() {
-                    sessions.remove(session_id);
+                    sessions.insert(session_id.to_owned(), Route::Retired);
                 }
             }
             Some(Route::Early(buffer)) => {
@@ -177,11 +181,21 @@ impl Router {
                     buffer.push(message);
                 }
             }
+            Some(Route::Retired) => {}
             None => {
-                let early = sessions.values().filter(|route| matches!(route, Route::Early(_))).count();
-                if early < EARLY_SESSIONS && !self.closed.load(Ordering::Acquire) {
-                    sessions.insert(session_id.to_owned(), Route::Early(vec![message]));
+                // Only updates can precede a session's registration; a stop or a permission
+                // decision for an unknown id belongs to a session that is already gone.
+                if !matches!(message, Routed::Update(_)) || self.closed.load(Ordering::Acquire) {
+                    return;
                 }
+                let early: Vec<String> =
+                    sessions.iter().filter(|(_, route)| matches!(route, Route::Early(_))).map(|(id, _)| id.clone()).collect();
+                if early.len() >= EARLY_SESSIONS
+                    && let Some(evicted) = early.first()
+                {
+                    sessions.remove(evicted);
+                }
+                sessions.insert(session_id.to_owned(), Route::Early(vec![message]));
             }
         }
     }
@@ -202,7 +216,7 @@ impl Router {
     }
 
     pub(crate) fn unregister(&self, session_id: &str) {
-        lock(&self.sessions).remove(session_id);
+        lock(&self.sessions).insert(session_id.to_owned(), Route::Retired);
     }
 
     /// Marks the connection closed. Routes stay: every in-flight prompt still delivers its
@@ -624,5 +638,69 @@ impl AcpClient {
                 process.kill_group();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn update() -> Routed {
+        Routed::Update(json!({"sessionUpdate": "plan", "entries": []}))
+    }
+
+    fn routes(router: &Router) -> (usize, usize, usize) {
+        let sessions = lock(&router.sessions);
+        let count = |f: fn(&Route) -> bool| sessions.values().filter(|r| f(r)).count();
+        (count(|r| matches!(r, Route::Live(_))), count(|r| matches!(r, Route::Early(_))), count(|r| matches!(r, Route::Retired)))
+    }
+
+    #[test]
+    fn updates_before_registration_are_replayed_in_order() {
+        let router = Router::default();
+        router.deliver("s1", Routed::Update(json!({"n": 1})));
+        router.deliver("s1", Routed::Update(json!({"n": 2})));
+        let mut rx = router.register("s1");
+        for n in [1, 2] {
+            assert!(matches!(rx.try_recv(), Ok(Routed::Update(v)) if v["n"] == n));
+        }
+        assert_eq!(routes(&router), (1, 0, 0));
+    }
+
+    #[test]
+    fn messages_for_gone_sessions_are_dropped_not_buffered() {
+        let router = Router::default();
+        // A stop or a permission for an unknown session never opens an early buffer.
+        router.deliver("gone", Routed::Stopped { turn: 1, result: Ok(json!({})) });
+        assert_eq!(routes(&router), (0, 0, 0));
+        // A dropped session's late updates are discarded.
+        drop(router.register("s1"));
+        router.deliver("s1", update());
+        assert_eq!(routes(&router), (0, 0, 1));
+        let rx = router.register("s2");
+        router.unregister("s2");
+        router.deliver("s2", update());
+        drop(rx);
+        assert_eq!(routes(&router), (0, 0, 2));
+    }
+
+    #[test]
+    fn early_buffers_are_bounded() {
+        let router = Router::default();
+        for i in 0..EARLY_SESSIONS + 5 {
+            router.deliver(&format!("s{i}"), update());
+        }
+        assert_eq!(routes(&router), (0, EARLY_SESSIONS, 0));
+        for _ in 0..EARLY_UPDATES_PER_SESSION + 5 {
+            router.deliver("busy", update());
+        }
+        let mut rx = router.register("busy");
+        let mut delivered = 0;
+        while rx.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, EARLY_UPDATES_PER_SESSION);
     }
 }
