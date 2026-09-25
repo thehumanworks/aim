@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture as ToolFuture, ToolHost};
 use aim::daemon::{client::DaemonClient, server, socket_path, spawn};
-use aim::host::{BoxFuture, Connected, HostConfig, SessionClient, SessionHost, WorkspaceFactory, aimx_workspaces};
+use aim::host::{BoxFuture, Connected, HostConfig, SessionClient, SessionHost, WorkspaceFactory, native_backends};
 use aim::store::MemoryStore;
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
@@ -80,9 +80,7 @@ fn host(deltas: usize, delay: Duration) -> (Arc<dyn SessionClient>, Arc<Scripted
     });
     let host = Arc::new(SessionHost::new(HostConfig {
         store: Arc::new(MemoryStore::default()),
-        providers: Arc::new(move |_, _| Ok((Arc::clone(&cloned) as Arc<dyn ModelProvider>, "m".into()))),
-        workspaces,
-        max_requests: 4,
+        backends: native_backends(Arc::new(move |_, _| Ok((Arc::clone(&cloned) as Arc<dyn ModelProvider>, "m".into()))), workspaces, 4),
         update_capacity: 4096,
     }));
     (host, provider)
@@ -491,9 +489,7 @@ async fn live_daemon_codex_turn() {
     let socket = socket_path(dir.path());
     let host = Arc::new(SessionHost::new(HostConfig {
         store: Arc::new(MemoryStore::default()),
-        providers: Arc::new(aim::providers::build),
-        workspaces: aimx_workspaces(Path::new(env!("CARGO_BIN_EXE_aim")).with_file_name("aimx")),
-        max_requests: 4,
+        backends: aim::providers::backends(Path::new(env!("CARGO_BIN_EXE_aim")).with_file_name("aimx"), 4),
         update_capacity: 1024,
     }));
     let task = tokio::spawn({
