@@ -578,7 +578,7 @@ impl Agent {
         };
         let prefix: Vec<Item> = self.items.iter().take(cut).cloned().collect();
         let summarized = tokio::select! {
-            summarized = self.summarize(prefix, specs, turn_id) => summarized,
+            summarized = self.summarize(prefix, specs, turn_id, events) => summarized,
             () = cancel.cancelled() => return false,
         };
         let (mut replacement, method) = match summarized {
@@ -614,7 +614,13 @@ impl Agent {
     }
 
     /// Replaces `prefix` with the provider's compaction item, else with a local summary.
-    async fn summarize(&self, prefix: Vec<Item>, specs: &[ToolSpec], turn_id: &str) -> Result<(Vec<Item>, String), LlmError> {
+    async fn summarize(
+        &self,
+        prefix: Vec<Item>,
+        specs: &[ToolSpec],
+        turn_id: &str,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> Result<(Vec<Item>, String), LlmError> {
         let mut request = self.request(specs.to_vec(), turn_id);
         request.items.clone_from(&prefix);
         match self.provider.compact(request.clone()).await {
@@ -631,7 +637,11 @@ impl Agent {
         while let Some(event) = stream.next().await {
             match event? {
                 StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
-                StreamEvent::Completed { .. } => completed = true,
+                StreamEvent::Completed { usage, .. } => {
+                    // The summary is a full-context request: account for it like any other.
+                    emit(events, AgentEvent::Usage { usage });
+                    completed = true;
+                }
                 _ => {}
             }
         }

@@ -179,6 +179,8 @@ async fn past_the_threshold_the_prefix_is_summarized_locally_and_the_turn_contin
     let (method, before, after, replaced) = compacted.expect("a Compacted event");
     assert_eq!(method, "summary");
     assert!(after < before, "{after} < {before}");
+    let usages = events.iter().filter(|e| matches!(e, AgentEvent::Usage { .. })).count();
+    assert_eq!(usages, 2, "the summary request's usage is accounted for too");
     assert!(replaced > 0);
     let seen = provider.seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 2, "one summary request, then the real one");
