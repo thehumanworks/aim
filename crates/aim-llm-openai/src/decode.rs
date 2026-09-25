@@ -1,8 +1,11 @@
 //! Streamed Chat Completions decoding: deltas for display, complete items only at the end.
 //!
 //! - Tool calls are keyed by `index`; a chunk without `index` falls back to its `id`, then to the
-//!   last open call. The id and name are set once, from the first non-empty value, so servers
-//!   that repeat the name or send `"id": ""` in continuation chunks assemble correctly.
+//!   last open call. A chunk whose `index` is new and that has no `id` continues the one call
+//!   that arrived without an index (unless its name differs); if several calls could be meant,
+//!   the response is a `Protocol` error rather than a guess. The id and name are set once, from
+//!   the first non-empty value, so servers that repeat the name or send `"id": ""` in
+//!   continuation chunks assemble correctly.
 //! - `reasoning_details` arrive as fragments; consecutive `reasoning.text`/`reasoning.summary`
 //!   fragments of the same `index` are merged into one entry (their signature is the first
 //!   non-empty one), `reasoning.encrypted` entries stay discrete.
@@ -191,7 +194,7 @@ impl ChatDecoder {
             return Ok(events);
         };
         if let Some(delta) = choice.get("delta") {
-            self.delta(delta, &mut events);
+            self.delta(delta, &mut events)?;
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str).filter(|reason| !reason.is_empty()) {
             if reason == "error" {
@@ -202,7 +205,7 @@ impl ChatDecoder {
         Ok(events)
     }
 
-    fn delta(&mut self, delta: &Value, events: &mut Vec<StreamEvent>) {
+    fn delta(&mut self, delta: &Value, events: &mut Vec<StreamEvent>) -> Result<(), LlmError> {
         let item_id = self.response_id.clone().unwrap_or_default();
         if let Some(text) = delta.get("content").and_then(Value::as_str).filter(|text| !text.is_empty()) {
             self.text.push_str(text);
@@ -222,30 +225,54 @@ impl ChatDecoder {
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
-                events.extend(self.tool_delta(call));
+                events.extend(self.tool_delta(call)?);
             }
         }
+        Ok(())
     }
 
-    /// The accumulator a tool-call chunk belongs to: by `index`, else by `id`, else the last open call.
-    fn slot(&mut self, index: Option<u64>, id: Option<&str>) -> usize {
+    /// The accumulator a tool-call chunk belongs to: by `index`, else by `id`, else (no index, no
+    /// id) the last open call. A new `index` without an `id` continues the single call that has no
+    /// index yet and no conflicting name; two candidates are ambiguous. Otherwise a new call.
+    fn slot(&mut self, index: Option<u64>, id: Option<&str>, name: Option<&str>) -> Result<usize, LlmError> {
         let found = index
             .and_then(|index| self.tools.iter().position(|tool| tool.index == Some(index)))
-            .or_else(|| id.and_then(|id| self.tools.iter().position(|tool| tool.id == id)))
-            .or_else(|| if index.is_none() && id.is_none() { self.tools.len().checked_sub(1) } else { None });
-        found.unwrap_or_else(|| {
-            self.tools.push(ToolAcc { index, ..ToolAcc::default() });
-            self.tools.len().saturating_sub(1)
-        })
+            .or_else(|| id.and_then(|id| self.tools.iter().position(|tool| tool.id == id)));
+        if let Some(position) = found {
+            return Ok(position);
+        }
+        match (index, id) {
+            (None, None) => {
+                if let Some(last) = self.tools.len().checked_sub(1) {
+                    return Ok(last);
+                }
+            }
+            (Some(_), None) => {
+                let mut unindexed = self
+                    .tools
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tool)| tool.index.is_none() && name.is_none_or(|name| tool.name.is_empty() || tool.name == name))
+                    .map(|(position, _)| position);
+                match (unindexed.next(), unindexed.next()) {
+                    (Some(position), None) => return Ok(position),
+                    (Some(_), Some(_)) => return Err(protocol("a tool-call chunk with a new index could continue several calls")),
+                    (None, _) => {}
+                }
+            }
+            (_, Some(_)) => {}
+        }
+        self.tools.push(ToolAcc { index, ..ToolAcc::default() });
+        Ok(self.tools.len().saturating_sub(1))
     }
 
-    fn tool_delta(&mut self, call: &Value) -> Option<StreamEvent> {
+    fn tool_delta(&mut self, call: &Value) -> Result<Option<StreamEvent>, LlmError> {
         let index = call.get("index").and_then(Value::as_u64);
         let id = call.get("id").and_then(Value::as_str).filter(|id| !id.is_empty());
         let name = call.pointer("/function/name").and_then(Value::as_str).filter(|name| !name.is_empty());
         let arguments = call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("");
-        let position = self.slot(index, id);
-        let tool = self.tools.get_mut(position)?;
+        let position = self.slot(index, id, name)?;
+        let Some(tool) = self.tools.get_mut(position) else { return Ok(None) };
         if tool.index.is_none() {
             tool.index = index;
         }
@@ -256,11 +283,11 @@ impl ChatDecoder {
             name.clone_into(&mut tool.name);
         }
         tool.arguments.push_str(arguments);
-        Some(StreamEvent::ToolCallDelta {
+        Ok(Some(StreamEvent::ToolCallDelta {
             call_id: tool.id.clone(),
             name: (!tool.name.is_empty()).then(|| tool.name.clone()),
             delta: arguments.into(),
-        })
+        }))
     }
 
     /// Completes the response. `done`: the `[DONE]` sentinel arrived.
@@ -550,6 +577,45 @@ mod tests {
         // A usage chunk that is sent anyway is still reported.
         let events = decode(&quiet, &[text, finish_chunk("stop")], true);
         assert!(events.is_ok_and(|events| completed(&events).is_some_and(|(usage, _)| usage.input_tokens == 1)));
+    }
+
+    /// REV4-B Minor 3: an `index` first seen on a continuation chunk continues the one call that
+    /// arrived without an index; a different name starts a new call; two candidates are ambiguous.
+    #[test]
+    fn an_index_first_seen_on_a_continuation_binds_to_the_unindexed_call() -> Result<(), LlmError> {
+        let events = decode(
+            &Profile::openrouter(),
+            &[
+                tool_chunk(&json!({"id": "a", "function": {"name": "weather", "arguments": "{"}})),
+                tool_chunk(&json!({"index": 0, "function": {"arguments": "}"}})),
+                finish_chunk("tool_calls"),
+            ],
+            true,
+        )?;
+        assert_eq!(calls(&events), [triple("a", "weather", "{}")]);
+        let events = decode(
+            &Profile::openrouter(),
+            &[
+                tool_chunk(&json!({"id": "a", "function": {"name": "one", "arguments": "{}"}})),
+                tool_chunk(&json!({"index": 1, "function": {"name": "two", "arguments": "{"}})),
+                tool_chunk(&json!({"index": 1, "function": {"arguments": "}"}})),
+                finish_chunk("tool_calls"),
+            ],
+            true,
+        )?;
+        assert_eq!(calls(&events), [triple("a", "one", "{}"), triple("call_1", "two", "{}")]);
+        let ambiguous = decode(
+            &Profile::openrouter(),
+            &[
+                tool_chunk(&json!({"id": "a", "function": {"name": "one", "arguments": "{"}})),
+                tool_chunk(&json!({"id": "b", "function": {"name": "two", "arguments": "{"}})),
+                tool_chunk(&json!({"index": 0, "function": {"arguments": "}"}})),
+                finish_chunk("tool_calls"),
+            ],
+            true,
+        );
+        assert_eq!(ambiguous.err().map(|e| e.kind), Some(LlmErrorKind::Protocol));
+        Ok(())
     }
 
     #[test]
