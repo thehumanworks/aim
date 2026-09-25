@@ -159,6 +159,23 @@ fn a_tool_call_starts_once_finishes_once_and_its_items_follow() {
 }
 
 #[test]
+fn a_call_starts_when_its_input_is_known_not_when_it_is_announced() {
+    let mut bridge = Bridge::default();
+    let mut announced = ToolCallState::new("t1");
+    announced.name = Some("mcp__aim__read".into());
+    announced.raw_input = Some(json!({}));
+    let (updates, _) = run(&mut bridge, vec![update(Update::ToolCall(announced.clone()))]);
+    assert!(updates.is_empty(), "an empty input is not known yet");
+    announced.status = ToolCallStatus::InProgress;
+    announced.raw_input = Some(json!({"file_path": "a.txt"}));
+    let (updates, _) = run(&mut bridge, vec![update(Update::ToolCall(announced))]);
+    assert_eq!(
+        updates,
+        [SessionUpdate::ToolStarted { call_id: "t1".into(), name: "mcp__aim__read".into(), arguments: r#"{"file_path":"a.txt"}"#.into() }]
+    );
+}
+
+#[test]
 fn calls_left_open_by_the_stop_are_settled_with_a_failed_result() {
     let mut bridge = Bridge::default();
     let (_, end) = run(&mut bridge, vec![tool("t1", ToolCallStatus::InProgress), stopped(StopReason::Cancelled)]);

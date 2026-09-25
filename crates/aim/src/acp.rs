@@ -79,7 +79,10 @@ impl Bridge {
                         out.push(SessionUpdate::ReasoningDelta { delta: text });
                     }
                 }
-                Update::ToolCall(call) => {
+                // A call is announced before its input streams in (`rawInput` absent or `{}`): start
+                // it once the input is known, so the start carries real arguments. Calls whose input
+                // really is empty start from their final item instead.
+                Update::ToolCall(call) if call.raw_input.as_ref().is_some_and(|v| v.as_object().is_none_or(|o| !o.is_empty())) => {
                     let arguments = call.raw_input.as_ref().map_or_else(|| "{}".to_owned(), ToString::to_string);
                     self.start(&call.id, call.display_name(), &arguments, &mut out);
                 }
@@ -303,7 +306,10 @@ impl Backend for AcpBackend {
             emit(events, SessionUpdate::ItemAdded { item: Item::User { parts: input.clone() } });
             let mut prompt = input;
             let mut queued: Vec<Vec<Part>> = Vec::new();
+            let mut prompts: u32 = 0;
             loop {
+                prompts = prompts.saturating_add(1);
+                emit(events, SessionUpdate::RequestStarted { index: prompts });
                 let mut bridge = Bridge::default();
                 let outcome = self.prompt(&prompt, events, cancel, steer, &mut queued, &mut bridge).await;
                 for update in bridge.settle() {
