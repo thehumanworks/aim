@@ -1,0 +1,615 @@
+{
+  "note": "every kept T4b scripting report (cohort 1 primary and codex, cohort 2 primary) re-graded offline with the final graders (REV-T4b2 fixes); reports kept by run.py --keep-outputs; acp_claude kept none. A missing report fails under any grader. Trajectories, usage and costs are the recorded ones.",
+  "grader_source_sha": "a9213440dd1f8785fdf5e710348db38bf9212e39",
+  "grader_source_dirty": false,
+  "summary": {
+    "1": {
+      "trials": 39,
+      "changed_verdicts": 0,
+      "reports_missing": 3
+    },
+    "2": {
+      "trials": 27,
+      "changed_verdicts": 0,
+      "reports_missing": 1
+    }
+  },
+  "cohort1": [
+    {
+      "result": "t4b-openrouter-r1.json",
+      "harness": "aim_openrouter@off",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r1.json",
+      "harness": "aim_openrouter@on",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r1.json",
+      "harness": "aim_openrouter@only",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r1.json",
+      "harness": "aim_openrouter@on",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r1.json",
+      "harness": "aim_openrouter@only",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r1.json",
+      "harness": "aim_openrouter@off",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r1.json",
+      "harness": "aim_openrouter@only",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": false,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r1.json",
+      "harness": "aim_openrouter@off",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r1.json",
+      "harness": "aim_openrouter@on",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r2.json",
+      "harness": "aim_openrouter@on",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r2.json",
+      "harness": "aim_openrouter@only",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": false,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r2.json",
+      "harness": "aim_openrouter@off",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r2.json",
+      "harness": "aim_openrouter@only",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r2.json",
+      "harness": "aim_openrouter@off",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r2.json",
+      "harness": "aim_openrouter@on",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r2.json",
+      "harness": "aim_openrouter@off",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r2.json",
+      "harness": "aim_openrouter@on",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r2.json",
+      "harness": "aim_openrouter@only",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r3.json",
+      "harness": "aim_openrouter@only",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r3.json",
+      "harness": "aim_openrouter@off",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r3.json",
+      "harness": "aim_openrouter@on",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r3.json",
+      "harness": "aim_openrouter@off",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-openrouter-r3.json",
+      "harness": "aim_openrouter@on",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": false,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r3.json",
+      "harness": "aim_openrouter@only",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r3.json",
+      "harness": "aim_openrouter@on",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r3.json",
+      "harness": "aim_openrouter@only",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-openrouter-r3.json",
+      "harness": "aim_openrouter@off",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@off",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@on",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@on",
+      "case": "todo_table",
+      "repetition": 1,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@off",
+      "case": "todo_table",
+      "repetition": 1,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@on",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@off",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@off",
+      "case": "callers",
+      "repetition": 1,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@on",
+      "case": "callers",
+      "repetition": 1,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@off",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@on",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@on",
+      "case": "doc_index",
+      "repetition": 1,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-codex.json",
+      "harness": "aim_codex@off",
+      "case": "doc_index",
+      "repetition": 1,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    }
+  ],
+  "cohort2": [
+    {
+      "result": "t4b-c2-openrouter-r1.json",
+      "harness": "aim_openrouter@off",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r1.json",
+      "harness": "aim_openrouter@on",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r1.json",
+      "harness": "aim_openrouter@only",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r1.json",
+      "harness": "aim_openrouter@on",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r1.json",
+      "harness": "aim_openrouter@only",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r1.json",
+      "harness": "aim_openrouter@off",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r1.json",
+      "harness": "aim_openrouter@only",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r1.json",
+      "harness": "aim_openrouter@off",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r1.json",
+      "harness": "aim_openrouter@on",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r2.json",
+      "harness": "aim_openrouter@on",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r2.json",
+      "harness": "aim_openrouter@only",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r2.json",
+      "harness": "aim_openrouter@off",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r2.json",
+      "harness": "aim_openrouter@only",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": false,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r2.json",
+      "harness": "aim_openrouter@off",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r2.json",
+      "harness": "aim_openrouter@on",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r2.json",
+      "harness": "aim_openrouter@off",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r2.json",
+      "harness": "aim_openrouter@on",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r2.json",
+      "harness": "aim_openrouter@only",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r3.json",
+      "harness": "aim_openrouter@only",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r3.json",
+      "harness": "aim_openrouter@off",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r3.json",
+      "harness": "aim_openrouter@on",
+      "case": "todo_table",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r3.json",
+      "harness": "aim_openrouter@off",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r3.json",
+      "harness": "aim_openrouter@on",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r3.json",
+      "harness": "aim_openrouter@only",
+      "case": "callers",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r3.json",
+      "harness": "aim_openrouter@on",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": true,
+      "passed_final_grader": true
+    },
+    {
+      "result": "t4b-c2-openrouter-r3.json",
+      "harness": "aim_openrouter@only",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    },
+    {
+      "result": "t4b-c2-openrouter-r3.json",
+      "harness": "aim_openrouter@off",
+      "case": "doc_index",
+      "repetition": 0,
+      "report_kept": true,
+      "passed_recorded": false,
+      "passed_final_grader": false
+    }
+  ]
+}
