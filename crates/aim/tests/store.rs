@@ -142,6 +142,78 @@ async fn sqlite_store_summarizes_many_sessions_and_forks() {
 }
 
 #[tokio::test]
+async fn sqlite_summary_has_indexed_stats_and_preserves_fork_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".aim/aim.db");
+    let store = SqliteStore::open(&path).unwrap();
+    store.create(meta("parent", 1)).await.unwrap();
+    // The store accepts nonmonotone turns; a summary must take the maximum visible turn.
+    store.append("parent".into(), vec![timed_event(1, 7, 100), timed_event(2, 2, 200), timed_event(3, 1, 300)]).await.unwrap();
+    let mut child = meta("child", 4);
+    child.parent = Some(ForkPoint { session: "parent".into(), seq: 2 });
+    store.create(child).await.unwrap();
+    store.append("child".into(), vec![timed_event(3, 3, 50)]).await.unwrap();
+    let summaries = store.summarize(1).await.unwrap();
+    assert_eq!(summaries[0].meta.id, "parent");
+    assert_eq!((summaries[0].turns, summaries[0].last_activity_ms), (7, 300));
+    let child = store.summarize(2).await.unwrap().into_iter().find(|s| s.meta.id == "child").unwrap();
+    assert_eq!((child.turns, child.last_activity_ms), (7, 50));
+    store.append("parent".into(), vec![timed_event(4, 1, 400)]).await.unwrap();
+    let summaries = store.summarize(2).await.unwrap();
+    assert_eq!(summaries[0].last_activity_ms, 400);
+    assert_eq!(summaries[1].last_activity_ms, 50, "a later parent event is outside the fork prefix");
+
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let mut plan = conn
+        .prepare("EXPLAIN QUERY PLAN SELECT s.meta FROM session_stats AS st JOIN sessions AS s ON s.id = st.session_id ORDER BY st.last_activity_ms DESC, st.session_id ASC LIMIT 50")
+        .unwrap();
+    let details: Vec<String> = plan.query_map([], |row| row.get(3)).unwrap().map(Result::unwrap).collect();
+    assert!(details.iter().any(|detail| detail.contains("session_stats_by_activity")), "{details:?}");
+    assert!(!details.iter().any(|detail| detail.contains("events") || detail.contains("TEMP B-TREE")), "{details:?}");
+}
+
+#[tokio::test]
+async fn sqlite_v1_migration_backfills_fork_summaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".aim/aim.db");
+    let mut child = meta("child", 4);
+    child.parent = Some(ForkPoint { session: "parent".into(), seq: 2 });
+    std::fs::create_dir(path.parent().unwrap()).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE db_schema (version INTEGER NOT NULL);
+             INSERT INTO db_schema VALUES (1);
+             CREATE TABLE sessions (id TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, meta TEXT NOT NULL);
+             CREATE TABLE events (session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL,
+               turn INTEGER NOT NULL, ts_ms INTEGER NOT NULL, schema INTEGER NOT NULL, body TEXT NOT NULL,
+               PRIMARY KEY (session_id, seq)) WITHOUT ROWID;",
+        )
+        .unwrap();
+        for session in [meta("parent", 1), child] {
+            conn.execute(
+                "INSERT INTO sessions (id, created_ms, meta) VALUES (?1, ?2, ?3)",
+                rusqlite::params![session.id, session.created_ms, serde_json::to_string(&session).unwrap()],
+            )
+            .unwrap();
+        }
+        for (id, seq, turn, ts) in [("parent", 1, 7, 100), ("parent", 2, 2, 200), ("parent", 3, 1, 300), ("child", 3, 3, 50)] {
+            conn.execute(
+                "INSERT INTO events(session_id, seq, turn, ts_ms, schema, body) VALUES (?1, ?2, ?3, ?4, 1, '{}')",
+                rusqlite::params![id, seq, turn, ts],
+            )
+            .unwrap();
+        }
+    }
+    let store = SqliteStore::open(&path).unwrap();
+    let summaries = store.summarize(2).await.unwrap();
+    assert_eq!((summaries[0].meta.id.as_str(), summaries[0].turns, summaries[0].last_activity_ms), ("parent", 7, 300));
+    assert_eq!((summaries[1].meta.id.as_str(), summaries[1].turns, summaries[1].last_activity_ms), ("child", 7, 50));
+    let version: i64 = rusqlite::Connection::open(&path).unwrap().query_row("SELECT version FROM db_schema", [], |row| row.get(0)).unwrap();
+    assert_eq!(version, 2);
+}
+
+#[tokio::test]
 async fn sqlite_store_obeys_the_contract_and_survives_reopening() {
     let dir = std::env::temp_dir().join(format!("aim-store-test-{}", std::process::id()));
     let path = dir.join("aim.db");
