@@ -15,6 +15,7 @@
 //! - [`tool`] — tool descriptors and results, shared by aimx, the agent layer and MCP.
 //! - [`conversation`] — provider-neutral conversation items, usage and rate limits.
 //! - [`event`] — durable session events (the append-only session log).
+pub mod board;
 pub mod content;
 pub mod conversation;
 pub mod daemon;
