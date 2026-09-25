@@ -32,7 +32,11 @@ docs/architecture.md §6.5.
 - Preserve provider-specific usage as a sidecar to normalized usage. Do not flatten cost,
   cache-write and surcharge fields into a value whose semantics differ by gateway. The normalized
   `cost_micro_usd` is the **billed** amount named by the profile's `cost_pointer`; the whole usage
-  object stays in `Usage.native`.
+  object stays in `Usage.native`. Usage a profile asked for is required: budgets and cost
+  accounting never see a completed turn with zero usage the server did not report. This is a
+  `Protocol` error, not an "unknown usage" value. `aim-proto`'s `Usage` has no such state, both
+  gateways send usage on every streamed turn (verbatim captures, seven live tests), and an
+  endpoint that cannot report usage says so with `supports_stream_usage = false`.
 - Derive available models and caps from endpoint catalogs when provided; a configured slug
   remains explicit when discovery is absent. A listed model still needs a live turn before
   aim claims it is usable.
@@ -57,7 +61,7 @@ implements after its first two reviews. The first version named `key_env` (the f
 | `min_output_tokens` | A smaller requested output cap is raised to this. | – | `16` |
 | `max_output_tokens_field` | `max_tokens`, `max_completion_tokens` or `max_output_tokens`. | `max_tokens` | `max_tokens` |
 | `supports_parallel_tool_calls` | Send `parallel_tool_calls` when tools are offered. | yes | yes |
-| `supports_stream_usage` | Send `stream_options.include_usage`. | yes | yes |
+| `supports_stream_usage` | Request usage with `stream_options.include_usage` **and require it**: a response without a usage chunk (numeric `prompt_tokens` and `completion_tokens`; `usage: {}` does not count) is a `Protocol` error, never a turn reported with zero usage. `false` opts out: usage is neither requested nor required, and a turn without it reports zero counts and no `native` usage. | yes | yes |
 | `reasoning_param` | Effort as `reasoning: {effort}` (`open_router`), `reasoning_effort` (`open_ai`) or unsupported (`none`, a request with an effort is `InvalidRequest`). | `open_router` | `open_ai` |
 | `cost_pointer` | JSON pointer into the streamed `usage` object naming the billed USD amount. | `/cost` | `/gateway_cost` |
 | `replay_reasoning_details` | Replay streamed `reasoning_details` on the assistant message of the same response (only this profile's own). | yes | yes |

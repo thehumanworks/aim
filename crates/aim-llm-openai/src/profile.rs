@@ -67,7 +67,9 @@ pub struct Quirks {
     pub max_output_tokens_field: MaxOutputTokensField,
     /// Whether the endpoint accepts `parallel_tool_calls`.
     pub supports_parallel_tool_calls: bool,
-    /// Whether the endpoint accepts `stream_options.include_usage`.
+    /// Whether usage is requested with `stream_options.include_usage` — and then required: a
+    /// response without a usage chunk is a `Protocol` error, never a turn with zero usage. `false`
+    /// opts out for endpoints that cannot report usage; their turns report zero usage.
     pub supports_stream_usage: bool,
     /// Reasoning parameter shape.
     pub reasoning_param: ReasoningParam,

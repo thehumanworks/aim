@@ -366,8 +366,9 @@ plan fits the budget; compaction strictly shrinks; token arithmetic cannot overf
   - Caching and affinity: `extra_body` (OpenRouter `cache_control`, AI Gateway
     `providerOptions.gateway.caching = "auto"`), `session_header` for `Request.session_id`
     (`x-session-id` / `x-session-affinity`), `cache_key_field` for `Request.cache_key`.
-  - Wire capabilities: `supports_parallel_tool_calls`, `supports_stream_usage`,
-    `reasoning_param`, `replay_reasoning_details`, `tool_result_images`, `idle_timeout_secs`.
+  - Wire capabilities: `supports_parallel_tool_calls`, `supports_stream_usage` (usage is then
+    required: a turn without it is a `Protocol` error, never zero usage), `reasoning_param`,
+    `replay_reasoning_details`, `tool_result_images`, `idle_timeout_secs`.
   - `headers` holds extra request headers with literal, non-secret values; `models` is a static
     catalog for endpoints without discovery.
 

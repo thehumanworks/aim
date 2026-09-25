@@ -113,6 +113,11 @@ fn sse_response(body: &str) -> Vec<u8> {
     format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}").into_bytes()
 }
 
+/// A finished text answer with the usage chunk a `supports_stream_usage` profile requires.
+const ANSWER: &str = "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+                      data: {\"id\":\"r\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\n\
+                      data: [DONE]\n\n";
+
 fn local(base: String) -> Profile {
     let mut profile = Profile::openrouter();
     profile.base_url = base;
@@ -182,9 +187,11 @@ async fn a_stream_cut_after_finish_is_a_protocol_error() -> Result<(), Box<dyn s
     let error = collect(&OpenAiProvider::new(local(base))?, request()).await.err().ok_or("expected an error")?;
     assert_eq!(error.kind, LlmErrorKind::Protocol);
 
-    // Without a trailing blank line the final `[DONE]` is still honoured.
+    // Without a trailing blank line the final `[DONE]` is still honoured (usage not requested).
     let (base, _server) = serve(sse_response(&format!("{cut}data: [DONE]")), None).await?;
-    let events = collect(&OpenAiProvider::new(local(base))?, request()).await?;
+    let mut quiet = local(base);
+    quiet.quirks.supports_stream_usage = false;
+    let events = collect(&OpenAiProvider::new(quiet)?, request()).await?;
     assert!(matches!(events.last(), Some(StreamEvent::Completed { stop: StopReason::EndTurn, .. })));
     Ok(())
 }
@@ -255,5 +262,21 @@ async fn in_stream_errors_are_scrubbed_of_the_key() -> Result<(), Box<dyn std::e
     assert_eq!(error.kind, LlmErrorKind::InvalidRequest);
     assert!(error.message.contains("rejected"), "detail kept: {}", error.message);
     assert!(!error.message.contains(KEY), "key scrubbed: {}", error.message);
+    Ok(())
+}
+
+/// REV4-B Major 2: a profile that requests streamed usage never reports a completed turn with
+/// usage it did not receive — neither after `[DONE]` without usage nor after `usage: {}` and EOF.
+#[tokio::test]
+async fn promised_usage_that_never_arrives_is_a_protocol_error() -> Result<(), Box<dyn std::error::Error>> {
+    let finished = "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+    for body in [format!("{finished}data: [DONE]\n\n"), format!("{finished}data: {{\"id\":\"r\",\"choices\":[],\"usage\":{{}}}}\n\n")] {
+        let (base, _server) = serve(sse_response(&body), None).await?;
+        let outcome = collect(&OpenAiProvider::new(local(base))?, request()).await;
+        assert_eq!(outcome.err().map(|error| error.kind), Some(LlmErrorKind::Protocol), "{body}");
+    }
+    let (base, _server) = serve(sse_response(ANSWER), None).await?;
+    let events = collect(&OpenAiProvider::new(local(base))?, request()).await?;
+    assert!(matches!(events.last(), Some(StreamEvent::Completed { usage, .. }) if usage.input_tokens == 5 && usage.output_tokens == 1));
     Ok(())
 }

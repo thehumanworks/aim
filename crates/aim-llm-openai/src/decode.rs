@@ -7,7 +7,10 @@
 //!   fragments of the same `index` are merged into one entry (their signature is the first
 //!   non-empty one), `reasoning.encrypted` entries stay discrete.
 //! - A response is complete when it has a `finish_reason` and either `[DONE]` or a usage chunk
-//!   arrived; anything less is a `Protocol` error.
+//!   arrived; anything less is a `Protocol` error. A profile with `supports_stream_usage` asked
+//!   for usage, so its responses also need the usage chunk (numeric `prompt_tokens` and
+//!   `completion_tokens`): a turn is never reported with usage the server did not send. Without
+//!   that quirk a response without usage completes with zero counts and no `native` usage.
 //! - At `length`/`content_filter`, tool calls whose arguments are not complete JSON are dropped:
 //!   only complete calls are ever emitted.
 
@@ -45,6 +48,8 @@ pub(crate) struct ChatDecoder {
     reasoning: String,
     reasoning_details: Vec<Value>,
     tools: Vec<ToolAcc>,
+    /// The profile asked for streamed usage, so a response without it is incomplete.
+    usage_required: bool,
     usage: Option<Usage>,
     finish: Option<StopReason>,
     created: bool,
@@ -114,6 +119,13 @@ fn integer(value: &Value, path: &str) -> u64 {
     value.pointer(path).and_then(Value::as_u64).unwrap_or(0)
 }
 
+/// Whether a `usage` value reports the turn: an object with numeric `prompt_tokens` and
+/// `completion_tokens` (both are required by the Chat Completions schema). `null`, `{}` and
+/// partial objects are not usage and not a completion signal.
+fn is_reported(usage: &Value) -> bool {
+    ["prompt_tokens", "completion_tokens"].iter().all(|field| usage.get(field).and_then(Value::as_u64).is_some())
+}
+
 fn parse_usage(value: &Value, cost_pointer: Option<&str>) -> Usage {
     Usage {
         input_tokens: integer(value, "/prompt_tokens"),
@@ -151,6 +163,7 @@ impl ChatDecoder {
             reasoning: String::new(),
             reasoning_details: Vec::new(),
             tools: Vec::new(),
+            usage_required: profile.quirks.supports_stream_usage,
             usage: None,
             finish: None,
             created: false,
@@ -171,7 +184,7 @@ impl ChatDecoder {
             self.created = true;
             events.push(StreamEvent::Created { response_id: self.response_id.clone() });
         }
-        if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+        if let Some(usage) = value.get("usage").filter(|usage| is_reported(usage)) {
             self.usage = Some(parse_usage(usage, self.cost_pointer.as_deref()));
         }
         let Some(choice) = value.get("choices").and_then(Value::as_array).and_then(|choices| choices.first()) else {
@@ -253,8 +266,13 @@ impl ChatDecoder {
     /// Completes the response. `done`: the `[DONE]` sentinel arrived.
     pub(crate) fn finish(self, done: bool) -> Result<Vec<StreamEvent>, LlmError> {
         let stop = self.finish.ok_or_else(|| protocol("stream ended without finish_reason"))?;
-        if !done && self.usage.is_none() {
-            return Err(protocol("stream ended after finish_reason without [DONE] or usage"));
+        if self.usage.is_none() {
+            if self.usage_required {
+                return Err(protocol("the response carried no usage although the profile requests it (supports_stream_usage)"));
+            }
+            if !done {
+                return Err(protocol("stream ended after finish_reason without [DONE] or usage"));
+            }
         }
         let truncated = matches!(stop, StopReason::MaxTokens | StopReason::ContentFilter);
         let mut events = Vec::new();
@@ -501,10 +519,37 @@ mod tests {
     fn completion_rules() {
         let text = json!({"id": "r", "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]});
         assert_eq!(decode(&Profile::openrouter(), std::slice::from_ref(&text), false).err().map(|e| e.kind), Some(LlmErrorKind::Protocol));
-        assert!(decode(&Profile::openrouter(), std::slice::from_ref(&text), true).is_ok(), "[DONE] without usage");
+        let mut quiet = Profile::openrouter();
+        quiet.quirks.supports_stream_usage = false;
+        assert!(decode(&quiet, std::slice::from_ref(&text), true).is_ok(), "[DONE] without usage that was not requested");
         assert!(decode(&Profile::openrouter(), &[text, finish_chunk("stop")], false).is_ok(), "usage without [DONE]");
         let unfinished = json!({"id": "r", "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": ""}]});
         assert_eq!(decode(&Profile::openrouter(), &[unfinished], true).err().map(|e| e.kind), Some(LlmErrorKind::Protocol));
+    }
+
+    /// REV4-B Major 2: with `supports_stream_usage` the usage chunk is part of a complete
+    /// response; an empty `usage: {}` is no usage and no completion signal.
+    #[test]
+    fn promised_usage_is_required() {
+        let text = json!({"id": "r", "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]});
+        let empty = json!({"id": "r", "choices": [], "usage": {}});
+        let partial = json!({"id": "r", "choices": [], "usage": {"prompt_tokens": 4}});
+        let kind = |profile: &Profile, chunks: &[Value], done: bool| decode(profile, chunks, done).err().map(|e| e.kind);
+        for preset in [Profile::openrouter(), Profile::ai_gateway()] {
+            assert_eq!(kind(&preset, std::slice::from_ref(&text), true), Some(LlmErrorKind::Protocol), "[DONE] without usage");
+            assert_eq!(kind(&preset, &[text.clone(), empty.clone()], false), Some(LlmErrorKind::Protocol), "usage {{}} then EOF");
+            assert_eq!(kind(&preset, &[text.clone(), empty.clone()], true), Some(LlmErrorKind::Protocol), "usage {{}} then [DONE]");
+            assert_eq!(kind(&preset, &[text.clone(), partial.clone()], true), Some(LlmErrorKind::Protocol), "no completion_tokens");
+        }
+        // Profile data opts out: an endpoint that is not asked for usage completes without it.
+        let mut quiet = Profile::openrouter();
+        quiet.quirks.supports_stream_usage = false;
+        let events = decode(&quiet, std::slice::from_ref(&text), true);
+        assert!(events.as_ref().is_ok_and(|events| completed(events).is_some_and(|(usage, _)| usage.native.is_none())));
+        assert_eq!(kind(&quiet, &[text.clone(), empty], false), Some(LlmErrorKind::Protocol), "still needs [DONE] or usage");
+        // A usage chunk that is sent anyway is still reported.
+        let events = decode(&quiet, &[text, finish_chunk("stop")], true);
+        assert!(events.is_ok_and(|events| completed(&events).is_some_and(|(usage, _)| usage.input_tokens == 1)));
     }
 
     #[test]
