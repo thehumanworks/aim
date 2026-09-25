@@ -31,4 +31,5 @@ pub mod board;
 pub mod compaction;
 pub mod job;
 pub mod negotiate;
+pub mod path;
 pub mod turn;

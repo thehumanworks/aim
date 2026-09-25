@@ -7,3 +7,8 @@
 decision = "negotiate::agreed"
 adr = "0005"
 sha256 = "7b09700a52ae6b8b126a036d515d00a5a38012025a731040b46dff167774e425"
+
+[[locked]]
+decision = "path::confined"
+adr = "0008"
+sha256 = "8a559150598f4595a7ee9fd6a2c835a758a37f8641e5442ad9d729c4c26ea456"
