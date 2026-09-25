@@ -195,7 +195,8 @@ impl HarnessClient {
             Err(_) => usize::MAX,
         };
         peer.set_max_outgoing_bytes(max_outgoing);
-        let workspace = peer.call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_owned(), backend: BackendSpec::Local }).await?;
+        let workspace =
+            peer.call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_owned(), backend: BackendSpec::Local, ceiling: None }).await?;
         let tools = peer.call::<ToolsList>(ToolsListParams::default()).await?.tools;
         Ok(Self { peer, init, workspace, tools, notifications, child: None })
     }
@@ -253,7 +254,9 @@ impl ToolHost for HarnessClient {
     fn call(&self, name: String, arguments: Value, key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
         let peer = self.peer.clone();
         let workspace = self.workspace.id.clone();
-        Box::pin(async move { peer.call::<ToolsCall>(ToolsCallParams { workspace, name, arguments, idempotency_key: Some(key) }).await })
+        Box::pin(async move {
+            peer.call::<ToolsCall>(ToolsCallParams { workspace, name, arguments, idempotency_key: Some(key), scope: None }).await
+        })
     }
 
     fn write_blob(&self, path: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
@@ -267,6 +270,7 @@ impl ToolHost for HarnessClient {
                 precondition: Precondition::IfAbsent,
                 create_dirs: true,
                 idempotency_key: key,
+                scope: None,
             })
             .await
             .map(|_| ())

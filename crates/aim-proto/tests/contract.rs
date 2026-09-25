@@ -81,6 +81,7 @@ fn typed_method_params_serialize_to_the_documented_shape() {
         edits: vec![ExactEdit { old: "a".into(), new: "b".into(), replace_all: false }],
         precondition: Precondition::IfAbsent,
         idempotency_key: IdempotencyKey::new("k1"),
+        scope: None,
     };
     let wire = serde_json::to_value(&params).unwrap();
     assert_eq!(
