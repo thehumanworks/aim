@@ -53,8 +53,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Projects one ACP prompt's events onto session updates.
 #[derive(Default, Debug)]
 pub struct Bridge {
-    /// Calls reported as started: call id → tool name.
-    started: HashMap<String, String>,
+    /// Calls reported as started: call id → (tool name, arguments).
+    started: HashMap<String, (String, String)>,
     /// Calls reported as finished.
     finished: HashSet<String>,
 }
@@ -107,12 +107,22 @@ impl Bridge {
         (out, None)
     }
 
-    /// Settles calls that started but never finished (the prompt ended or failed first).
+    /// Settles calls that started but never finished (the prompt ended or failed first). Each is
+    /// also added to the transcript as a call and a failed result, so the durable history keeps it.
     pub fn settle(&mut self) -> Vec<SessionUpdate> {
-        let open: Vec<String> = self.started.keys().filter(|id| !self.finished.contains(*id)).cloned().collect();
+        let mut open: Vec<(String, String, String)> = self
+            .started
+            .iter()
+            .filter(|(id, _)| !self.finished.contains(*id))
+            .map(|(id, (name, arguments))| (id.clone(), name.clone(), arguments.clone()))
+            .collect();
+        open.sort();
         let mut out = Vec::new();
-        for call_id in open {
-            self.finish(&call_id, ToolResult::error("not finished: the agent's turn ended"), &mut out);
+        for (call_id, name, arguments) in open {
+            let result = ToolResult::error("not finished: the agent's turn ended");
+            self.finish(&call_id, result.clone(), &mut out);
+            out.push(SessionUpdate::ItemAdded { item: Item::ToolCall { call_id: call_id.clone(), name, arguments, native: None } });
+            out.push(SessionUpdate::ItemAdded { item: Item::ToolResult { call_id, result } });
         }
         out
     }
@@ -121,7 +131,7 @@ impl Bridge {
         if self.started.contains_key(call_id) {
             return;
         }
-        self.started.insert(call_id.to_owned(), name.to_owned());
+        self.started.insert(call_id.to_owned(), (name.to_owned(), arguments.to_owned()));
         out.push(SessionUpdate::ToolStarted { call_id: call_id.to_owned(), name: name.to_owned(), arguments: arguments.to_owned() });
     }
 
@@ -129,7 +139,7 @@ impl Bridge {
         if !self.finished.insert(call_id.to_owned()) {
             return;
         }
-        let name = self.started.get(call_id).cloned().unwrap_or_default();
+        let name = self.started.get(call_id).map(|(name, _)| name.clone()).unwrap_or_default();
         out.push(SessionUpdate::ToolFinished { call_id: call_id.to_owned(), name, result });
     }
 }
@@ -146,6 +156,14 @@ pub fn current_config(options: &[ConfigOption]) -> (String, Option<String>) {
 fn emit(events: &UnboundedSender<AgentEvent>, update: SessionUpdate) {
     // A closed receiver only means nobody is watching.
     let _unwatched = events.send(update);
+}
+
+/// Why a prompt did not reach its stop.
+enum PromptFailure {
+    /// The prompt never started; the steers it was to carry were not sent.
+    NotStarted(String, Vec<Vec<Part>>),
+    /// The prompt started and then failed.
+    Failed(String),
 }
 
 /// A session running in an ACP agent.
@@ -254,31 +272,45 @@ impl AcpBackend {
     }
 
     /// Runs one prompt to its stop, queueing steering that arrives meanwhile.
+    /// Runs one prompt to its stop, queueing steering that arrives meanwhile. `delivering` are
+    /// the steers this prompt carries: they count as delivered only once the prompt has started,
+    /// and come back in [`PromptFailure::NotStarted`] otherwise.
+    #[expect(clippy::too_many_arguments, reason = "one prompt's plumbing, kept explicit")]
     async fn prompt(
         &mut self,
         prompt: &[Part],
+        delivering: Vec<Vec<Part>>,
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         steer: &mut UnboundedReceiver<Vec<Part>>,
         queued: &mut Vec<Vec<Part>>,
         bridge: &mut Bridge,
-    ) -> Result<StopReason, String> {
-        let mut turn = self.session.prompt_parts(prompt).await.map_err(|e| e.to_string())?;
+    ) -> Result<StopReason, PromptFailure> {
+        let mut turn = match self.session.prompt_parts(prompt).await {
+            Ok(turn) => turn,
+            Err(e) => return Err(PromptFailure::NotStarted(e.to_string(), delivering)),
+        };
+        if !delivering.is_empty() {
+            emit(events, SessionUpdate::SteerDelivered { count: delivering.len() });
+            for parts in delivering {
+                emit(events, SessionUpdate::ItemAdded { item: Item::User { parts } });
+            }
+        }
         let mut cancelled = false;
         loop {
             tokio::select! {
                 biased;
                 () = cancel.cancelled(), if !cancelled => {
                     cancelled = true;
-                    turn.cancel().map_err(|e| e.to_string())?;
+                    turn.cancel().map_err(|e| PromptFailure::Failed(e.to_string()))?;
                 }
                 Some(parts) = steer.recv() => {
                     queued.push(parts);
                     emit(events, SessionUpdate::SteerQueued);
                 }
                 next = turn.next() => match next {
-                    None => return Err("the agent ended the turn without a stop reason".to_owned()),
-                    Some(Err(e)) => return Err(e.to_string()),
+                    None => return Err(PromptFailure::Failed("the agent ended the turn without a stop reason".to_owned())),
+                    Some(Err(e)) => return Err(PromptFailure::Failed(e.to_string())),
                     Some(Ok(event)) => {
                         let (updates, end) = bridge.accept(event);
                         for update in updates {
@@ -305,13 +337,14 @@ impl Backend for AcpBackend {
         Box::pin(async move {
             emit(events, SessionUpdate::ItemAdded { item: Item::User { parts: input.clone() } });
             let mut prompt = input;
+            let mut delivering: Vec<Vec<Part>> = Vec::new();
             let mut queued: Vec<Vec<Part>> = Vec::new();
             let mut prompts: u32 = 0;
             loop {
                 prompts = prompts.saturating_add(1);
                 emit(events, SessionUpdate::RequestStarted { index: prompts });
                 let mut bridge = Bridge::default();
-                let outcome = self.prompt(&prompt, events, cancel, steer, &mut queued, &mut bridge).await;
+                let outcome = self.prompt(&prompt, core::mem::take(&mut delivering), events, cancel, steer, &mut queued, &mut bridge).await;
                 for update in bridge.settle() {
                     emit(events, update);
                 }
@@ -321,7 +354,18 @@ impl Backend for AcpBackend {
                 }
                 let stop = match outcome {
                     Ok(stop) => stop,
-                    Err(message) => {
+                    Err(failure) => {
+                        let message = match failure {
+                            PromptFailure::NotStarted(message, undelivered) => {
+                                // Steers the prompt was to carry were never sent: they come back
+                                // first, in the order they were typed.
+                                let mut back = undelivered;
+                                back.append(&mut queued);
+                                queued = back;
+                                message
+                            }
+                            PromptFailure::Failed(message) => message,
+                        };
                         if !queued.is_empty() {
                             emit(events, SessionUpdate::SteersReturned { steers: queued });
                         }
@@ -338,13 +382,10 @@ impl Backend for AcpBackend {
                     emit(events, SessionUpdate::TurnEnded { stop: stop.clone() });
                     return Ok(stop);
                 }
-                // The agent stopped with steering queued: send it and keep the turn going.
-                let steers = core::mem::take(&mut queued);
-                emit(events, SessionUpdate::SteerDelivered { count: steers.len() });
-                for parts in &steers {
-                    emit(events, SessionUpdate::ItemAdded { item: Item::User { parts: parts.clone() } });
-                }
-                prompt = steers.into_iter().flatten().collect();
+                // The agent stopped with steering queued: send it and keep the turn going. It counts
+                // as delivered once the follow-up prompt has started.
+                delivering = core::mem::take(&mut queued);
+                prompt = delivering.iter().flatten().cloned().collect();
             }
         })
     }
@@ -371,8 +412,12 @@ impl Backend for AcpBackend {
     fn shutdown(self: Box<Self>) -> BackendFuture<'static, ()> {
         let Self { client, session, scratch } = *self;
         Box::pin(async move {
-            if let Err(error) = session.close().await {
-                tracing::debug!(%error, "closing the ACP session failed");
+            // Bounded: a peer that never answers `session/close` must not hold the host's
+            // shutdown (the process is stopped below either way).
+            match tokio::time::timeout(SHUTDOWN_GRACE, session.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::debug!(%error, "closing the ACP session failed"),
+                Err(_) => tracing::debug!("closing the ACP session timed out"),
             }
             client.shutdown(SHUTDOWN_GRACE).await;
             drop(scratch);

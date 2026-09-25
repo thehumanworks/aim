@@ -262,7 +262,7 @@ impl SessionHost {
         let transcript = resume.as_ref().map(|r| items_of(&r.events)).unwrap_or_default();
         let context = resume.as_ref().map(|r| model_items_of(&r.events)).unwrap_or_default();
         let request = BackendRequest { spec: spec.clone(), session_id: session_id.clone(), transcript: context };
-        let Built { backend, model, root, location, shutdown } = (self.config.backends)(request).await?;
+        let Built { mut backend, model, root, location, shutdown } = (self.config.backends)(request).await?;
 
         let store: Arc<dyn SessionStore> = match spec.persistence {
             Persistence::Persistent => Arc::clone(&self.config.store),
@@ -282,7 +282,21 @@ impl SessionHost {
                 title: None,
                 parent: None,
             };
-            Recorder::create(Arc::clone(&store), meta.clone()).await.map(|recorder| (meta, recorder))
+            let created = Recorder::create(Arc::clone(&store), meta.clone()).await;
+            match created {
+                Ok(mut recorder) => {
+                    // Record the configuration in force, so a resumed session continues with the
+                    // same model and effort (Recorder::resume and last_config read it back).
+                    match backend.set_config(None, None).await {
+                        Ok((model, effort)) => recorder.record(EventBody::ConfigChanged { model, effort }).await.map(|()| (meta, recorder)),
+                        Err(message) => {
+                            tracing::warn!(%message, "the backend could not report its configuration");
+                            Ok((meta, recorder))
+                        }
+                    }
+                }
+                Err(e) => Err(e),
+            }
         };
         let (meta, recorder) = match opened {
             Ok(opened) => opened,
@@ -402,13 +416,15 @@ impl Actor {
         while let Some(message) = control.recv().await {
             match message {
                 Control::Prompt(parts, reply) => {
-                    if let Some((model, effort)) = pending_config.take() {
-                        self.apply_config(model, effort).await;
-                    }
                     let turn = self.recorder.turns().saturating_add(1);
                     // The requester learns the turn number before it runs.
                     let _gone = reply.send(PromptOutcome::Started { turn });
-                    if self.run_turn(parts, &mut control, &mut pending_config).await {
+                    let closing = self.run_turn(parts, &mut control, &mut pending_config).await;
+                    // Changes asked for during the turn apply now, before any later control.
+                    if let Some((model, effort)) = pending_config.take() {
+                        self.apply_config(model, effort).await;
+                    }
+                    if closing {
                         break;
                     }
                 }
@@ -475,7 +491,11 @@ impl Actor {
                             let _ended = steer_tx.send(steer);
                         }
                         Control::Cancel => cancel.cancel(),
-                        Control::SetConfig { model, effort } => *pending_config = Some((model, effort)),
+                        Control::SetConfig { model, effort } => {
+                            // Later requests win field by field; unspecified fields keep earlier ones.
+                            let (pending_model, pending_effort) = pending_config.take().unwrap_or_default();
+                            *pending_config = Some((model.or(pending_model), effort.or(pending_effort)));
+                        }
                         Control::Close => {
                             closing = true;
                             cancel.cancel();

@@ -35,6 +35,7 @@ pub trait Backend: Send {
     ) -> BackendFuture<'a, Result<StopReason, AgentError>>;
 
     /// Changes the model and/or effort for the next turn; returns what is now in force.
+    /// `set_config(None, None)` changes nothing and reports the configuration in force.
     ///
     /// # Errors
     /// A message for the user when the backend refused the change (nothing changed).

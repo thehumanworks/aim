@@ -343,3 +343,39 @@ async fn listing_stored_sessions_uses_event_turns_and_activity() {
     }
     assert!(listed.windows(2).all(|pair| pair[0].last_activity_ms >= pair[1].last_activity_ms));
 }
+
+#[tokio::test]
+async fn config_changes_during_a_turn_merge_field_by_field() {
+    let f = fixture(vec![slow_call("a", 100), text("done"), text("next")]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    f.host.prompt(id.clone(), user("go")).await.unwrap();
+    until(&mut updates, |u| matches!(u, SessionUpdate::ToolStarted { .. })).await;
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m2".into()), effort: None }).await.unwrap();
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("high".into()) }).await.unwrap();
+    let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
+    assert_eq!(got.last(), Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("high".into()) }), "neither change lost");
+    f.host.prompt(id, user("next")).await.unwrap();
+    until(&mut updates, is_idle).await;
+    let last = f.provider.seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!((last.model.as_str(), last.effort.as_deref()), ("m2", Some("high")));
+}
+
+#[tokio::test]
+async fn a_resumed_session_keeps_its_initial_effort() {
+    let store = Arc::new(MemoryStore::default());
+    let first = fixture_with(Arc::clone(&store), vec![text("one")]);
+    let with_effort = SessionSpec { effort: Some("high".into()), ..spec(Persistence::Persistent) };
+    let id = first.host.create(with_effort).await.unwrap().meta.id;
+    let (_, mut updates) = first.host.attach(id.clone()).await.unwrap();
+    first.host.prompt(id.clone(), user("hi")).await.unwrap();
+    until(&mut updates, is_idle).await;
+    first.host.close(id.clone()).await.unwrap();
+
+    let second = fixture_with(Arc::clone(&store), vec![text("two")]);
+    let (_, mut updates) = second.host.attach(id.clone()).await.unwrap();
+    second.host.prompt(id, user("more")).await.unwrap();
+    until(&mut updates, is_idle).await;
+    let seen = second.provider.seen.lock().unwrap().clone();
+    assert_eq!(seen[0].effort.as_deref(), Some("high"), "the effort chosen at creation survives a restart");
+}

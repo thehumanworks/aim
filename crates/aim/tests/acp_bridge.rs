@@ -181,7 +181,14 @@ fn calls_left_open_by_the_stop_are_settled_with_a_failed_result() {
     let (_, end) = run(&mut bridge, vec![tool("t1", ToolCallStatus::InProgress), stopped(StopReason::Cancelled)]);
     assert_eq!(end.map(|e| e.stop), Some(StopReason::Cancelled));
     let settled = bridge.settle();
-    assert!(matches!(settled.as_slice(), [SessionUpdate::ToolFinished { call_id, result, .. }] if call_id == "t1" && result.is_error));
+    assert!(matches!(settled.first(), Some(SessionUpdate::ToolFinished { call_id, result, .. }) if call_id == "t1" && result.is_error));
+    // The durable history keeps the interrupted call, paired with its failed result.
+    assert!(
+        matches!(settled.get(1), Some(SessionUpdate::ItemAdded { item: Item::ToolCall { call_id, name, .. } }) if call_id == "t1" && name == "Read")
+    );
+    assert!(
+        matches!(settled.get(2), Some(SessionUpdate::ItemAdded { item: Item::ToolResult { call_id, result } }) if call_id == "t1" && result.is_error)
+    );
     assert!(bridge.settle().is_empty(), "settled once");
 }
 
