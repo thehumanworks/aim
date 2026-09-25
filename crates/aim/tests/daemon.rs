@@ -11,13 +11,13 @@ use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture as ToolFuture, ToolHost};
 use aim::daemon::{client::DaemonClient, server, socket_path, spawn};
-use aim::host::{BoxFuture, Connected, HostConfig, SessionClient, SessionHost, WorkspaceFactory, native_backends};
+use aim::host::{BoxFuture, Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends};
 use aim::store::MemoryStore;
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
 use aim_proto::daemon::{
-    DaemonInitialize, DaemonInitializeParams, Location, Persistence, PromptOutcome, SessionListParams, SessionSpec, SessionState,
-    SessionUpdate,
+    DaemonInitialize, DaemonInitializeParams, DetachReason, Location, Persistence, PromptOutcome, SessionAttachResult, SessionConfigParams,
+    SessionListParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{GenerationRange, PeerInfo};
@@ -67,6 +67,43 @@ impl ToolHost for NoTools {
     }
     fn call(&self, _name: String, _arguments: Value, _key: IdempotencyKey) -> ToolFuture<Result<ToolResult, ProtoError>> {
         Box::pin(async { Ok(ToolResult::text("")) })
+    }
+}
+
+/// Models the host closing an attached source on broadcast lag.
+struct EndsOnAttach(Arc<dyn SessionClient>);
+
+impl SessionClient for EndsOnAttach {
+    fn create(&self, spec: SessionSpec) -> BoxFuture<Result<SessionSummary, ProtoError>> {
+        self.0.create(spec)
+    }
+
+    fn list(&self, params: SessionListParams) -> BoxFuture<Result<Vec<SessionSummary>, ProtoError>> {
+        self.0.list(params)
+    }
+
+    fn attach(&self, session: String) -> BoxFuture<Result<(SessionAttachResult, UpdateStream), ProtoError>> {
+        let host = Arc::clone(&self.0);
+        Box::pin(async move {
+            let (snapshot, _updates) = host.attach(session).await?;
+            Ok((snapshot, Box::pin(futures_util::stream::empty()) as UpdateStream))
+        })
+    }
+
+    fn prompt(&self, session: String, parts: Vec<Part>) -> BoxFuture<Result<PromptOutcome, ProtoError>> {
+        self.0.prompt(session, parts)
+    }
+
+    fn cancel(&self, session: String) -> BoxFuture<Result<(), ProtoError>> {
+        self.0.cancel(session)
+    }
+
+    fn set_config(&self, params: SessionConfigParams) -> BoxFuture<Result<(), ProtoError>> {
+        self.0.set_config(params)
+    }
+
+    fn close(&self, session: String) -> BoxFuture<Result<(), ProtoError>> {
+        self.0.close(session)
     }
 }
 
@@ -128,7 +165,7 @@ async fn started(
     (dir, host, provider, background)
 }
 
-async fn until_idle(stream: &mut aim::host::UpdateStream) -> Vec<SessionUpdate> {
+async fn until_idle(stream: &mut UpdateStream) -> Vec<SessionUpdate> {
     let mut updates = Vec::new();
     loop {
         let next = tokio::time::timeout(Duration::from_secs(5), stream.next()).await.unwrap().expect("stream ended early");
@@ -199,10 +236,35 @@ async fn reattach_on_one_connection_replaces_forwarder() {
     let (_, mut old) = client.attach(session.clone()).await.unwrap();
     let (_, mut current) = client.attach(session.clone()).await.unwrap();
     assert!(tokio::time::timeout(Duration::from_secs(1), old.next()).await.unwrap().is_none());
+    assert_eq!(client.take_detach_reason(&session), Some(DetachReason::Replaced));
     drop(old);
     client.prompt(session, input()).await.unwrap();
     let updates = until_idle(&mut current).await;
     assert!(updates.iter().any(|u| matches!(u, SessionUpdate::TurnEnded { .. })));
+    task.abort();
+}
+
+#[tokio::test]
+async fn reattach_while_streaming_preserves_finished_items_once() {
+    let (dir, _, _, task) = started(200, Duration::from_millis(1)).await;
+    let socket = socket_path(dir.path());
+    let client = DaemonClient::connect(&socket).await.unwrap();
+    let session = client.create(spec()).await.unwrap().meta.id;
+    let (_, mut old) = client.attach(session.clone()).await.unwrap();
+    client.prompt(session.clone(), input()).await.unwrap();
+    while !matches!(tokio::time::timeout(Duration::from_secs(5), old.next()).await.unwrap(), Some(SessionUpdate::TextDelta { .. })) {}
+    let (snapshot, mut current) = client.attach(session.clone()).await.unwrap();
+    let _old_tail: Vec<_> = tokio::time::timeout(Duration::from_secs(5), old.collect()).await.unwrap();
+    assert_eq!(client.take_detach_reason(&session), Some(DetachReason::Replaced));
+    let updates = until_idle(&mut current).await;
+    let mut assembled = snapshot.transcript;
+    assembled.extend(updates.iter().filter_map(|update| match update {
+        SessionUpdate::ItemAdded { item } => Some(item.clone()),
+        _ => None,
+    }));
+    let late = DaemonClient::connect(&socket).await.unwrap();
+    let (finished, _) = late.attach(session).await.unwrap();
+    assert_eq!(assembled, finished.transcript);
     task.abort();
 }
 
@@ -212,12 +274,33 @@ async fn close_delivers_terminal_state_then_ends_stream() {
     let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
     let session = client.create(spec()).await.unwrap().meta.id;
     let (_, mut updates) = client.attach(session.clone()).await.unwrap();
-    client.close(session).await.unwrap();
+    client.close(session.clone()).await.unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), updates.next()).await.unwrap(),
         Some(SessionUpdate::StateChanged { state: SessionState::Closed })
     );
     assert!(tokio::time::timeout(Duration::from_secs(1), updates.next()).await.unwrap().is_none());
+    assert_eq!(client.take_detach_reason(&session), Some(DetachReason::Closed));
+    task.abort();
+}
+
+#[tokio::test]
+async fn host_broadcast_lag_sends_detached_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = socket_path(dir.path());
+    let (host, _) = host(1, Duration::ZERO);
+    let lagged: Arc<dyn SessionClient> = Arc::new(EndsOnAttach(host));
+    let task = tokio::spawn({
+        let home = dir.path().to_path_buf();
+        let socket = socket.clone();
+        async move { server::serve(&home, &socket, None, lagged).await }
+    });
+    wait_socket(&socket).await;
+    let client = DaemonClient::connect(&socket).await.unwrap();
+    let session = client.create(spec()).await.unwrap().meta.id;
+    let (_, mut updates) = client.attach(session.clone()).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(1), updates.next()).await.unwrap().is_none());
+    assert_eq!(client.take_detach_reason(&session), Some(DetachReason::Lagged));
     task.abort();
 }
 
@@ -243,6 +326,7 @@ async fn slow_ui_stream_ends_at_its_bound_and_can_reattach() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let received: Vec<_> = tokio::time::timeout(Duration::from_secs(5), updates.collect()).await.unwrap();
     assert!(received.len() <= 1024);
+    assert_eq!(client.take_detach_reason(&session), Some(DetachReason::Lagged));
     let (snapshot, _) = client.attach(session).await.unwrap();
     assert_eq!(snapshot.transcript.len(), 2);
     task.abort();

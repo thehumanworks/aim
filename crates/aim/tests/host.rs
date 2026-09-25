@@ -313,3 +313,33 @@ async fn attaching_to_a_stored_session_resumes_it_once_and_continues_its_log() {
     assert!(events.windows(2).all(|w| w[1].seq == w[0].seq + 1));
     assert_eq!(events.last().map(|e| e.turn), Some(2));
 }
+
+#[tokio::test]
+async fn listing_stored_sessions_uses_event_turns_and_activity() {
+    let store = Arc::new(MemoryStore::default());
+    let first = fixture_with(Arc::clone(&store), (0..6).map(|_| text("done")).collect());
+    let mut ids = Vec::new();
+    for turns in 1..=3 {
+        let id = first.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+        let (_, mut updates) = first.host.attach(id.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        for _ in 0..turns {
+            first.host.prompt(id.clone(), user("go")).await.unwrap();
+            until(&mut updates, is_idle).await;
+        }
+        first.host.close(id.clone()).await.unwrap();
+        ids.push(id);
+    }
+    first.host.shutdown().await.unwrap();
+
+    let resumed = fixture_with(store, Vec::new());
+    let listed = resumed.host.list(SessionListParams { limit: Some(10), workspace: None }).await.unwrap();
+    assert_eq!(listed.len(), 3);
+    for (index, id) in ids.iter().enumerate() {
+        let summary = listed.iter().find(|summary| &summary.meta.id == id).unwrap();
+        assert_eq!(summary.turns, u64::try_from(index + 1).unwrap());
+        assert_eq!(summary.state, SessionState::Closed);
+        assert!(summary.last_activity_ms > summary.meta.created_ms);
+    }
+    assert!(listed.windows(2).all(|pair| pair[0].last_activity_ms >= pair[1].last_activity_ms));
+}
