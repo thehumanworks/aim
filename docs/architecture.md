@@ -346,6 +346,12 @@ The plan's kernel spec: a tool call and its result (matched by **call id**, so p
 `call₁ call₂ result₁ result₂` are handled) are never separated; pinned items are always kept; the
 plan fits the budget; compaction strictly shrinks; token arithmetic cannot overflow.
 
+**As built (`agent::compact`, ADR 0025).**
+- **Trigger.** Before each request, the context estimate is the provider-measured size of the last request plus response, plus a byte estimate (JSON/4) of the items added since. Compaction starts when this passes 85% of the catalog window. On a provider `ContextOverflow`, the engine compacts once and retries the request.
+- **Cut.** The cut keeps the longest verbatim tail within 20% of the window, and the running turn's prompt is pinned. The verified `plan_cut` chooses it.
+- **Replacement.** The prefix becomes one provider compaction item (`ModelProvider::compact`; codex V2), or a local handoff summary. The summary request uses the conversation's own instructions and tools, so the provider's prompt cache still covers the prefix.
+- **Recording.** A `Compacted` event records `replaced` and the replacement items. `host::model_items_of` replays those events to rebuild the model's context on resume, while the user's transcript keeps every item.
+
 ### 6.5 Providers
 
 `ModelProvider::{catalog, stream}` with normalized events and provider-native sidecars.
@@ -762,3 +768,17 @@ contract exists.
 
 M2–M4 are self-hosted with ordinary `aim run` sessions (codex and Claude workers in herdr panes,
 cross-model review). From M5, milestones are posted as blackboard jobs and executed by aim agents.
+
+**Status (2026-09-25).**
+
+| M | State |
+| --- | --- |
+| M0, M1-proto | Done. The kernel has 97 verified obligations; locked specs are `negotiate::agreed`, `path::confined`, `compaction::plan_ok` and `compaction::cut_ok`. |
+| M1a | Done: aimx local, 88 tests. A second review round (FIX4) is in flight. |
+| M1b | SSH in slices 1–2: the connection manager, bootstrap, the agentless fallback, and a resident remote aimx with proxy, reconnect and resume. `aim run --ssh` works live. Review fixes (FIX6) and `aimx mcp` (W09) are in flight. |
+| M2-llm | codex, OpenRouter and AI Gateway are live. `acp:claude` is live through the session host. |
+| M2a | Done. aim made and tested a change on its own repo (6658595). |
+| M2b | codex, OpenRouter and Claude run end to end locally through one session host. SSH works for the native backends; Claude over SSH (W09) is in flight. |
+| M3 | The daemon (`aim daemon`, auto-spawn) is merged. The TUI (W07) is in flight. |
+| M4 | Compaction is done: remote codex V2 or a local summary, retry on overflow, and the verified planner. Live on codex (~16k → ~2k tokens) and OpenRouter; both kept the fact in the test history. Skills, agents, instructions and memory (W12) are in flight. |
+| M6 | Jev (W13) and the policy kernel (W11) are in flight. |
