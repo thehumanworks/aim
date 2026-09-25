@@ -62,6 +62,7 @@ Rules (enforced by `mise run check`):
 | [0040](0040-daemon-recovery-and-paged-attachments.md) | Recover daemon attachments and page large session histories. |
 | [0041](0041-indexed-session-summaries.md) | Index durable session summaries. |
 | [0042](0042-bound-media-services-and-private-opt-in.md) | Bound media output and require private-session opt-in. |
+| [0045](0045-trusted-mcp-edges.md) | Bind MCP imports to source hash and run location; serve aim tools over both MCP lifecycles. |
 | [0046](0046-per-call-harness-authority.md) | Carry narrowing authority on harness calls and sessions. |
 | [0047](0047-remote-harness-websocket-and-http.md) | Carry the harness protocol over bounded WebSocket and HTTP sessions. |
 | [0048](0048-board-workers-and-integration.md) | Run fenced board attempts in isolated worktrees and integrate accepted evidence serially. |
@@ -70,4 +71,5 @@ Rules (enforced by `mise run check`):
 | [0052](0052-remote-workspace-location.md) | Persist remote harness URLs as workspace locations without credentials. |
 | [0053](0053-network-token-call-scope-ceilings.md) | Bind network bearer scopes to harness sessions. |
 | [0054](0054-reserve-image-destination-before-generation.md) | Reserve image destinations before paid generation. |
+| [0063](0063-compose-native-mcp-and-board-tools.md) | Compose trusted MCP and durable board tools, with a private last-known MCP catalog. |
 | [0065](0065-locked-digests-resolve-names-by-module.md) | LOCKED digests resolve kernel names by module. |

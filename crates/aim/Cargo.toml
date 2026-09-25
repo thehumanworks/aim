@@ -25,6 +25,7 @@ aim-llm-codex = { path = "../aim-llm-codex" }
 aim-llm-openai = { path = "../aim-llm-openai" }
 aim-proto = { path = "../aim-proto" }
 aim-rpc = { path = "../aim-rpc" }
+base64 = "0.22"
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 futures-core = "0.3"
@@ -39,14 +40,16 @@ nucleo-matcher = "0.3"
 pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "stream"] }
+rmcp = { version = "=3.4.1", default-features = false, features = ["auth", "client", "reqwest", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 rusqlite = { version = "0.40", features = ["bundled"] }
+schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "0.9"
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "net", "fs"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "io-std", "signal", "net", "fs"] }
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }

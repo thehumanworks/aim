@@ -218,6 +218,11 @@ version = "0.81.2"
 backend = "npm:@agentclientprotocol/claude-agent-acp"
 specifiers = ["0.81.2"]
 
+[[tools."npm:@modelcontextprotocol/server-everything"]]
+version = "2026.8.31"
+backend = "npm:@modelcontextprotocol/server-everything"
+specifiers = ["2026.8.31"]
+
 [[tools.pi]]
 version = "0.87.1"
 backend = "aqua:earendil-works/pi"

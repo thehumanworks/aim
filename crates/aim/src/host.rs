@@ -319,7 +319,9 @@ pub fn native_backends_with(
             {
                 tools = Arc::new(Dispatcher::with_policy(tools, media, spec.persistence == Persistence::Persistent));
             }
-            tools = with_extra_tools(tools, &services.tools, &spec).await;
+            let mut tools_spec = spec.clone();
+            tools_spec.workspace = root.clone();
+            tools = with_extra_tools(tools, &services.tools, &tools_spec).await;
             let code_permitted = agent.as_ref().is_none_or(|(_, policy)| policy.permits("run_code"));
             let (mut tools, record) = match &agent {
                 Some((agent, policy)) => (narrowed(tools, agent, policy), Some(policy.record(&agent.meta.name))),

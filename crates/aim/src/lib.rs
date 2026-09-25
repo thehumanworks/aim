@@ -27,6 +27,7 @@ pub mod harness;
 pub mod host;
 pub mod jev;
 pub mod login;
+pub mod mcp;
 pub mod media;
 pub mod programs;
 pub mod providers;

@@ -140,6 +140,17 @@ fn fixture_services(
     models: Vec<ModelInfo>,
     services: NativeServices,
 ) -> Fixture {
+    fixture_services_root(backing, store, script, models, services, None)
+}
+
+fn fixture_services_root(
+    backing: Arc<dyn SessionStore>,
+    store: Arc<MemoryStore>,
+    script: Vec<Vec<Result<StreamEvent, LlmError>>>,
+    models: Vec<ModelInfo>,
+    services: NativeServices,
+    connected_root: Option<String>,
+) -> Fixture {
     let provider =
         Arc::new(Scripted { responses: Mutex::new(script.into()), seen: Mutex::default(), models, stall_catalog: AtomicBool::new(false) });
     let connects = Arc::new(AtomicUsize::new(0));
@@ -147,7 +158,7 @@ fn fixture_services(
     let (c, s) = (Arc::clone(&connects), Arc::clone(&shutdowns));
     let workspaces: WorkspaceFactory = Arc::new(move |spec: &SessionSpec| {
         c.fetch_add(1, Ordering::SeqCst);
-        let root = spec.workspace.clone();
+        let root = connected_root.clone().unwrap_or_else(|| spec.workspace.clone());
         let s = Arc::clone(&s);
         Box::pin(async move {
             // Connecting takes a while, as spawning a harness does.
@@ -161,7 +172,13 @@ fn fixture_services(
                 tools: Arc::new(Echo),
                 root,
                 location: "local".into(),
-                project: Some(Arc::new(MemoryFiles::new([("AGENTS.md", "Be terse.")]))),
+                project: Some(Arc::new(MemoryFiles::new([
+                    ("AGENTS.md", "Be terse."),
+                    (
+                        ".agents/agents/mcp_only.md",
+                        "---\nschema: aim.agent/v1\nname: mcp_only\ndescription: MCP only.\ntools: [mcp__everything__echo]\n---\nUse only the permitted MCP tool.\n",
+                    ),
+                ]))),
                 shutdown,
             })
         })
@@ -964,4 +981,159 @@ async fn an_automatic_session_switching_models_starts_from_the_new_ladder() {
     turn(&f, &mut updates, &id, "two").await;
     let efforts: Vec<Option<String>> = f.provider.seen.lock().unwrap().iter().map(|r| r.effort.clone()).collect();
     assert_eq!(efforts, [Some("low".to_owned()), Some("medium".to_owned())], "each model's ladder start");
+}
+
+struct ExtraTool {
+    name: &'static str,
+    unavailable: bool,
+}
+
+impl ToolHost for ExtraTool {
+    fn specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: self.name.to_owned(),
+            description: "test service".to_owned(),
+            input_schema: json!({"type":"object"}),
+            input: aim_proto::tool::ToolInput::Json,
+            annotations: ToolAnnotations::default(),
+        }]
+    }
+
+    fn call(&self, _name: String, _arguments: Value, _key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
+        let unavailable = self.unavailable;
+        Box::pin(async move {
+            if unavailable { Err(ProtoError::new(ErrorCode::Unavailable, "MCP server did not start")) } else { Ok(ToolResult::text("ok")) }
+        })
+    }
+}
+
+fn composed_services() -> NativeServices {
+    let mcp: aim::host::ToolsFactory = Arc::new(|_spec| {
+        Box::pin(async { Some(Arc::new(ExtraTool { name: "mcp__everything__echo", unavailable: false }) as Arc<dyn ToolHost>) })
+    });
+    let board: aim::host::ToolsFactory = Arc::new(|spec| {
+        let persistent = spec.persistence == Persistence::Persistent;
+        Box::pin(async move { persistent.then(|| Arc::new(ExtraTool { name: "board_list", unavailable: false }) as Arc<dyn ToolHost>) })
+    });
+    NativeServices {
+        tools: vec![mcp, board],
+        code: Some(aim::host::CodeConfig { worker: "/missing-test-worker".into(), user_programs: "/missing-test-programs".into() }),
+        ..NativeServices::default()
+    }
+}
+
+#[tokio::test]
+async fn agent_allowlist_narrows_composed_mcp_board_and_program_tools() {
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_services(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, vec![text("done")], Vec::new(), composed_services());
+    let mut session = spec(Persistence::Persistent);
+    session.agent = Some("mcp_only".into());
+    let id = f.host.create(session).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    turn(&f, &mut updates, &id, "go").await;
+    let seen = f.provider.seen.lock().unwrap();
+    let offered = seen[0].tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
+    assert_eq!(offered, ["mcp__everything__echo"]);
+}
+
+#[tokio::test]
+async fn private_session_keeps_mcp_but_omits_board() {
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_services(
+        Arc::clone(&memory) as Arc<dyn SessionStore>,
+        memory,
+        vec![text("persistent"), text("private")],
+        Vec::new(),
+        composed_services(),
+    );
+    for persistence in [Persistence::Persistent, Persistence::Ephemeral] {
+        let id = f.host.create(spec(persistence)).await.unwrap().meta.id;
+        let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+        turn(&f, &mut updates, &id, "go").await;
+    }
+    let seen = f.provider.seen.lock().unwrap();
+    let first = seen[0].tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
+    let second = seen[1].tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
+    assert!(first.contains(&"board_list"));
+    assert!(!second.contains(&"board_list"));
+    assert!(second.contains(&"mcp__everything__echo"));
+}
+
+#[tokio::test]
+async fn unavailable_mcp_tool_returns_an_error_without_failing_the_session() {
+    let call = vec![
+        Ok(StreamEvent::ItemDone {
+            item: Item::ToolCall { call_id: "mcp1".into(), name: "mcp__failed__echo".into(), arguments: "{}".into(), native: None },
+        }),
+        completed(StopReason::ToolUse),
+    ];
+    let service: aim::host::ToolsFactory =
+        Arc::new(|_| Box::pin(async { Some(Arc::new(ExtraTool { name: "mcp__failed__echo", unavailable: true }) as Arc<dyn ToolHost>) }));
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_services(
+        Arc::clone(&memory) as Arc<dyn SessionStore>,
+        memory,
+        vec![call, text("recovered")],
+        Vec::new(),
+        NativeServices { tools: vec![service], ..NativeServices::default() },
+    );
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    turn(&f, &mut updates, &id, "go").await;
+    assert_eq!(f.host.attach(id).await.unwrap().0.summary.state, SessionState::Idle);
+    assert_eq!(f.provider.seen.lock().unwrap().len(), 2, "the model received a follow-up request after the tool error");
+}
+
+#[tokio::test]
+#[ignore = "uses the mise-pinned Everything MCP server to measure the first normalized request"]
+async fn live_mcp_first_request_bytes_with_and_without_everything() {
+    let f = fixture(vec![text("done")]);
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    turn(&f, &mut updates, &id, "size").await;
+    let plain = f.provider.seen.lock().unwrap()[0].clone();
+    let client = aim::mcp::client::McpToolHost::connect(vec![aim::mcp::client::ServerDefinition {
+        name: "everything".to_owned(),
+        trusted: true,
+        location: aim_proto::tool::ToolLocation::LocalService,
+        endpoint: aim::mcp::client::Endpoint::StdioLocal {
+            command: "mcp-server-everything".to_owned(),
+            args: vec!["stdio".to_owned()],
+            env: std::collections::BTreeMap::new(),
+        },
+    }])
+    .await
+    .expect("pinned MCP server");
+    let mut with_mcp = plain.clone();
+    with_mcp.tools.extend(client.specs());
+    let without_bytes = serde_json::to_vec(&plain).unwrap().len();
+    let with_bytes = serde_json::to_vec(&with_mcp).unwrap().len();
+    assert!(with_bytes > without_bytes);
+    eprintln!(
+        "w29_first_normalized_request_without_mcp_bytes={without_bytes} with_mcp_bytes={with_bytes} base_tools={} mcp_tools={}",
+        plain.tools.len(),
+        with_mcp.tools.len() - plain.tools.len()
+    );
+}
+
+#[tokio::test]
+async fn extra_tool_factories_receive_the_connected_root_for_resume_stability() {
+    let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let held = Arc::clone(&observed);
+    let factory: aim::host::ToolsFactory = Arc::new(move |spec| {
+        held.lock().unwrap().push(spec.workspace.clone());
+        Box::pin(async { None })
+    });
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_services_root(
+        Arc::clone(&memory) as Arc<dyn SessionStore>,
+        memory,
+        Vec::new(),
+        Vec::new(),
+        NativeServices { tools: vec![factory], ..NativeServices::default() },
+        Some("/canonical/workspace".into()),
+    );
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    assert_eq!(observed.lock().unwrap().as_slice(), ["/canonical/workspace"]);
+    f.host.close(id).await.unwrap();
 }

@@ -14,6 +14,8 @@ node = "26.8.1"
 python = "3.14.7"
 lightpanda = "0.4.1"
 "npm:@agentclientprotocol/claude-agent-acp" = "0.81.2"
+# Live MCP interop fixture, run only by W19's ignored smoke test.
+"npm:@modelcontextprotocol/server-everything" = "2026.8.31"
 # Benchmark peers (ADR 0024): local pins, never a workstation-global latest shim.
 codex = "0.158.0-alpha.10"
 pi = "0.87.1"

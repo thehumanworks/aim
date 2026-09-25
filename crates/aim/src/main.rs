@@ -6,6 +6,7 @@
 //! - `aim daemon` — serve local sessions over `aim-daemon/1`.
 //! - `aim search`, `aim image`, `aim transcribe` — Codex media services.
 //! - `aim board` — inspect and mutate the durable blackboard through the daemon.
+//! - `aim mcp` — trusted user MCP servers and aim's own MCP service endpoint.
 #![expect(clippy::print_stderr, reason = "the CLI reports errors on stderr")]
 #![expect(clippy::print_stdout, reason = "daemon status reports to stdout")]
 
@@ -20,6 +21,8 @@ use aim::board::cli as board_cli;
 use aim::cli::{self, RunOptions};
 use aim::daemon::{client::DaemonClient, server, socket_path};
 use aim::host::{HostConfig, SessionClient, SessionHost};
+use aim::mcp::{config as mcp_config, server as mcp_server, services::AimServices, trust as mcp_trust};
+use aim::resources::HarnessFiles;
 use aim::store::{SessionStore, SqliteStore};
 use aim_llm::ModelProvider;
 use aim_proto::daemon::SessionListParams;
@@ -131,6 +134,24 @@ enum Command {
         #[command(subcommand)]
         action: board_cli::BoardAction,
     },
+    /// Inspect and trust user MCP servers, or serve aim's tools to an MCP client.
+    Mcp {
+        /// Serve aim's local services over MCP stdio.
+        #[arg(long)]
+        stdio: bool,
+        /// Workspace root for project MCP config discovery.
+        #[arg(short = 'C', long, default_value = ".")]
+        cwd: PathBuf,
+        /// SSH destination for the workspace config.
+        #[arg(long)]
+        ssh: Option<String>,
+        /// aimx binary used to read the project config through the harness.
+        #[arg(long)]
+        aimx: Option<PathBuf>,
+        /// Inspect or change one trust grant.
+        #[command(subcommand)]
+        action: Option<McpAction>,
+    },
     /// Search the current user's persistent past conversations.
     SearchSessions {
         /// Rebuild the index from the lossless session log.
@@ -203,6 +224,28 @@ enum DaemonTokenAction {
         /// Bearer lifetime in seconds.
         #[arg(long, default_value_t = 30 * 24 * 60 * 60)]
         ttl_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// List discovered server definitions and their trust state without starting them.
+    List,
+    /// Trust the current hash of one discovered server definition.
+    Trust {
+        /// Server name.
+        name: String,
+        /// Select a particular config file when names collide.
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Remove a trust grant for one discovered server definition.
+    Untrust {
+        /// Server name.
+        name: String,
+        /// Select a particular config file when names collide.
+        #[arg(long)]
+        source: Option<String>,
     },
 }
 
@@ -326,6 +369,84 @@ async fn list_sessions(limit: u32) -> Result<i32, String> {
     Ok(0)
 }
 
+async fn discovered_mcp(cwd: PathBuf, ssh: Option<String>, aimx: Option<PathBuf>) -> Result<Vec<mcp_config::ServerEntry>, String> {
+    let aim_home = cli::aim_home();
+    let user_home = std::env::var_os("HOME").map(PathBuf::from).ok_or("HOME is unavailable")?;
+    let root = if ssh.is_some() { cwd } else { cwd.canonicalize().map_err(|_| "cannot resolve workspace root")? };
+    let root = root.to_string_lossy().into_owned();
+    let aimx = cli::find_aimx(aimx.as_deref());
+    if let Some(destination) = ssh {
+        let harness =
+            aim::remote::RemoteHarness::connect(&aimx, &destination, &root).await.map_err(|_| "cannot connect to SSH workspace")?;
+        let files = HarnessFiles::new(harness.client.peer().clone(), harness.client.workspace().id.clone());
+        let found = mcp_config::discover(Some(&files), &user_home, &aim_home, &harness.client.workspace().root).await;
+        harness.shutdown().await;
+        found
+    } else {
+        let harness = aim::harness::HarnessClient::spawn_stdio(&aimx.to_string_lossy(), &root)
+            .await
+            .map_err(|_| "cannot connect to workspace harness")?;
+        let files = HarnessFiles::new(harness.peer().clone(), harness.workspace().id.clone());
+        let found = mcp_config::discover(Some(&files), &user_home, &aim_home, &root).await;
+        harness.shutdown().await;
+        found
+    }
+}
+
+fn chosen_mcp<'a>(entries: &'a [mcp_config::ServerEntry], name: &str, source: Option<&str>) -> Result<&'a mcp_config::ServerEntry, String> {
+    let mut matches = entries.iter().filter(|entry| entry.name == name && source.is_none_or(|path| entry.source_path == path));
+    let first = matches.next().ok_or("MCP server name was not discovered")?;
+    if matches.next().is_some() {
+        return Err("MCP server name is ambiguous; pass --source".to_owned());
+    }
+    Ok(first)
+}
+
+async fn mcp_command(
+    stdio: bool,
+    cwd: PathBuf,
+    ssh: Option<String>,
+    aimx: Option<PathBuf>,
+    action: Option<McpAction>,
+) -> Result<i32, String> {
+    if stdio {
+        if action.is_some() || ssh.is_some() {
+            return Err("--stdio cannot be combined with a subcommand or --ssh".to_owned());
+        }
+        let aim_home = cli::aim_home();
+        let base: Arc<dyn aim::agent::ToolHost> = Arc::new(AimServices::open(&aim_home).await?);
+        let host = aim::mcp::services::with_programs(base, &aim_home);
+        mcp_server::serve_stdio(host).await.map_err(|_| "MCP stdio transport failed".to_owned())?;
+        return Ok(0);
+    }
+    let action = action.ok_or("choose `mcp list|trust|untrust` or `mcp --stdio`")?;
+    let entries = discovered_mcp(cwd, ssh, aimx).await?;
+    match action {
+        McpAction::List => {
+            let shadowing = aim::mcp::config::shadowing(&entries);
+            for (entry, shadow) in entries.iter().zip(shadowing) {
+                let state = match shadow.and_then(|index| entries.get(index)) {
+                    Some(winner) if entry.trusted => format!("shadowed by {}", winner.source_path),
+                    _ if entry.trusted => "trusted".to_owned(),
+                    _ => "untrusted".to_owned(),
+                };
+                println!("{}  {:?}  {:?}  {}  {}", entry.name, entry.origin, entry.location, state, entry.source_path);
+            }
+        }
+        McpAction::Trust { name, source } => {
+            let entry = chosen_mcp(&entries, &name, source.as_deref())?;
+            mcp_trust::trust(&cli::aim_home(), entry)?;
+            println!("trusted {} from {}", entry.name, entry.source_path);
+        }
+        McpAction::Untrust { name, source } => {
+            let entry = chosen_mcp(&entries, &name, source.as_deref())?;
+            mcp_trust::untrust(&cli::aim_home(), entry)?;
+            println!("untrusted {} from {}", entry.name, entry.source_path);
+        }
+    }
+    Ok(0)
+}
+
 #[expect(clippy::too_many_lines, reason = "the CLI command dispatcher keeps daemon status and stop adjacent")]
 async fn main_async(args: Args) -> Result<i32, String> {
     let Some(command) = args.command else { return tui(args.tui).await };
@@ -355,6 +476,7 @@ async fn main_async(args: Args) -> Result<i32, String> {
             search_sessions_command(reindex, limit, workspace, json, query).await
         }
         Command::Board { action } => Box::pin(board_cli::run(&cli::aim_home(), action)).await,
+        Command::Mcp { stdio, cwd, ssh, aimx, action } => mcp_command(stdio, cwd, ssh, aimx, action).await,
         Command::Daemon {
             socket,
             web,
