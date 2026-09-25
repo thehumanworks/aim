@@ -642,6 +642,34 @@ async fn cancelled_auto_spawn_reaps_its_child() {
 }
 
 #[tokio::test]
+async fn a_daemon_that_exits_at_startup_says_why_without_waiting_out_the_timeout() {
+    let dir = private_tempdir();
+    let script = dir.path().join("failing-daemon");
+    std::fs::write(&script, "#!/bin/sh\necho 'aim: refusing AIM_HOME: it is not private' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let started = std::time::Instant::now();
+    let Err(error) = spawn::connect_or_spawn_executable(dir.path(), &script).await else { panic!("a failing daemon connected") };
+    assert!(started.elapsed() < Duration::from_secs(3), "waited {:?} for a daemon that had already exited", started.elapsed());
+    assert_eq!(error.code, ErrorCode::Unavailable);
+    assert!(error.message.contains("exited"), "{}", error.message);
+    assert!(error.message.ends_with("aim: refusing AIM_HOME: it is not private"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn a_silent_failure_points_at_the_log_and_never_repeats_an_older_one() {
+    let dir = private_tempdir();
+    let logs = dir.path().join("logs");
+    std::fs::create_dir(&logs).unwrap();
+    std::fs::write(logs.join("daemon.log"), "aim: an older failure\n").unwrap();
+    let script = dir.path().join("silent-daemon");
+    std::fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let Err(error) = spawn::connect_or_spawn_executable(dir.path(), &script).await else { panic!("a failing daemon connected") };
+    assert!(!error.message.contains("older failure"), "{}", error.message);
+    assert!(error.message.contains("daemon.log"), "{}", error.message);
+}
+
+#[tokio::test]
 async fn losing_auto_spawn_reaps_before_the_winner_stops() {
     let dir = private_tempdir();
     let binary = Path::new(env!("CARGO_BIN_EXE_aim"));
