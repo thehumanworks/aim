@@ -572,6 +572,77 @@ mod tests {
         assert_eq!(workspace.writes.lock().unwrap().len(), 1);
     }
 
+    /// Live (ADR 0022, `REV13a` M4/M5): one real Codex image generated through aim's dispatcher
+    /// into a real `aimx serve --stdio` workspace, then one dropped mid-generation. No reservation
+    /// marker or journal entry is left. Two media calls.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live: needs ChatGPT credentials and image quota; build aimx first"]
+    async fn live_generate_image_through_aimx_and_cancel_mid_generation() {
+        use std::time::{Duration, Instant};
+        let aimx = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("aimx");
+        assert!(aimx.exists(), "build aimx (same profile) first: {}", aimx.display());
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let root = std::fs::canonicalize(dir.path().join("ws")).unwrap();
+        let mut child = tokio::process::Command::new(&aimx)
+            .args(["serve", "--stdio", "--root"])
+            .arg(&root)
+            .env("HOME", &home)
+            .env("AIMX_LOG", "off")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let harness = Arc::new(crate::harness::HarnessClient::connect(stdout, stdin, root.to_str().unwrap()).await.unwrap());
+        let media = Arc::new(aim_llm_codex::media::MediaClient::new().unwrap());
+        let dispatcher = Dispatcher::with_policy(Arc::clone(&harness) as Arc<dyn ToolHost>, media, true);
+        let key = || IdempotencyKey::new(uuid::Uuid::now_v7().to_string());
+        let arguments = |path: &str| json!({"prompt": "A single blue circle on a white background", "path": path, "size": "1024x1024", "quality": "low"});
+
+        let started = Instant::now();
+        let result = dispatcher.call("generate_image".into(), arguments("art/live.png"), key()).await.unwrap();
+        let generated_ms = started.elapsed().as_millis();
+        assert!(!result.is_error, "{result:?}");
+        let bytes = std::fs::read(root.join("art/live.png")).unwrap();
+        let image = bytes.starts_with(b"\x89PNG") || bytes.starts_with(b"\xff\xd8\xff") || bytes.get(8..12) == Some(b"WEBP");
+        assert!(image, "the finalized file is an image, not a marker");
+
+        let started = Instant::now();
+        let mut call = dispatcher.call("generate_image".into(), arguments("art/cancelled.png"), key());
+        tokio::select! {
+            finished = &mut call => panic!("the generation finished before it could be dropped: {finished:?}"),
+            () = tokio::time::sleep(Duration::from_secs(3)) => {}
+        }
+        let marker = std::fs::read_to_string(root.join("art/cancelled.png")).unwrap_or_default();
+        assert!(marker.starts_with("aim-reservation:"), "reserved before the provider answered");
+        drop(call);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while root.join("art/cancelled.png").exists() {
+            assert!(Instant::now() < deadline, "the dropped generation's marker must be cancelled");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let cancelled_ms = started.elapsed().as_millis();
+
+        drop(dispatcher);
+        let harness = Arc::try_unwrap(harness).unwrap_or_else(|_| panic!("the harness is still shared"));
+        harness.shutdown().await;
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait()).await.unwrap().unwrap();
+        assert!(status.success());
+        let journal = std::fs::read_dir(home.join(".aim/aimx/reservations")).map_or(0, Iterator::count);
+        assert_eq!(journal, 0, "no reservation is left in the journal");
+        let left: Vec<_> = std::fs::read_dir(root.join("art")).unwrap().flatten().map(|entry| entry.file_name()).collect();
+        assert_eq!(left, [std::ffi::OsString::from("live.png")], "only the finalized image is left");
+        eprintln!(
+            "live_generate_image generated_ms={generated_ms} bytes={} cancelled_after_drop_ms={cancelled_ms} journal_entries={journal}",
+            bytes.len()
+        );
+    }
+
     #[tokio::test]
     async fn disabled_session_exposes_no_media_tools_or_calls() {
         let workspace = Arc::new(Workspace::default());
