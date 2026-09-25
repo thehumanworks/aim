@@ -29,6 +29,7 @@ extern crate alloc;
 
 pub mod agent_tools;
 pub mod board;
+pub mod cells;
 pub mod compaction;
 pub mod dedup;
 pub mod discovery;
