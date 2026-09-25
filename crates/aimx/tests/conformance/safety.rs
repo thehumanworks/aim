@@ -5,8 +5,9 @@ use std::os::unix::fs::symlink;
 
 use aim_proto::error::ErrorCode;
 use aim_proto::harness::{
-    Command, ExecSpawn, ExecSpawnParams, FsList, FsListParams, FsMkdir, FsMkdirParams, FsRead, FsReadParams, FsRemove, FsRemoveParams,
-    FsRename, FsRenameParams, FsStat, FsStatParams, FsWrite, FsWriteParams, Grep, GrepParams, Precondition, ToolsCall, ToolsCallParams,
+    Command, ExecSpawn, ExecSpawnParams, FsCopy, FsCopyParams, FsList, FsListParams, FsMkdir, FsMkdirParams, FsRead, FsReadParams,
+    FsRemove, FsRemoveParams, FsRename, FsRenameParams, FsStat, FsStatParams, FsWrite, FsWriteParams, Grep, GrepParams, Precondition,
+    ToolsCall, ToolsCallParams,
 };
 use aim_proto::ids::WorkspaceId;
 use aimx::authz::ProtectedPaths;
@@ -148,6 +149,39 @@ async fn protected_paths_are_never_written() {
     };
     assert_eq!(client.peer.call::<ToolsCall>(call).await.unwrap_err().code, ErrorCode::Denied);
     assert_eq!(std::fs::read_to_string(env.path("gate/policy")).unwrap(), "p");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dangling_protected_links_guard_their_future_targets() {
+    let env = env_with(|config, root| {
+        config.protected =
+            ProtectedPaths::new([root.join("gate").to_str().unwrap().to_owned(), root.join("deep-gate").to_str().unwrap().to_owned()]);
+    })
+    .await;
+    symlink("future-gate", env.path("gate")).unwrap();
+    symlink("missing/sub/future-gate", env.path("deep-gate")).unwrap();
+    std::fs::write(env.path("source"), "source").unwrap();
+    let (client, _, ws) = session(&env).await;
+
+    for target in ["future-gate", "missing/sub/future-gate"] {
+        assert_eq!(write(&client, &ws, target).await, ErrorCode::Denied, "write {target}");
+        let mkdir = FsMkdirParams { workspace: ws.clone(), path: target.into(), idempotency_key: key() };
+        assert_eq!(client.peer.call::<FsMkdir>(mkdir).await.unwrap_err().code, ErrorCode::Denied, "mkdir {target}");
+        let copy = FsCopyParams {
+            workspace: ws.clone(),
+            from: "source".into(),
+            to: target.into(),
+            overwrite: false,
+            recursive: false,
+            idempotency_key: key(),
+        };
+        assert_eq!(client.peer.call::<FsCopy>(copy).await.unwrap_err().code, ErrorCode::Denied, "copy {target}");
+        let rename =
+            FsRenameParams { workspace: ws.clone(), from: "source".into(), to: target.into(), overwrite: false, idempotency_key: key() };
+        assert_eq!(client.peer.call::<FsRename>(rename).await.unwrap_err().code, ErrorCode::Denied, "rename {target}");
+        assert!(!env.path(target).exists(), "protected target remains absent: {target}");
+    }
+    assert_eq!(std::fs::read_to_string(env.path("source")).unwrap(), "source");
 }
 
 #[tokio::test(flavor = "multi_thread")]

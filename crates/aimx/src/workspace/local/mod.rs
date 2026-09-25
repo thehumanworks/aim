@@ -21,6 +21,19 @@ use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::Caps;
 use tokio::sync::Semaphore;
 
+#[cfg(test)]
+tokio::task_local! {
+    static ROOT_OPEN_HOOK: Arc<(tokio::sync::Barrier, tokio::sync::Barrier)>;
+}
+
+#[cfg(test)]
+async fn pause_after_root_choice() {
+    if let Ok(hook) = ROOT_OPEN_HOOK.try_with(Arc::clone) {
+        hook.0.wait().await;
+        hook.1.wait().await;
+    }
+}
+
 use self::exec::LocalExec;
 use self::fs::LocalFs;
 use self::protect::Protector;
@@ -28,6 +41,11 @@ use self::search::LocalSearch;
 use self::walk::{Follow, Loc, Root, WalkError};
 use super::{Exec, Fs, Outcome, Search, Workspace};
 use crate::authz::ProtectedPaths;
+
+/// Recognizes the local PTY permit refusal, which occurs before process creation.
+pub(crate) fn spawn_admission_refused(err: &ProtoError) -> bool {
+    err.code == ErrorCode::LimitExceeded && err.message == exec::PTY_CAPACITY_MESSAGE
+}
 
 /// Default bytes of output retained per process.
 pub const DEFAULT_OUTPUT_RING_BYTES: usize = 8 * 1024 * 1024;
@@ -66,6 +84,25 @@ pub struct LocalWorkspace {
     search: LocalSearch,
 }
 
+/// A local root whose path and identity come from the same held directory descriptor.
+#[derive(Debug)]
+pub(crate) struct OpenRoot {
+    canonical: String,
+    root: Root,
+}
+
+impl OpenRoot {
+    /// The descriptor's actual absolute path, used for authorization and the grant.
+    pub(crate) fn path(&self) -> &str {
+        &self.canonical
+    }
+
+    /// The descriptor shared with the grant, so its authority stays bound to this root.
+    pub(crate) fn descriptor(&self) -> Arc<std::os::fd::OwnedFd> {
+        Arc::clone(&self.root.fd)
+    }
+}
+
 impl std::fmt::Debug for LocalWorkspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalWorkspace").field("root", &self.root).finish_non_exhaustive()
@@ -79,14 +116,31 @@ impl LocalWorkspace {
     /// `invalid_params` for a relative root, `not_found` when it does not exist, `conflict` when it
     /// is not a directory.
     pub async fn open(root: &str, config: LocalConfig) -> Outcome<Self> {
-        let canonical = canonical_root(root).await?;
-        let path = PathBuf::from(&canonical);
-        let protected = config.protected;
-        let base = blocking(move || {
-            let root = Root::open(&path).map_err(|err| io_error(&err, &path.to_string_lossy()))?;
-            Ok(Base { protector: Protector::new(protected, &path), root })
+        let opened = Self::acquire_root(root).await?;
+        #[cfg(test)]
+        pause_after_root_choice().await;
+        Self::from_open_root(opened, config).await
+    }
+
+    /// Acquires a local root once and derives its authorization path from that descriptor.
+    pub(crate) async fn acquire_root(root: &str) -> Outcome<OpenRoot> {
+        if !root.starts_with('/') {
+            return Err(ProtoError::new(ErrorCode::InvalidParams, "workspace root must be an absolute path"));
+        }
+        let requested = root.to_owned();
+        blocking(move || {
+            let root = Root::acquire(Path::new(&requested)).map_err(|err| io_error(&err, &requested))?;
+            let canonical = path_string(&root.path)?;
+            Ok(OpenRoot { canonical, root })
         })
-        .await?;
+        .await
+    }
+
+    /// Builds the backend from the same descriptor already selected for authorization.
+    pub(crate) async fn from_open_root(opened: OpenRoot, config: LocalConfig) -> Outcome<Self> {
+        let OpenRoot { canonical, root } = opened;
+        let protected = config.protected;
+        let base = blocking(move || Ok(Base { protector: Protector::new(protected, &root.path), root })).await?;
         let base = Arc::new(base);
         Ok(Self {
             caps: Caps { max_concurrency: config.max_concurrency, ..local_caps() },
@@ -98,24 +152,66 @@ impl LocalWorkspace {
     }
 }
 
+#[cfg(test)]
+mod root_race_tests {
+    use std::os::unix::fs::symlink;
+
+    use aim_proto::error::ErrorCode;
+
+    use super::{LocalConfig, LocalWorkspace, ROOT_OPEN_HOOK, Workspace};
+
+    async fn raced_root(ancestor: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let root = parent.join("ws");
+        let outside_parent = dir.path().join("outside-parent");
+        let outside = if ancestor { outside_parent.join("ws") } else { dir.path().join("outside") };
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("secret"), "inside").unwrap();
+        std::fs::write(outside.join("secret"), "OUTSIDE-SENTINEL").unwrap();
+        let canonical = std::fs::canonicalize(&root).unwrap().to_str().unwrap().to_owned();
+        let hook = std::sync::Arc::new((tokio::sync::Barrier::new(2), tokio::sync::Barrier::new(2)));
+        let opening = ROOT_OPEN_HOOK.scope(std::sync::Arc::clone(&hook), LocalWorkspace::open(&canonical, LocalConfig::default()));
+        let swapping = async {
+            hook.0.wait().await;
+            if ancestor {
+                std::fs::rename(&parent, dir.path().join("parked-parent")).unwrap();
+                symlink(&outside_parent, &parent).unwrap();
+            } else {
+                std::fs::rename(&root, dir.path().join("parked-root")).unwrap();
+                symlink(&outside, &root).unwrap();
+            }
+            hook.1.wait().await;
+        };
+        let (opened, ()) = tokio::join!(opening, swapping);
+        if let Ok(workspace) = opened {
+            assert_eq!(workspace.root(), canonical);
+            let path = format!("{canonical}/secret");
+            match workspace.fs().read(&path, None, 1024).await {
+                Ok(read) => assert_eq!(read.content.into_bytes(), b"inside", "the held root descriptor reached the outside sentinel"),
+                Err(err) => assert!(matches!(err.code, ErrorCode::Denied | ErrorCode::NotFound | ErrorCode::Conflict)),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn root_swap_after_authorization_cannot_rebind_backend() {
+        raced_root(false).await;
+    }
+
+    #[tokio::test]
+    async fn ancestor_swap_after_authorization_cannot_rebind_backend() {
+        raced_root(true).await;
+    }
+}
+
 /// Canonicalises a workspace root: absolute, symlink-free, an existing directory.
 ///
 /// # Errors
 /// As [`LocalWorkspace::open`].
 pub async fn canonical_root(root: &str) -> Outcome<String> {
-    if !root.starts_with('/') {
-        return Err(ProtoError::new(ErrorCode::InvalidParams, "workspace root must be an absolute path"));
-    }
-    let root = root.to_owned();
-    blocking(move || {
-        let canonical = std::fs::canonicalize(&root).map_err(|err| io_error(&err, &root))?;
-        let meta = std::fs::metadata(&canonical).map_err(|err| io_error(&err, &root))?;
-        if !meta.is_dir() {
-            return Err(ProtoError::new(ErrorCode::Conflict, format!("`{root}` is not a directory")));
-        }
-        path_string(&canonical)
-    })
-    .await
+    LocalWorkspace::acquire_root(root).await.map(|opened| opened.canonical)
 }
 
 /// What this host's backend can do (with no concurrency cap; the server sets its own).

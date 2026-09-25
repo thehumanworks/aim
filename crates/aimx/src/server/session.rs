@@ -202,16 +202,9 @@ async fn forward(session: Weak<Session>, backend: Arc<dyn Workspace>, proc: Proc
 }
 
 impl State {
-    /// The live session for `token`, when it belongs to `principal` and is within its TTL.
-    pub(crate) fn resumable(&self, token: &str, principal: &Principal) -> Option<Arc<Session>> {
-        let sessions = lock(&self.sessions);
-        sessions.get(token).filter(|s| s.principal.id == principal.id && !s.expired(self.config.resume_ttl)).cloned()
-    }
-
     /// Checks the resume window and attaches while holding the session-map lock. The reaper holds
     /// that same lock through expiry selection and removal, so it cannot remove a session between
     /// a successful resume lookup and the replacement attachment.
-    #[expect(dead_code, reason = "the handlers.rs owner switches initialize to this atomic API during integration")]
     pub(crate) fn resume_and_attach(
         &self,
         token: &str,

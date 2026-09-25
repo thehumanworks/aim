@@ -26,6 +26,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
@@ -41,15 +42,36 @@ pub(super) struct Root {
     /// Canonical path of the root.
     pub(super) path: PathBuf,
     /// The root directory.
-    pub(super) fd: OwnedFd,
+    pub(super) fd: Arc<OwnedFd>,
 }
 
 impl Root {
-    /// Opens the canonical directory `path`.
-    pub(super) fn open(path: &Path) -> io::Result<Self> {
+    /// Opens one directory descriptor and derives its actual path from that descriptor.
+    pub(super) fn acquire(path: &Path) -> io::Result<Self> {
         let fd = rustix::fs::openat(rustix::fs::CWD, path, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
-        Ok(Self { path: path.to_path_buf(), fd })
+        let actual = descriptor_path(&fd)?;
+        if !actual.is_absolute() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "workspace descriptor has no absolute path"));
+        }
+        Ok(Self { path: actual, fd: Arc::new(fd) })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn descriptor_path(fd: &OwnedFd) -> io::Result<PathBuf> {
+    let path = rustix::fs::getpath(fd)?;
+    Ok(PathBuf::from(OsString::from_vec(path.into_bytes())))
+}
+
+#[cfg(target_os = "linux")]
+fn descriptor_path(fd: &OwnedFd) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+
+    let path = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+    if path.to_string_lossy().ends_with(" (deleted)") {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "workspace root was removed during acquisition"));
+    }
+    Ok(path)
 }
 
 /// Whether the final component's symlink is followed.
@@ -322,7 +344,7 @@ mod tests {
         std::fs::create_dir_all(real.join("ws/a/b")).unwrap();
         std::fs::write(real.join("ws/a/b/f"), "x").unwrap();
         std::fs::create_dir(real.join("out")).unwrap();
-        let root = Root::open(&real.join("ws")).unwrap();
+        let root = Root::acquire(&real.join("ws")).unwrap();
         (dir, root)
     }
 
