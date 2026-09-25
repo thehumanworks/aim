@@ -22,8 +22,8 @@ client still builds.
 | ID | Task | Status | Now | Next | Branch / worktree |
 |---|---|---|---|---|---|
 | T0 | Base: merge FIX16 (`agent/claude/fix16-coderun`) and W26 (`agent/perf/tokens`) as-is (maintainer decision) | done | Merged (`eda6444`, `36f1bd8`); conflicts resolved in event.rs, session.rs, agent/mod.rs, agent/tools.rs, host.rs; clippy, xtask and 963/963 tests green | — | integration branch |
-| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | in progress | Worker running | Review its report, merge | `agent/claude/tui-options` · `../aim-wt/tui-options` |
-| T2 | `/clear` clears the chat and starts fresh | todo | Folded into T1 (same files) | — | with T1 |
+| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | review | Merged (`84bbbc4`); kernel `switch`; live completion checked on codex, openrouter, acp:claude; follow-ups running (effort case-fold, `auto` only where supported, stale model on reattach); codex REV-T1 running | Merge follow-ups and review fixes | `agent/claude/tui-options` · `../aim-wt/tui-options` |
+| T2 | `/clear` clears the chat and starts fresh | review | Merged with T1 (transcript, inline rows, row cache, screen + scrollback best effort, new session) | With T1 | with T1 |
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | in progress | Worker running | Review its report, merge, then T4b | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | todo | Waits for T4a | Wire gate: 31 regressions on the merged base + 4 from T3's prompt | — |
@@ -91,3 +91,9 @@ client still builds.
   replace with a rendezvous proving both calls were in flight. The reviewer's code-cell failure was
   its own sandbox refusing nested `sandbox-exec`, not the branch. Sent back to the T3 worker.
 - 2026-09-25 — REV-T3 B1 fixed (`bd418ae`, merged): rendezvous tests; with temporary mutexes all three fail, without they pass 3/3.
+- 2026-09-25 — T1+T2 done (`7bcd18b`, merged as `84bbbc4`). SessionOptions update + attach replay
+  (ADR 0074), kernel `switch` (318 verified on the rebased tree). Live: codex `/model` listed the
+  real catalog; `/provider openrouter` reset to the gateway default; acp:claude listed the
+  adapter's five models. Lead decisions sent back: case-fold effort/model in the shell registry
+  (so ACP resolution of `Low` works), offer `auto` only where the backend accepts it (ACP refuses),
+  fix the stale reattach model if small. Codex REV-T1 started on `7bcd18b`.
