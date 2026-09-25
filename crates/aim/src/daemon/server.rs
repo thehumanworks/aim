@@ -14,11 +14,13 @@ use aim_proto::board::{
     BoardAssign, BoardCancel, BoardClaim, BoardComplete, BoardEvent, BoardEventNotification, BoardEventParams, BoardFail, BoardHeartbeat,
     BoardList, BoardMessage, BoardPoll, BoardPost, BoardRetry, BoardReview, BoardShow, BoardWatch, PollParams,
 };
+use aim_proto::content::Base64Bytes;
 use aim_proto::daemon::{
     DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeResult, DetachReason, MAX_DAEMON_MESSAGE_BYTES, MediaTranscribe, PromptOutcome,
-    SessionAttach, SessionCancel, SessionClose, SessionConfigParams, SessionCreate, SessionDetach, SessionDetachedNotification,
-    SessionDetachedParams, SessionList, SessionListResult, SessionPrompt, SessionPromptParams, SessionSetConfig, SessionState,
-    SessionUpdate, SessionUpdateNotification, SessionUpdateParams,
+    SessionAttach, SessionAttachPaged, SessionAttachPagedResult, SessionCancel, SessionClose, SessionConfigParams, SessionCreate,
+    SessionDetach, SessionDetachedNotification, SessionDetachedParams, SessionList, SessionListResult, SessionPrompt, SessionPromptParams,
+    SessionSetConfig, SessionState, SessionTranscript, SessionTranscriptParams, SessionTranscriptResult, SessionUpdate,
+    SessionUpdateNotification, SessionUpdateParams,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::PeerInfo;
@@ -26,7 +28,9 @@ use aim_proto::ids::IdempotencyKey;
 use aim_rpc::{Handler, Peer, PeerConfig, RequestCtx, Router};
 use futures_util::StreamExt as _;
 use serde_json::Value;
+use sha2::Digest as _;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
 use crate::board::{Board as BoardService, Error as BoardError};
@@ -54,13 +58,25 @@ fn board_error(cause: BoardError) -> ProtoError {
     }
 }
 
+/// Raw bytes per transcript frame; base64 and the JSON-RPC envelope stay below 36 MiB.
+const TRANSCRIPT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+struct SnapshotBytes {
+    session: String,
+    bytes: Arc<Vec<u8>>,
+    created: Instant,
+}
+
 struct Forwarder {
     cancel: CancellationToken,
+    /// Serializes an update enqueue with replacement or detach cancellation.
+    send_gate: tokio::sync::Mutex<()>,
 }
 
 struct Connection {
     initialized: AtomicBool,
     forwarders: Mutex<HashMap<String, Arc<Forwarder>>>,
+    snapshots: Mutex<HashMap<String, SnapshotBytes>>,
     ordering: Arc<tokio::sync::Mutex<()>>,
     host: Arc<dyn SessionClient>,
     board: Arc<BoardService>,
@@ -73,6 +89,7 @@ struct PendingForwarder {
     connection: Arc<Connection>,
     session: String,
     forwarder: Arc<Forwarder>,
+    snapshot_id: Option<String>,
     started: bool,
 }
 
@@ -86,6 +103,9 @@ impl PendingForwarder {
 impl Drop for PendingForwarder {
     fn drop(&mut self) {
         if !self.started {
+            if let Some(snapshot_id) = &self.snapshot_id {
+                lock(&self.connection.snapshots).remove(snapshot_id);
+            }
             let mut forwarders = lock(&self.connection.forwarders);
             if forwarders.get(&self.session).is_some_and(|active| Arc::ptr_eq(active, &self.forwarder)) {
                 forwarders.remove(&self.session);
@@ -93,6 +113,46 @@ impl Drop for PendingForwarder {
             self.forwarder.cancel.cancel();
         }
     }
+}
+
+/// Install an attachment only after its successful reply is queued. Replacement cancellation
+/// and update enqueues share the old forwarder's gate (ADR 0026).
+async fn prepare_attachment(
+    state: Arc<Connection>,
+    ctx: RequestCtx,
+    session: String,
+    updates: UpdateStream,
+    snapshot_id: Option<String>,
+) -> Result<(), ProtoError> {
+    let forwarder = Arc::new(Forwarder { cancel: CancellationToken::new(), send_gate: tokio::sync::Mutex::new(()) });
+    let ordered = Arc::clone(&state.ordering).lock_owned().await;
+    let old = { lock(&state.forwarders).insert(session.clone(), Arc::clone(&forwarder)) };
+    let registration = PendingForwarder { connection: state, session: session.clone(), forwarder, snapshot_id, started: false };
+    if let Some(old) = old {
+        let send_gate = old.send_gate.lock().await;
+        old.cancel.cancel();
+        drop(send_gate);
+        let peer = ctx.peer.clone();
+        let detached_session = session.clone();
+        // Keep ordering through the detached enqueue, even if the attach request is cancelled.
+        tokio::spawn(async move {
+            let _ordered = ordered;
+            peer.notify::<SessionDetachedNotification>(SessionDetachedParams { session: detached_session, reason: DetachReason::Replaced })
+                .await
+        })
+        .await
+        .map_err(|_| error(ErrorCode::Internal, "replacement notifier stopped"))??;
+    } else {
+        drop(ordered);
+    }
+    let peer = ctx.peer.clone();
+    let cancelled = ctx.cancelled.clone();
+    ctx.after_reply(move || {
+        if !cancelled.is_cancelled() {
+            registration.start(peer, updates);
+        }
+    })?;
+    Ok(())
 }
 
 struct GuardedRouter {
@@ -127,12 +187,11 @@ async fn forward_updates(connection: Arc<Connection>, peer: Peer, session: Strin
         if matches!(update, SessionUpdate::StateChanged { state: SessionState::Closed }) {
             reason = DetachReason::Closed;
         }
-        let sent = tokio::select! {
-            biased;
-            () = forwarder.cancel.cancelled() => return,
-            () = peer.closed() => return,
-            sent = peer.notify::<SessionUpdateNotification>(SessionUpdateParams { session: session.clone(), update }) => sent,
-        };
+        let _send = forwarder.send_gate.lock().await;
+        if forwarder.cancel.is_cancelled() {
+            return;
+        }
+        let sent = peer.notify::<SessionUpdateNotification>(SessionUpdateParams { session: session.clone(), update }).await;
         if sent.is_err() {
             return;
         }
@@ -191,6 +250,7 @@ async fn forward_board_events(
 
 struct DedupEntry {
     created: Instant,
+    payload_hash: [u8; 32],
     completed: Mutex<Option<Instant>>,
     result: tokio::sync::watch::Sender<Option<Result<PromptOutcome, ProtoError>>>,
 }
@@ -201,7 +261,10 @@ struct Dedup {
 }
 
 impl Dedup {
-    async fn prompt(&self, host: Arc<dyn SessionClient>, params: SessionPromptParams) -> Result<PromptOutcome, ProtoError> {
+    async fn prompt(self: &Arc<Self>, host: Arc<dyn SessionClient>, params: SessionPromptParams) -> Result<PromptOutcome, ProtoError> {
+        let payload =
+            serde_json::to_vec(&params.parts).map_err(|_| error(ErrorCode::Internal, "encoding prompt for retry safety failed"))?;
+        let payload_hash: [u8; 32] = sha2::Sha256::digest(payload).into();
         let (entry, first) = {
             let mut entries = lock(&self.entries);
             entries.retain(|_, table| {
@@ -210,6 +273,9 @@ impl Dedup {
             });
             let table = entries.entry(params.session.clone()).or_default();
             if let Some(entry) = table.get(&params.idempotency_key) {
+                if entry.payload_hash != payload_hash {
+                    return Err(error(ErrorCode::Conflict, "idempotency key was reused with different input"));
+                }
                 (Arc::clone(entry), false)
             } else {
                 if table.len() >= 1024
@@ -225,15 +291,27 @@ impl Dedup {
                     return Err(error(ErrorCode::LimitExceeded, "too many in-flight prompts"));
                 }
                 let (result, _) = tokio::sync::watch::channel(None);
-                let entry = Arc::new(DedupEntry { created: Instant::now(), completed: Mutex::new(None), result });
-                table.insert(params.idempotency_key, Arc::clone(&entry));
+                let entry = Arc::new(DedupEntry { created: Instant::now(), payload_hash, completed: Mutex::new(None), result });
+                table.insert(params.idempotency_key.clone(), Arc::clone(&entry));
                 (entry, true)
             }
         };
         let mut result = entry.result.subscribe();
         if first {
+            let dedup = Arc::clone(self);
+            let session = params.session;
+            let key = params.idempotency_key;
+            let parts = params.parts;
             tokio::spawn(async move {
-                let outcome = host.prompt(params.session, params.parts).await;
+                let outcome = host.prompt(session.clone(), parts).await;
+                if outcome.is_err() {
+                    let mut entries = lock(&dedup.entries);
+                    if let Some(table) = entries.get_mut(&session)
+                        && table.get(&key).is_some_and(|current| Arc::ptr_eq(current, &entry))
+                    {
+                        table.remove(&key);
+                    }
+                }
                 entry.result.send_replace(Some(outcome));
                 *lock(&entry.completed) = Some(Instant::now());
             });
@@ -247,6 +325,7 @@ impl Dedup {
     }
 }
 
+#[expect(clippy::too_many_lines, reason = "all daemon protocol routes are registered together")]
 fn routes(connection: Arc<Connection>) -> GuardedRouter {
     let router = Router::new(Arc::clone(&connection))
         .method::<DaemonInitialize, _, _>(|state, _, params| async move {
@@ -273,41 +352,67 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
         .method::<SessionList, _, _>(|state, _, params| async move { Ok(SessionListResult { sessions: state.host.list(params).await? }) })
         .method::<SessionAttach, _, _>(|state, ctx, reference| async move {
             let (snapshot, updates) = state.host.attach(reference.session.clone()).await?;
-            let forwarder = Arc::new(Forwarder { cancel: CancellationToken::new() });
-            let ordered = Arc::clone(&state.ordering).lock_owned().await;
-            let old = { lock(&state.forwarders).insert(reference.session.clone(), Arc::clone(&forwarder)) };
-            let registration =
-                PendingForwarder { connection: Arc::clone(state.as_ref()), session: reference.session.clone(), forwarder, started: false };
-            if let Some(old) = old {
-                old.cancel.cancel();
-                let peer = ctx.peer.clone();
-                let session = reference.session.clone();
-                // The notifier owns the ordering gate. Even if the request is cancelled while
-                // waiting for writer capacity, the old attachment receives its terminal event
-                // before a later attach can queue its response.
-                tokio::spawn(async move {
-                    let _ordered = ordered;
-                    peer.notify::<SessionDetachedNotification>(SessionDetachedParams { session, reason: DetachReason::Replaced }).await
-                })
-                .await
-                .map_err(|_| error(ErrorCode::Internal, "replacement notifier stopped"))??;
-            } else {
-                drop(ordered);
+            // Legacy single-frame attach remains available for small snapshots. Refuse before
+            // registering the forwarder when the frame would exceed the peer's hard limit.
+            let encoded = serde_json::to_vec(&snapshot).map_err(|_| error(ErrorCode::Internal, "encoding transcript snapshot failed"))?;
+            if encoded.len() >= MAX_DAEMON_MESSAGE_BYTES.saturating_sub(1024) {
+                return Err(error(ErrorCode::LimitExceeded, "transcript requires session.attach_paged"));
             }
-            let peer = ctx.peer.clone();
-            let cancelled = ctx.cancelled.clone();
-            ctx.after_reply(move || {
-                if !cancelled.is_cancelled() {
-                    registration.start(peer, updates);
-                }
-            })?;
+            prepare_attachment(Arc::clone(state.as_ref()), ctx, reference.session, updates, None).await?;
             Ok(snapshot)
+        })
+        .method::<SessionAttachPaged, _, _>(|state, ctx, reference| async move {
+            let (snapshot, updates) = state.host.attach(reference.session.clone()).await?;
+            let bytes =
+                serde_json::to_vec(&snapshot.transcript).map_err(|_| error(ErrorCode::Internal, "encoding transcript snapshot failed"))?;
+            let total_bytes = u64::try_from(bytes.len()).map_err(|_| error(ErrorCode::LimitExceeded, "transcript is too large"))?;
+            let first_chunk = Base64Bytes(bytes.iter().take(TRANSCRIPT_CHUNK_BYTES).copied().collect());
+            let snapshot_id = uuid::Uuid::new_v4().simple().to_string();
+            let result = SessionAttachPagedResult { summary: snapshot.summary, snapshot_id: snapshot_id.clone(), total_bytes, first_chunk };
+            let encoded = serde_json::to_vec(&result).map_err(|_| error(ErrorCode::Internal, "encoding paged attachment failed"))?;
+            if encoded.len() >= MAX_DAEMON_MESSAGE_BYTES.saturating_sub(1024) {
+                return Err(error(ErrorCode::LimitExceeded, "attachment metadata exceeds the message limit"));
+            }
+            if bytes.len() > TRANSCRIPT_CHUNK_BYTES {
+                let mut snapshots = lock(&state.snapshots);
+                snapshots.retain(|_, item| item.session != reference.session && item.created.elapsed() < Duration::from_secs(600));
+                snapshots.insert(
+                    snapshot_id.clone(),
+                    SnapshotBytes { session: reference.session.clone(), bytes: Arc::new(bytes), created: Instant::now() },
+                );
+            }
+            prepare_attachment(Arc::clone(state.as_ref()), ctx, reference.session, updates, Some(snapshot_id)).await?;
+            Ok(result)
+        })
+        .method::<SessionTranscript, _, _>(|state, _, params: SessionTranscriptParams| async move {
+            let bytes = {
+                let snapshots = lock(&state.snapshots);
+                snapshots.get(&params.snapshot_id).filter(|item| item.session == params.session).map(|item| Arc::clone(&item.bytes))
+            }
+            .ok_or_else(|| error(ErrorCode::NotFound, "transcript snapshot expired"))?;
+            let offset = usize::try_from(params.offset).map_err(|_| error(ErrorCode::InvalidParams, "transcript offset is too large"))?;
+            if offset >= bytes.len() {
+                return Err(error(ErrorCode::InvalidParams, "transcript offset is past the snapshot"));
+            }
+            let end = offset.saturating_add(TRANSCRIPT_CHUNK_BYTES).min(bytes.len());
+            let chunk = bytes.get(offset..end).ok_or_else(|| error(ErrorCode::Internal, "transcript chunk bounds failed"))?.to_vec();
+            if end == bytes.len() {
+                lock(&state.snapshots).remove(&params.snapshot_id);
+            }
+            Ok(SessionTranscriptResult {
+                chunk: Base64Bytes(chunk),
+                next_offset: u64::try_from(end).unwrap_or(u64::MAX),
+                total_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            })
         })
         .method::<SessionDetach, _, _>(|state, _, reference| async move {
             let _ordered = state.ordering.lock().await;
-            if let Some(forwarder) = lock(&state.forwarders).remove(&reference.session) {
+            let forwarder = { lock(&state.forwarders).remove(&reference.session) };
+            if let Some(forwarder) = forwarder {
+                let _send = forwarder.send_gate.lock().await;
                 forwarder.cancel.cancel();
             }
+            lock(&state.snapshots).retain(|_, item| item.session != reference.session);
             Ok(())
         })
         .method::<SessionPrompt, _, _>(|state, _, params| async move { state.dedup.prompt(Arc::clone(&state.host), params).await })
@@ -429,6 +534,7 @@ fn serve_connection(
     let connection = Arc::new(Connection {
         initialized: AtomicBool::new(false),
         forwarders: Mutex::new(HashMap::new()),
+        snapshots: Mutex::new(HashMap::new()),
         ordering: Arc::new(tokio::sync::Mutex::new(())),
         host,
         board,
@@ -450,7 +556,7 @@ pub async fn serve(home: &Path, socket: &Path, idle_exit: Option<Duration>, host
 /// Serves sessions and runs `shutdown` while still holding the exclusive daemon lock.
 ///
 /// # Errors
-/// Returns a protocol error if startup, session listing, or shutdown fails.
+/// Returns a protocol error if startup or shutdown fails.
 pub async fn serve_with_shutdown<F>(
     home: &Path,
     socket: &Path,
@@ -467,10 +573,22 @@ where
     let connections = Arc::new(AtomicUsize::new(0));
     let mut idle_since = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Register once. Recreating signal streams on each select iteration loses signals received
+    // while a branch is waiting on I/O.
+    let mut terminate = signal(SignalKind::terminate()).map_err(|e| io_error("registering SIGTERM", &e))?;
+    let mut interrupt = signal(SignalKind::interrupt()).map_err(|e| io_error("registering SIGINT", &e))?;
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|e| io_error("accepting daemon client", &e))?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(cause) => {
+                        tracing::warn!(%cause, "accepting daemon client failed; retrying");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 match serve_connection(stream, Arc::clone(&host), Arc::clone(&board), Arc::clone(&dedup)) {
                     Ok(peer) => {
                         connections.fetch_add(1, Ordering::AcqRel);
@@ -484,31 +602,45 @@ where
                 }
             }
             _ = tick.tick(), if idle_exit.is_some() => {
-                let sessions = host.list(aim_proto::daemon::SessionListParams { limit: Some(u32::MAX), workspace: None }).await?;
-                let busy = connections.load(Ordering::Acquire) != 0
-                    || sessions.iter().any(|s| matches!(s.state, SessionState::Running | SessionState::RequiresAction));
+                let busy = if connections.load(Ordering::Acquire) != 0 {
+                    true
+                } else {
+                    match host.live_summaries().await {
+                        Ok(sessions) => sessions.iter().any(|s| matches!(s.state, SessionState::Running | SessionState::RequiresAction)),
+                        Err(cause) => {
+                            tracing::warn!(%cause, "idle state unavailable; keeping daemon alive");
+                            true
+                        }
+                    }
+                };
                 if busy {
                     idle_since = Instant::now();
                 } else if idle_exit.is_some_and(|limit| idle_since.elapsed() >= limit) {
                     break;
                 }
             }
-            _ = tokio::signal::ctrl_c() => break,
-            () = terminate_signal() => break,
+            _ = interrupt.recv() => break,
+            _ = terminate.recv() => break,
         }
     }
-    let sessions = host.list(aim_proto::daemon::SessionListParams { limit: Some(u32::MAX), workspace: None }).await?;
-    for summary in sessions {
-        if summary.state != SessionState::Closed {
-            let _ignored = host.close(summary.meta.id).await;
+    let drain = async {
+        match host.live_summaries().await {
+            Ok(sessions) => {
+                for summary in sessions {
+                    if summary.state != SessionState::Closed
+                        && let Err(cause) = host.close(summary.meta.id).await
+                    {
+                        tracing::warn!(%cause, "closing session during daemon shutdown failed");
+                    }
+                }
+            }
+            Err(cause) => tracing::warn!(%cause, "listing live sessions during daemon shutdown failed"),
         }
-    }
-    shutdown.await
-}
-
-#[cfg(unix)]
-async fn terminate_signal() {
-    if let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        let _ignored = signal.recv().await;
+        shutdown.await
+    };
+    tokio::select! {
+        result = drain => result,
+        _ = terminate.recv() => Err(error(ErrorCode::Cancelled, "second SIGTERM during daemon shutdown")),
+        _ = interrupt.recv() => Err(error(ErrorCode::Cancelled, "second SIGINT during daemon shutdown")),
     }
 }

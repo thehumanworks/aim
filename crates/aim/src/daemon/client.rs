@@ -6,6 +6,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use aim_proto::board::{
     AssignParams, BoardAssign, BoardCancel, BoardClaim, BoardComplete, BoardEvent, BoardEventParams, BoardFail, BoardHeartbeat, BoardList,
@@ -13,12 +14,13 @@ use aim_proto::board::{
     CompleteParams, FailParams, HeartbeatParams, JobRef, JobSnapshot, ListParams, ListResult, MessageParams, MessageResult, PollParams,
     PollResult, PostParams, PostResult, RetryParams, ReviewParams, WatchParams,
 };
-use aim_proto::conversation::Part;
+use aim_proto::conversation::{Item, Part};
 use aim_proto::daemon::{
     DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeParams, DaemonInitializeResult, DetachReason, MAX_DAEMON_MESSAGE_BYTES,
-    MediaTranscribe, MediaTranscribeParams, MediaTranscribeResult, PromptOutcome, SessionAttach, SessionAttachResult, SessionCancel,
+    MediaTranscribe, MediaTranscribeParams, MediaTranscribeResult, PromptOutcome, SessionAttachPaged, SessionAttachResult, SessionCancel,
     SessionClose, SessionConfigParams, SessionCreate, SessionDetach, SessionDetachedParams, SessionList, SessionListParams, SessionPrompt,
-    SessionPromptParams, SessionRef, SessionSetConfig, SessionSpec, SessionSummary, SessionUpdate, SessionUpdateParams,
+    SessionPromptParams, SessionRef, SessionSetConfig, SessionSpec, SessionSummary, SessionTranscript, SessionTranscriptParams,
+    SessionUpdate, SessionUpdateParams,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{GenerationRange, PeerInfo};
@@ -152,8 +154,10 @@ impl DaemonClient {
     /// # Errors
     /// Returns `unavailable` for a failed socket connection, or the handshake error.
     pub async fn connect(socket: &Path) -> Result<Self, ProtoError> {
-        let stream =
-            UnixStream::connect(socket).await.map_err(|e| ProtoError::new(ErrorCode::Unavailable, format!("connecting daemon: {e}")))?;
+        let stream = tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(socket))
+            .await
+            .map_err(|_| ProtoError::new(ErrorCode::Timeout, "connecting daemon timed out"))?
+            .map_err(|e| ProtoError::new(ErrorCode::Unavailable, format!("connecting daemon: {e}")))?;
         let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
         let detach_reasons: DetachReasons = Arc::new(Mutex::new(HashMap::new()));
         let board_events: BoardEventChannels = Arc::new(Mutex::new(HashMap::new()));
@@ -169,13 +173,19 @@ impl DaemonClient {
             PeerConfig { max_message_bytes: MAX_DAEMON_MESSAGE_BYTES, ..PeerConfig::default() },
         );
         let (min, max) = DAEMON_GENERATIONS;
-        let init = peer
-            .call::<DaemonInitialize>(DaemonInitializeParams {
+        let init = tokio::time::timeout(
+            Duration::from_secs(2),
+            peer.call::<DaemonInitialize>(DaemonInitializeParams {
                 generations: GenerationRange { min, max },
                 client: PeerInfo { name: "aim-client".into(), version: env!("CARGO_PKG_VERSION").into() },
                 auth: None,
-            })
-            .await;
+            }),
+        )
+        .await;
+        let Ok(init) = init else {
+            peer.close();
+            return Err(ProtoError::new(ErrorCode::Timeout, "daemon handshake timed out"));
+        };
         let init = match init {
             Ok(init) => init,
             Err(err) => {
@@ -363,6 +373,60 @@ struct AttachedUpdates {
     receiver: mpsc::Receiver<SessionUpdate>,
 }
 
+/// Removes a staged subscriber if its attach future is dropped before returning a stream.
+/// An active stage also detaches its possible server forwarder before another attach starts.
+struct StagedAttach {
+    session: String,
+    serial: u64,
+    subscribers: Subscribers,
+    peer: Peer,
+    armed: bool,
+}
+
+impl Drop for StagedAttach {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let detaching = {
+            let mut attached = lock(&self.subscribers);
+            let Some(slot) = attached.get_mut(&self.session) else { return };
+            if slot.pending.as_ref().is_some_and(|pending| pending.serial == self.serial) {
+                slot.pending = None;
+                None
+            } else if slot.active.as_ref().is_some_and(|active| active.serial == self.serial) {
+                slot.active = None;
+                let token = CancellationToken::new();
+                slot.detaching = Some(token.clone());
+                Some(token)
+            } else {
+                return;
+            }
+        };
+        if let Some(detaching) = detaching {
+            let peer = self.peer.clone();
+            let session = self.session.clone();
+            let subscribers = Arc::clone(&self.subscribers);
+            tokio::spawn(async move {
+                let _ignored = peer.call::<SessionDetach>(SessionRef { session: session.clone() }).await;
+                let mut attached = lock(&subscribers);
+                if let Some(slot) = attached.get_mut(&session) {
+                    slot.detaching = None;
+                    if slot.active.is_none() && slot.pending.is_none() {
+                        attached.remove(&session);
+                    }
+                }
+                detaching.cancel();
+            });
+        } else {
+            let mut attached = lock(&self.subscribers);
+            if attached.get(&self.session).is_some_and(|slot| slot.active.is_none() && slot.pending.is_none() && slot.detaching.is_none()) {
+                attached.remove(&self.session);
+            }
+        }
+    }
+}
+
 impl Stream for AttachedUpdates {
     type Item = SessionUpdate;
 
@@ -459,24 +523,43 @@ impl SessionClient for DaemonClient {
                     slot.active = Some(next);
                 }
             }
-            let snapshot = match peer.call::<SessionAttach>(SessionRef { session: session.clone() }).await {
-                Ok(snapshot) => snapshot,
-                Err(err) => {
-                    let mut attached = lock(&subscribers);
-                    if let Some(slot) = attached.get_mut(&session) {
-                        if slot.pending.as_ref().is_some_and(|pending| pending.serial == serial) {
-                            slot.pending = None;
-                        } else if slot.active.as_ref().is_some_and(|active| active.serial == serial) {
-                            attached.remove(&session);
-                        }
-                    }
-                    return Err(err);
+            let mut staged =
+                StagedAttach { session: session.clone(), serial, subscribers: Arc::clone(&subscribers), peer: peer.clone(), armed: true };
+            let paged = peer.call::<SessionAttachPaged>(SessionRef { session: session.clone() }).await?;
+            let total = usize::try_from(paged.total_bytes)
+                .map_err(|_| ProtoError::new(ErrorCode::LimitExceeded, "transcript size cannot fit this client"))?;
+            let mut bytes = paged.first_chunk.0;
+            if bytes.len() > total {
+                return Err(ProtoError::new(ErrorCode::Internal, "first transcript chunk exceeds snapshot size"));
+            }
+            while bytes.len() < total {
+                let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                let page = peer
+                    .call::<SessionTranscript>(SessionTranscriptParams {
+                        session: session.clone(),
+                        snapshot_id: paged.snapshot_id.clone(),
+                        offset,
+                    })
+                    .await?;
+                let new_len = bytes.len().saturating_add(page.chunk.0.len());
+                if page.total_bytes != paged.total_bytes
+                    || page.chunk.0.is_empty()
+                    || new_len > total
+                    || page.next_offset != u64::try_from(new_len).unwrap_or(u64::MAX)
+                {
+                    return Err(ProtoError::new(ErrorCode::Internal, "transcript chunk offset or length is inconsistent"));
                 }
-            };
+                bytes.extend(page.chunk.0);
+            }
+            let transcript: Vec<Item> =
+                serde_json::from_slice(&bytes).map_err(|_| ProtoError::new(ErrorCode::Internal, "transcript snapshot is malformed"))?;
+            let snapshot = SessionAttachResult { summary: paged.summary, transcript };
             tokio::select! {
                 () = ready.cancelled() => {},
                 () = peer.closed() => return Err(ProtoError::new(ErrorCode::Unavailable, "connection closed")),
+                () = tokio::time::sleep(Duration::from_secs(5)) => return Err(ProtoError::new(ErrorCode::Timeout, "attachment replacement did not finish")),
             }
+            staged.armed = false;
             Ok((snapshot, Box::pin(AttachedUpdates { session, serial, subscribers, peer, _lifetime: lifetime, receiver }) as UpdateStream))
         })
     }

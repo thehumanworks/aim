@@ -14,6 +14,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aim::board::cli as board_cli;
 use aim::cli::{self, RunOptions};
@@ -286,6 +287,7 @@ async fn list_sessions(limit: u32) -> Result<i32, String> {
     Ok(0)
 }
 
+#[expect(clippy::too_many_lines, reason = "the CLI command dispatcher keeps daemon status and stop adjacent")]
 async fn main_async(args: Args) -> Result<i32, String> {
     let Some(command) = args.command else { return tui(args.tui).await };
     match command {
@@ -343,6 +345,14 @@ async fn main_async(args: Args) -> Result<i32, String> {
                     if !status.success() {
                         return Err(format!("kill exited with {status}"));
                     }
+                    drop(client);
+                    let started = Instant::now();
+                    while socket.exists() || home.join("run/daemon.pid").exists() {
+                        if started.elapsed() >= Duration::from_secs(15) {
+                            return Err("daemon did not stop within fifteen seconds".into());
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                     Ok(0)
                 }
                 None => {
@@ -367,7 +377,7 @@ async fn main_async(args: Args) -> Result<i32, String> {
                     match server::serve_with_shutdown(
                         &home,
                         &socket,
-                        idle_exit.map(std::time::Duration::from_secs),
+                        idle_exit.map(Duration::from_secs),
                         host as Arc<dyn SessionClient>,
                         on_shutdown,
                     )
