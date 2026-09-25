@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::harness::{ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, WorkspaceInfo};
+use aim_proto::harness::{CallScope, ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, WorkspaceInfo};
 use aim_proto::ids::{ProcId, WorkspaceId};
 use aim_rpc::Peer;
 use tokio::sync::watch;
@@ -15,6 +15,7 @@ use super::{State, lock};
 use crate::authz::{Grant, Principal};
 use crate::tools::ProcTable;
 use crate::workspace::{Outcome, Workspace};
+use aim_kernel::policy::Limits as PolicyLimits;
 
 /// Output bytes pushed per `exec.output` batch read.
 const PUSH_BYTES: u64 = 256 * 1024;
@@ -45,6 +46,7 @@ pub(crate) struct Session {
     pub(crate) procs: Arc<ProcTable>,
     attached: watch::Sender<Option<Attachment>>,
     detached_at: Mutex<Option<Instant>>,
+    ceiling: Mutex<Option<CallScope>>,
 }
 
 impl Session {
@@ -57,6 +59,7 @@ impl Session {
             procs: Arc::new(procs),
             attached: watch::channel(None).0,
             detached_at: Mutex::new(Some(Instant::now())),
+            ceiling: Mutex::new(None),
         }
     }
 
@@ -100,6 +103,27 @@ impl Session {
 
     pub(crate) fn find_root(&self, root: &str) -> Option<Arc<OpenWorkspace>> {
         lock(&self.workspaces).values().find(|ws| ws.info.root == root).cloned()
+    }
+
+    /// The bound ceiling survives reconnection and cannot be omitted by a later call.
+    pub(crate) fn ceiling(&self) -> Option<CallScope> {
+        lock(&self.ceiling).clone()
+    }
+
+    /// Binds or narrows the session ceiling atomically with respect to another workspace open.
+    pub(crate) fn bind_ceiling(&self, grant: &Grant, requested: &CallScope, limits: PolicyLimits) -> Outcome<()> {
+        let mut canonical = grant.ceiling(requested, limits)?;
+        let mut slot = lock(&self.ceiling);
+        if let Some(earlier) = slot.as_ref() {
+            canonical.deny_write.extend(earlier.deny_write.iter().cloned());
+            canonical.deny_write.sort();
+            canonical.deny_write.dedup();
+            if !grant.ceiling_narrows(&canonical, earlier, limits)? {
+                return Err(ProtoError::new(ErrorCode::Denied, "workspace ceiling would widen this session's bound authority"));
+            }
+        }
+        *slot = Some(canonical);
+        Ok(())
     }
 
     /// Whether the session may open another workspace.

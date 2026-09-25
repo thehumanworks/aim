@@ -100,6 +100,14 @@ async fn deny_overrides_allow() {
     scope["deny_write"] = json!([root(&env.root)]);
     denied(&client, "fs.write", write_params(&ws, "f", Some(scope))).await;
     assert_eq!(std::fs::read_to_string(env.path("f")).unwrap(), "original");
+
+    std::fs::create_dir(env.path("parent")).unwrap();
+    std::fs::write(env.path("parent/guarded"), "safe").unwrap();
+    let mut scope = write_scope(&root(&env.root));
+    scope["deny_write"] = json!([root(&env.path("parent/guarded"))]);
+    denied(&client, "fs.remove", json!({"workspace": ws, "path": "parent", "recursive": true, "idempotency_key": key(), "scope": scope}))
+        .await;
+    assert_eq!(std::fs::read_to_string(env.path("parent/guarded")).unwrap(), "safe");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -117,7 +125,66 @@ async fn session_ceiling_survives_omitted_scope() {
     assert!(client.peer.call_raw("fs.read", json!({"workspace": ws, "path": "f"})).await.is_ok());
     denied(&client, "fs.write", write_params(&ws, "f", None)).await;
     denied(&client, "fs.read", json!({"workspace": ws, "path": "f", "scope": write_scope(&root(&env.root))})).await;
+    denied(
+        &client,
+        "workspace.open",
+        json!({"root": root(&env.root), "backend": {"kind": "local"}, "ceiling": write_scope(&root(&env.root))}),
+    )
+    .await;
     assert_eq!(std::fs::read_to_string(env.path("f")).unwrap(), "original");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_ceiling_can_name_a_descendant_prefix() {
+    let env = env().await;
+    std::fs::create_dir(env.path("sub")).unwrap();
+    std::fs::write(env.path("sub/allowed"), "yes").unwrap();
+    std::fs::write(env.path("outside"), "no").unwrap();
+    let client = connect(&env.socket).await;
+    initialize(&client, None).await;
+    let opened = client
+        .peer
+        .call_raw("workspace.open", json!({"root": root(&env.root), "ceiling": {"roots": ["sub"], "ops": ["read"]}}))
+        .await
+        .unwrap();
+    let ws: WorkspaceId = serde_json::from_value(opened["id"].clone()).unwrap();
+    assert!(client.peer.call_raw("fs.read", json!({"workspace": ws, "path": "sub/allowed"})).await.is_ok());
+    denied(&client, "fs.read", json!({"workspace": ws, "path": "outside"})).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scope_limits_bound_reads_search_and_process_admission() {
+    let env = env().await;
+    std::fs::write(env.path("f"), "original").unwrap();
+    let (client, _, ws) = session(&env).await;
+    let mut scope = read_scope(&root(&env.root));
+    scope["max_output_bytes"] = json!(3);
+    let read = client.peer.call_raw("fs.read", json!({"workspace": ws, "path": "f", "hash": false, "scope": scope})).await.unwrap();
+    assert_eq!(read["content"]["text"], "ori");
+    assert_eq!(read["hash"], Value::Null);
+    denied(&client, "search.grep", json!({"workspace": ws, "pattern": "original", "path": "f", "scope": scope})).await;
+
+    let mut exec_scope = write_scope(&root(&env.root));
+    exec_scope["max_processes"] = json!(0);
+    let err = client
+        .peer
+        .call_raw(
+            "exec.spawn",
+            json!({"workspace": ws, "command": {"kind": "argv", "argv": ["true"]}, "idempotency_key": key(), "scope": exec_scope}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::LimitExceeded);
+    let bash = client
+        .peer
+        .call_raw(
+            "tools.call",
+            json!({"workspace": ws, "name": "Bash", "arguments": {"command": "touch pwned"}, "idempotency_key": key(), "scope": exec_scope}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bash["is_error"], true);
+    assert!(!env.path("pwned").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

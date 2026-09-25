@@ -34,7 +34,7 @@ async fn write(client: &Client, ws: &WorkspaceId, path: &str) -> ErrorCode {
 async fn read(client: &Client, ws: &WorkspaceId, path: &str) -> Result<(), ErrorCode> {
     client
         .peer
-        .call::<FsRead>(FsReadParams { workspace: ws.clone(), path: path.into(), range: None, scope: None })
+        .call::<FsRead>(FsReadParams { workspace: ws.clone(), path: path.into(), range: None, hash: true, scope: None })
         .await
         .map(|_| ())
         .map_err(|e| e.code)

@@ -82,8 +82,10 @@ async fn reads_never_see_outside_the_root_while_it_is_swapped() {
     let deadline = Instant::now() + RACE;
     let mut answered = 0u32;
     while Instant::now() < deadline {
-        let read =
-            client.peer.call::<FsRead>(FsReadParams { workspace: ws.clone(), path: "d/secret".into(), range: None, scope: None }).await;
+        let read = client
+            .peer
+            .call::<FsRead>(FsReadParams { workspace: ws.clone(), path: "d/secret".into(), range: None, hash: true, scope: None })
+            .await;
         if let Ok(read) = read {
             answered += 1;
             let body = String::from_utf8(read.content.into_bytes()).unwrap();
