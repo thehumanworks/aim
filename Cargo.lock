@@ -10,6 +10,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aim-llm"
+version = "0.0.0"
+dependencies = [
+ "aim-proto",
+ "futures-core",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aim-proto"
 version = "0.0.0"
 dependencies = [
@@ -86,6 +97,12 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "futures-core"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
 name = "generic-array"

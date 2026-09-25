@@ -12,7 +12,9 @@
 //! - [`ids`] — identifiers, idempotency keys and resume tokens.
 //! - [`harness`] — `aim-harness/1`: the execution layer's methods.
 //! - [`tool`] — tool descriptors and results, shared by aimx, the agent layer and MCP.
+//! - [`conversation`] — provider-neutral conversation items, usage and rate limits.
 pub mod content;
+pub mod conversation;
 pub mod error;
 pub mod harness;
 pub mod ids;
