@@ -423,15 +423,14 @@ async fn mcp_command(
     let entries = discovered_mcp(cwd, ssh, aimx).await?;
     match action {
         McpAction::List => {
-            for entry in entries {
-                println!(
-                    "{}  {:?}  {:?}  {}  {}",
-                    entry.name,
-                    entry.origin,
-                    entry.location,
-                    if entry.trusted { "trusted" } else { "untrusted" },
-                    entry.source_path
-                );
+            let shadowing = aim::mcp::config::shadowing(&entries);
+            for (entry, shadow) in entries.iter().zip(shadowing) {
+                let state = match shadow.and_then(|index| entries.get(index)) {
+                    Some(winner) if entry.trusted => format!("shadowed by {}", winner.source_path),
+                    _ if entry.trusted => "trusted".to_owned(),
+                    _ => "untrusted".to_owned(),
+                };
+                println!("{}  {:?}  {:?}  {}  {}", entry.name, entry.origin, entry.location, state, entry.source_path);
             }
         }
         McpAction::Trust { name, source } => {

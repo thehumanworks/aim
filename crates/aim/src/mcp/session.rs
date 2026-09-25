@@ -166,7 +166,14 @@ pub async fn connect_for_session(spec: &SessionSpec) -> Option<Arc<dyn ToolHost>
     else {
         return None;
     };
-    let trusted = entries.into_iter().filter(|entry| entry.trusted).take(8).collect::<Vec<_>>();
+    let shadowed = config::shadowing(&entries);
+    let trusted = entries
+        .into_iter()
+        .zip(shadowed)
+        .filter(|(entry, shadow)| entry.trusted && shadow.is_none())
+        .map(|(entry, _)| entry)
+        .take(8)
+        .collect::<Vec<_>>();
     if trusted.is_empty() {
         return None;
     }

@@ -106,6 +106,21 @@ struct SourceSpec<'a> {
     toml: bool,
 }
 
+/// For each entry, the earlier trusted entry with the same server name that shadows it, if any.
+/// Discovery order is precedence: project before user, native before imported, so the nearest
+/// definition of a name wins and the others are never started (their tools would be unreachable
+/// behind the same `mcp__<name>__` prefix).
+#[must_use]
+pub fn shadowing(entries: &[ServerEntry]) -> Vec<Option<usize>> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entries.get(..index).and_then(|earlier| earlier.iter().position(|other| other.trusted && other.name == entry.name))
+        })
+        .collect()
+}
+
 /// Discover native and foreign definitions without launching or connecting to them.
 /// Project reads always use `project`; this remains correct for SSH workspaces.
 ///
@@ -234,7 +249,13 @@ fn parse_entries(
     }
     let mut entries = Vec::new();
     for (name, definition) in maps.into_iter().flat_map(|map| map.iter()) {
-        if name.is_empty() || name.len() > 128 || name.contains('/') || name.contains('\0') {
+        // The same rule the client applies when it namespaces tools (`mcp__<server>__<tool>`), so a
+        // name that could never connect is never offered for trust.
+        if name.is_empty()
+            || name.len() > 128
+            || name.contains("__")
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
             continue;
         }
         if definition.get("enabled").and_then(Value::as_bool) == Some(false)
@@ -366,6 +387,37 @@ mod tests {
             ]
         );
         assert!(matches!(entries[1].transport, Transport::Http { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_trusted_name_defined_twice_is_served_by_the_nearest_definition_only() {
+        let home = tempfile::tempdir().unwrap();
+        let aim_home = home.path().join(".aim");
+        std::fs::create_dir(&aim_home).unwrap();
+        std::fs::set_permissions(&aim_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(aim_home.join("mcp.json"), r#"{"mcpServers":{"docs":{"command":"user-docs"}}}"#).unwrap();
+        std::fs::set_permissions(aim_home.join("mcp.json"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let project = MemoryFiles::new([(".agents/mcp.json", r#"{"mcpServers":{"docs":{"command":"project-docs"}}}"#)]);
+        let entries = discover(Some(&project), home.path(), &aim_home, "/project").await.unwrap();
+        // Untrusted, the project entry shadows nothing: the user's trusted server is the one served.
+        assert_eq!(shadowing(&entries), [None, None]);
+        super::super::trust::trust(&aim_home, &entries[0]).unwrap();
+        let entries = discover(Some(&project), home.path(), &aim_home, "/project").await.unwrap();
+        assert!(entries.iter().all(|entry| entry.trusted));
+        assert_eq!(entries[0].location, Location::Workspace);
+        assert_eq!(shadowing(&entries), [None, Some(0)]);
+    }
+
+    #[tokio::test]
+    async fn names_that_could_never_be_namespaced_are_not_offered() {
+        let home = tempfile::tempdir().unwrap();
+        let aim_home = home.path().join(".aim");
+        let files = MemoryFiles::new([(
+            ".agents/mcp.json",
+            r#"{"mcpServers":{"a__b":{"command":"tool"},"sp ace":{"command":"tool"},"ok-name_1":{"command":"tool"}}}"#,
+        )]);
+        let entries = discover(Some(&files), home.path(), &aim_home, "/project").await.unwrap();
+        assert_eq!(entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), ["ok-name_1"]);
     }
 
     #[tokio::test]
