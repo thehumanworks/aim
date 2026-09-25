@@ -58,6 +58,9 @@ run = [
 description = "Verify aim-kernel with Verus (--no-cheating: no assume/admit/external_body)"
 # Changing Verus flags does not invalidate cargo's cache, so always re-verify the kernel crate.
 run = [
+  # `cargo clean` refuses a target dir without cargo's cache tag, which `cargo verus focus` (the
+  # edit loop) does not write; tag it first so verify works after verify:fast in a fresh checkout.
+  "mkdir -p target/verus && test -f target/verus/CACHEDIR.TAG || printf 'Signature: 8a477f597d28d172789f06886806bc55\\n# This file is a cache directory tag created by cargo.\\n' > target/verus/CACHEDIR.TAG",
   "cargo clean -p aim-kernel --target-dir target/verus",
   # --no-cheating applies to aim-kernel only: vstd itself legitimately contains trusted axioms.
   "cargo verus verify -p aim-kernel --target-dir target/verus --fwd-verus-args-to roots -- --no-cheating --time",
