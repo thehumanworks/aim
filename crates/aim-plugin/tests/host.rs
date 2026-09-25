@@ -55,6 +55,13 @@ async fn project_source_requires_exact_hash_and_edited_bytes_lose_trust() {
     trust.grant(&src.hash(), ["tools.provide".into(), "kv".into()]).unwrap();
     let host = PluginToolHost::load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
     assert_eq!(host.specs().len(), 1);
+    let mut formatted = src.clone();
+    formatted.manifest_text.push('\n');
+    assert_eq!(formatted.hash(), src.hash(), "formatting alone does not change canonical trust identity");
+    let mut reworded = src.clone();
+    reworded.manifest_text = reworded.manifest_text.replace("Increase a named durable counter", "Raise a named durable counter");
+    let host = PluginToolHost::load(&trust, vec![reworded], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
+    assert!(host.specs().is_empty(), "an edited manifest needs new trust even when component bytes are unchanged");
     let mut edited = src;
     edited.component.push(0);
     let host = PluginToolHost::load(&trust, vec![edited], delegate, HashSet::new()).unwrap();

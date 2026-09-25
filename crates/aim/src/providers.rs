@@ -12,7 +12,8 @@
 //!   local built-ins. Both are agent backends, not model providers: sessions run them through
 //!   [`crate::acp::with_acp`].
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -23,6 +24,11 @@ use aim_llm_codex::CodexProvider;
 use aim_llm_codex::media::{MediaClient, MediaConfig};
 use aim_llm_openai::{OpenAiProvider, Profile};
 use sha2::Digest as _;
+use aim_plugin::{PluginDelegate, PluginManifest, PluginSource, PluginToolHost, SessionMetadata, TrustStore};
+use aim_proto::harness::EntryKind;
+
+use crate::agent::ToolHost;
+use crate::resources::files::{Files, MAX_BINARY_BYTES, Read};
 
 /// A provider endpoint override from the environment (endpoints are configuration data: a
 /// recording proxy for benchmarks, an enterprise gateway). Only `https://` URLs, or `http://` to a
@@ -113,7 +119,7 @@ pub fn services() -> crate::host::NativeServices {
     let decider = std::env::var_os("TYPESAFE_API_KEY")
         .is_some_and(|value| !value.is_empty())
         .then(|| Arc::new(crate::jev::JevDecider) as Arc<dyn crate::jev::Decider>);
-    crate::host::NativeServices { media: Some(media), decider, tools: vec![search_tools(), board_tools(), mcp_tools()], code: code_mode() }
+    crate::host::NativeServices { media: Some(media), decider, tools: vec![search_tools(), board_tools(), mcp_tools()], plugins: Some(plugin_tools()), code: code_mode() }
 }
 
 /// Code mode, when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this
@@ -227,7 +233,7 @@ struct LazySearch {
     persistence: aim_proto::daemon::Persistence,
 }
 
-impl crate::agent::ToolHost for LazySearch {
+impl ToolHost for LazySearch {
     fn specs(&self) -> Vec<aim_proto::tool::ToolSpec> {
         crate::search::tools::specs()
     }
@@ -267,7 +273,7 @@ fn search_tools() -> crate::host::ToolsFactory {
     let index: Arc<SearchIndex> = Arc::new(SearchIndex::default());
     Arc::new(move |spec: &aim_proto::daemon::SessionSpec| {
         index.ensure_opening();
-        let host: Arc<dyn crate::agent::ToolHost> = Arc::new(LazySearch { index: Arc::clone(&index), persistence: spec.persistence });
+        let host: Arc<dyn ToolHost> = Arc::new(LazySearch { index: Arc::clone(&index), persistence: spec.persistence });
         Box::pin(async move { Some(host) })
     })
 }
@@ -296,6 +302,164 @@ fn board_tools_at(aim_home: PathBuf) -> crate::host::ToolsFactory {
             let host: Arc<dyn crate::agent::ToolHost> =
                 Arc::new(crate::board::tools::BoardTools::reviewer(board, run_id.clone(), format!("session:{run_id}")));
             Some(host)
+        })
+    })
+}
+
+const MAX_PLUGIN_COUNT: usize = 32;
+const MAX_PLUGIN_MANIFEST_BYTES: u64 = 64 * 1024;
+
+fn safe_plugin_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn safe_component_filename(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("wasm"))
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// Reads bounded project plugin sources through the workspace, including remote workspaces.
+pub async fn project_plugin_sources(project: &dyn Files) -> Vec<PluginSource> {
+    let Ok(Some(entries)) = project.list(".agents/plugins", u32::try_from(MAX_PLUGIN_COUNT).unwrap_or(u32::MAX)).await else {
+        return Vec::new();
+    };
+    let names = entries
+        .into_iter()
+        .filter(|entry| entry.kind == EntryKind::Dir && safe_plugin_name(&entry.name))
+        .map(|entry| entry.name)
+        .take(MAX_PLUGIN_COUNT)
+        .collect::<Vec<_>>();
+    let paths = names.iter().map(|name| format!(".agents/plugins/{name}/aim-plugin.toml")).collect();
+    let manifests = project.read_many(paths, MAX_PLUGIN_MANIFEST_BYTES).await;
+    let mut sources = Vec::new();
+    for (name, read) in names.into_iter().zip(manifests) {
+        let Read::Ok(file) = read else { continue };
+        if file.truncated {
+            continue;
+        }
+        let Ok(manifest) = PluginManifest::parse(&file.text) else { continue };
+        if manifest.name != name || !safe_component_filename(&manifest.component) {
+            continue;
+        }
+        let path = format!(".agents/plugins/{name}/{}", manifest.component);
+        if let Ok(Some(component)) = project.read_binary(&path, MAX_BINARY_BYTES).await {
+            sources.push(PluginSource { manifest_text: file.text, component, project: true });
+        }
+    }
+    sources
+}
+
+fn global_plugin_sources(home: &Path) -> Vec<PluginSource> {
+    let Ok(entries) = std::fs::read_dir(home.join("plugins")) else { return Vec::new() };
+    let mut sources = Vec::new();
+    for entry in entries.take(MAX_PLUGIN_COUNT).flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !safe_plugin_name(name) || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let manifest_path = entry.path().join("aim-plugin.toml");
+        if !std::fs::metadata(&manifest_path).is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_PLUGIN_MANIFEST_BYTES) {
+            continue;
+        }
+        let Ok(manifest_text) = std::fs::read_to_string(manifest_path) else { continue };
+        let Ok(manifest) = PluginManifest::parse(&manifest_text) else { continue };
+        if manifest.name != name || manifest.component != "plugin.wasm" {
+            continue;
+        }
+        let component_path = entry.path().join("plugin.wasm");
+        if !std::fs::metadata(&component_path).is_ok_and(|meta| meta.is_file() && meta.len() > 0 && meta.len() <= 16 * 1024 * 1024) {
+            continue;
+        }
+        if let Ok(component) = std::fs::read(component_path) {
+            sources.push(PluginSource { manifest_text, component, project: false });
+        }
+    }
+    sources
+}
+
+struct PluginToolAdapter(Arc<PluginToolHost>);
+
+impl ToolHost for PluginToolAdapter {
+    fn specs(&self) -> Vec<aim_proto::tool::ToolSpec> {
+        self.0.specs()
+    }
+
+    fn call(
+        &self,
+        name: String,
+        arguments: serde_json::Value,
+        key: aim_proto::ids::IdempotencyKey,
+    ) -> crate::agent::tools::BoxFuture<Result<aim_proto::tool::ToolResult, aim_proto::error::ProtoError>> {
+        self.0.call(name, arguments, key)
+    }
+}
+
+struct PluginDelegateAdapter(Arc<dyn ToolHost>);
+
+impl PluginDelegate for PluginDelegateAdapter {
+    fn call(
+        &self,
+        name: String,
+        arguments: serde_json::Value,
+        key: aim_proto::ids::IdempotencyKey,
+    ) -> aim_plugin::BoxFuture<Result<aim_proto::tool::ToolResult, aim_proto::error::ProtoError>> {
+        self.0.call(name, arguments, key)
+    }
+}
+
+fn plugin_tools() -> crate::host::PluginToolsFactory {
+    let home = crate::cli::aim_home();
+    Arc::new(move |spec, project, delegate| {
+        let home = home.clone();
+        let spec = spec.clone();
+        Box::pin(async move {
+            let mut sources = match project.as_deref() {
+                Some(project) => project_plugin_sources(project).await,
+                None => Vec::new(),
+            };
+            sources.extend(
+                tokio::task::spawn_blocking({
+                    let home = home.clone();
+                    move || global_plugin_sources(&home)
+                })
+                .await
+                .unwrap_or_default(),
+            );
+            if sources.is_empty() {
+                return None;
+            }
+            let Ok(trust) = TrustStore::load(&home) else {
+                tracing::warn!("plugin trust store could not be opened; omitting plugins");
+                return None;
+            };
+            sources.retain(|source| !source.project || trust.grants(&source.hash()).is_some());
+            let mut names = HashSet::new();
+            sources.retain(|source| PluginManifest::parse(&source.manifest_text).is_ok_and(|manifest| names.insert(manifest.name)));
+            let allowed = delegate.specs().into_iter().map(|tool| tool.name).collect();
+            let bridge: Arc<dyn PluginDelegate> = Arc::new(PluginDelegateAdapter(delegate));
+            let Ok(plugin) = PluginToolHost::load(&trust, sources, bridge, allowed) else {
+                tracing::warn!("plugin manifests or grants are invalid; omitting plugins");
+                return None;
+            };
+            let metadata = SessionMetadata {
+                session_id: None,
+                provider: Some(spec.provider),
+                model: spec.model,
+                workspace: Some(spec.workspace),
+                persistence: Some(match spec.persistence {
+                    aim_proto::daemon::Persistence::Persistent => "persistent".to_owned(),
+                    aim_proto::daemon::Persistence::Ephemeral => "ephemeral".to_owned(),
+                }),
+            };
+            let plugin = plugin.with_session_metadata(metadata);
+            if plugin.specs().is_empty() {
+                return None;
+            }
+            plugin.prewarm();
+            Some(Arc::new(PluginToolAdapter(Arc::new(plugin))) as Arc<dyn ToolHost>)
         })
     })
 }

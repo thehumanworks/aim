@@ -8,11 +8,12 @@
 //! - `aim board` — inspect and mutate the durable blackboard through the daemon.
 //! - `aim mcp` — trusted user MCP servers and aim's own MCP service endpoint.
 #![expect(clippy::print_stderr, reason = "the CLI reports errors on stderr")]
-#![expect(clippy::print_stdout, reason = "daemon status reports to stdout")]
+#![expect(clippy::print_stdout, reason = "CLI results and one-time tokens report to stdout")]
 
 use std::io::Read as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,8 +26,9 @@ use aim::mcp::{config as mcp_config, server as mcp_server, services::AimServices
 use aim::resources::HarnessFiles;
 use aim::store::{SessionStore, SqliteStore};
 use aim_llm::ModelProvider;
-use aim_proto::daemon::SessionListParams;
-use clap::{Parser, Subcommand};
+use aim_plugin::{PluginManifest, PluginSource, TrustStore};
+use aim_proto::daemon::{Location, Persistence, SessionListParams, SessionSpec};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 
 /// aim — Agent I am.
 #[derive(Parser)]
@@ -152,6 +154,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<McpAction>,
     },
+    /// Install and trust capability-scoped WebAssembly component plugins.
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
     /// Search the current user's persistent past conversations.
     SearchSessions {
         /// Rebuild the index from the lossless session log.
@@ -249,6 +256,47 @@ enum McpAction {
     },
 }
 
+enum PluginAction {
+    /// List installed or project plugins and their exact-hash trust state.
+    List {
+        #[command(flatten)]
+        project: PluginProject,
+    },
+    /// Copy a component and its adjacent manifest to the user's plugin directory.
+    Install {
+        /// Component, manifest, or directory containing `aim-plugin.toml`.
+        path: PathBuf,
+    },
+    /// Grant the installed plugin's requested capabilities to its current component hash.
+    Trust {
+        /// Installed or project plugin name.
+        name: String,
+        /// Grant only these requested capabilities (repeatable; defaults to all requested).
+        #[arg(long = "cap")]
+        capabilities: Vec<String>,
+        #[command(flatten)]
+        project: PluginProject,
+    },
+    /// Revoke grants for an installed plugin's current hash (or an explicit SHA-256 hash).
+    Untrust {
+        /// Installed plugin name or 64-character SHA-256 hex digest.
+        name_or_hash: String,
+    },
+}
+
+#[derive(ClapArgs, Default)]
+struct PluginProject {
+    /// Project workspace root; read plugins through aimx.
+    #[arg(long)]
+    project: Option<PathBuf>,
+    /// SSH destination for a project workspace.
+    #[arg(long, requires = "project", conflicts_with = "remote")]
+    ssh: Option<String>,
+    /// Authenticated aimx endpoint for a project workspace.
+    #[arg(long, requires = "project", conflicts_with = "ssh")]
+    remote: Option<String>,
+}
+
 fn provider(name: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, String), String> {
     aim::providers::build(name, model)
 }
@@ -261,6 +309,232 @@ fn read_prompt(words: &[String]) -> Result<String, String> {
         return Ok(text);
     }
     Ok(joined)
+}
+
+const MAX_PLUGIN_COMPONENT_BYTES: u64 = 16 * 1024 * 1024;
+
+fn plugin_name_is_safe(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn plugin_component_path(manifest_dir: &Path, component: &str, installed: bool) -> Result<PathBuf, String> {
+    if installed && component != "plugin.wasm" {
+        return Err("installed plugin component must be plugin.wasm".into());
+    }
+    let path = manifest_dir.join(component);
+    let metadata = std::fs::metadata(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_PLUGIN_COMPONENT_BYTES {
+        return Err(format!("{} must be a regular 1..=16 MiB component", path.display()));
+    }
+    Ok(path)
+}
+
+fn plugin_source_from_manifest(manifest_path: &Path, installed: bool) -> Result<(PluginManifest, PluginSource), String> {
+    if std::fs::metadata(manifest_path).map_err(|err| err.to_string())?.len() > 64 * 1024 {
+        return Err("plugin manifest exceeds 64 KiB".into());
+    }
+    let text = std::fs::read_to_string(manifest_path).map_err(|err| format!("{}: {err}", manifest_path.display()))?;
+    let manifest = PluginManifest::parse(&text).map_err(|err| err.to_string())?;
+    let directory = manifest_path.parent().ok_or("plugin manifest has no directory")?;
+    let component_path = plugin_component_path(directory, &manifest.component, installed)?;
+    let component = std::fs::read(&component_path).map_err(|err| format!("{}: {err}", component_path.display()))?;
+    Ok((manifest, PluginSource { manifest_text: text, component, project: false }))
+}
+
+fn installed_plugin(home: &Path, name: &str) -> Result<(PluginManifest, PluginSource), String> {
+    if !plugin_name_is_safe(name) {
+        return Err("plugin name must contain only letters, digits, hyphen or underscore".into());
+    }
+    let path = home.join("plugins").join(name).join("aim-plugin.toml");
+    let (manifest, source) = plugin_source_from_manifest(&path, true)?;
+    if manifest.name != name {
+        return Err("installed plugin name differs from its directory".into());
+    }
+    Ok((manifest, source))
+}
+
+fn plugin_install(home: &Path, source_path: &Path) -> Result<i32, String> {
+    let manifest_path = if source_path.is_dir() {
+        source_path.join("aim-plugin.toml")
+    } else if source_path.extension().is_some_and(|ext| ext == "wasm") {
+        source_path.parent().ok_or("component has no parent directory")?.join("aim-plugin.toml")
+    } else {
+        source_path.to_path_buf()
+    };
+    let (manifest, source) = plugin_source_from_manifest(&manifest_path, false)?;
+    if source_path.extension().is_some_and(|ext| ext == "wasm") {
+        let component = plugin_component_path(manifest_path.parent().ok_or("manifest has no directory")?, &manifest.component, false)?;
+        if source_path.canonicalize().map_err(|err| err.to_string())? != component.canonicalize().map_err(|err| err.to_string())? {
+            return Err("component path differs from adjacent manifest".into());
+        }
+    }
+    let directory = home.join("plugins");
+    std::fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).map_err(|err| err.to_string())?;
+    let installed = directory.join(&manifest.name);
+    std::fs::create_dir(&installed).map_err(|err| format!("{}: {err} (existing plugins are never overwritten)", installed.display()))?;
+    std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o700)).map_err(|err| err.to_string())?;
+    let mut document: toml::Value = toml::from_str(&source.manifest_text).map_err(|err| err.to_string())?;
+    document.as_table_mut().ok_or("plugin manifest must be a table")?.insert("component".into(), toml::Value::String("plugin.wasm".into()));
+    for (name, bytes) in [
+        ("plugin.wasm", source.component),
+        ("aim-plugin.toml", toml::to_string_pretty(&document).map_err(|err| err.to_string())?.into_bytes()),
+    ] {
+        let path = installed.join(name);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        std::io::Write::write_all(&mut file, &bytes).map_err(|err| format!("{}: {err}", path.display()))?;
+    }
+    println!("installed {} (run `aim plugin trust {}` to grant capabilities)", manifest.name, manifest.name);
+    Ok(0)
+}
+
+async fn project_plugin_sources(project: &PluginProject) -> Result<Option<Vec<PluginSource>>, String> {
+    let Some(root) = &project.project else { return Ok(None) };
+    let location = if let Some(destination) = &project.ssh {
+        Location::Ssh { destination: destination.clone() }
+    } else if let Some(url) = &project.remote {
+        Location::Remote { url: url.clone() }
+    } else {
+        Location::Local
+    };
+    let spec = SessionSpec {
+        workspace: root.to_string_lossy().into_owned(),
+        location,
+        provider: String::new(),
+        model: None,
+        effort: None,
+        agent: None,
+        persistence: Persistence::Ephemeral,
+    };
+    let connect = aim::host::aimx_workspaces(cli::find_aimx(None));
+    let connected = connect(&spec).await.map_err(|error| error.to_string())?;
+    let aim::host::Connected { tools, project, shutdown, .. } = connected;
+    let sources = match project.as_ref() {
+        Some(files) => aim::providers::project_plugin_sources(files.as_ref()).await,
+        None => Vec::new(),
+    };
+    drop(project);
+    drop(tools);
+    shutdown().await;
+    Ok(Some(sources))
+}
+
+async fn plugin_command(home: &Path, action: PluginAction) -> Result<i32, String> {
+    match action {
+        PluginAction::Install { path } => plugin_install(home, &path),
+        PluginAction::List { project } => {
+            if let Some(sources) = project_plugin_sources(&project).await? {
+                let trust = TrustStore::load(home).map_err(|err| err.to_string())?;
+                for source in sources {
+                    let Ok(manifest) = PluginManifest::parse(&source.manifest_text) else { continue };
+                    let hash = source.hash();
+                    let state = if trust.grants(&hash).is_some() { "trusted" } else { "untrusted" };
+                    println!("{} {} {} {}", manifest.name, manifest.version, hash.get(..12).unwrap_or(&hash), state);
+                }
+                return Ok(0);
+            }
+            let directory = home.join("plugins");
+            let entries = match std::fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(err) => return Err(err.to_string()),
+            };
+            let trust = TrustStore::load(home).map_err(|err| err.to_string())?;
+            let mut names = entries
+                .take(64)
+                .filter_map(|entry| entry.ok().and_then(|entry| entry.file_name().to_str().map(str::to_owned)))
+                .filter(|name| plugin_name_is_safe(name))
+                .collect::<Vec<_>>();
+            names.sort();
+            for name in names {
+                let Ok((manifest, source)) = installed_plugin(home, &name) else { continue };
+                let hash = source.hash();
+                let state = if trust.grants(&hash).is_some() { "trusted" } else { "untrusted" };
+                println!("{} {} {} {}", manifest.name, manifest.version, hash.get(..12).unwrap_or(&hash), state);
+            }
+            Ok(0)
+        }
+        PluginAction::Trust { name, capabilities, project } => {
+            let (manifest, source) = if let Some(sources) = project_plugin_sources(&project).await? {
+                let source = sources
+                    .into_iter()
+                    .find(|source| PluginManifest::parse(&source.manifest_text).is_ok_and(|manifest| manifest.name == name))
+                    .ok_or_else(|| format!("project plugin `{name}` was not found"))?;
+                let manifest = PluginManifest::parse(&source.manifest_text).map_err(|error| error.to_string())?;
+                (manifest, source)
+            } else {
+                installed_plugin(home, &name)?
+            };
+            let grants: std::collections::BTreeSet<String> =
+                if capabilities.is_empty() { manifest.capabilities.clone() } else { capabilities.into_iter().collect() };
+            if !grants.is_subset(&manifest.capabilities) {
+                return Err("capabilities must be requested in the plugin manifest".into());
+            }
+            let mut trust = TrustStore::load(home).map_err(|err| err.to_string())?;
+            trust.grant(&source.hash(), grants).map_err(|err| err.to_string())?;
+            println!("trusted {name} at its current manifest and component hash");
+            Ok(0)
+        }
+        PluginAction::Untrust { name_or_hash } => {
+            let hash = if name_or_hash.len() == 64 && name_or_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                name_or_hash
+            } else {
+                installed_plugin(home, &name_or_hash)?.1.hash()
+            };
+            let mut trust = TrustStore::load(home).map_err(|err| err.to_string())?;
+            trust.untrust(&hash).map_err(|err| err.to_string())?;
+            println!("revoked plugin grant");
+            Ok(0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod plugin_tests {
+    use super::{PluginAction, PluginProject, TrustStore, installed_plugin, plugin_command};
+
+    #[tokio::test]
+    async fn cli_installs_grants_only_requested_capabilities_and_revokes() {
+        let home = tempfile::tempdir().unwrap();
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/examples/kv_counter");
+        assert_eq!(plugin_command(home.path(), PluginAction::Install { path: source.clone() }).await.unwrap(), 0);
+        assert!(plugin_command(home.path(), PluginAction::Install { path: source }).await.is_err(), "never overwrite an installed plugin");
+        let (manifest, component) = installed_plugin(home.path(), "kv_counter").unwrap();
+        let hash = component.hash();
+        assert_eq!(manifest.component, "plugin.wasm");
+        assert!(TrustStore::load(home.path()).unwrap().grants(&hash).is_none());
+        assert!(
+            plugin_command(
+                home.path(),
+                PluginAction::Trust {
+                    name: "kv_counter".into(),
+                    capabilities: vec!["net.http:*".into()],
+                    project: PluginProject::default()
+                }
+            )
+            .await
+            .is_err(),
+            "cannot grant capabilities the manifest never requested"
+        );
+        assert_eq!(
+            plugin_command(
+                home.path(),
+                PluginAction::Trust { name: "kv_counter".into(), capabilities: vec!["kv".into()], project: PluginProject::default() }
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let trusted = TrustStore::load(home.path()).unwrap();
+        assert_eq!(trusted.grants(&hash).unwrap().iter().map(String::as_str).collect::<Vec<_>>(), ["kv"]);
+        assert_eq!(plugin_command(home.path(), PluginAction::Untrust { name_or_hash: "kv_counter".into() }).await.unwrap(), 0);
+        assert!(TrustStore::load(home.path()).unwrap().grants(&hash).is_none());
+    }
 }
 
 async fn search_cli(query: &str) -> Result<i32, String> {
@@ -477,6 +751,7 @@ async fn main_async(args: Args) -> Result<i32, String> {
         }
         Command::Board { action } => Box::pin(board_cli::run(&cli::aim_home(), action)).await,
         Command::Mcp { stdio, cwd, ssh, aimx, action } => mcp_command(stdio, cwd, ssh, aimx, action).await,
+        Command::Plugin { action } => plugin_command(&cli::aim_home(), action).await,
         Command::Daemon {
             socket,
             web,

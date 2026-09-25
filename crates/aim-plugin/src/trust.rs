@@ -14,7 +14,7 @@ struct TrustFile {
     plugins: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// Capability grants keyed by the exact SHA-256 hash of component bytes.
+/// Capability grants keyed by the exact SHA-256 plugin identity (manifest and component bytes).
 #[derive(Clone, Debug)]
 pub struct TrustStore {
     path: PathBuf,
@@ -41,41 +41,62 @@ impl TrustStore {
         Ok(Self { path, data })
     }
 
-    /// Returns the grants for exactly this component hash.
+    /// Returns the grants for exactly this plugin hash.
     #[must_use]
     pub fn grants(&self, hash: &str) -> Option<&BTreeSet<String>> {
         self.data.plugins.get(hash)
     }
 
-    /// Adds or replaces an exact-hash grant. A new component hash has no inherited trust.
+    /// Adds or replaces an exact-hash grant. Edited manifests or components inherit nothing.
     ///
     /// # Errors
     /// Returns an error for an invalid digest or a failed persistence write.
     pub fn grant(&mut self, hash: &str, capabilities: impl IntoIterator<Item = String>) -> Result<(), PluginError> {
         validate_hash(hash)?;
-        self.data.plugins.insert(hash.to_owned(), capabilities.into_iter().collect());
-        self.save()
+        let grants = capabilities.into_iter().collect();
+        self.transaction(|data| {
+            data.plugins.insert(hash.to_owned(), grants);
+        })
     }
 
-    /// Revokes every grant for one component hash.
+    /// Revokes every grant for one plugin hash.
     ///
     /// # Errors
     /// Returns an error for an invalid digest or a failed persistence write.
     pub fn untrust(&mut self, hash: &str) -> Result<(), PluginError> {
         validate_hash(hash)?;
-        self.data.plugins.remove(hash);
-        self.save()
+        self.transaction(|data| {
+            data.plugins.remove(hash);
+        })
     }
 
-    /// Persists the store with an atomic replacement.
-    ///
-    /// # Errors
-    /// Returns an error if serialization or the atomic replacement fails.
-    pub fn save(&self) -> Result<(), PluginError> {
+    fn transaction(&mut self, mutate: impl FnOnce(&mut TrustFile)) -> Result<(), PluginError> {
         let parent = self.path.parent().ok_or_else(|| PluginError::Invalid("trust path has no parent".into()))?;
         fs::create_dir_all(parent)?;
-        let text = toml::to_string_pretty(&self.data).map_err(|e| PluginError::Invalid(e.to_string()))?;
-        let tmp = self.path.with_extension("toml.tmp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        let lock_path = self.path.with_extension("lock");
+        #[cfg(unix)]
+        let lock = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(lock_path)?
+        };
+        #[cfg(not(unix))]
+        let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(lock_path)?;
+        lock.lock()?;
+        let mut latest = Self::load(parent)?.data;
+        mutate(&mut latest);
+        Self::write_snapshot(&self.path, &latest)?;
+        self.data = latest;
+        Ok(())
+    }
+
+    fn write_snapshot(path: &Path, data: &TrustFile) -> Result<(), PluginError> {
+        let text = toml::to_string_pretty(data).map_err(|e| PluginError::Invalid(e.to_string()))?;
+        let tmp = path.with_extension("toml.tmp");
         #[cfg(unix)]
         {
             use std::io::Write;
@@ -86,7 +107,7 @@ impl TrustStore {
         }
         #[cfg(not(unix))]
         fs::write(&tmp, text)?;
-        fs::rename(tmp, &self.path)?;
+        fs::rename(tmp, path)?;
         Ok(())
     }
 }
@@ -113,5 +134,24 @@ mod tests {
         let reloaded = TrustStore::load(dir.path()).unwrap();
         assert!(reloaded.grants(&first).unwrap().contains("kv"));
         assert!(reloaded.grants(&second).is_none());
+    }
+
+    #[test]
+    fn stale_writers_cannot_restore_revoked_grants_or_drop_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        let mut first = TrustStore::load(dir.path()).unwrap();
+        let mut stale = TrustStore::load(dir.path()).unwrap();
+        first.grant(&a, ["kv".into()]).unwrap();
+        stale.grant(&b, ["tools.provide".into()]).unwrap();
+        let mut revoker = TrustStore::load(dir.path()).unwrap();
+        let mut stale_again = TrustStore::load(dir.path()).unwrap();
+        revoker.untrust(&a).unwrap();
+        stale_again.grant(&c, ["session.read".into()]).unwrap();
+        let reloaded = TrustStore::load(dir.path()).unwrap();
+        assert!(reloaded.grants(&a).is_none());
+        assert!(reloaded.grants(&b).is_some() && reloaded.grants(&c).is_some());
     }
 }

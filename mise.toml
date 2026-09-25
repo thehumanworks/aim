@@ -6,7 +6,7 @@
 # with that rustc. Bump both in one commit, then refresh `mise.lock`.
 
 [tools]
-rust = { version = "1.98.1", components = "rustfmt,clippy", targets = "wasm32-unknown-unknown" }
+rust = { version = "1.98.1", components = "rustfmt,clippy", targets = "wasm32-unknown-unknown,wasm32-wasip2" }
 # Claude Code over ACP (docs/adr/0012): the adapter is pinned exactly and gated by aim's live
 # capability probe at every bump. Node runs it (`#!/usr/bin/env node`). These must stay under
 # `[tools]` — below a `[tools."…"]` table they would silently become that tool's options.
@@ -78,6 +78,10 @@ run = "cargo test --workspace --locked -- --ignored live_"
 [tasks."web:build"]
 description = "Build the browser bundle separately from the native quality gate (WASM link dominates routine checks)"
 run = "cd crates/aim-web && NO_COLOR=true trunk build --release --locked --offline && python externalize_bootstrap.py"
+
+[tasks."plugins:examples"]
+description = "Rebuild the checked-in WASIp2 example components and verify their hashes"
+run = "plugins/examples/build.sh --verify"
 
 [tasks."locked:update"]
 description = "Re-record LOCKED spec digests after a maintainer-approved decision change (with its ADR)"

@@ -164,6 +164,18 @@ fn fake_harness(files: MemoryFiles) -> (Peer, Arc<FakeHarness>, Peer) {
         })
         .method::<FsRead, _, _>(|state, _, params| async move {
             state.log.lock().unwrap().push(format!("fs.read {}", params.path));
+            if let Some(range) = params.range {
+                return match state.files.read_binary(&params.path, range.len).await {
+                    Ok(Some(bytes)) => Ok(FsReadResult {
+                        size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                        content: Content::from_bytes(bytes),
+                        hash: None,
+                        truncated: false,
+                    }),
+                    Ok(None) => Err(ProtoError::new(ErrorCode::NotFound, params.path)),
+                    Err(message) => Err(ProtoError::new(ErrorCode::LimitExceeded, message)),
+                };
+            }
             match state.files.read_many(vec![params.path.clone()], u64::MAX).await.pop() {
                 Some(Read::Ok(file)) => Ok(read_result(file)),
                 _ => Err(ProtoError::new(ErrorCode::NotFound, params.path)),
@@ -281,6 +293,16 @@ async fn remote_project_resources() {
     let prefix = aim::context::instructions(&catalog, None, 4096).text;
     assert!(prefix.contains("## AGENTS.md (remote, ssh:example)"), "{prefix}");
     assert!(prefix.contains(".agents/skills/haiku/SKILL.md; remote, ssh:example"), "{prefix}");
+}
+
+#[tokio::test]
+async fn remote_project_binary_plugin_uses_bounded_workspace_read() {
+    let path = ".agents/plugins/counter/plugin.wasm";
+    let (peer, harness, _server) = fake_harness(MemoryFiles::default().with_binary(path, vec![0, 0xff, 1]));
+    let files = HarnessFiles::new(peer, WorkspaceId::new("w"));
+    assert_eq!(files.read_binary(path, 3).await.unwrap(), Some(vec![0, 0xff, 1]));
+    assert!(files.read_binary(path, 2).await.is_err(), "oversized components fail closed");
+    assert!(harness.log.lock().unwrap().iter().all(|entry| entry == &format!("fs.read {path}")));
 }
 
 #[tokio::test]
@@ -779,6 +801,35 @@ async fn agent_allowlist_refuses_calls() {
 }
 
 #[tokio::test]
+async fn plugin_delegate_cannot_reach_a_tool_removed_by_the_agent() {
+    let tools = Arc::new(FakeTools::default());
+    let observed = Arc::new(Mutex::new(None));
+    let mut services = NativeServices::default();
+    let observation = Arc::clone(&observed);
+    services.plugins = Some(Arc::new(move |_spec, _project, delegate| {
+        let observation = Arc::clone(&observation);
+        Box::pin(async move {
+            let offered = delegate.specs().into_iter().map(|tool| tool.name).collect::<Vec<_>>();
+            let denied = delegate.call("Write".into(), json!({}), IdempotencyKey::new("plugin-nested")).await.err().map(|err| err.code);
+            *observation.lock().unwrap() = Some((offered, denied));
+            None
+        })
+    }));
+    let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(project()));
+    let base_tools = Arc::clone(&tools);
+    let f = fixture_on(Arc::new(MemoryStore::default()), Vec::new(), vec![text("ok")], services, move |session| Connected {
+        tools: Arc::clone(&base_tools) as Arc<dyn ToolHost>,
+        root: session.workspace.clone(),
+        location: "local".into(),
+        project: Some(Arc::clone(&files)),
+        shutdown: Box::new(|| Box::pin(async {})),
+    });
+    turns(&f, spec(Some("reader")), &["hi"]).await;
+    assert_eq!(*observed.lock().unwrap(), Some((vec!["Read".into()], Some(ErrorCode::Denied))));
+    assert!(tools.calls.lock().unwrap().is_empty(), "denied nested call never reaches the workspace");
+}
+
+#[tokio::test]
 async fn unknown_and_unimportable_agents_are_refused() {
     let f = local_fixture(vec![], Arc::default());
     let unknown = f.host.create(spec(Some("ghost"))).await.err().unwrap();
@@ -829,6 +880,7 @@ fn with_media(media: &Arc<FakeMedia>) -> NativeServices {
         })),
         decider: None,
         tools: Vec::new(),
+        plugins: None,
         code: None,
     }
 }
@@ -1127,6 +1179,7 @@ async fn program_tools_obey_the_agent_allowlist() {
         media: None,
         decider: None,
         tools: Vec::new(),
+        plugins: None,
         code: Some(CodeConfig { worker: "/nonexistent/aim-coderun".into(), user_programs: programs.path().join("programs") }),
     };
     let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(reader_project(Some("Read, run_code"))));

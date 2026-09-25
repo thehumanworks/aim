@@ -75,7 +75,7 @@ impl From<std::io::Error> for PluginError {
 }
 
 /// A manifest tool, advertised without compiling the component.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ManifestTool {
     /// Tool name within the plugin.
     pub name: String,
@@ -89,7 +89,7 @@ pub struct ManifestTool {
 }
 
 /// A plugin's identity, requested capabilities, and declared tools.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PluginManifest {
     /// Stable namespace.
     pub name: String,
@@ -147,9 +147,29 @@ pub struct PluginSource {
 }
 
 impl PluginSource {
-    /// Exact SHA-256 trust identity for source bytes.
+    /// SHA-256 trust identity for the canonical manifest and component bytes. A changed tool
+    /// definition cannot reuse the old component's grants; formatting alone preserves trust.
     #[must_use]
     pub fn hash(&self) -> String {
+        let canonical = PluginManifest::parse(&self.manifest_text)
+            .ok()
+            .and_then(|mut manifest| {
+                for tool in &mut manifest.tools {
+                    let schema: Value = serde_json::from_str(&tool.input_schema).ok()?;
+                    tool.input_schema = serde_json::to_string(&schema).ok()?;
+                }
+                serde_json::to_vec(&manifest).ok()
+            })
+            .unwrap_or_else(|| self.manifest_text.as_bytes().to_vec());
+        let mut digest = Sha256::new();
+        digest.update(b"aim-plugin-trust-v1\0");
+        digest.update(u64::try_from(canonical.len()).unwrap_or(u64::MAX).to_le_bytes());
+        digest.update(&canonical);
+        digest.update(&self.component);
+        format!("{:x}", digest.finalize())
+    }
+
+    fn component_hash(&self) -> String {
         format!("{:x}", Sha256::digest(&self.component))
     }
 }
@@ -182,6 +202,7 @@ pub struct SessionMetadata {
 struct RuntimePlugin {
     manifest: PluginManifest,
     hash: String,
+    component_hash: String,
     bytes: Arc<Vec<u8>>,
     grants: BTreeSet<String>,
     specs: Vec<ToolSpec>,
@@ -220,6 +241,7 @@ impl PluginToolHost {
             }
             let manifest = PluginManifest::parse(&source.manifest_text)?;
             let hash = source.hash();
+            let component_hash = source.component_hash();
             let grant = trust.grants(&hash);
             if source.project && grant.is_none() {
                 continue;
@@ -243,7 +265,7 @@ impl PluginToolHost {
                 Vec::new()
             };
             let kv_path = trust.home().join("plugin-kv").join(format!("{hash}.json"));
-            plugins.push(RuntimePlugin { manifest, hash, bytes: Arc::new(source.component), grants, specs, kv_path });
+            plugins.push(RuntimePlugin { manifest, hash, component_hash, bytes: Arc::new(source.component), grants, specs, kv_path });
         }
         Ok(Self {
             plugins: Arc::new(plugins),
@@ -266,6 +288,22 @@ impl PluginToolHost {
         self.plugins.iter().flat_map(|plugin| plugin.specs.iter().cloned()).collect()
     }
 
+    /// Starts compilation on a background blocking worker after session creation. The first
+    /// model request does not await compilation; a first call still compiles if warming lags.
+    pub fn prewarm(&self) {
+        let plugins = Arc::clone(&self.plugins);
+        if plugins.iter().all(|plugin| plugin.specs.is_empty()) {
+            return;
+        }
+        tokio::spawn(async move {
+            for plugin in plugins.iter().filter(|plugin| !plugin.specs.is_empty()) {
+                if compile_component(plugin).await.is_err() {
+                    tracing::warn!(plugin = %plugin.manifest.name, "plugin background compilation failed");
+                }
+            }
+        });
+    }
+
     /// Calls a plugin tool, compiling and validating its component on first use.
     pub fn call(&self, name: String, arguments: Value, key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
         let plugin = self.plugins.iter().find(|plugin| plugin.specs.iter().any(|spec| spec.name == name)).cloned();
@@ -285,14 +323,7 @@ impl PluginToolHost {
                     Arc::clone(registry.entry(plugin.hash.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
                 };
                 let _guard = call_lock.lock().await;
-                let engine = ENGINE.get_or_init(create_engine).as_ref().map_err(runtime_error)?.clone();
-                let compile_engine = engine.clone();
-                let compile_hash = plugin.hash.clone();
-                let compile_bytes = Arc::clone(&plugin.bytes);
-                let component = tokio::task::spawn_blocking(move || compiled(&compile_engine, &compile_hash, &compile_bytes))
-                    .await
-                    .map_err(runtime_error)?
-                    .map_err(runtime_error)?;
+                let (engine, component) = compile_component(&plugin).await.map_err(runtime_error)?;
                 let prefix = format!("plugin__{}__", plugin.manifest.name);
                 let raw_name =
                     name.strip_prefix(&prefix).ok_or_else(|| ProtoError::new(ErrorCode::InvalidParams, "plugin namespace mismatch"))?;
@@ -358,6 +389,18 @@ fn compiled(engine: &Engine, hash: &str, source: &[u8]) -> Result<Component, Plu
     let component = Component::new(engine, source).map_err(|e| PluginError::Runtime(e.to_string()))?;
     cache.lock().map_err(|_| PluginError::Runtime("component cache poisoned".into()))?.insert(key, component.clone());
     Ok(component)
+}
+
+async fn compile_component(plugin: &RuntimePlugin) -> Result<(Engine, Component), PluginError> {
+    let hash = plugin.component_hash.clone();
+    let bytes = Arc::clone(&plugin.bytes);
+    tokio::task::spawn_blocking(move || {
+        let engine = ENGINE.get_or_init(create_engine).as_ref().map_err(|message| PluginError::Runtime(message.clone()))?.clone();
+        let component = compiled(&engine, &hash, &bytes)?;
+        Ok((engine, component))
+    })
+    .await
+    .map_err(|error| PluginError::Runtime(error.to_string()))?
 }
 
 fn cache_key(hash: &str, fuel: u64, memory_limit: usize) -> String {
