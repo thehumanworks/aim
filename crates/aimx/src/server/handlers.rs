@@ -187,7 +187,8 @@ impl Conn {
         if let BackendSpec::Ssh { .. } = params.backend {
             return Err(ProtoError::new(ErrorCode::Unavailable, "SSH workspaces are not available yet (milestone M1b)"));
         }
-        let root = canonical_root(&params.root).await?;
+        let root =
+            if let Some(backend) = &self.state.fixed_workspace { backend.root().to_owned() } else { canonical_root(&params.root).await? };
         if !session.principal.may_open(&root) {
             return Err(ProtoError::new(
                 ErrorCode::Denied,
@@ -197,15 +198,19 @@ impl Conn {
         if let Some(open) = session.find_root(&root) {
             return Ok(open.info.clone());
         }
-        let config = LocalConfig {
-            output_ring_bytes: usize::try_from(self.state.config.output_ring_bytes).unwrap_or(usize::MAX),
-            protected: Arc::clone(&self.state.protected),
+        let backend: Arc<dyn crate::workspace::Workspace> = if let Some(fixed) = &self.state.fixed_workspace {
+            Arc::clone(fixed)
+        } else {
+            let config = LocalConfig {
+                output_ring_bytes: usize::try_from(self.state.config.output_ring_bytes).unwrap_or(usize::MAX),
+                protected: Arc::clone(&self.state.protected),
+            };
+            Arc::new(LocalWorkspace::open(&root, config).await?)
         };
-        let backend = LocalWorkspace::open(&root, config).await?;
         let id = WorkspaceId::new(format!("w{}", crate::id::random_hex()));
-        let info = WorkspaceInfo { id: id.clone(), root: root.clone(), caps: crate::workspace::Workspace::caps(&backend).clone() };
+        let info = WorkspaceInfo { id: id.clone(), root: root.clone(), caps: backend.caps().clone() };
         let grant = Grant::new(Arc::clone(&session.principal), Arc::clone(&self.state.protected), root, normalize(&params.root));
-        session.add_workspace(Arc::new(OpenWorkspace { id, info: info.clone(), grant, backend: Arc::new(backend) }));
+        session.add_workspace(Arc::new(OpenWorkspace { id, info: info.clone(), grant, backend }));
         Ok(info)
     }
 

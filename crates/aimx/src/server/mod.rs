@@ -27,6 +27,7 @@ use tokio::sync::watch;
 use self::session::Session;
 use crate::authz::{Principal, ProtectedPaths};
 use crate::dedup::{Begin, DedupConfig, DedupTable};
+use crate::workspace::Workspace;
 
 /// Server settings.
 #[derive(Clone, Debug)]
@@ -146,6 +147,8 @@ pub(crate) struct State {
     dedup: Mutex<DedupTable<Result<Value, ProtoError>>>,
     dedup_done: watch::Sender<u64>,
     next_conn: AtomicU64,
+    active_connections: AtomicU64,
+    fixed_workspace: Option<Arc<dyn Workspace>>,
 }
 
 impl std::fmt::Debug for State {
@@ -233,6 +236,16 @@ impl Server {
     /// reaper).
     #[must_use]
     pub fn new(config: ServerConfig) -> Self {
+        Self::with_workspace(config, None)
+    }
+
+    /// A server bound to one pre-opened workspace, used by the SSH agentless fallback.
+    #[must_use]
+    pub fn new_agentless(config: ServerConfig, workspace: Arc<dyn Workspace>) -> Self {
+        Self::with_workspace(config, Some(workspace))
+    }
+
+    fn with_workspace(config: ServerConfig, fixed_workspace: Option<Arc<dyn Workspace>>) -> Self {
         let dedup = DedupConfig {
             window_ms: u64::try_from(config.dedup_window.as_millis()).unwrap_or(u64::MAX),
             tombstone_ms: u64::try_from(config.tombstone_ttl.as_millis()).unwrap_or(u64::MAX),
@@ -248,6 +261,8 @@ impl Server {
             dedup: Mutex::new(DedupTable::new(dedup)),
             dedup_done: watch::channel(0).0,
             next_conn: AtomicU64::new(1),
+            active_connections: AtomicU64::new(0),
+            fixed_workspace,
         });
         let every = (state.config.resume_ttl / 4).clamp(Duration::from_millis(50), Duration::from_secs(10));
         let weak = Arc::downgrade(&state);
@@ -275,14 +290,17 @@ impl Server {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let conn_id = self.state.next_conn.fetch_add(1, Ordering::Relaxed);
+        self.state.active_connections.fetch_add(1, Ordering::Relaxed);
         let router = handlers::router(Arc::clone(&self.state), conn_id);
         let conn = Arc::clone(router.state());
+        let state = Arc::clone(&self.state);
         let max = usize::try_from(self.state.config.max_message_bytes).unwrap_or(usize::MAX);
         let peer = Peer::spawn(reader, writer, router, PeerConfig { max_message_bytes: max, ..PeerConfig::default() });
         let watched = peer.clone();
         tokio::spawn(async move {
             watched.closed().await;
             conn.disconnected();
+            state.active_connections.fetch_sub(1, Ordering::Relaxed);
         });
         peer
     }
@@ -301,6 +319,30 @@ impl Server {
         for session in sessions {
             session.close().await;
         }
+    }
+
+    /// Whether no client is attached and no retained process is still running.
+    pub async fn idle(&self) -> bool {
+        if self.state.active_connections.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        let sessions: Vec<Arc<Session>> = lock(&self.state.sessions).values().cloned().collect();
+        for session in sessions {
+            for (proc, workspace) in session.procs.all() {
+                let Ok(workspace) = session.workspace(&workspace) else {
+                    continue;
+                };
+                let Some(exec) = workspace.backend.exec() else {
+                    continue;
+                };
+                match exec.read(&proc, 0, self.state.config.output_ring_bytes, Duration::ZERO).await {
+                    Ok(read) if read.exit.is_none() => return false,
+                    Err(_) => return false,
+                    _ => {}
+                }
+            }
+        }
+        true
     }
 
     /// Binds a unix socket at `path`: creates a missing parent directory with mode 0700, removes a

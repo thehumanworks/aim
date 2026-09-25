@@ -7,8 +7,17 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use aim_proto::content::Content;
+use aim_proto::harness::{
+    BackendSpec, ExecRead, ExecReadParams, ExecRelease, ExecReleaseParams, ExecSpawn, ExecSpawnParams, FsRead, FsReadParams, FsWrite,
+    FsWriteParams, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams, WorkspaceOpen,
+    WorkspaceOpenParams,
+};
 use aim_proto::harness::{CaseMode, Command as RemoteCommand, Precondition};
 use aim_proto::ids::IdempotencyKey;
+use aim_proto::ids::ResumeToken;
+use aim_proto::ids::WorkspaceId;
+use aim_proto::tool::{ToolContent, ToolResult};
+use aim_rpc::{NoHandler, Peer, PeerConfig};
 use tempfile::TempDir;
 
 use super::agentless::AgentlessWorkspace;
@@ -20,6 +29,121 @@ struct Sshd {
     dir: TempDir,
     child: Child,
     config: PathBuf,
+}
+
+pub(super) fn aimx_binary() -> PathBuf {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            assert!(Command::new("cargo").args(["build", "-q", "-p", "aimx", "--bin", "aimx"]).status().expect("build aimx").success());
+            let executable = std::env::current_exe().expect("test executable");
+            executable.parent().expect("deps directory").parent().expect("target directory").join("aimx")
+        })
+        .clone()
+}
+
+fn aim_binary() -> PathBuf {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            assert!(Command::new("cargo").args(["build", "-q", "-p", "aim", "--bin", "aim"]).status().expect("build aim").success());
+            let executable = std::env::current_exe().expect("test executable");
+            executable.parent().expect("deps directory").parent().expect("target directory").join("aim")
+        })
+        .clone()
+}
+
+fn spawn_forward(sshd: &Sshd, root: &Path, bootstrap: &str) -> (Peer, tokio::process::Child) {
+    let local_home = sshd.dir.path().join("local_home");
+    std::fs::create_dir_all(&local_home).expect("local home");
+    let mut command = tokio::process::Command::new(aimx_binary());
+    command
+        .args(["serve", "--stdio", "--ssh", "aim-test", "--root"])
+        .arg(root)
+        .args(["--ssh-config"])
+        .arg(&sshd.config)
+        .args(["--bootstrap", bootstrap, "--idle-secs", "2"])
+        .env("HOME", local_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("aimx forward");
+    let stdin = child.stdin.take().expect("forward stdin");
+    let stdout = child.stdout.take().expect("forward stdout");
+    (Peer::spawn(stdout, stdin, NoHandler, PeerConfig::default()), child)
+}
+
+async fn initialize(peer: &Peer, resume: Option<ResumeToken>) -> InitializeResult {
+    let (min, max) = aim_proto::HARNESS_GENERATIONS;
+    peer.call::<Initialize>(InitializeParams {
+        generations: GenerationRange { min, max },
+        client: PeerInfo { name: "ssh-live-test".to_owned(), version: "0".to_owned() },
+        auth: None,
+        resume,
+    })
+    .await
+    .expect("initialize")
+}
+
+fn tool_text(result: &ToolResult) -> &str {
+    result
+        .content
+        .iter()
+        .find_map(|item| match item {
+            ToolContent::Text { text } => Some(text.as_str()),
+            ToolContent::Image { .. } => None,
+        })
+        .unwrap_or("")
+}
+
+async fn tool(peer: &Peer, workspace: &WorkspaceId, name: &str, arguments: serde_json::Value, key: &str) -> ToolResult {
+    let result = peer
+        .call::<ToolsCall>(ToolsCallParams {
+            workspace: workspace.clone(),
+            name: name.to_owned(),
+            arguments,
+            idempotency_key: Some(IdempotencyKey::new(key)),
+        })
+        .await
+        .expect("tool call");
+    assert!(!result.is_error, "tool {name} failed: {}", tool_text(&result));
+    result
+}
+
+async fn exercise_tools(peer: &Peer, workspace: &WorkspaceId, remote: &Path, local: &Path) {
+    std::fs::write(local.join("tool.txt"), "local").expect("local fixture");
+    tool(peer, workspace, "Write", serde_json::json!({"file_path":"tool.txt","content":"alpha\n"}), "tool-write").await;
+    assert_eq!(std::fs::read_to_string(remote.join("tool.txt")).expect("remote write"), "alpha\n");
+    assert!(tool_text(&tool(peer, workspace, "Read", serde_json::json!({"file_path":"tool.txt"}), "tool-read").await).contains("alpha"));
+    tool(peer, workspace, "Edit", serde_json::json!({"file_path":"tool.txt","old_string":"alpha","new_string":"beta"}), "tool-edit").await;
+    assert!(tool_text(&tool(peer, workspace, "LS", serde_json::json!({"path":"."}), "tool-ls").await).contains("tool.txt"));
+    assert!(tool_text(&tool(peer, workspace, "Glob", serde_json::json!({"pattern":"*.txt"}), "tool-glob").await).contains("tool.txt"));
+    assert!(
+        tool_text(&tool(peer, workspace, "Grep", serde_json::json!({"pattern":"beta","output_mode":"content"}), "tool-grep").await)
+            .contains("beta")
+    );
+    let bash = tool(peer, workspace, "Bash", serde_json::json!({"command":"printf shell > command.txt; cat tool.txt"}), "tool-bash").await;
+    assert!(tool_text(&bash).contains("beta"));
+    assert_eq!(std::fs::read_to_string(remote.join("command.txt")).expect("remote bash"), "shell");
+    let background =
+        tool(peer, workspace, "Bash", serde_json::json!({"command":"printf started; sleep 30","run_in_background":true}), "tool-bg").await;
+    let id = tool_text(&background).split("id ").nth(1).and_then(|text| text.split('.').next()).expect("background id");
+    tool(peer, workspace, "BashOutput", serde_json::json!({"id":id}), "tool-output").await;
+    tool(peer, workspace, "KillShell", serde_json::json!({"id":id}), "tool-kill").await;
+    assert_eq!(std::fs::read_to_string(local.join("tool.txt")).expect("local untouched"), "local");
+    assert!(!local.join("command.txt").exists());
+}
+
+fn kill_ssh_child(parent: &tokio::process::Child) {
+    let pid = parent.id().expect("forwarder pid");
+    let output = Command::new("pgrep").args(["-P", &pid.to_string()]).output().expect("find ssh child");
+    assert!(output.status.success(), "SSH channel child must exist");
+    let text = String::from_utf8(output.stdout).expect("pid list");
+    let child = text.lines().next().expect("ssh pid");
+    let command = Command::new("ps").args(["-p", child, "-o", "comm="]).output().expect("inspect child");
+    assert!(String::from_utf8_lossy(&command.stdout).contains("ssh"));
+    assert!(Command::new("kill").args(["-KILL", child]).status().expect("kill ssh").success());
 }
 
 impl Sshd {
@@ -183,6 +307,245 @@ async fn live_ssh_native_search() {
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches.first().expect("match").before, vec!["first"]);
     assert_eq!(result.matches.first().expect("match").after, vec!["last"]);
+}
+
+#[tokio::test]
+#[ignore = "runs the aimx binary through a private user-space sshd"]
+async fn live_ssh_resident_resume_two_proxies_and_idle_exit() {
+    let sshd = Sshd::start(false);
+    let root = sshd.dir.path().join("resident_workspace");
+    let local = sshd.dir.path().join("local_workspace");
+    std::fs::create_dir(&root).expect("remote root");
+    std::fs::create_dir(&local).expect("local root");
+    std::fs::write(local.join("different.txt"), "local").expect("local fixture");
+    let started = Instant::now();
+    let (peer, child) = spawn_forward(&sshd, &root, "auto");
+    let init = initialize(&peer, None).await;
+    assert!(!init.resumed);
+    let workspace = peer
+        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_string_lossy().into_owned(), backend: BackendSpec::Local })
+        .await
+        .expect("resident workspace");
+    assert!(workspace.caps.resumable);
+    eprintln!("resident_handshake_ms={}", started.elapsed().as_millis());
+    let path = root.join("different.txt").to_string_lossy().into_owned();
+    peer.call::<FsWrite>(FsWriteParams {
+        workspace: workspace.id.clone(),
+        path: path.clone(),
+        content: Content::Utf8 { text: "remote".to_owned() },
+        precondition: Precondition::IfAbsent,
+        create_dirs: false,
+        idempotency_key: IdempotencyKey::new("resident-write"),
+    })
+    .await
+    .expect("resident write");
+    assert_eq!(std::fs::read_to_string(&path).expect("remote file"), "remote");
+    assert_eq!(std::fs::read_to_string(local.join("different.txt")).expect("local file"), "local");
+    exercise_tools(&peer, &workspace.id, &root, &local).await;
+    resume_two_proxies(&sshd, &root, peer, child, init, workspace.id).await;
+}
+
+async fn resume_two_proxies(
+    sshd: &Sshd,
+    root: &Path,
+    peer: Peer,
+    mut child: tokio::process::Child,
+    init: InitializeResult,
+    workspace: WorkspaceId,
+) {
+    let (peer_two, mut child_two) = spawn_forward(sshd, root, "auto");
+    initialize(&peer_two, None).await;
+    let run_dir = sshd.dir.path().join("remote_home/.aim/run");
+    let pid_files = std::fs::read_dir(&run_dir)
+        .expect("run dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pid"))
+        .count();
+    assert_eq!(pid_files, 1, "two proxies must share the resident");
+
+    let process = peer
+        .call::<ExecSpawn>(ExecSpawnParams {
+            workspace: workspace.clone(),
+            command: RemoteCommand::Shell { script: "printf 'first'; sleep 1; printf 'second'".to_owned() },
+            cwd: Some(root.to_string_lossy().into_owned()),
+            env: std::collections::BTreeMap::new(),
+            pty: None,
+            stdin: false,
+            timeout_ms: None,
+            idempotency_key: IdempotencyKey::new("resident-spawn"),
+        })
+        .await
+        .expect("spawn")
+        .proc;
+    let mut first_seq = 0;
+    for _ in 0..8 {
+        let read = peer
+            .call::<ExecRead>(ExecReadParams { proc: process.clone(), after_seq: 0, max_bytes: Some(1024), wait_ms: 500 })
+            .await
+            .expect("read first output");
+        if let Some(chunk) = read.chunks.first() {
+            first_seq = chunk.seq;
+            break;
+        }
+    }
+    assert!(first_seq > 0);
+    child.kill().await.expect("kill first ssh forwarder");
+    peer.close();
+    let (resumed_peer, mut resumed_child) = spawn_forward(sshd, root, "auto");
+    let resumed = initialize(&resumed_peer, Some(init.resume_token)).await;
+    assert!(resumed.resumed);
+    let mut remaining = Vec::new();
+    let mut cursor = first_seq;
+    for _ in 0..8 {
+        let read = resumed_peer
+            .call::<ExecRead>(ExecReadParams { proc: process.clone(), after_seq: cursor, max_bytes: Some(1024), wait_ms: 500 })
+            .await
+            .expect("read resumed output");
+        for chunk in read.chunks {
+            cursor = chunk.seq;
+            remaining.extend(chunk.data.into_bytes());
+        }
+        if read.exit.is_some() {
+            break;
+        }
+    }
+    assert_eq!(remaining, b"second");
+    resumed_peer.call::<ExecRelease>(ExecReleaseParams { proc: process }).await.expect("release");
+    resumed_peer.close();
+    peer_two.close();
+    resumed_child.kill().await.expect("stop resumed proxy");
+    child_two.kill().await.expect("stop second proxy");
+    let mut gone = false;
+    for _ in 0..60 {
+        if std::fs::read_dir(&run_dir)
+            .expect("run dir")
+            .filter_map(Result::ok)
+            .all(|entry| entry.path().extension().is_none_or(|ext| ext != "sock"))
+        {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(gone, "resident should exit after becoming idle");
+}
+
+#[tokio::test]
+#[ignore = "runs the aimx binary through a private user-space sshd"]
+async fn live_ssh_agentless_stdio_fallback() {
+    let sshd = Sshd::start(false);
+    let root = sshd.dir.path().join("agentless_workspace");
+    let local = sshd.dir.path().join("agentless_local");
+    std::fs::create_dir(&root).expect("remote root");
+    std::fs::create_dir(&local).expect("local root");
+    let (peer, mut child) = spawn_forward(&sshd, &root, "never");
+    initialize(&peer, None).await;
+    let workspace = peer
+        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_string_lossy().into_owned(), backend: BackendSpec::Local })
+        .await
+        .expect("agentless workspace");
+    assert!(!workspace.caps.resumable);
+    let path = root.join("fallback.txt").to_string_lossy().into_owned();
+    peer.call::<FsWrite>(FsWriteParams {
+        workspace: workspace.id.clone(),
+        path: path.clone(),
+        content: Content::Utf8 { text: "remote-only".to_owned() },
+        precondition: Precondition::IfAbsent,
+        create_dirs: false,
+        idempotency_key: IdempotencyKey::new("fallback-write"),
+    })
+    .await
+    .expect("agentless write");
+    let read = peer.call::<FsRead>(FsReadParams { workspace: workspace.id.clone(), path, range: None }).await.expect("agentless read");
+    assert_eq!(read.content.into_bytes(), b"remote-only");
+    exercise_tools(&peer, &workspace.id, &root, &local).await;
+    peer.close();
+    child.kill().await.expect("stop fallback");
+}
+
+#[tokio::test]
+#[ignore = "kills one OpenSSH channel in a private user-space sshd"]
+async fn live_ssh_transparent_reconnect_after_channel_killed() {
+    let sshd = Sshd::start(false);
+    let root = sshd.dir.path().join("reconnect_workspace");
+    std::fs::create_dir(&root).expect("root");
+    let (peer, mut child) = spawn_forward(&sshd, &root, "auto");
+    initialize(&peer, None).await;
+    let workspace = peer
+        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_string_lossy().into_owned(), backend: BackendSpec::Local })
+        .await
+        .expect("open");
+    let proc = peer
+        .call::<ExecSpawn>(ExecSpawnParams {
+            workspace: workspace.id,
+            command: RemoteCommand::Shell { script: "printf first; sleep 2; printf second".to_owned() },
+            cwd: Some(root.to_string_lossy().into_owned()),
+            env: std::collections::BTreeMap::new(),
+            pty: None,
+            stdin: false,
+            timeout_ms: None,
+            idempotency_key: IdempotencyKey::new("reconnect-process"),
+        })
+        .await
+        .expect("spawn")
+        .proc;
+    let first = peer
+        .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: 0, max_bytes: Some(1024), wait_ms: 1000 })
+        .await
+        .expect("first output");
+    let first_seq = first.chunks.first().expect("first chunk").seq;
+    assert_eq!(first.chunks.first().expect("first chunk").data.clone().into_bytes(), b"first");
+    let started = Instant::now();
+    kill_ssh_child(&child);
+    let mut cursor = first_seq;
+    let mut rest = Vec::new();
+    for _ in 0..8 {
+        let read = peer
+            .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: cursor, max_bytes: Some(1024), wait_ms: 1000 })
+            .await
+            .expect("read through reconnection");
+        for chunk in read.chunks {
+            cursor = chunk.seq;
+            rest.extend(chunk.data.into_bytes());
+        }
+        if read.exit.is_some() {
+            break;
+        }
+    }
+    assert_eq!(rest, b"second");
+    assert!(child.try_wait().expect("forwarder status").is_none(), "local aimx stream must stay alive");
+    eprintln!("transparent_reconnect_ms={}", started.elapsed().as_millis());
+    peer.call::<ExecRelease>(ExecReleaseParams { proc }).await.expect("release");
+    peer.close();
+    child.kill().await.expect("stop forwarder");
+}
+
+#[tokio::test]
+#[ignore = "uses a real OpenRouter turn through a private user-space sshd"]
+async fn live_ssh_aim_run_openrouter_edits_and_executes_remote_file() {
+    assert!(std::env::var_os("OPENROUTER_API_KEY").is_some(), "OpenRouter credential is required for this live test");
+    let sshd = Sshd::start(false);
+    let remote = sshd.dir.path().join("provider_remote");
+    let local = sshd.dir.path().join("provider_local");
+    std::fs::create_dir(&remote).expect("remote workspace");
+    std::fs::create_dir(&local).expect("local workspace");
+    std::fs::write(local.join("probe.sh"), "local sentinel\n").expect("local sentinel");
+    let started = Instant::now();
+    let output = Command::new(aim_binary())
+        .arg("run")
+        .args(["--ssh", "aim-test", "-p", "openrouter", "--model", "openai/gpt-4.1-mini", "--ephemeral", "--max-requests", "6", "--aimx"])
+        .arg(aimx_binary())
+        .arg("-C")
+        .arg(&remote)
+        .arg("Use Write to create probe.sh containing exactly '#!/bin/sh\nprintf ssh-ok\n'. Then use Bash to run 'sh probe.sh'. Reply with the command output.")
+        .env("AIM_SSH_CONFIG", &sshd.config)
+        .output()
+        .expect("aim run");
+    eprintln!("aim_ssh_openrouter_turn_ms={}", started.elapsed().as_millis());
+    assert!(output.status.success(), "aim run status: {}", output.status);
+    assert_eq!(std::fs::read_to_string(remote.join("probe.sh")).expect("remote script"), "#!/bin/sh\nprintf ssh-ok\n");
+    assert_eq!(std::fs::read_to_string(local.join("probe.sh")).expect("local sentinel"), "local sentinel\n");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ssh-ok"), "agent should report execution output");
 }
 
 async fn exercise_agentless(sshd: &Sshd, connection: Connection) {

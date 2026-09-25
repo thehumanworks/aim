@@ -38,6 +38,9 @@ enum Command {
         /// Workspace directory.
         #[arg(short = 'C', long, default_value = ".")]
         cwd: PathBuf,
+        /// SSH destination for a remote workspace.
+        #[arg(long)]
+        ssh: Option<String>,
         /// The aimx binary (default: next to aim, else on PATH).
         #[arg(long)]
         aimx: Option<PathBuf>,
@@ -77,12 +80,12 @@ fn read_prompt(words: &[String]) -> Result<String, String> {
 
 async fn main_async(args: Args) -> Result<i32, String> {
     match args.command {
-        Command::Run { provider: p, model, effort, cwd, aimx, ephemeral, json, max_requests, prompt } => {
+        Command::Run { provider: p, model, effort, cwd, ssh, aimx, ephemeral, json, max_requests, prompt } => {
             let prompt = read_prompt(&prompt)?;
             if prompt.trim().is_empty() {
                 return Err("empty prompt".to_owned());
             }
-            let options = RunOptions { provider: p, model, effort, cwd, aimx, ephemeral, json, max_requests, prompt };
+            let options = RunOptions { provider: p, model, effort, cwd, ssh, aimx, ephemeral, json, max_requests, prompt };
             cli::run(options, provider).await
         }
         Command::Sessions { limit } => {

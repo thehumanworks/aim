@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{Agent, AgentConfig, Backend, ToolHost};
 use crate::context;
 use crate::harness::HarnessClient;
+use crate::remote::RemoteHarness;
 use crate::session::{self, Recorder};
 use crate::store::{MemoryStore, SessionStore};
 
@@ -59,15 +60,33 @@ pub struct Connected {
     pub shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send>,
 }
 
-/// Connects local workspaces by spawning `aimx serve --stdio --root <workspace>`.
+/// Connects workspaces by spawning the local aimx harness.
 #[must_use]
 pub fn aimx_workspaces(aimx: PathBuf) -> WorkspaceFactory {
     Arc::new(move |spec: &SessionSpec| {
         let aimx = aimx.clone();
         let spec = spec.clone();
         Box::pin(async move {
-            if !matches!(spec.location, Location::Local) {
-                return Err(err(ErrorCode::Unavailable, "ssh workspaces arrive with the SSH integration (M1b)"));
+            if let Location::Ssh { destination } = &spec.location {
+                let harness = RemoteHarness::connect(&aimx, destination, &spec.workspace).await?;
+                let project = context::project_instructions(harness.client.peer(), &harness.client.workspace().id).await;
+                let root = harness.client.workspace().root.clone();
+                let harness = Arc::new(harness);
+                let held = Arc::clone(&harness);
+                let shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send> = Box::new(move || {
+                    Box::pin(async move {
+                        if let Ok(harness) = Arc::try_unwrap(held) {
+                            harness.shutdown().await;
+                        }
+                    })
+                });
+                return Ok(Connected {
+                    tools: harness as Arc<dyn ToolHost>,
+                    root,
+                    location: format!("ssh:{destination}"),
+                    project,
+                    shutdown,
+                });
             }
             let harness = HarnessClient::spawn_stdio(&aimx.to_string_lossy(), &spec.workspace).await?;
             let project = context::project_instructions(harness.peer(), &harness.workspace().id).await;
