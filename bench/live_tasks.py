@@ -116,30 +116,55 @@ OUTPUTS: dict[str, tuple[str, ...]] = {"todo_table": ("REPORT.md", "src/REPORT.m
 # The hidden tests read a report as exact entries (T4b cohort 2, bench/plans/code-mode.md): a path
 # that names the right file, relative to the repository root (or to the directory the prompt
 # names), and the right counts, function or heading for it. Every entry must be right and none may
-# be missing or extra. Markdown decoration (bullets, backticks, bold, table pipes) is ignored.
+# be missing, extra or listed twice, under any spelling. Markdown decoration (bullets, backticks,
+# bold or italic stars, links, table pipes) is ignored.
+#
+# `_LINKS` is shared by the three tests. Where a link stands for a path, `[text](target)` becomes
+# its text if that names a file, else its target if that does; elsewhere it becomes its text.
+_LINKS = r"""
+LINK = re.compile(r'\[([^\]]*)\]\(([^)\s]*)\)')
+FILE = re.compile(r'\.\w+$')
+def link_path(match):
+    label, target = match.group(1).strip(), match.group(2).split('#', 1)[0]
+    return label if FILE.search(label) else target if FILE.search(target) else label
+def unlabel(text):
+    return LINK.sub(lambda match: match.group(1), text)
+def plain(text):
+    return LINK.sub(link_path, text).replace('`', '').replace('*', '').strip()
+"""
+
 _REPORT_TEST = r"""import re, unittest
 EXPECTED = {expected!r}
+""" + _LINKS + r"""
 def cells(line):
-    return [cell.strip().strip('`*').strip() for cell in line.strip().strip('|').split('|')]
+    return [plain(cell) for cell in line.strip().strip('|').split('|')]
+def column(header, *words):
+    return next((index for index, cell in enumerate(header) if any(word in cell.upper() for word in words)), None)
 class TestTask(unittest.TestCase):
     def test_counts(self):
-        rows = [cells(line) for line in open('REPORT.md', encoding='utf-8').read().splitlines() if line.strip().startswith('|')]
-        header = next((row for row in rows if any('TODO' in cell.upper() for cell in row)), None)
+        # A table row may omit its outer pipes (GitHub-flavoured Markdown).
+        rows = [cells(line) for line in open('REPORT.md', encoding='utf-8').read().splitlines() if '|' in line]
+        header = next((row for row in rows if column(row, 'TODO') is not None), None)
         self.assertIsNotNone(header, 'a table with a TODO column')
-        todo = next(index for index, cell in enumerate(header) if 'TODO' in cell.upper())
-        fixme = next((index for index, cell in enumerate(header) if 'FIXME' in cell.upper()), None)
+        todo, fixme = column(header, 'TODO'), column(header, 'FIXME')
         self.assertIsNotNone(fixme, 'a FIXME column')
+        # The file column by its header; else the one column that holds no count.
+        rest = [index for index in range(len(header)) if index not in (todo, fixme)]
+        name_column = column(header, 'FILE', 'PATH', 'NAME')
+        name_column = name_column if name_column is not None else (rest[0] if len(rest) == 1 else None)
+        self.assertIsNotNone(name_column, 'a file column')
         found = {{}}
         for row in rows:
             if row is header or all(set(cell) <= set('-: ') for cell in row):
                 continue
-            name = row[0].removeprefix('./')
-            if not re.search(r'\.\w+$', name):
+            name = row[name_column].removeprefix('./') if name_column < len(row) else ''
+            if not FILE.search(name):
                 continue  # a total or note row names no file
+            self.assertEqual(len(row), len(header), 'a row with the header\'s columns: ' + ' | '.join(row))
             path = name if name.startswith('src/') else 'src/' + name  # relative to src/, as the prompt scopes it
-            self.assertIn(path, EXPECTED, 'not a file under src/: ' + row[0])
+            self.assertIn(path, EXPECTED, 'not a file under src/: ' + row[name_column])
             self.assertNotIn(path, found, 'listed twice: ' + path)
-            self.assertTrue(max(todo, fixme) < len(row) and row[todo].isdigit() and row[fixme].isdigit(), 'counts of ' + path)
+            self.assertTrue(row[todo].isdigit() and row[fixme].isdigit(), 'counts of ' + path)
             found[path] = (int(row[todo]), int(row[fixme]))
         self.assertEqual(found, EXPECTED)
 """
@@ -148,36 +173,41 @@ _CALLERS_TEST = r"""import re, unittest
 EXPECTED = {expected!r}
 QUALIFIED = {{('app/worker.py', 7): 'Worker'}}  # a method may be named with its class
 ENTRY = re.compile(r'(?:\./)?(?P<path>[\w/-]+(?:\.[\w-]+)*\.py):(?P<line>\d+)\s*[:,\-–—]?\s*(?P<name>[A-Za-z_][\w.]*)(?:\(\))?')
+""" + _LINKS + r"""
 class TestTask(unittest.TestCase):
     def test_callers(self):
-        found = set()
+        found = {{}}
         for text in open('CALLERS.md', encoding='utf-8').read().splitlines():
+            # A link's text carries path:line; its target (app/cli.py#L6) does not.
+            text = unlabel(text)
             if not re.search(r'\.py:\d+', text):
                 continue  # a heading or a note
-            plain = re.sub(r'^\s*(?:[-*+]|\d+[.)])\s+', '', text.replace('`', '').replace('**', '').replace('|', ' ')).strip()
-            entry = ENTRY.fullmatch(plain)
+            entry = re.sub(r'^\s*(?:[-+]|\d+[.)])\s+', '', plain(text).replace('|', ' ')).strip()
+            entry = ENTRY.fullmatch(entry)
             self.assertIsNotNone(entry, 'not "path:line function_name" with a path relative to the root: ' + text)
             path, line, name = entry['path'], int(entry['line']), entry['name']
             owner = QUALIFIED.get((path, line))
             if owner and name.startswith(owner + '.'):
                 name = name[len(owner) + 1:]
-            found.add((path, line, name))
-        self.assertEqual(found, set(EXPECTED))
+            self.assertNotIn((path, line), found, 'listed twice: {{}}:{{}}'.format(path, line))
+            found[(path, line)] = name
+        self.assertEqual({{(path, line, name) for (path, line), name in found.items()}}, set(EXPECTED))
 """
 
 _INDEX_TEST = r"""import re, unittest
 EXPECTED = {expected!r}
+""" + _LINKS + r"""
 class TestTask(unittest.TestCase):
     def test_index(self):
         found = {{}}
         for text in open('INDEX.md', encoding='utf-8').read().splitlines():
-            bullet = re.match(r'^\s*[-*+]\s+(.*)$', text)
+            bullet = re.match(r'^\s*(?:[-*+]|\d+[.)])\s+(.*)$', text)
             if not bullet:
-                continue  # the format is "- path: heading"; other lines are titles or notes
-            entry = bullet.group(1).replace('`', '').replace('**', '')
-            link = re.match(r'^\[([^\]]*)\]\(([^)]*)\)(.*)$', entry)
-            if link:
-                entry = link.group(2) + link.group(3)
+                continue  # the format is "- path: heading" (any list marker); other lines are titles or notes
+            # A leading link stands for the path; any other link is heading text.
+            entry = bullet.group(1).replace('`', '').replace('*', '').strip()
+            lead = LINK.match(entry)
+            entry = unlabel(link_path(lead) + entry[lead.end():] if lead else entry)
             path, separator, heading = entry.partition(':')
             self.assertTrue(separator, 'not "- path: heading": ' + text)
             path = path.strip().removeprefix('./')
@@ -186,7 +216,7 @@ class TestTask(unittest.TestCase):
                 continue  # the index itself
             self.assertIn(path, EXPECTED, 'not a Markdown file under docs/: ' + text)
             self.assertNotIn(path, found, 'listed twice: ' + path)
-            found[path] = heading.strip().lstrip('#').strip().strip('"\'').strip()
+            found[path] = heading.strip().lstrip('#').strip().strip('"\'_').strip()
         self.assertEqual({{path: heading.lower() for path, heading in found.items()}},
                          {{path: heading.lower() for path, heading in EXPECTED.items()}})
 """
