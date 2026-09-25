@@ -146,11 +146,14 @@ impl ReservationGuard {
         self.reservation = None;
     }
 
-    /// Cancels now, logging a failure as `what`.
+    /// Cancels now, logging a failure as `what`. The guard stays armed until the harness answers,
+    /// so a future dropped while this cancel is pending still cancels from `Drop` (REV19 B5); the
+    /// retry reuses the idempotency key, so aimx runs the cancel at most once.
     async fn cancel(mut self, what: &str) {
-        if let Some(reservation) = self.reservation.take()
-            && let Err(cleanup) = self.workspace.cancel_blob(reservation, self.cancel_key.clone()).await
-        {
+        let Some(reservation) = self.reservation.clone() else { return };
+        let answered = self.workspace.cancel_blob(reservation, self.cancel_key.clone()).await;
+        self.reservation = None;
+        if let Err(cleanup) = answered {
             tracing::warn!(%cleanup, "could not cancel image reservation after {what}");
         }
     }
@@ -561,6 +564,42 @@ mod tests {
         assert!(workspace.writes.lock().unwrap().is_empty());
     }
 
+    /// A workspace whose first `cancel_blob` never answers, counting calls.
+    #[derive(Default)]
+    struct SlowCancel {
+        cancels: AtomicUsize,
+    }
+
+    impl ToolHost for SlowCancel {
+        fn specs(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn call(&self, _name: String, _arguments: Value, _key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
+            Box::pin(async { Ok(ToolResult::text("workspace result")) })
+        }
+
+        fn reserve_blob(&self, _path: String, _key: IdempotencyKey) -> BoxFuture<Result<String, ProtoError>> {
+            Box::pin(async { Ok("reservation".into()) })
+        }
+
+        fn cancel_blob(&self, _reservation: String, _key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+            if self.cancels.fetch_add(1, Ordering::SeqCst) == 0 { Box::pin(std::future::pending()) } else { Box::pin(async { Ok(()) }) }
+        }
+    }
+
+    /// REV19 B5: a generation dropped while its explicit cancel is still pending (after a provider
+    /// failure) still cancels from `Drop`, rather than losing the cancellation.
+    #[tokio::test]
+    async fn dropping_during_a_pending_cancel_still_cancels() {
+        let workspace = Arc::new(SlowCancel::default());
+        let service = Service { fail_image: true, ..Service::default() };
+        let dispatcher = Dispatcher::with_policy(Arc::clone(&workspace) as Arc<dyn ToolHost>, Arc::new(service), true);
+        let call = dispatcher.call("generate_image".into(), json!({"prompt":"sun","path":"art/sun.png"}), key());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), call).await.is_err(), "the explicit cancel is blocked");
+        assert_eq!(workspace.cancels.load(Ordering::SeqCst), 2, "the dropped call's guard sent the cancel again");
+    }
+
     /// A finalized image is never cancelled afterwards.
     #[tokio::test]
     async fn a_finalized_generation_is_not_cancelled() {
@@ -633,7 +672,8 @@ mod tests {
         harness.shutdown().await;
         let status = tokio::time::timeout(Duration::from_secs(10), child.wait()).await.unwrap().unwrap();
         assert!(status.success());
-        let journal = std::fs::read_dir(home.join(".aim/aimx/reservations")).map_or(0, Iterator::count);
+        let journal = std::fs::read_dir(home.join(".aim/aimx/reservations"))
+            .map_or(0, |dir| dir.flatten().filter(|entry| entry.file_name() != ".lock").count());
         assert_eq!(journal, 0, "no reservation is left in the journal");
         let left: Vec<_> = std::fs::read_dir(root.join("art")).unwrap().flatten().map(|entry| entry.file_name()).collect();
         assert_eq!(left, [std::ffi::OsString::from("live.png")], "only the finalized image is left");

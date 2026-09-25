@@ -795,7 +795,8 @@ mod tests {
         assert!(root.join("art/sun.png").exists());
         client.shutdown().await;
         assert!(!root.join("art/sun.png").exists(), "the unused marker must be cancelled before aimx stops");
-        let journal = std::fs::read_dir(home.join(".aim/aimx/reservations")).unwrap().count();
+        let journal =
+            std::fs::read_dir(home.join(".aim/aimx/reservations")).unwrap().flatten().filter(|entry| entry.file_name() != ".lock").count();
         assert_eq!(journal, 0, "the reservation journal is empty again");
     }
 
