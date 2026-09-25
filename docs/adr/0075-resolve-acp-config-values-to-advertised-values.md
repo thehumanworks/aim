@@ -142,4 +142,21 @@ in an error.
 
 ### Live results
 
-Pending: recorded when the live tests run.
+Recorded 2026-09-25 against claude-agent-acp 0.81.2 with the maintainer's Claude login:
+
+- `live_probe` (before the change): the `model` option offers `default`, `opus[1m]`,
+  `claude-fable-5-1[1m]`, `sonnet`, `haiku` — the fixture list.
+- `cargo test --locked -p aim-acp --test live -- --ignored live_set_config`: `effort=low` and
+  `model=haiku` confirmed; `no-such-model` refused locally with "model `no-such-model` is not
+  offered; the agent offers `default` (Default (recommended)), `opus[1m]` (Opus 5.5),
+  `claude-fable-5-1[1m]` (Fable 5.1), `sonnet` (Sonnet 5), `haiku` (Haiku 4.5)"; `model=opus`
+  resolved to `opus[1m]` and confirmed; the turn replied "OK" with usage model
+  `claude-opus-5-5`. Passed.
+- `cargo test --locked -p aim --test acp_bridge -- --ignored live_acp_claude_session_with_model_alias`:
+  a strict `acp:claude` host session with model `gpt-6` is refused with the same list; with
+  model `opus` it starts on `opus[1m]` and replies "ok". Passed.
+- Release binary built in the worker's worktree (`cargo build --release --locked -p aim -p aimx
+  -p aim-coderun`): `aim run -p acp:claude -m opus "Reply with the word ok."` printed "ok"
+  (`EndTurn`, one request), and `aim sessions` records the session as `acp:claude/opus[1m]`;
+  `aim run -p acp:claude -m gpt-6 …` exits 1 with "acp:claude: model `gpt-6` is not offered;
+  the agent offers …" listing all five values.

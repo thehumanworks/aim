@@ -237,7 +237,8 @@ pub fn set_params(options: &[ConfigOption], key: &ConfigKey, value: &str) -> Res
     Ok((id, resolved, params))
 }
 
-/// The rejection of `value` for `option`, listing what the option offers.
+/// The rejection of `value` for `option`, listing what the option offers. The request is
+/// redacted too: a mistyped secret must not be echoed.
 fn rejected(option: &ConfigOption, value: &str, matches: &[&ConfigValue]) -> AcpError {
     let allowed = match &option.kind {
         ConfigKind::Select { values, .. } => values.iter().map(redacted).collect(),
@@ -246,7 +247,7 @@ fn rejected(option: &ConfigOption, value: &str, matches: &[&ConfigValue]) -> Acp
         }
         ConfigKind::Other { .. } => Vec::new(),
     };
-    let (id, value) = (option.id.clone(), value.to_owned());
+    let (id, value) = (option.id.clone(), redact(value));
     if matches.is_empty() {
         AcpError::ConfigValueRejected { id, value, allowed }
     } else {

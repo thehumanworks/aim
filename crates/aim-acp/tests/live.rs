@@ -322,11 +322,20 @@ async fn live_set_config() {
     let rejected = session.set_config(&ConfigKey::Model, "no-such-model").await.unwrap_err();
     println!("[live_set_config] unadvertised model rejected locally: {rejected}");
     assert!(matches!(rejected, aim_acp::AcpError::ConfigValueRejected { .. }));
+    assert!(rejected.to_string().contains(&format!("`{target}`")), "the refusal lists the offered values: {rejected}");
+
+    // The adapter offers no plain `opus` (ADR 0075): the alias resolves to the advertised Opus
+    // value, which the agent then reports as current.
+    let start = Instant::now();
+    session.set_config(&ConfigKey::Model, "opus").await.unwrap();
+    let opus = session.config_options().iter().find(|o| o.id == "model").and_then(aim_acp::ConfigOption::current).unwrap();
+    println!("[live_set_config] model=opus resolved to {opus} and confirmed in {} ms: {}", start.elapsed().as_millis(), show(&session));
+    assert!(opus.contains("opus"), "{opus}");
 
     let (events, reply, elapsed) = run_turn(&mut session, "Reply with exactly: OK").await;
     let models: Vec<_> = usage_updates(&events).into_iter().filter_map(|u| u.model).collect();
-    println!("[live_set_config] turn on {target}: {} ms, reply {reply:?}, usage model {models:?}", elapsed.as_millis());
-    assert!(models.iter().any(|m| m.contains(target)), "turn did not run on {target}: {models:?}");
+    println!("[live_set_config] turn on opus: {} ms, reply {reply:?}, usage model {models:?}", elapsed.as_millis());
+    assert!(models.iter().any(|m| m.contains("claude-opus")), "turn did not run on Opus: {models:?}");
     session.close().await.unwrap();
     client.shutdown(Duration::from_secs(3)).await;
 }
