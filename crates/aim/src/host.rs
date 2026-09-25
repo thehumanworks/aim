@@ -545,8 +545,25 @@ struct Live {
     /// `ui_*` tools through the outlet each turn runs in.
     ui: Arc<crate::ui::SessionUi>,
     /// What the session can switch to (ADR 0074): the latest options, published under the
-    /// transcript lock so `attach` sees them in its snapshot or on its stream.
-    options: Mutex<Option<SessionOptions>>,
+    /// transcript lock so `attach` sees them in its snapshot or on its stream, and the
+    /// configuration generation lookups are tagged with.
+    options: Mutex<Offered>,
+}
+
+/// A session's latest options, and the generation of its configuration: bumped before every
+/// announced change and at close, so a lookup for an older configuration never publishes, even
+/// when it resolved before it could be aborted (ADR 0074).
+#[derive(Default)]
+struct Offered {
+    generation: u64,
+    latest: Option<SessionOptions>,
+}
+
+/// Starts a new configuration generation; returns it. Lookups tagged with an older one are stale.
+fn next_options_generation(live: &Live) -> u64 {
+    let mut offered = lock(&live.options);
+    offered.generation = offered.generation.wrapping_add(1);
+    offered.generation
 }
 
 impl Live {
@@ -566,7 +583,7 @@ impl Live {
             control,
             close_requested: CancellationToken::new(),
             ui,
-            options: Mutex::new(None),
+            options: Mutex::new(Offered::default()),
         };
         (Arc::new(live), control_rx)
     }
@@ -723,13 +740,17 @@ impl SessionHost {
             return Err(shutting_down());
         }
 
-        let summary = SessionSummary {
+        let mut summary = SessionSummary {
             meta: meta.clone(),
             state: SessionState::Idle,
             persistence: spec.persistence,
             last_activity_ms: session::now_ms(),
             turns: recorder.turns(),
         };
+        // A resumed session's summary shows the model it resumed with, not the one it began with.
+        if let Some(now) = &announced {
+            summary.meta.model.clone_from(&now.model);
+        }
         let (live, control_rx) = Live::new(summary.clone(), transcript, self.config.update_capacity, ui);
         lock(&self.sessions).insert(meta.id.clone(), Arc::clone(&live));
         let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location, announced, options: None };
@@ -876,18 +897,20 @@ async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<Strin
     let _unwatched = live.updates.send(update);
 }
 
-/// Publishes what a session's backend says it can switch to (ADR 0074), unless nothing changed
-/// and nothing is `forced` (after a model change clients expect the new model's options, even
-/// equal ones). Under the transcript lock, like items and surfaces: `attach` sees it in its
-/// snapshot or on its stream. It is not recorded.
-async fn publish_options(live: Arc<Live>, lookup: BackendFuture<'static, Option<SessionOptions>>, forced: bool) {
+/// Publishes what a session's backend says it can switch to (ADR 0074), when the configuration it
+/// was looked up for (`generation`) is still current, unless nothing changed and nothing is
+/// `forced` (after a model change clients expect the new model's options, even equal ones). The
+/// generation is checked and the update sent under the options lock, which also orders every
+/// generation bump before its `ConfigChanged`; and under the transcript lock, like items and
+/// surfaces, so `attach` sees it in its snapshot or on its stream. It is not recorded.
+async fn publish_options(live: Arc<Live>, lookup: BackendFuture<'static, Option<SessionOptions>>, forced: bool, generation: u64) {
     let Some(options) = lookup.await else { return };
     let _ordered = lock(&live.transcript);
-    let mut current = lock(&live.options);
-    if !forced && current.as_ref() == Some(&options) {
+    let mut offered = lock(&live.options);
+    if offered.generation != generation || (!forced && offered.latest.as_ref() == Some(&options)) {
         return;
     }
-    *current = Some(options.clone());
+    offered.latest = Some(options.clone());
     let _unwatched = live.updates.send(SessionUpdate::Options { options });
 }
 
@@ -936,6 +959,8 @@ impl Actor {
         if let Some(lookup) = self.options.take() {
             lookup.abort();
         }
+        // Nothing looked up before the close publishes after it.
+        next_options_generation(&self.live);
         set_state(&self.live, SessionState::Closed);
         self.backend.shutdown().await;
     }
@@ -947,7 +972,8 @@ impl Actor {
         if let Some(lookup) = self.options.take() {
             lookup.abort();
         }
-        self.options = Some(tokio::spawn(publish_options(Arc::clone(&self.live), self.backend.options(), forced)));
+        let generation = lock(&self.live.options).generation;
+        self.options = Some(tokio::spawn(publish_options(Arc::clone(&self.live), self.backend.options(), forced, generation)));
     }
 
     /// Applies a change accepted during the turn that just ended and reports its outcome:
@@ -1000,6 +1026,9 @@ impl Actor {
     /// Records and broadcasts `in_force`; an error when the log could not keep it (nothing is
     /// broadcast then, and the session closes).
     async fn announce(&mut self, in_force: InForce) -> Result<(), String> {
+        // Options looked up for the configuration before this one are stale from here on, before
+        // any client learns of the change (ADR 0074).
+        next_options_generation(&self.live);
         let update = SessionUpdate::ConfigChanged {
             model: in_force.model.clone(),
             effort: in_force.effort.clone(),
@@ -1010,6 +1039,8 @@ impl Actor {
             return Err(why.clone());
         }
         let model_changed = self.announced.as_ref().is_none_or(|before| before.model != in_force.model);
+        // A client attaching later is told the model in force, not the one the session began with.
+        lock(&self.live.summary).meta.model.clone_from(&in_force.model);
         self.announced = Some(in_force);
         self.refresh_options(model_changed);
         Ok(())
@@ -1243,7 +1274,7 @@ impl SessionClient for SessionHost {
                 summary: lock(&live.summary).clone(),
                 transcript: transcript.clone(),
                 surfaces: live.ui.snapshot(),
-                options: lock(&live.options).clone(),
+                options: lock(&live.options).latest.clone(),
             };
             drop(transcript);
             Ok((result, updates_of(rx)))
@@ -1289,5 +1320,61 @@ impl SessionClient for SessionHost {
             live.close_requested.cancel();
             live.control.send(Control::Close).map_err(|_| err(ErrorCode::Unavailable, "session closed"))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aim_proto::daemon::{ChoiceValue, Persistence, SessionOptions, SessionState, SessionSummary, SessionUpdate};
+    use aim_proto::event::SessionMeta;
+
+    use super::{Arc, Live, lock, next_options_generation, publish_options};
+
+    fn options(model: &str) -> SessionOptions {
+        let level = ChoiceValue { value: format!("{model}-level"), name: None, description: None };
+        SessionOptions { models: Vec::new(), efforts: vec![level], auto_effort: None }
+    }
+
+    fn live() -> Arc<Live> {
+        let meta = SessionMeta {
+            id: "s".into(),
+            created_ms: 0,
+            workspace: "/w".into(),
+            location: "local".into(),
+            provider: "p".into(),
+            model: "m1".into(),
+            title: None,
+            parent: None,
+            agent: None,
+        };
+        let summary =
+            SessionSummary { meta, state: SessionState::Idle, persistence: Persistence::Ephemeral, last_activity_ms: 0, turns: 0 };
+        Live::new(summary, Vec::new(), 16, Arc::new(crate::ui::SessionUi::restore("s", &[]))).0
+    }
+
+    /// REV-T1 B1: a lookup that resolves after the configuration changed (too late for its abort)
+    /// publishes nothing, before or after the newer options; nor does one after close.
+    #[tokio::test]
+    async fn a_lookup_for_an_older_configuration_never_publishes() {
+        let live = live();
+        let mut updates = live.updates.subscribe();
+        let (release, gate) = tokio::sync::oneshot::channel::<SessionOptions>();
+        let before = lock(&live.options).generation;
+        let stale = tokio::spawn(publish_options(Arc::clone(&live), Box::pin(async move { gate.await.ok() }), false, before));
+        // The model changes while m1's lookup is in flight; m2's lookup publishes first.
+        let current = next_options_generation(&live);
+        publish_options(Arc::clone(&live), Box::pin(async { Some(options("m2")) }), true, current).await;
+        // Then m1's answer arrives.
+        release.send(options("m1")).unwrap();
+        stale.await.unwrap();
+        assert_eq!(lock(&live.options).latest, Some(options("m2")), "the snapshot keeps the current model's options");
+        assert_eq!(updates.try_recv().unwrap(), SessionUpdate::Options { options: options("m2") });
+        assert!(updates.try_recv().is_err(), "the stale answer was dropped");
+        // A close starts a generation of its own: nothing looked up before it publishes.
+        let open = lock(&live.options).generation;
+        next_options_generation(&live);
+        publish_options(Arc::clone(&live), Box::pin(async { Some(options("m3")) }), true, open).await;
+        assert!(updates.try_recv().is_err());
+        assert_eq!(lock(&live.options).latest, Some(options("m2")));
     }
 }

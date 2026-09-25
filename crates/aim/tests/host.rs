@@ -1262,6 +1262,27 @@ async fn a_session_without_a_catalog_sends_no_options_and_is_not_held_up() {
     until(&mut updates, is_idle).await;
 }
 
+/// A client attaching after a model change is told the model in force, by the live session and by
+/// one resumed from the store (REV: the summary kept the model the session began with).
+#[tokio::test]
+async fn attach_reports_the_model_in_force_after_a_change_and_a_resume() {
+    let m2 = ModelInfo { id: "m2".into(), display_name: "m2".into(), ..ladder_model() };
+    let store = Arc::new(MemoryStore::default());
+    let first = fixture_full(Arc::clone(&store) as Arc<dyn SessionStore>, Arc::clone(&store), Vec::new(), vec![ladder_model(), m2.clone()]);
+    let id = first.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    first.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m2".into()), effort: None }).await.unwrap();
+    let (attached, _) = first.host.attach(id.clone()).await.unwrap();
+    assert_eq!(attached.summary.meta.model, "m2");
+    let listed = first.host.list(SessionListParams::default()).await.unwrap();
+    assert_eq!(listed.iter().find(|s| s.meta.id == id).map(|s| s.meta.model.as_str()), Some("m2"));
+    first.host.shutdown().await.unwrap();
+
+    // A restarted host resumes it with the model its log ended with, and says so.
+    let second = fixture_full(Arc::clone(&store) as Arc<dyn SessionStore>, store, Vec::new(), vec![ladder_model(), m2]);
+    let (resumed, _) = second.host.attach(id).await.unwrap();
+    assert_eq!(resumed.summary.meta.model, "m2");
+}
+
 /// Jev's `auto`: a persistent session with a decider says Jev picks the effort.
 #[tokio::test]
 async fn options_say_what_auto_does_in_an_advised_session() {
