@@ -15,6 +15,7 @@ pub mod authz;
 pub mod dedup;
 pub mod edit;
 mod id;
+pub mod mcp;
 pub mod ring;
 pub mod server;
 pub mod ssh;
