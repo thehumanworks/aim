@@ -86,7 +86,8 @@ everywhere code mode is composed:
 - `acp.rs` derives the Claude aliases from the kernel's answer.
 
 A requested mode that falls back is logged: as a warning when it was set explicitly, at debug
-level when it was the default. A missing worker is normal on some machines.
+level when it was the default, and always at debug level for a ceiling without `run_code`. A
+missing worker is normal on some machines, and a configured ceiling is not a misconfiguration.
 
 ### 3. The code tool sells itself, with types
 
@@ -117,13 +118,15 @@ The model answered that there were no TODOs, which was wrong. So the worker now:
   not defined"). For `require`, a missing module, `fetch` or `process`, it adds that a cell is not
   Node and names `tools.*`. QuickJS's own memory and stack limits stay `LimitExceeded`.
 - returns a cell's last top-level expression statement as its value, as a REPL does, so a
-  trailing promise chain is awaited.
+  trailing promise chain is awaited. This applies to `run_code` and to codex's `exec` cells
+  (ADR 0018's contract gains it; `codex_exec_wait_contract` still passes), not to saved programs,
+  which return from `main`.
 - maps `console.log`, `info`, `warn`, `error` and `debug` to `text`, and `global` to
   `globalThis`.
 
 `run_code` names an empty result: "no output: emit results with text(value), or end the script
-with an expression; await its promises". The description adds "Not Node: no require/import, fs or
-fetch; use tools.*".
+with an expression; await its promises". The `run_code` and `exec` descriptions add "Not Node: no
+require/import, fs or fetch".
 
 ### 4. Claude gets code mode through aim's relay
 
@@ -150,6 +153,9 @@ chosen for four reasons:
 aimx spawns nothing new, and the aim crate's spawning is outside the `crates/aimx/src` OS-access
 rule.
 
+**The relay's executable** is `$AIM_BIN`, else the running process when it is `aim`. An embedder,
+such as a test binary hosting sessions in process, keeps `aimx mcp` rather than spawning itself.
+
 **The relay's session.** A relay session has no named agent (ACP refuses them), so its ceiling
 permits `run_code`. Nested calls from a relay cell run without child events, because no agent
 turn observes them (ADR 0066 §2, "Direct callers").
@@ -170,11 +176,13 @@ turn observes them (ADR 0066 §2, "Direct callers").
 
 `off`, or no worker, keeps `aimx mcp` exactly as before. `acp:claude-native` is unchanged.
 
-**Timeouts.** `AimMcpServer` gives `run_code`, `exec`, `wait` and `run_program` a 330 s call
-timeout: a cell's 300 s maximum deadline plus a margin. Other tools keep 60 s. Claude Code's own
-default MCP tool timeout is 1e8 ms, unless `MCP_TOOL_TIMEOUT` or a per-server `timeout` is set.
-This was read from the `claude` 2.1.282 binary (`a.MCP_TOOL_TIMEOUT??Es`, `Es=1e8`) and is not
-verified against the adapter's bundled build. So long cells are not cut short on Claude's side.
+**Timeouts.** `AimMcpServer` gives `run_code`, `exec`, `wait` and `run_program` at least a 330 s
+call timeout: a cell's 300 s maximum deadline plus a margin. Other tools in `aim mcp` keep 60 s.
+The relay serves every call with a 630 s timeout, because aimx's `Bash` may run 600 s.
+`aim_acp::CODE_RELAY_TOOL_TIMEOUT_MS` holds that value, and it is also Claude's
+`MCP_TOOL_TIMEOUT` in `_meta.claudeCode.options.env` on the code route. Claude Code's own default
+could not be established: the minified `claude` 2.1.282 binary defines its fallback name twice,
+once as `1e3` and once as `1e8`. So aim does not rely on it. `aimx mcp` sessions are unchanged.
 
 ### 5. Benchmark arms
 
@@ -283,16 +291,16 @@ repository and summarize them". The binaries were release builds of this branch.
 |---|---|---|---|---|
 | `only`, before the runtime fixes | 6 | 5 `run_code` | $0.0043 | **wrong**: "no TODO comments" |
 | `only`, after (1) | 2 | 1 `run_code` (1 nested `Grep`) | $0.0012 | right, 4/4 |
-| `only`, after the Node hint (a–e) | 3, 4, 3, 8, 16 | 2, 4, 2, 12, 30 | $0.0019–$0.0089 | right, 4/4 in all five |
+| `only`, after the Node hint (a–e) | 3, 4, 3, 8, 16 | `run_code` 2, 3, 2, 8, 4; `list_programs` 0, 1, 0, 4, 26 | $0.0019–$0.0070 | right, 4/4 in all five |
 | `on` | 3 | 2 `Bash` (no `run_code`) | $0.0016 | right, 4/4 |
 | `off` | 2 | 2 `Grep` | $0.0017 | right, 4/4 |
 
 - **Before the fixes**, the model's scripts failed silently (see Decision §3), and it answered
   that there were no TODOs.
 - **After the fixes**, every `only` run was right, but the cost varied widely. gpt-4.1-mini
-  still writes `require('fs')` first. Its two long runs (8 and 16 requests) spent most of their
-  calls on `list_programs`, which answers `[]`: in `only`, the program tools distract a weak model.
-  That is an input for the benchmark, not fixed here.
+  still writes `require('fs')` first. Its longest run (16 requests) spent 26 of its 30 calls on
+  `list_programs`, which answers `[]`: in `only`, the program tools distract a weak model. That
+  is an input for the benchmark, not fixed here.
 - **These are single runs, not a benchmark.** They show the modes work end to end; they do not
   choose the default.
 
@@ -304,6 +312,18 @@ repository and summarize them". The binaries were release builds of this branch.
   23,756 input tokens (11,740 cached) and 311 output tokens.
 - **`only`:** the session started, so the conformance challenge passed through `run_code`.
   Claude again used one `run_code` cell and answered right.
+
+**`acp:claude` over SSH** (`acp_bridge.rs` `live_acp_claude_ssh_remote_changed_local_untouched`,
+private sshd; it spawns the `aim` binary, so the relay applies):
+
+- **`AIM_CODE_MODE=only`:** the SSH conformance write went through `run_code`, and Claude did the
+  test's read, edit, glob, grep and run steps in two `mcp__aim__run_code` cells. The remote file
+  changed and the local sentinel did not.
+- **The default (`on`):** Claude called `Read`, `Edit` and `Bash` directly, and `run_code` for
+  the hidden `Glob` and `Grep`.
+
+Both passed. The relay needs the adapter to pass its environment to MCP servers: `HOME`, `PATH`
+and `SSH_AUTH_SOCK` for `aimx serve --ssh`. The `aimx mcp` relay needs the same.
 
 **Smoke tests:** `live_openrouter_code_mode_only_summarizes_todos_through_run_code` and
 `live_acp_claude_code_mode_only_works_through_the_relay` (`crates/aim/tests/code_mode.rs`, run by

@@ -490,7 +490,7 @@ impl ToolHost for CodeToolHost {
                 spec(
                     "exec",
                     &format!(
-                        "Run raw JavaScript in an isolated async cell. Prefer one script to several tool calls for multi-step work and fan-out: await Promise.all([tools.NAME(args), ...]) runs calls together. Use text(value), store/load, notify and yield_control(). A result's .text is its text. Optional // @exec: {{\"yield_time_ms\":10000,\"max_output_tokens\":1000}}; use wait for running cells.\n{index}"
+                        "Run raw JavaScript in an isolated async cell. Prefer one script to several tool calls for multi-step work and fan-out: await Promise.all([tools.NAME(args), ...]) runs calls together. Use text(value), store/load, notify and yield_control(). A result's .text is its text. Not Node: no require/import, fs or fetch. Optional // @exec: {{\"yield_time_ms\":10000,\"max_output_tokens\":1000}}; use wait for running cells.\n{index}"
                     ),
                     ToolInput::Freeform { syntax: None, definition: None },
                     Value::Null,

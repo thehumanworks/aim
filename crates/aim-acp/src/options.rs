@@ -26,6 +26,11 @@ pub const DEFAULT_ALIASES: [(&str, &str); 6] = [
 /// The code tool of aim's code-mode relay, as Claude names it (ADR 0076).
 pub const AIM_CODE_TOOL: &str = "mcp__aim__run_code";
 
+/// The longest a call to aim's code-mode relay may take, on either side: above its longest tool
+/// (a 600 s `Bash`, or a cell's 300 s deadline) with a margin (ADR 0076). Claude is told it as
+/// `MCP_TOOL_TIMEOUT` rather than relying on its default.
+pub const CODE_RELAY_TOOL_TIMEOUT_MS: u64 = 630_000;
+
 /// Which strict aim relay a session uses, and so which aim tools stand in for Claude's built-ins
 /// (ADR 0076).
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -290,6 +295,9 @@ impl SessionOptions {
             // removes (docs/research/acp-mcp.md §2.7 caveat 5).
             let mut env = options.get("env").and_then(Value::as_object).cloned().unwrap_or_default();
             env.insert("ENABLE_TOOL_SEARCH".into(), json!("false"));
+            if matches!(self.tool_authority, ToolAuthority::Aim) && matches!(self.aim_route, AimRoute::Code { .. }) {
+                env.insert("MCP_TOOL_TIMEOUT".into(), json!(CODE_RELAY_TOOL_TIMEOUT_MS.to_string()));
+            }
             options.insert("env".into(), Value::Object(env));
         }
         if !self.persist {

@@ -239,7 +239,7 @@ impl AcpBackend {
             }
         };
         let cwd = scratch.as_ref().map_or_else(|| PathBuf::from(&root), |dir| dir.path().to_path_buf());
-        let aim = std::env::current_exe().ok();
+        let aim = aim_executable();
         let (relay, route) = strict_relay(aim.as_deref(), aimx, &root, &spec.location, crate::providers::code_mode());
         let client = AcpClient::spawn(agent.with_cwd(cwd.clone())).await.map_err(|err| err.to_string())?;
         let mut options = SessionOptions::strict_aim_via(&cwd, relay.clone(), route.clone()).map_err(|err| err.to_string())?;
@@ -508,6 +508,16 @@ pub fn agent_for(provider: &str) -> Option<AcpAgentConfig> {
     }
 }
 
+/// The `aim` executable that serves the code-mode relay: `$AIM_BIN`, else this process when it is
+/// `aim`. An embedder (a test binary, say) has none unless it names one, and its strict sessions
+/// keep `aimx mcp`, rather than spawning itself as the relay.
+fn aim_executable() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("AIM_BIN") {
+        return Some(PathBuf::from(path));
+    }
+    std::env::current_exe().ok().filter(|exe| exe.file_name().is_some_and(|name| name == "aim"))
+}
+
 /// The strict relay for a workspace, and its kind. When code mode is on or only (ADR 0076) and
 /// aim's own executable is known, it is aim's code-mode relay (`aim code-mcp`), which connects the
 /// workspace through `aimx` and shows the mode's direct tools beside `run_code`; otherwise it is
@@ -718,6 +728,7 @@ mod tests {
             ])
         );
         let options = &on["_meta"]["claudeCode"]["options"];
+        assert_eq!(options["env"]["MCP_TOOL_TIMEOUT"], "630000", "Claude waits as long as the relay's longest call");
         assert_eq!(
             options["toolAliases"],
             json!({"Bash": "mcp__aim__Bash", "Edit": "mcp__aim__Edit", "Read": "mcp__aim__Read", "Write": "mcp__aim__Write"}),
@@ -735,6 +746,7 @@ mod tests {
         assert_eq!(off["mcpServers"][0]["command"], "/opt/aim/aimx");
         assert_eq!(off["mcpServers"][0]["args"], json!(["mcp", "--stdio", "--root", "/w"]));
         assert_eq!(off["_meta"]["claudeCode"]["options"]["toolAliases"]["Glob"], "mcp__aim__glob");
+        assert!(off["_meta"]["claudeCode"]["options"]["env"].get("MCP_TOOL_TIMEOUT").is_none(), "aimx mcp is unchanged");
     }
 
     #[test]

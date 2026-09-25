@@ -71,13 +71,14 @@ pub const fn reason(fallback: Fallback) -> &'static str {
 
 /// Asks the kernel what a session is offered ([`aim_kernel::code_mode::decide`], with the
 /// provisional [`DEFAULT_MODE`]) and logs a fallback: as a warning when the mode was asked for
-/// explicitly, else at debug level (an unset request on a machine without the worker is normal).
+/// explicitly, else at debug level (an unset request on a machine without the worker is normal,
+/// and so is an agent whose ceiling leaves out `run_code`).
 #[must_use]
 pub fn decide(requested: Option<Mode>, worker: bool, platform: bool, permitted: bool) -> Exposure {
     let exposure = aim_kernel::code_mode::decide(requested, DEFAULT_MODE, worker, platform, permitted);
     if let Some(fallback) = exposure.fallback {
         let wanted = label(requested.unwrap_or(DEFAULT_MODE));
-        if requested.is_some() {
+        if requested.is_some() && fallback != Fallback::NotPermitted {
             tracing::warn!("code mode `{wanted}` is off: {}", reason(fallback));
         } else {
             tracing::debug!("code mode `{wanted}` (the default) is off: {}", reason(fallback));

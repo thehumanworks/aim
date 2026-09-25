@@ -119,7 +119,9 @@ where
     W: AsyncWrite + Unpin,
 {
     let (tools, shutdown) = relay.connect().await.map_err(|err| format!("code-mode relay: {}", err.message))?;
-    let served = super::server::AimMcpServer::new(Arc::clone(&tools)).serve(reader, writer).await;
+    // Direct `Bash` calls may run 600 s and cells 300 s: the relay waits as long as Claude does.
+    let timeout = Duration::from_millis(aim_acp::CODE_RELAY_TOOL_TIMEOUT_MS);
+    let served = super::server::AimMcpServer::new(Arc::clone(&tools)).with_call_timeout(timeout).serve(reader, writer).await;
     drop(tools);
     shutdown().await;
     served.map_err(|_| "code-mode relay: MCP stdio transport failed".to_owned())
