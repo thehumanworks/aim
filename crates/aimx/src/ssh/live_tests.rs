@@ -493,6 +493,46 @@ async fn linux_master_recovery(sshd: &LinuxSshd) {
     assert!(short.check_master().await, "Linux recovery bypassed multiplexing");
 }
 
+async fn linux_concurrent_release(connection: &Connection, workspace: &Arc<AgentlessWorkspace>, root: &str) {
+    // N3: process slots plus transient reads fill sshd's ten-session limit. Concurrent release
+    // must still kill every process, report failures, and leave capacity for the reads.
+    let mut processes = Vec::new();
+    for index in 0..6 {
+        let marker = format!("{root}/sleep-{index}.pid");
+        let script = format!("sleep 30 & printf '%s' \"$!\" > {marker}; wait");
+        let proc = linux_spawn(workspace, root, script, None).await;
+        processes.push((proc, marker));
+    }
+    for (_, marker) in &processes {
+        for _ in 0..40 {
+            if workspace.fs().read(marker, None, 100, true).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(workspace.fs().read(marker, None, 100, true).await.is_ok(), "Linux sleep PID marker missing");
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for (proc, _) in &processes {
+        let workspace = Arc::clone(workspace);
+        let proc = proc.clone();
+        tasks.spawn(async move { workspace.exec().expect("exec").release(&proc).await.expect("concurrent Linux release") });
+    }
+    for _ in 0..3 {
+        let workspace = Arc::clone(workspace);
+        let root = root.to_owned();
+        tasks.spawn(async move {
+            workspace.fs().stat(&root, false).await.expect("concurrent Linux stat");
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.expect("Linux concurrent operation panicked");
+    }
+    for (_, marker) in &processes {
+        assert_linux_sleep_stopped(connection, workspace, marker).await;
+    }
+}
+
 async fn linux_regressions(distribution: &str) {
     let sshd = LinuxSshd::start(distribution);
     let connection = sshd.connect().await;
@@ -569,42 +609,7 @@ async fn linux_regressions(distribution: &str) {
     assert_eq!(linux_exit(&workspace, &proc).await, ExitStatus::TimedOut);
     assert_linux_sleep_stopped(&connection, &workspace, &marker).await;
 
-    // N3: process slots plus transient reads fill sshd's ten-session limit. Concurrent release
-    // must still kill every process, report failures, and leave capacity for the reads.
-    let mut processes = Vec::new();
-    for index in 0..6 {
-        let marker = format!("{root}/sleep-{index}.pid");
-        let script = format!("sleep 30 & printf '%s' \"$!\" > {marker}; wait");
-        let proc = linux_spawn(&workspace, root, script, None).await;
-        processes.push((proc, marker));
-    }
-    for (_, marker) in &processes {
-        for _ in 0..40 {
-            if workspace.fs().read(marker, None, 100, true).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(workspace.fs().read(marker, None, 100, true).await.is_ok(), "Linux sleep PID marker missing");
-    }
-    let mut tasks = tokio::task::JoinSet::new();
-    for (proc, _) in &processes {
-        let workspace = Arc::clone(&workspace);
-        let proc = proc.clone();
-        tasks.spawn(async move { workspace.exec().expect("exec").release(&proc).await.expect("concurrent Linux release") });
-    }
-    for _ in 0..3 {
-        let workspace = Arc::clone(&workspace);
-        tasks.spawn(async move {
-            workspace.fs().stat(root, false).await.expect("concurrent Linux stat");
-        });
-    }
-    while let Some(result) = tasks.join_next().await {
-        result.expect("Linux concurrent operation panicked");
-    }
-    for (_, marker) in &processes {
-        assert_linux_sleep_stopped(&connection, &workspace, marker).await;
-    }
+    linux_concurrent_release(&connection, &workspace, root).await;
 }
 
 fn linux_target_enabled(distribution: &str) -> bool {
@@ -1782,6 +1787,21 @@ async fn live_ssh_aim_run_openrouter_edits_and_executes_remote_file() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("ssh-ok"), "agent should report execution output");
 }
 
+async fn assert_agentless_prefix_read(workspace: &AgentlessWorkspace, file: &str, full_size: u64) {
+    let prefix = workspace.fs().read(file, None, 4, false).await.expect("prefix read");
+    assert_eq!(prefix.content.into_bytes(), b"firs");
+    assert_eq!(prefix.size, full_size);
+    assert!(prefix.hash.is_none());
+    assert!(prefix.truncated);
+    let past_end = workspace
+        .fs()
+        .read(file, Some(aim_proto::harness::ByteRange { start: u64::MAX, len: 4 }), 4, false)
+        .await
+        .expect("out-of-range prefix read");
+    assert!(past_end.content.into_bytes().is_empty());
+    assert!(!past_end.truncated);
+}
+
 async fn exercise_agentless(sshd: &Sshd, connection: Connection) {
     let remote_root = sshd.remote_root("agentless");
     let local_root = sshd.local_root("agentless");
@@ -1807,18 +1827,7 @@ async fn exercise_agentless(sshd: &Sshd, connection: Connection) {
     assert!(timed("stat", workspace.fs().stat(&file, true)).await.expect("stat").hash.is_some());
     let read = timed("read", workspace.fs().read(&file, None, 100, true)).await.expect("read");
     assert_eq!(read.content, content);
-    let prefix = workspace.fs().read(&file, None, 4, false).await.expect("prefix read");
-    assert_eq!(prefix.content.into_bytes(), b"firs");
-    assert_eq!(prefix.size, content.len() as u64);
-    assert!(prefix.hash.is_none());
-    assert!(prefix.truncated);
-    let past_end = workspace
-        .fs()
-        .read(&file, Some(aim_proto::harness::ByteRange { start: u64::MAX, len: 4 }), 4, false)
-        .await
-        .expect("out-of-range prefix read");
-    assert!(past_end.content.into_bytes().is_empty());
-    assert!(!past_end.truncated);
+    assert_agentless_prefix_read(&workspace, &file, content.len() as u64).await;
     let edit = ExactEdit { old: "before".to_owned(), new: "after".to_owned(), replace_all: false };
     timed(
         "edit",
