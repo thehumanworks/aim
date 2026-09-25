@@ -21,6 +21,9 @@ use crate::workspace::{BoxFuture, GlobQuery, GrepQuery, Outcome, Search};
 
 /// Longest line (in bytes) returned in a match or context line; longer lines are cut.
 const MAX_LINE_BYTES: usize = 4096;
+/// Text (paths and lines) collected per search before it is reported as truncated, so a result
+/// always fits in one message (JSON escaping can grow text up to six-fold; 16 MiB messages).
+const MAX_RESULT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Search over the local filesystem.
 #[derive(Debug)]
@@ -64,7 +67,20 @@ struct Collector<'a> {
     first: usize,
     pending_before: Vec<String>,
     limit: usize,
+    bytes: &'a mut usize,
     truncated: &'a mut bool,
+}
+
+impl Collector<'_> {
+    /// Accounts for `text`; false once the byte budget is spent.
+    fn charge(&mut self, text: &str) -> bool {
+        *self.bytes = self.bytes.saturating_add(text.len());
+        if *self.bytes > MAX_RESULT_BYTES {
+            *self.truncated = true;
+            return false;
+        }
+        true
+    }
 }
 
 impl Sink for Collector<'_> {
@@ -75,10 +91,15 @@ impl Sink for Collector<'_> {
             *self.truncated = true;
             return Ok(false);
         }
+        let text = line_text(mat.bytes());
+        let path = self.path;
+        if !self.charge(path) || !self.charge(&text) {
+            return Ok(false);
+        }
         self.matches.push(GrepMatch {
             path: self.path.to_owned(),
             line: mat.line_number().unwrap_or(0),
-            text: line_text(mat.bytes()),
+            text,
             before: std::mem::take(&mut self.pending_before),
             after: Vec::new(),
         });
@@ -87,6 +108,9 @@ impl Sink for Collector<'_> {
 
     fn context(&mut self, _searcher: &Searcher, context: &SinkContext<'_>) -> Result<bool, io::Error> {
         let text = line_text(context.bytes());
+        if !self.charge(&text) {
+            return Ok(false);
+        }
         match context.kind() {
             SinkContextKind::Before => self.pending_before.push(text),
             SinkContextKind::After | SinkContextKind::Other => {
@@ -149,6 +173,7 @@ fn grep(base: &Base, job: &GrepJob) -> Outcome<GrepResult> {
     let limit = usize::try_from(max).unwrap_or(usize::MAX);
     let mut matches = Vec::new();
     let mut truncated = false;
+    let mut bytes = 0usize;
     for entry in walk.build() {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -156,7 +181,15 @@ fn grep(base: &Base, job: &GrepJob) -> Outcome<GrepResult> {
         }
         let rel = base.relative(entry.path());
         let first = matches.len();
-        let mut sink = Collector { path: &rel, matches: &mut matches, first, pending_before: Vec::new(), limit, truncated: &mut truncated };
+        let mut sink = Collector {
+            path: &rel,
+            matches: &mut matches,
+            first,
+            pending_before: Vec::new(),
+            limit,
+            bytes: &mut bytes,
+            truncated: &mut truncated,
+        };
         if let Err(err) = searcher.search_path(&regex, entry.path(), &mut sink) {
             tracing::debug!(%err, path = %rel, "skipping an unreadable file");
         }
@@ -187,6 +220,7 @@ fn glob(base: &Base, patterns: &[String], path: &str, max: u32) -> Outcome<GlobR
     let limit = usize::try_from(max).unwrap_or(usize::MAX);
     let mut paths = Vec::new();
     let mut truncated = false;
+    let mut bytes = 0usize;
     for entry in walker(&start, hidden).build() {
         let Ok(entry) = entry else { continue };
         if entry.depth() == 0 || entry.file_type().is_some_and(|t| t.is_dir()) {
@@ -194,11 +228,13 @@ fn glob(base: &Base, patterns: &[String], path: &str, max: u32) -> Outcome<GlobR
         }
         let Ok(within) = entry.path().strip_prefix(&start) else { continue };
         if set.is_match(within) {
-            if paths.len() >= limit {
+            let path = base.relative(entry.path());
+            bytes = bytes.saturating_add(path.len());
+            if paths.len() >= limit || bytes > MAX_RESULT_BYTES {
                 truncated = true;
                 break;
             }
-            paths.push(base.relative(entry.path()));
+            paths.push(path);
         }
     }
     paths.sort();

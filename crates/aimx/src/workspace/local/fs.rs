@@ -211,11 +211,11 @@ fn write(
     let real = base.resolve(path, Follow::Final)?;
     base.check_protected(&real, false)?;
     let _serial = lock(mutations);
+    let current = existing(&real, path)?;
+    check_precondition(&real, current.is_some(), precondition, path)?;
     if create_dirs && let Some(parent) = real.parent() {
         fs::create_dir_all(parent).map_err(|err| io_error(&err, path))?;
     }
-    let current = existing(&real, path)?;
-    check_precondition(&real, current.is_some(), precondition, path)?;
     let exclusive = matches!(precondition, Precondition::IfAbsent);
     atomic_replace(&real, bytes, current.as_ref().map(fs::Metadata::permissions), exclusive, path)?;
     Ok(WriteOutcome { hash: hash_bytes(bytes), size: bytes.len() as u64, created: current.is_none() })

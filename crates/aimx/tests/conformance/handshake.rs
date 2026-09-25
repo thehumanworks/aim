@@ -19,7 +19,8 @@ async fn initialize_negotiates_and_reports_limits() {
     assert!(!init.principal.read_only);
     assert_eq!(init.limits.resume_ttl_secs, 1800);
     assert_eq!(init.limits.output_ring_bytes, 8 * 1024 * 1024);
-    assert!(init.limits.max_read_bytes < init.limits.max_message_bytes);
+    // Even fully escaped (`\u0000` is six bytes per input byte) a read fits in one message.
+    assert!(init.limits.max_read_bytes * 6 < init.limits.max_message_bytes);
 
     let again = client.peer.call::<Initialize>(init_params(1, 1, None)).await.unwrap_err();
     assert_eq!(again.code, ErrorCode::InvalidRequest);

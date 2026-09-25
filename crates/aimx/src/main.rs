@@ -71,6 +71,7 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
                 outcome = server.serve_listener(listener) => outcome.map_err(|err| format!("accept: {err}"))?,
                 _ = tokio::signal::ctrl_c() => tracing::info!("interrupted; shutting down"),
             }
+            server.shutdown().await;
             if let Err(err) = std::fs::remove_file(&path) {
                 tracing::debug!(%err, "could not remove the socket");
             }

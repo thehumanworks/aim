@@ -54,15 +54,16 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Defaults for `principal`: 16 MiB messages, 8 MiB reads and output rings, a 10-minute dedup
-    /// window with 24-hour tombstones, and a 30-minute resume TTL.
+    /// Defaults for `principal`: 16 MiB messages, 2 MiB reads (JSON escaping can grow text up to
+    /// six-fold, so a read always fits in a message), 8 MiB output rings, a 10-minute dedup window
+    /// with 24-hour tombstones, and a 30-minute resume TTL.
     #[must_use]
     pub fn new(principal: Principal, protected: ProtectedPaths) -> Self {
         Self {
             principal,
             protected,
             max_message_bytes: aim_rpc::DEFAULT_MAX_MESSAGE_BYTES as u64,
-            max_read_bytes: 8 * 1024 * 1024,
+            max_read_bytes: 2 * 1024 * 1024,
             output_ring_bytes: 8 * 1024 * 1024,
             dedup_window: Duration::from_secs(600),
             tombstone_ttl: Duration::from_hours(24),
@@ -286,10 +287,20 @@ impl Server {
         peer
     }
 
-    /// Serves stdin/stdout as one connection until it closes (what SSH bootstrap runs).
+    /// Serves stdin/stdout as one connection until it closes (what SSH bootstrap runs). Nothing
+    /// can resume a stdio session, so its processes are released when it ends.
     pub async fn serve_stdio(&self) {
         let peer = self.connect(tokio::io::stdin(), tokio::io::stdout());
         peer.closed().await;
+        self.shutdown().await;
+    }
+
+    /// Ends every session, releasing (killing) their processes.
+    pub async fn shutdown(&self) {
+        let sessions: Vec<Arc<Session>> = lock(&self.state.sessions).drain().map(|(_, session)| session).collect();
+        for session in sessions {
+            session.close().await;
+        }
     }
 
     /// Binds a unix socket at `path`: creates a missing parent directory with mode 0700, removes a

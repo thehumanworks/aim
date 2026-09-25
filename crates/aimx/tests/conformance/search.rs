@@ -138,3 +138,18 @@ async fn glob_respects_gitignore_and_is_sorted() {
     let err = client.peer.call::<Glob>(glob(&["a[b"], None, None)).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidParams);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn results_stay_within_one_message() {
+    let env = env().await;
+    let line = format!("match {}\n", "x".repeat(94));
+    std::fs::write(env.path("big.txt"), line.repeat(40_000)).unwrap();
+    let (client, init, ws) = session(&env).await;
+    let mut params = grep(&ws, "match");
+    params.max_matches = Some(100_000);
+    let found = run(&client, params).await;
+    assert!(found.truncated);
+    let bytes: usize = found.matches.iter().map(|m| m.path.len() + m.text.len()).sum();
+    assert!(bytes <= 2 * 1024 * 1024 + 200, "{bytes}");
+    assert!(serde_json::to_vec(&found).unwrap().len() < usize::try_from(init.limits.max_message_bytes).unwrap());
+}
