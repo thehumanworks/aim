@@ -9,11 +9,11 @@
 //! every glob hit checked, through [`Beneath`], by descriptors from the start directory the
 //! resolution held open (REV4-A finding 3). An entry that no longer resolves inside is skipped.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use aim_proto::error::{ErrorCode, ProtoError};
@@ -40,8 +40,9 @@ const MAX_RESULT_BYTES: usize = 2 * 1024 * 1024;
 struct Beneath<'a> {
     /// The start: a directory, or (a single-file search) the directory holding the file and its name.
     start: Start<'a>,
-    /// The last directory opened, by its path relative to the start.
-    cached: Option<(PathBuf, OwnedFd)>,
+    /// The directories opened for the last lookup, from the start down (the walk is sorted, so
+    /// consecutive lookups share most of it and each directory is opened about once).
+    stack: Vec<(OsString, OwnedFd)>,
 }
 
 enum Start<'a> {
@@ -56,7 +57,7 @@ impl<'a> Beneath<'a> {
             (None, Ok(dir), Some(name)) if loc.missing.is_empty() => Start::File(dir, name),
             _ => return None,
         };
-        Some(Self { start, cached: None })
+        Some(Self { start, stack: Vec::new() })
     }
 
     /// The directory `rel` (relative to the start), opened component by component without
@@ -65,17 +66,20 @@ impl<'a> Beneath<'a> {
         let Start::Dir(start) = self.start else {
             return Err(io::Error::new(io::ErrorKind::NotADirectory, "the start is a file"));
         };
-        if self.cached.as_ref().is_none_or(|(cached, _)| cached != rel) {
-            let mut current = start.try_clone()?;
-            for component in rel.components() {
-                let Component::Normal(name) = component else {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a plain relative path"));
-                };
-                current = open_dir(&current, name)?;
-            }
-            self.cached = Some((rel.to_path_buf(), current));
+        let mut names = Vec::new();
+        for component in rel.components() {
+            let Component::Normal(name) = component else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a plain relative path"));
+            };
+            names.push(name);
         }
-        self.cached.as_ref().map(|(_, fd)| fd).ok_or_else(|| io::Error::other("no directory"))
+        let common = self.stack.iter().zip(&names).take_while(|((held, _), wanted)| held.as_os_str() == **wanted).count();
+        self.stack.truncate(common);
+        for name in names.into_iter().skip(common) {
+            let opened = open_dir(self.stack.last().map_or(start, |(_, fd)| fd), name)?;
+            self.stack.push((name.to_owned(), opened));
+        }
+        Ok(self.stack.last().map_or(start, |(_, fd)| fd))
     }
 
     /// The directory holding `rel` and its name.
