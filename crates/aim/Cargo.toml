@@ -18,6 +18,7 @@ test-support = []
 
 [dependencies]
 aim-acp = { path = "../aim-acp" }
+aim-coderun = { path = "../aim-coderun" }
 aim-kernel = { path = "../aim-kernel" }
 aim-llm = { path = "../aim-llm" }
 aim-llm-codex = { path = "../aim-llm-codex" }

@@ -1,0 +1,376 @@
+//! `QuickJS` cell execution. The worker has no host bindings other than its parent RPC peer.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use aim_proto::error::{ErrorCode, ProtoError};
+use aim_rpc::Peer;
+use oxc_allocator::Allocator;
+use oxc_ast::ast::{ComputedMemberExpression, ExportDefaultDeclarationKind, Expression, Statement, StaticMemberExpression};
+use oxc_ast_visit::Visit;
+use oxc_ast_visit::walk::{walk_computed_member_expression, walk_static_member_expression};
+use oxc_codegen::Codegen;
+use oxc_parser::Parser;
+use oxc_semantic::SemanticBuilder;
+use oxc_span::{GetSpan, SourceType};
+use oxc_transformer::{TransformOptions, Transformer};
+use rquickjs::prelude::{Async, Func};
+use rquickjs::{AsyncContext, AsyncRuntime, Promise, Value as JsValue};
+use serde_json::Value;
+use tokio::sync::mpsc;
+
+use crate::protocol::{CallTool, CellOutput, Execute, ExecuteResult, Output, ToolCall};
+
+const BOOTSTRAP: &str = r"
+const __aimToolSpecs = JSON.parse(__aimToolsJson);
+const __aimToolNames = new Set(__aimToolSpecs.map(t => t.name));
+const ALL_TOOLS = Object.freeze(__aimToolSpecs.map(t => Object.freeze({name:t.name,description:t.description})));
+const __aimStore = Object.assign(Object.create(null), JSON.parse(__aimStoreJson));
+function store(key, value) { __aimStore[String(key)] = value; }
+function load(key) { return __aimStore[String(key)]; }
+function __aimFormat(value) {
+  if (typeof value === 'string') return value;
+  const s = JSON.stringify(value);
+  return s === undefined ? String(value) : s;
+}
+function text(value) { __aimEmit(__aimFormat(value), false, false); }
+function image(value) { __aimEmit(__aimFormat(value), false, false); }
+function audio(value) { __aimEmit(__aimFormat(value), false, false); }
+function generatedImage(value) { __aimEmit(__aimFormat(value), false, false); }
+function notify(value) { __aimEmit(__aimFormat(value), true, false); }
+function yield_control() { __aimEmit('', true, true); }
+function exit() { throw new Error('__AIM_EXIT__'); }
+function describe(name) { return __aimToolSpecs.find(t => t.name === name); }
+function search(query) {
+  const q = String(query).toLowerCase();
+  return __aimToolSpecs.filter(t => (t.name + ' ' + t.description).toLowerCase().includes(q));
+}
+function __aimTool(name) {
+  if (typeof name !== 'string') return undefined;
+  const canonical = name.startsWith('functions.') ? name.slice('functions.'.length) : name;
+  if (!__aimToolNames.has(canonical)) return undefined;
+  return async (arguments_) => {
+    const response = JSON.parse(await __aimCallTool(canonical, JSON.stringify(arguments_ ?? {})));
+    if (!response.ok) throw new Error(response.error);
+    return response.result;
+  };
+}
+const __aimFunctions = new Proxy(Object.create(null), {
+  get(_target, name) { return __aimTool(name); }
+});
+const tools = new Proxy(Object.create(null), {
+  get(_target, name) { return name === 'functions' ? __aimFunctions : __aimTool(name); }
+});
+globalThis.tools = tools;
+globalThis.ALL_TOOLS = ALL_TOOLS;
+globalThis.functions = __aimFunctions;
+const __aimTimers = new Map();
+let __aimNextTimer = 0;
+function setTimeout(callback, delay_ms) {
+  const id = ++__aimNextTimer;
+  const timer = {cancelled:false};
+  __aimTimers.set(id, timer);
+  __aimDelay(Math.min(60000, Math.max(0, Math.trunc(Number(delay_ms) || 0)))).then(() => {
+    __aimTimers.delete(id);
+    if (!timer.cancelled) callback();
+  });
+  return id;
+}
+function clearTimeout(id) {
+  const timer = __aimTimers.get(id);
+  if (timer) timer.cancelled = true;
+  __aimTimers.delete(id);
+}
+";
+
+/// Backend boundary for future language runtimes.
+pub trait CodeRuntime: Send + Sync {
+    /// Executes one cell, returning only explicit output and its store snapshot.
+    fn execute(&self, request: Execute, parent: Peer) -> Pin<Box<dyn Future<Output = Result<ExecuteResult, ProtoError>> + Send>>;
+}
+
+/// JavaScript and TypeScript backend using QuickJS-ng.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QuickJsRuntime;
+
+impl CodeRuntime for QuickJsRuntime {
+    fn execute(&self, request: Execute, parent: Peer) -> Pin<Box<dyn Future<Output = Result<ExecuteResult, ProtoError>> + Send>> {
+        Box::pin(run_cell(request, parent))
+    }
+}
+
+#[derive(Default)]
+struct Emitted {
+    output: String,
+    bytes: usize,
+    yielded: bool,
+    exceeded: bool,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Strips TypeScript types. JavaScript passes through the same parser for syntax validation.
+///
+/// # Errors
+/// Invalid source is rejected before it enters `QuickJS`.
+pub fn strip_types(source: &str) -> Result<String, ProtoError> {
+    let allocator = Allocator::default();
+    let path = Path::new("cell.ts");
+    let source_type = SourceType::from_path(path).map_err(|err| ProtoError::new(ErrorCode::InvalidParams, err.to_string()))?;
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if let Some(diagnostic) = parsed.diagnostics.first() {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, diagnostic.to_string()));
+    }
+    let mut program = parsed.program;
+    let semantic = SemanticBuilder::new().build(&program);
+    if let Some(diagnostic) = semantic.diagnostics.first() {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, diagnostic.to_string()));
+    }
+    let result =
+        Transformer::new(&allocator, path, &TransformOptions::default()).build_with_scoping(semantic.semantic.into_scoping(), &mut program);
+    if let Some(diagnostic) = result.diagnostics.first() {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, diagnostic.to_string()));
+    }
+    Ok(Codegen::new().build(&program).code)
+}
+
+/// Finds literal `tools.name` and `tools['name']` references in JS/TS source.
+/// Dynamic property access has no statically known name and is still denied at runtime unless
+/// the caller explicitly advertised the resulting tool in [`Execute::tools`].
+///
+/// # Errors
+/// Invalid JS/TS source is rejected.
+pub fn referenced_tools(source: &str) -> Result<BTreeSet<String>, ProtoError> {
+    let allocator = Allocator::default();
+    let source_type =
+        SourceType::from_path(Path::new("program.ts")).map_err(|err| ProtoError::new(ErrorCode::InvalidParams, err.to_string()))?;
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if let Some(diagnostic) = parsed.diagnostics.first() {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, diagnostic.to_string()));
+    }
+    let mut finder = Finder(BTreeSet::new());
+    finder.visit_program(&parsed.program);
+    Ok(finder.0)
+}
+
+struct Finder(BTreeSet<String>);
+
+impl<'a> Visit<'a> for Finder {
+    fn visit_static_member_expression(&mut self, node: &StaticMemberExpression<'a>) {
+        if matches!(&node.object, Expression::Identifier(name) if name.name == "tools") {
+            self.0.insert(node.property.name.to_string());
+        }
+        walk_static_member_expression(self, node);
+    }
+
+    fn visit_computed_member_expression(&mut self, node: &ComputedMemberExpression<'a>) {
+        if matches!(&node.object, Expression::Identifier(name) if name.name == "tools")
+            && let Expression::StringLiteral(name) = &node.expression
+        {
+            self.0.insert(name.value.to_string());
+        }
+        walk_computed_member_expression(self, node);
+    }
+}
+
+fn prepare_program(source: &str) -> Result<String, ProtoError> {
+    let allocator = Allocator::default();
+    let source_type =
+        SourceType::from_path(Path::new("program.ts")).map_err(|err| ProtoError::new(ErrorCode::InvalidParams, err.to_string()))?;
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if let Some(diagnostic) = parsed.diagnostics.first() {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, diagnostic.to_string()));
+    }
+    let Some(Statement::ExportDefaultDeclaration(declaration)) =
+        parsed.program.body.iter().find(|statement| matches!(statement, Statement::ExportDefaultDeclaration(_)))
+    else {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, "program needs an exported default main function"));
+    };
+    let ExportDefaultDeclarationKind::FunctionDeclaration(function) = &declaration.declaration else {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, "program default export must be a function"));
+    };
+    if function.id.as_ref().map(|id| id.name.as_str()) != Some("main") || !function.r#async {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, "program default export must be async function main"));
+    }
+    let start = usize::try_from(declaration.span.start).map_err(|err| ProtoError::new(ErrorCode::InvalidParams, err.to_string()))?;
+    let function_start =
+        usize::try_from(declaration.declaration.span().start).map_err(|err| ProtoError::new(ErrorCode::InvalidParams, err.to_string()))?;
+    let before = source.get(..start).ok_or_else(|| ProtoError::new(ErrorCode::InvalidParams, "invalid export span"))?;
+    let body = source.get(function_start..).ok_or_else(|| ProtoError::new(ErrorCode::InvalidParams, "invalid function span"))?;
+    Ok(format!("{before}{body}\nreturn await main(JSON.parse(__aimProgramArgsJson));"))
+}
+
+#[expect(clippy::too_many_lines, reason = "cell setup, bindings, and finalization form one lifecycle with shared limits and state")]
+async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, ProtoError> {
+    if request.timeout_ms == 0 || request.memory_limit_bytes == 0 || request.output_limit_bytes == 0 {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, "cell limits must be positive"));
+    }
+    let code = if request.program_args.is_some() { prepare_program(&request.code)? } else { request.code.clone() };
+    let source = strip_types(&format!(
+        "(async function() {{\ntry {{\n{code}\n}} catch (e) {{ if (e?.message !== '__AIM_EXIT__') throw e; }}\n}})()"
+    ))?;
+    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+    let runtime = AsyncRuntime::new().map_err(js_error)?;
+    runtime.set_memory_limit(request.memory_limit_bytes).await;
+    runtime.set_max_stack_size(512 * 1024).await;
+    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline))).await;
+    let context = AsyncContext::full(&runtime).await.map_err(js_error)?;
+    let emitted = Arc::new(Mutex::new(Emitted::default()));
+    let (event_tx, mut event_rx) = mpsc::channel::<CellOutput>(128);
+    let event_peer = parent.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            if event_peer.notify::<Output>(event).await.is_err() {
+                break;
+            }
+        }
+    });
+    let specs_json = serde_json::to_string(&request.tools).map_err(|err| ProtoError::new(ErrorCode::InvalidParams, err.to_string()))?;
+    let store_json = serde_json::to_string(&request.store).map_err(|err| ProtoError::new(ErrorCode::InvalidParams, err.to_string()))?;
+    let program_args_json =
+        serde_json::to_string(&request.program_args).map_err(|err| ProtoError::new(ErrorCode::InvalidParams, err.to_string()))?;
+    let allowed: HashSet<String> = request.tools.iter().map(|spec| spec.name.clone()).collect();
+    let cell_id = request.cell_id.clone();
+    let session_id = request.session_id.clone();
+    let max_bytes = request.output_limit_bytes;
+    let next_call = Arc::new(AtomicU64::new(0));
+    let execution = tokio::time::timeout(
+        Duration::from_millis(request.timeout_ms),
+        context.async_with(async |ctx| {
+            let globals = ctx.globals();
+            globals.set("__aimToolsJson", specs_json).map_err(js_error)?;
+            globals.set("__aimStoreJson", store_json).map_err(js_error)?;
+            globals.set("__aimProgramArgsJson", program_args_json).map_err(js_error)?;
+            let output_state = Arc::clone(&emitted);
+            let output_tx = event_tx.clone();
+            let output_cell = cell_id.clone();
+            globals
+                .set(
+                    "__aimEmit",
+                    Func::from(move |text: String, immediate: bool, yielded: bool| -> rquickjs::Result<()> {
+                        let mut state = locked(&output_state);
+                        let next = state.bytes.saturating_add(text.len());
+                        if next > max_bytes {
+                            state.exceeded = true;
+                            return Err(rquickjs::Error::new_from_js_message("output", "limit", "cell output limit exceeded"));
+                        }
+                        state.bytes = next;
+                        if yielded {
+                            state.yielded = true;
+                        } else if !immediate {
+                            state.output.push_str(&text);
+                            state.output.push('\n');
+                        }
+                        drop(state);
+                        output_tx
+                            .try_send(CellOutput { cell_id: output_cell.clone(), text, immediate, yielded })
+                            .map_err(|_| rquickjs::Error::new_from_js_message("output", "queue", "output queue full"))
+                    }),
+                )
+                .map_err(js_error)?;
+            let call_peer = parent.clone();
+            let call_allowed = allowed.clone();
+            let call_cell = cell_id.clone();
+            let call_session = session_id.clone();
+            let counter = Arc::clone(&next_call);
+            globals
+                .set(
+                    "__aimCallTool",
+                    Func::from(Async(move |name: String, arguments: String| {
+                        let call_peer = call_peer.clone();
+                        let call_allowed = call_allowed.clone();
+                        let call_cell = call_cell.clone();
+                        let call_session = call_session.clone();
+                        let counter = Arc::clone(&counter);
+                        async move {
+                            if !call_allowed.contains(&name) {
+                                return Ok::<String, rquickjs::Error>(
+                                    serde_json::json!({"ok":false,"error":"tool is not available in this cell"}).to_string(),
+                                );
+                            }
+                            let arguments: Value = match serde_json::from_str(&arguments) {
+                                Ok(value) => value,
+                                Err(err) => return Ok(serde_json::json!({"ok":false,"error":err.to_string()}).to_string()),
+                            };
+                            let sequence = counter.fetch_add(1, Ordering::Relaxed);
+                            let response = call_peer
+                                .call::<CallTool>(ToolCall {
+                                    session_id: call_session,
+                                    cell_id: call_cell,
+                                    name,
+                                    arguments,
+                                    call_id: sequence,
+                                })
+                                .await;
+                            Ok(match response {
+                                Ok(result) => serde_json::json!({"ok":true,"result":result.result}).to_string(),
+                                Err(err) => serde_json::json!({"ok":false,"error":err.message}).to_string(),
+                            })
+                        }
+                    })),
+                )
+                .map_err(js_error)?;
+            globals
+                .set(
+                    "__aimDelay",
+                    Func::from(Async(|delay_ms: i64| async move {
+                        let ms = u64::try_from(delay_ms).unwrap_or_default().min(60_000);
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        Ok::<(), rquickjs::Error>(())
+                    })),
+                )
+                .map_err(js_error)?;
+            ctx.eval::<(), _>(BOOTSTRAP).map_err(js_error)?;
+            let promise: Promise<'_> = ctx.eval(source).map_err(js_error)?;
+            let outcome: JsValue<'_> = promise.into_future().await.map_err(js_error)?;
+            let returned = if outcome.is_undefined() {
+                None
+            } else if let Some(value) = outcome.as_string() {
+                Some(value.to_string().map_err(js_error)?)
+            } else {
+                ctx.json_stringify(outcome).map_err(js_error)?.map(|value| value.to_string().map_err(js_error)).transpose()?
+            };
+            let stored: String = ctx.eval("JSON.stringify(__aimStore)").map_err(js_error)?;
+            Ok::<_, ProtoError>((returned, stored))
+        }),
+    )
+    .await
+    .map_err(|_| ProtoError::new(ErrorCode::Timeout, "cell deadline exceeded"))?;
+    drop(context);
+    drop(runtime);
+    drop(event_tx);
+    drop(forwarder.await);
+    let mut state = locked(&emitted);
+    if state.exceeded {
+        return Err(ProtoError::new(ErrorCode::LimitExceeded, "cell output limit exceeded"));
+    }
+    let (returned, stored) = match execution {
+        Err(_) if Instant::now() >= deadline => return Err(ProtoError::new(ErrorCode::Timeout, "cell deadline exceeded")),
+        other => other?,
+    };
+    if state.output.is_empty()
+        && let Some(value) = returned
+    {
+        if value.len() > max_bytes {
+            return Err(ProtoError::new(ErrorCode::LimitExceeded, "cell output limit exceeded"));
+        }
+        state.output = value;
+    }
+    let store: HashMap<String, Value> = serde_json::from_str(&stored)
+        .map_err(|err| ProtoError::new(ErrorCode::InvalidParams, format!("store contains non-JSON data: {err}")))?;
+    Ok(ExecuteResult { output: state.output.clone(), yielded: state.yielded, store })
+}
+
+fn js_error(err: rquickjs::Error) -> ProtoError {
+    match err {
+        rquickjs::Error::Allocation => ProtoError::new(ErrorCode::LimitExceeded, "JavaScript memory limit exceeded"),
+        other => ProtoError::new(ErrorCode::Internal, format!("JavaScript execution failed: {other}")),
+    }
+}
