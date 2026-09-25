@@ -6,6 +6,7 @@
 //!
 //! - outgoing calls are correlated by id; dropping a call's future sends `$/cancel`;
 //! - incoming requests run concurrently, each with a cancellation token tripped by `$/cancel`;
+//! - incoming notifications reach handlers in wire order through one bounded queue per connection;
 //! - when the connection ends, every pending call fails with `unavailable`;
 //! - a typed [`Router`] turns [`aim_proto::rpc::Method`] markers into handlers, so parameters are
 //!   validated against their Rust types before handler code runs.

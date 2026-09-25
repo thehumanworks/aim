@@ -43,7 +43,7 @@ impl<S: Send + Sync + 'static> Router<S> {
                 let handler = Arc::clone(&handler);
                 Box::pin(async move {
                     let params: M::Params = serde_json::from_value(params)
-                        .map_err(|err| ProtoError::new(ErrorCode::InvalidParams, format!("{}: {err}", M::NAME)))?;
+                        .map_err(|_| ProtoError::new(ErrorCode::InvalidParams, format!("{}: parameters do not match schema", M::NAME)))?;
                     let result = handler(state, ctx, params).await?;
                     serde_json::to_value(result)
                         .map_err(|err| ProtoError::new(ErrorCode::Internal, format!("encoding {} result: {err}", M::NAME)))
@@ -67,9 +67,10 @@ impl<S: Send + Sync + 'static> Router<S> {
             Box::new(move |state, ctx, params| {
                 let handler = Arc::clone(&handler);
                 Box::pin(async move {
-                    match serde_json::from_value::<N::Params>(params) {
-                        Ok(params) => handler(state, ctx, params).await,
-                        Err(err) => tracing::warn!(%err, method = N::NAME, "dropping a malformed notification"),
+                    if let Ok(params) = serde_json::from_value::<N::Params>(params) {
+                        handler(state, ctx, params).await;
+                    } else {
+                        tracing::warn!(method = N::NAME, "dropping a malformed notification");
                     }
                 })
             }),
@@ -88,14 +89,14 @@ impl<S: Send + Sync + 'static> Handler for Router<S> {
     fn request(&self, ctx: RequestCtx, method: String, params: Value) -> BoxFuture<Result<Value, ProtoError>> {
         match self.methods.get(method.as_str()) {
             Some(route) => route(Arc::clone(&self.state), ctx, params),
-            None => Box::pin(async move { Err(ProtoError::new(ErrorCode::MethodNotFound, format!("unknown method `{method}`"))) }),
+            None => Box::pin(async { Err(ProtoError::new(ErrorCode::MethodNotFound, "method not found")) }),
         }
     }
 
     fn notification(&self, ctx: NotificationCtx, method: String, params: Value) -> BoxFuture<()> {
         match self.notifications.get(method.as_str()) {
             Some(route) => route(Arc::clone(&self.state), ctx, params),
-            None => Box::pin(async move { tracing::debug!(%method, "ignoring an unknown notification") }),
+            None => Box::pin(async { tracing::debug!("ignoring an unknown notification") }),
         }
     }
 }

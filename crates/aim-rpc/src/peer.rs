@@ -3,14 +3,15 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::rpc::{self, CancelParams, Envelope, ErrorObject, Message, Method, Notification, RequestId};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::framing::{DEFAULT_MAX_MESSAGE_BYTES, FrameReader, FrameWriter, ReadError};
@@ -23,7 +24,8 @@ pub trait Handler: Send + Sync + 'static {
     /// Handles a request. Runs on its own task; `ctx.cancelled` fires on `$/cancel` or disconnect.
     fn request(&self, ctx: RequestCtx, method: String, params: Value) -> BoxFuture<Result<Value, ProtoError>>;
 
-    /// Handles a notification (other than `$/cancel`, which the peer handles itself).
+    /// Handles a notification (other than `$/cancel`, which the peer handles itself). The peer
+    /// awaits each notification future before delivering the next one on this connection.
     fn notification(&self, _ctx: NotificationCtx, _method: String, _params: Value) -> BoxFuture<()> {
         Box::pin(async {})
     }
@@ -35,7 +37,8 @@ pub struct NoHandler;
 
 impl Handler for NoHandler {
     fn request(&self, _ctx: RequestCtx, method: String, _params: Value) -> BoxFuture<Result<Value, ProtoError>> {
-        Box::pin(async move { Err(ProtoError::new(ErrorCode::MethodNotFound, format!("no handler for `{method}`"))) })
+        drop(method);
+        Box::pin(async { Err(ProtoError::new(ErrorCode::MethodNotFound, "method not found")) })
     }
 }
 
@@ -66,22 +69,56 @@ pub struct PeerConfig {
     pub max_message_bytes: usize,
     /// Outgoing message queue capacity (backpressure beyond it).
     pub outgoing_capacity: usize,
+    /// Maximum active request handlers on this connection.
+    pub max_inflight_requests: usize,
+    /// Maximum notifications waiting behind this connection's ordered handler.
+    pub notification_queue_capacity: usize,
 }
 
 impl Default for PeerConfig {
     fn default() -> Self {
-        Self { max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES, outgoing_capacity: 1024 }
+        Self {
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            outgoing_capacity: 1024,
+            max_inflight_requests: 128,
+            notification_queue_capacity: 64,
+        }
     }
 }
 
 type Pending = HashMap<RequestId, oneshot::Sender<Result<Value, ErrorObject>>>;
+
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct OutboundFrame {
+    body: String,
+    sent: Option<Arc<AtomicBool>>,
+    delivered: Option<oneshot::Sender<()>>,
+}
+
+struct QueuedNotification {
+    method: String,
+    params: Value,
+}
+
+impl OutboundFrame {
+    fn new(body: String) -> Self {
+        Self { body, sent: None, delivered: None }
+    }
+}
 
 #[derive(Debug)]
 struct Inner {
     next_id: AtomicI64,
     pending: Mutex<Pending>,
     inflight: Mutex<HashMap<RequestId, CancellationToken>>,
-    outgoing: mpsc::Sender<String>,
+    outgoing: mpsc::Sender<OutboundFrame>,
+    control: mpsc::Sender<OutboundFrame>,
+    max_outgoing_bytes: AtomicUsize,
+    request_slots: Arc<Semaphore>,
+    notification_queue: mpsc::Sender<QueuedNotification>,
+    notification_limit: usize,
     closed: CancellationToken,
 }
 
@@ -98,6 +135,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 fn closed_error() -> ProtoError {
     ProtoError::new(ErrorCode::Unavailable, "connection closed")
+}
+
+fn size_error() -> ProtoError {
+    ProtoError::new(ErrorCode::LimitExceeded, "message too large")
 }
 
 fn encode(message: Message) -> Option<String> {
@@ -120,17 +161,26 @@ impl Peer {
         H: Handler,
     {
         let (tx, rx) = mpsc::channel(config.outgoing_capacity.max(1));
+        let (control_tx, control_rx) = mpsc::channel(config.outgoing_capacity.clamp(1, 32));
+        let (notification_tx, notification_rx) = mpsc::channel(config.notification_queue_capacity.max(1));
         let peer = Self {
             inner: Arc::new(Inner {
                 next_id: AtomicI64::new(1),
                 pending: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
                 outgoing: tx,
+                control: control_tx,
+                max_outgoing_bytes: AtomicUsize::new(config.max_message_bytes),
+                request_slots: Arc::new(Semaphore::new(config.max_inflight_requests)),
+                notification_queue: notification_tx,
+                notification_limit: config.notification_queue_capacity,
                 closed: CancellationToken::new(),
             }),
         };
-        tokio::spawn(write_loop(FrameWriter::new(writer), rx, peer.inner.closed.clone()));
-        tokio::spawn(read_loop(peer.clone(), FrameReader::new(reader, config.max_message_bytes), Arc::new(handler)));
+        let handler: Arc<dyn Handler> = Arc::new(handler);
+        tokio::spawn(write_loop(FrameWriter::new(writer), control_rx, rx, peer.inner.closed.clone()));
+        tokio::spawn(notification_loop(peer.clone(), Arc::clone(&handler), notification_rx));
+        tokio::spawn(read_loop(peer.clone(), FrameReader::new(reader, config.max_message_bytes), handler));
         peer
     }
 
@@ -157,12 +207,14 @@ impl Peer {
             return Err(closed_error());
         }
         let id = RequestId::Number(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
+        let frame = encode(Message::Request { id: id.clone(), method: method.to_owned(), params })
+            .ok_or_else(|| ProtoError::new(ErrorCode::Internal, "failed to encode request"))?;
+        self.check_outgoing_size(&frame)?;
         let (tx, rx) = oneshot::channel();
         lock(&self.inner.pending).insert(id.clone(), tx);
-        let mut guard = CancelOnDrop { peer: self, id: Some(id.clone()) };
-        let frame = encode(Message::Request { id, method: method.to_owned(), params })
-            .ok_or_else(|| ProtoError::new(ErrorCode::Internal, "failed to encode request"))?;
-        if self.inner.outgoing.send(frame).await.is_err() {
+        let sent = Arc::new(AtomicBool::new(false));
+        let mut guard = CancelOnDrop { peer: self, id: Some(id.clone()), sent: Arc::clone(&sent) };
+        if self.inner.outgoing.send(OutboundFrame { body: frame, sent: Some(sent), delivered: None }).await.is_err() {
             return Err(closed_error());
         }
         let outcome = tokio::select! {
@@ -194,7 +246,18 @@ impl Peer {
     pub async fn notify_raw(&self, method: &str, params: Value) -> Result<(), ProtoError> {
         let frame = encode(Message::Notification { method: method.to_owned(), params })
             .ok_or_else(|| ProtoError::new(ErrorCode::Internal, "failed to encode notification"))?;
-        self.inner.outgoing.send(frame).await.map_err(|_| closed_error())
+        self.check_outgoing_size(&frame)?;
+        self.inner.outgoing.send(OutboundFrame::new(frame)).await.map_err(|_| closed_error())
+    }
+
+    /// Narrows the largest frame this peer may send after a protocol handshake. It cannot raise
+    /// the local ceiling set by [`PeerConfig::max_message_bytes`].
+    pub fn set_max_outgoing_bytes(&self, bytes: usize) {
+        self.inner.max_outgoing_bytes.fetch_min(bytes, Ordering::AcqRel);
+    }
+
+    fn check_outgoing_size(&self, frame: &str) -> Result<(), ProtoError> {
+        if frame.len() > self.inner.max_outgoing_bytes.load(Ordering::Acquire) { Err(size_error()) } else { Ok(()) }
     }
 
     /// Whether the connection has ended.
@@ -218,11 +281,34 @@ impl Peer {
         }
     }
 
-    fn send_nowait(&self, message: Message) {
-        if let Some(frame) = encode(message)
-            && self.inner.outgoing.try_send(frame).is_err()
-        {
-            tracing::debug!("outgoing queue full or closed; dropping a best-effort message");
+    fn send_control(&self, message: Message) {
+        let Some(frame) = encode(message) else {
+            self.close();
+            return;
+        };
+        if self.check_outgoing_size(&frame).is_err() || self.inner.control.try_send(OutboundFrame::new(frame)).is_err() {
+            self.close();
+        }
+    }
+
+    fn encode_bounded_response(&self, id: RequestId, outcome: Result<Value, ErrorObject>) -> Option<String> {
+        let primary = encode(Message::Response { id: id.clone(), outcome })?;
+        if self.check_outgoing_size(&primary).is_ok() {
+            return Some(primary);
+        }
+        let fallback = encode(Message::Response { id, outcome: Err(ErrorObject::from(size_error())) })?;
+        self.check_outgoing_size(&fallback).ok().map(|()| fallback)
+    }
+
+    fn error_nowait(&self, id: Option<&RequestId>, err: ProtoError) {
+        // A JSON-RPC error with no request id must still carry an explicit null id.
+        let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "error": ErrorObject::from(err)});
+        let Ok(frame) = serde_json::to_string(&response) else {
+            self.close();
+            return;
+        };
+        if self.check_outgoing_size(&frame).is_err() || self.inner.outgoing.try_send(OutboundFrame::new(frame)).is_err() {
+            self.close();
         }
     }
 }
@@ -231,33 +317,65 @@ impl Peer {
 struct CancelOnDrop<'a> {
     peer: &'a Peer,
     id: Option<RequestId>,
+    sent: Arc<AtomicBool>,
 }
 
 impl Drop for CancelOnDrop<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
             lock(&self.peer.inner.pending).remove(&id);
+            if !self.sent.load(Ordering::Acquire) {
+                // Priority cancellation must never overtake the request it names.
+                self.peer.close();
+                return;
+            }
             if !self.peer.is_closed()
                 && let Ok(params) = serde_json::to_value(CancelParams { id })
             {
-                self.peer.send_nowait(Message::Notification { method: <rpc::Cancel as Notification>::NAME.to_owned(), params });
+                self.peer.send_control(Message::Notification { method: <rpc::Cancel as Notification>::NAME.to_owned(), params });
             }
         }
     }
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(mut writer: FrameWriter<W>, mut rx: mpsc::Receiver<String>, closed: CancellationToken) {
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut writer: FrameWriter<W>,
+    mut control: mpsc::Receiver<OutboundFrame>,
+    mut normal: mpsc::Receiver<OutboundFrame>,
+    closed: CancellationToken,
+) {
     loop {
-        // Closing is an abort: once closed, nothing more is written.
+        // Control frames get the first available write slot; closing aborts a blocked write.
         let frame = tokio::select! {
             biased;
             () = closed.cancelled() => None,
-            frame = rx.recv() => frame,
+            frame = control.recv() => frame,
+            frame = normal.recv() => frame,
         };
         let Some(frame) = frame else { break };
-        if let Err(err) = writer.send(frame).await {
-            tracing::debug!(%err, "write failed; closing connection");
-            break;
+        let OutboundFrame { body, sent, delivered } = frame;
+        let write = tokio::select! {
+            biased;
+            () = closed.cancelled() => break,
+            write = tokio::time::timeout(WRITE_TIMEOUT, writer.send(body)) => write,
+        };
+        match write {
+            Ok(Ok(())) => {
+                if let Some(sent) = sent {
+                    sent.store(true, Ordering::Release);
+                }
+                if let Some(delivered) = delivered {
+                    let _unwatched = delivered.send(());
+                }
+            }
+            Ok(Err(err)) => {
+                tracing::debug!(%err, "write failed; closing connection");
+                break;
+            }
+            Err(_) => {
+                tracing::warn!("write timed out; closing connection");
+                break;
+            }
         }
     }
     closed.cancel();
@@ -285,30 +403,57 @@ async fn read_loop<R: AsyncRead + Unpin>(peer: Peer, mut reader: FrameReader<R>,
     peer.close();
 }
 
+async fn notification_loop(peer: Peer, handler: Arc<dyn Handler>, mut queue: mpsc::Receiver<QueuedNotification>) {
+    loop {
+        let notice = tokio::select! {
+            biased;
+            () = peer.inner.closed.cancelled() => break,
+            notice = queue.recv() => notice,
+        };
+        let Some(QueuedNotification { method, params }) = notice else { break };
+        let future = handler.notification(NotificationCtx { peer: peer.clone() }, method, params);
+        tokio::select! {
+            biased;
+            () = peer.inner.closed.cancelled() => break,
+            () = future => {},
+        }
+    }
+}
+
 fn dispatch(peer: &Peer, handler: &Arc<dyn Handler>, frame: &str) {
-    let envelope: Envelope = match serde_json::from_str(frame) {
-        Ok(envelope) => envelope,
+    let raw: Value = match serde_json::from_str(frame) {
+        Ok(raw) => raw,
         Err(err) => {
             // JSON-RPC: a parse error is answered with `"id": null`.
-            let obj = ErrorObject::from(ProtoError::new(ErrorCode::ParseError, format!("invalid JSON: {err}")));
-            if let Ok(error) = serde_json::to_string(&obj) {
-                let frame = format!(r#"{{"jsonrpc":"2.0","id":null,"error":{error}}}"#);
-                if peer.inner.outgoing.try_send(frame).is_err() {
-                    tracing::debug!("could not queue a parse-error response");
-                }
-            }
+            tracing::debug!(line = err.line(), column = err.column(), "invalid JSON from peer");
+            peer.error_nowait(None, ProtoError::new(ErrorCode::ParseError, "invalid JSON"));
             return;
         }
     };
+    let candidate_id = raw.get("id").and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok());
+    let envelope: Envelope = if let Ok(envelope) = serde_json::from_value(raw) {
+        envelope
+    } else {
+        peer.error_nowait(candidate_id.as_ref(), ProtoError::new(ErrorCode::InvalidRequest, "invalid JSON-RPC envelope"));
+        return;
+    };
+    if (envelope.method.is_some() && (envelope.result.is_some() || envelope.error.is_some()))
+        || (envelope.result.is_some() && envelope.error.is_some())
+    {
+        peer.error_nowait(envelope.id.as_ref(), ProtoError::new(ErrorCode::InvalidRequest, "conflicting JSON-RPC fields"));
+        return;
+    }
     let has_error = envelope.error.is_some();
+    let error_number = envelope.error.as_ref().map(|error| error.code);
+    let id = envelope.id.clone();
     match Message::from_envelope(envelope) {
         Ok(Message::Response { id, outcome }) => {
             if let Some(tx) = lock(&peer.inner.pending).remove(&id) {
                 if tx.send(outcome).is_err() {
-                    tracing::debug!(?id, "caller stopped waiting for its response");
+                    tracing::debug!("caller stopped waiting for its response");
                 }
             } else {
-                tracing::debug!(?id, "response to an unknown or cancelled request");
+                tracing::debug!("response to an unknown or cancelled request");
             }
         }
         Ok(Message::Request { id, method, params }) => serve_request(peer, handler, id, method, params),
@@ -321,37 +466,72 @@ fn dispatch(peer: &Peer, handler: &Arc<dyn Handler>, frame: &str) {
                 }
                 return;
             }
-            let fut = handler.notification(NotificationCtx { peer: peer.clone() }, method, params);
-            tokio::spawn(fut);
+            if peer.inner.notification_limit == 0 || peer.inner.notification_queue.try_send(QueuedNotification { method, params }).is_err()
+            {
+                tracing::warn!(reason = "limit_exceeded", "ordered notification queue is full; closing connection");
+                peer.close();
+            }
         }
         // An error with `"id": null` is the other side failing to parse something we sent: it
         // cannot be correlated with a request, so it is only logged.
-        Err(_) if has_error => tracing::warn!("peer reported an uncorrelated error: {frame}"),
-        Err(err) => tracing::warn!(%err, "ignoring a malformed message"),
+        Err(_) if has_error && id.is_none() => tracing::warn!(code = ?error_number, "peer reported an uncorrelated error"),
+        Err(err) => {
+            tracing::warn!(code = %err.code, "peer sent an invalid request");
+            peer.error_nowait(id.as_ref(), err);
+        }
+    }
+}
+
+struct InflightGuard {
+    peer: Peer,
+    id: RequestId,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        lock(&self.peer.inner.inflight).remove(&self.id);
     }
 }
 
 fn serve_request(peer: &Peer, handler: &Arc<dyn Handler>, id: RequestId, method: String, params: Value) {
+    let mut inflight = lock(&peer.inner.inflight);
+    if inflight.contains_key(&id) {
+        drop(inflight);
+        peer.error_nowait(Some(&id), ProtoError::new(ErrorCode::InvalidRequest, "duplicate active request id"));
+        return;
+    }
+    let Ok(permit) = Arc::clone(&peer.inner.request_slots).try_acquire_owned() else {
+        drop(inflight);
+        peer.error_nowait(Some(&id), ProtoError::new(ErrorCode::LimitExceeded, "too many active requests"));
+        return;
+    };
     let token = peer.inner.closed.child_token();
-    lock(&peer.inner.inflight).insert(id.clone(), token.clone());
+    inflight.insert(id.clone(), token.clone());
+    drop(inflight);
     let ctx = RequestCtx { id: id.clone(), peer: peer.clone(), cancelled: token.clone() };
     let fut = handler.request(ctx, method, params);
     let peer = peer.clone();
+    let guard = InflightGuard { peer: peer.clone(), id: id.clone() };
     tokio::spawn(async move {
+        let _permit = permit;
+        let _guard = guard;
         let outcome = tokio::select! {
             outcome = fut => outcome,
             () = token.cancelled() => Err(ProtoError::new(ErrorCode::Cancelled, "request cancelled")),
         };
-        lock(&peer.inner.inflight).remove(&id);
         if peer.is_closed() {
             // Cancelled by the connection ending: the caller learns `unavailable` from its own side.
             return;
         }
-        let message = Message::Response { id, outcome: outcome.map_err(ErrorObject::from) };
-        if let Some(frame) = encode(message)
-            && peer.inner.outgoing.send(frame).await.is_err()
-        {
-            tracing::debug!("connection closed before a response could be sent");
+        let Some(frame) = peer.encode_bounded_response(id, outcome.map_err(ErrorObject::from)) else {
+            peer.close();
+            return;
+        };
+        let (delivered, written) = oneshot::channel();
+        if peer.inner.outgoing.send(OutboundFrame { body: frame, sent: None, delivered: Some(delivered) }).await.is_err() {
+            tracing::debug!("connection closed before a response could be queued");
+            return;
         }
+        let _written = written.await;
     });
 }
