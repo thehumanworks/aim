@@ -1,6 +1,6 @@
 //! Fenced board attempts run as sessions in harness-created Git worktrees.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +9,7 @@ use aim_proto::board::{
 };
 use aim_proto::content::Base64Bytes;
 use aim_proto::conversation::{Part, StopReason};
-use aim_proto::daemon::{Location, Persistence, SessionSpec, SessionState, SessionUpdate};
+use aim_proto::daemon::{Location, Persistence, SessionSpec, SessionState, SessionSummary, SessionUpdate};
 use futures_util::StreamExt as _;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -22,10 +22,12 @@ use crate::board::{Board, CleanupReceipt, Error as BoardError};
 use crate::host::SessionClient;
 
 use super::harness::{CommandOutput, GitHarness};
-use super::receipt::{Receipt, ReceiptStore};
+use super::receipt::{Receipt, ReceiptStore, WORKER_TOOLS, agent_name};
 
 pub(super) const GIT_TIMEOUT_MS: u64 = 60_000;
 const LEASE_MS: u64 = 300_000;
+const MAX_CHECK_REVISIONS: u8 = 2;
+const MAX_CHECK_FEEDBACK_CHARS: usize = 8_000;
 
 /// Configuration of one stable local worker identity and its session backend.
 #[derive(Clone)]
@@ -152,6 +154,27 @@ fn worktree_path(source: &str, job_id: &str, attempt_id: &str) -> String {
     format!("{}-board-{job_id}-{attempt_id}", source.trim_end_matches('/'))
 }
 
+fn worktree_overlaps_home(worktree: &str, home: &Path) -> Result<bool, String> {
+    let home = home.canonicalize().map_err(error)?;
+    let raw = Path::new(worktree);
+    let canonical = raw.canonicalize().or_else(|_| {
+        raw.parent()
+            .ok_or_else(|| std::io::Error::other("worktree has no parent"))?
+            .canonicalize()
+            .map(|parent| parent.join(raw.file_name().unwrap_or_default()))
+    });
+    let worktree = canonical.as_deref().unwrap_or(raw);
+    Ok(worktree.starts_with(&home) || home.starts_with(worktree))
+}
+
+fn worker_session_is_confined(summary: &SessionSummary, receipt: &Receipt) -> bool {
+    let Some(agent) = &summary.meta.agent else { return false };
+    summary.meta.workspace == receipt.worktree
+        && agent.name == agent_name(&receipt.attempt_id)
+        && agent.allow.as_ref().is_some_and(|allowed| allowed.iter().map(String::as_str).eq(WORKER_TOOLS))
+        && agent.deny.is_empty()
+}
+
 impl Runner {
     /// Opens private receipts and locks a worker identity to one process.
     ///
@@ -160,6 +183,9 @@ impl Runner {
     pub fn new(board: Board, sessions: Arc<dyn SessionClient>, options: RunnerOptions) -> Result<Self, String> {
         if options.concurrency == 0 || options.concurrency > 64 || options.provider.is_empty() || options.turn_timeout.is_zero() {
             return Err("invalid worker capacity, provider, or timeout".into());
+        }
+        if options.agent.is_some() || options.provider.starts_with("acp:") {
+            return Err("board workers require a native provider and the private file-only agent".into());
         }
         let receipts = Arc::new(ReceiptStore::open(&options.home, &options.worker)?);
         Ok(Self { board, sessions, options, receipts })
@@ -221,13 +247,17 @@ impl Runner {
                 workspace
             };
             let branch = format!("board/{}/{}", job.id, attempt_id);
+            let worktree = worktree_path(&workspace, &job.id, &attempt_id);
+            if worktree_overlaps_home(&worktree, &self.options.home)? {
+                return Err("worker worktree overlaps AIM_HOME; receipt reads would be possible".into());
+            }
             let receipt = Receipt {
                 job_id: job.id.clone(),
                 run_id: job.run_id.clone(),
                 attempt_id: attempt_id.clone(),
                 token,
                 worker: self.options.worker.clone(),
-                worktree: worktree_path(&workspace, &job.id, &attempt_id),
+                worktree,
                 workspace,
                 location,
                 branch,
@@ -235,6 +265,11 @@ impl Runner {
                 session_id: None,
                 turn_succeeded: false,
                 session_closed: false,
+                file_only_session: false,
+                check_revisions: 0,
+                check_feedback: None,
+                check_passed: false,
+                check_log: None,
             };
             self.receipts.save(&receipt)?;
             let claim = self
@@ -461,6 +496,94 @@ impl Runner {
         result
     }
 
+    async fn run_worker_turn(
+        &self,
+        receipt: &mut Receipt,
+        job: &JobSnapshot,
+        heart_error: &mut tokio::sync::watch::Receiver<Option<String>>,
+        outcome: &mut AttemptOutcome,
+    ) -> Result<(), String> {
+        let confined_agent = self.receipts.ensure_agent(&receipt.attempt_id)?;
+        let session_id = if let Some(id) = &receipt.session_id {
+            id.clone()
+        } else {
+            let summary = self
+                .sessions
+                .create(SessionSpec {
+                    workspace: receipt.worktree.clone(),
+                    location: receipt.location.clone(),
+                    provider: self.options.provider.clone(),
+                    model: self.options.model.clone(),
+                    effort: self.options.effort.clone(),
+                    agent: Some(confined_agent),
+                    persistence: Persistence::Persistent,
+                })
+                .await
+                .map_err(error)?;
+            if !worker_session_is_confined(&summary, receipt) {
+                let _ignored = self.sessions.close(summary.meta.id.clone()).await;
+                return Err("worker session did not retain its file-only worktree ceiling".into());
+            }
+            receipt.session_id = Some(summary.meta.id.clone());
+            receipt.file_only_session = true;
+            self.receipts.save(receipt)?;
+            summary.meta.id
+        };
+        let (attached, mut updates) = self.sessions.attach(session_id.clone()).await.map_err(error)?;
+        if !worker_session_is_confined(&attached.summary, receipt) {
+            let _ignored = self.sessions.close(session_id).await;
+            return Err("worker session lost its file-only worktree ceiling".into());
+        }
+        receipt.file_only_session = true;
+        if receipt.turn_succeeded {
+            return Ok(());
+        }
+        if attached.summary.state == SessionState::Idle && attached.summary.turns == u64::from(receipt.check_revisions) {
+            let text = if receipt.check_revisions == 0 {
+                let messages = self.board.messages(job.id.clone()).await.map_err(error)?;
+                prompt(job, &messages)
+            } else {
+                receipt.check_feedback.clone().ok_or("missing check feedback for worker revision")?
+            };
+            self.sessions.prompt(session_id.clone(), vec![Part::Text { text }]).await.map_err(error)?;
+        } else if attached.summary.state != SessionState::Running {
+            return Err("session ended while runner was absent; result needs inspection".into());
+        }
+        let deadline = tokio::time::Instant::now() + self.options.turn_timeout;
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {
+                    let _ignored = self.sessions.cancel(session_id.clone()).await;
+                    return Err("worker session timed out".into());
+                }
+                changed = heart_error.changed() => {
+                    let reason = heart_error.borrow().clone();
+                    if changed.is_ok() && let Some(reason) = reason {
+                        let _ignored = self.sessions.cancel(session_id.clone()).await;
+                        return Err(format!("worker lease was lost: {reason}"));
+                    }
+                }
+                update = updates.next() => match update {
+                    Some(SessionUpdate::Usage {usage}) => {
+                        outcome.input_tokens = outcome.input_tokens.saturating_add(usage.input_tokens);
+                        outcome.output_tokens = outcome.output_tokens.saturating_add(usage.output_tokens);
+                        if let Some(cost) = usage.cost_micro_usd {
+                            outcome.cost_reported = true;
+                            outcome.cost_micro_usd = outcome.cost_micro_usd.saturating_add(cost);
+                        }
+                    }
+                    Some(SessionUpdate::TurnEnded {stop:StopReason::EndTurn}) => break,
+                    Some(SessionUpdate::TurnEnded {stop}) => return Err(format!("worker turn ended without completion: {stop:?}")),
+                    Some(SessionUpdate::TurnFailed {message}) => return Err(format!("worker turn failed: {message}")),
+                    None => return Err("worker update stream ended before the turn".into()),
+                    _ => {}
+                }
+            }
+        }
+        receipt.turn_succeeded = true;
+        self.receipts.save(receipt)
+    }
+
     #[expect(clippy::too_many_lines, reason = "session result, Git check, commit, and artifact form one attempt outcome")]
     async fn execute_in_worktree(
         &self,
@@ -477,92 +600,52 @@ impl Runner {
             return Err("attempt worktree is on an unexpected branch".into());
         }
         let mut outcome = AttemptOutcome::default();
-        if !receipt.session_closed {
-            let session_id = if let Some(id) = &receipt.session_id {
-                id.clone()
-            } else {
-                let summary = self
-                    .sessions
-                    .create(SessionSpec {
-                        workspace: receipt.worktree.clone(),
-                        location: receipt.location.clone(),
-                        provider: self.options.provider.clone(),
-                        model: self.options.model.clone(),
-                        effort: self.options.effort.clone(),
-                        agent: self.options.agent.clone(),
-                        persistence: Persistence::Persistent,
-                    })
-                    .await
-                    .map_err(error)?;
-                receipt.session_id = Some(summary.meta.id.clone());
-                self.receipts.save(receipt)?;
-                summary.meta.id
-            };
-            let (attached, mut updates) = self.sessions.attach(session_id.clone()).await.map_err(error)?;
-            if !receipt.turn_succeeded {
-                if attached.summary.state == SessionState::Idle && attached.summary.turns == 0 {
-                    let messages = self.board.messages(job.id.clone()).await.map_err(error)?;
-                    self.sessions.prompt(session_id.clone(), vec![Part::Text { text: prompt(job, &messages) }]).await.map_err(error)?;
-                } else if attached.summary.state != SessionState::Running {
-                    return Err("session ended while runner was absent; result needs inspection".into());
+        if !receipt.session_closed && !receipt.check_passed {
+            loop {
+                self.run_worker_turn(receipt, job, heart_error, &mut outcome).await?;
+                let status = valid_git(
+                    worktree.argv(vec!["git".into(), "status".into(), "--porcelain".into()], GIT_TIMEOUT_MS).await.map_err(error)?,
+                    "inspect worktree",
+                )?;
+                if status.is_empty() {
+                    return Err("worker produced no tracked or untracked changes".into());
                 }
-                let deadline = tokio::time::Instant::now() + self.options.turn_timeout;
-                loop {
-                    tokio::select! {
-                        () = tokio::time::sleep_until(deadline) => {
-                            let _ignored = self.sessions.cancel(session_id.clone()).await;
-                            return Err("worker session timed out".into());
+                if let Some(command) = &job.spec.work.as_ref().ok_or("missing work policy")?.check_command {
+                    let check = worktree
+                        .shell(command.clone(), u64::try_from(self.options.turn_timeout.as_millis()).unwrap_or(u64::MAX))
+                        .await
+                        .map_err(error)?;
+                    let safe = safe_log(&check.text);
+                    let passed = check.success() && !check.truncated;
+                    receipt.check_log = Some(format!("command: {}\npassed: {passed}\n{safe}", safe_log(command)));
+                    if !passed {
+                        if receipt.check_revisions >= MAX_CHECK_REVISIONS {
+                            return Err("job check command failed after bounded worker revisions".into());
                         }
-                        changed = heart_error.changed() => {
-                            let reason = heart_error.borrow().clone();
-                            if changed.is_ok() && let Some(reason) = reason {
-                                let _ignored = self.sessions.cancel(session_id.clone()).await;
-                                return Err(format!("worker lease was lost: {reason}"));
-                            }
-                        }
-                        update = updates.next() => match update {
-                            Some(SessionUpdate::Usage {usage}) => {
-                                outcome.input_tokens = outcome.input_tokens.saturating_add(usage.input_tokens);
-                                outcome.output_tokens = outcome.output_tokens.saturating_add(usage.output_tokens);
-                                if let Some(cost) = usage.cost_micro_usd {
-                                    outcome.cost_reported = true;
-                                    outcome.cost_micro_usd = outcome.cost_micro_usd.saturating_add(cost);
-                                }
-                            }
-                            Some(SessionUpdate::TurnEnded {stop:StopReason::EndTurn}) => break,
-                            Some(SessionUpdate::TurnEnded {stop}) => return Err(format!("worker turn ended without completion: {stop:?}")),
-                            Some(SessionUpdate::TurnFailed {message}) => return Err(format!("worker turn failed: {message}")),
-                            None => return Err("worker update stream ended before the turn".into()),
-                            _ => {}
-                        }
+                        let output = safe.chars().take(MAX_CHECK_FEEDBACK_CHARS).collect::<String>();
+                        receipt.check_feedback = Some(format!(
+                            "The runner's check failed (or its output was truncated). Fix the files and finish another turn.\nCheck: {}\nOutput (bounded):\n{output}",
+                            safe_log(command)
+                        ));
+                        receipt.check_revisions += 1;
+                        receipt.turn_succeeded = false;
+                        self.receipts.save(receipt)?;
+                        continue;
                     }
                 }
-                receipt.turn_succeeded = true;
+                receipt.check_passed = true;
                 self.receipts.save(receipt)?;
+                break;
             }
-            self.sessions.close(session_id).await.map_err(error)?;
+        }
+        if !receipt.file_only_session || !receipt.check_passed {
+            return Err("attempt lacks a verified file-only session and passing check".into());
+        }
+        if !receipt.session_closed {
+            let id = receipt.session_id.as_ref().ok_or("worker session id is missing")?;
+            self.sessions.close(id.clone()).await.map_err(error)?;
             receipt.session_closed = true;
             self.receipts.save(receipt)?;
-        }
-        let status = valid_git(
-            worktree.argv(vec!["git".into(), "status".into(), "--porcelain".into()], GIT_TIMEOUT_MS).await.map_err(error)?,
-            "inspect worktree",
-        )?;
-        if status.is_empty() {
-            return Err("worker produced no tracked or untracked changes".into());
-        }
-        let mut check_log = None;
-        if let Some(command) = &job.spec.work.as_ref().ok_or("missing work policy")?.check_command {
-            let check = worktree
-                .shell(command.clone(), u64::try_from(self.options.turn_timeout.as_millis()).unwrap_or(u64::MAX))
-                .await
-                .map_err(error)?;
-            let safe = safe_log(&check.text);
-            let passed = check.success() && !check.truncated;
-            check_log = Some(format!("command: {}\npassed: {passed}\n{safe}", safe_log(command)));
-            if !passed {
-                return Err("job check command failed; worktree retained for inspection".into());
-            }
         }
         valid_git(
             worktree.argv(vec!["git".into(), "add".into(), "-A".into()], GIT_TIMEOUT_MS).await.map_err(error)?,
@@ -592,7 +675,7 @@ impl Runner {
             base,
             commit: &commit,
             diff_stat: &diff_stat,
-            check_log: check_log.as_deref(),
+            check_log: receipt.check_log.as_deref(),
             input_tokens: outcome.input_tokens,
             output_tokens: outcome.output_tokens,
             cost_micro_usd: outcome.cost_reported.then_some(outcome.cost_micro_usd),
@@ -702,5 +785,22 @@ impl Runner {
             self.receipts.remove(&receipt.attempt_id)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::worktree_overlaps_home;
+
+    #[test]
+    fn home_inside_worktree_is_also_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("attempt");
+        let home = worktree.join("state");
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(worktree_overlaps_home(&worktree.to_string_lossy(), &home).unwrap());
+        let separate = root.path().join("separate");
+        std::fs::create_dir(&separate).unwrap();
+        assert!(!worktree_overlaps_home(&worktree.to_string_lossy(), &separate).unwrap());
     }
 }
