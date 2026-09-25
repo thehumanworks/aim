@@ -133,67 +133,73 @@ fn describe_exit(exit: ExitStatus, timeout_ms: u64) -> Option<String> {
     }
 }
 
-pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Outcome<ToolResult> {
+pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Result<Outcome<ToolResult>, ProtoError> {
     let args: BashArgs = match parse(arguments) {
         Ok(args) => args,
-        Err(result) => return Ok(result),
+        Err(result) => return Ok(Ok(result)),
     };
-    ctx.grant.exec()?;
-    let exec = exec_of(ctx)?;
-    let slot = match ctx.procs.reserve() {
-        Ok(slot) => slot,
-        Err(err) => return model_error(err),
+    if let Err(err) = ctx.grant.exec() {
+        return Ok(Err(err));
+    }
+    let exec = match exec_of(ctx) {
+        Ok(exec) => exec,
+        Err(err) => return Ok(Err(err)),
     };
-    if args.run_in_background {
-        let proc = match spawn(ctx, exec, &args.command, None).await {
+    let slot = ctx.procs.reserve()?;
+    let outcome: Outcome<ToolResult> = async {
+        if args.run_in_background {
+            let proc = match spawn(ctx, exec, &args.command, None).await {
+                Ok(proc) => proc,
+                Err(err) => return model_error(err),
+            };
+            ctx.procs.insert(proc.clone(), ctx.workspace_id.clone(), slot);
+            return Ok(ToolResult::text(format!(
+                "Started in the background with id {proc}. Read its output with BashOutput; stop it with KillShell."
+            )));
+        }
+        let timeout_ms = args.timeout.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1, MAX_TIMEOUT_MS);
+        let proc = match spawn(ctx, exec, &args.command, Some(Duration::from_millis(timeout_ms))).await {
             Ok(proc) => proc,
             Err(err) => return model_error(err),
         };
         ctx.procs.insert(proc.clone(), ctx.workspace_id.clone(), slot);
-        return Ok(ToolResult::text(format!(
-            "Started in the background with id {proc}. Read its output with BashOutput; stop it with KillShell."
-        )));
-    }
-    let timeout_ms = args.timeout.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1, MAX_TIMEOUT_MS);
-    let proc = match spawn(ctx, exec, &args.command, Some(Duration::from_millis(timeout_ms))).await {
-        Ok(proc) => proc,
-        Err(err) => return model_error(err),
-    };
-    ctx.procs.insert(proc.clone(), ctx.workspace_id.clone(), slot);
-    let mut output = HeadTail::new();
-    let mut cursor = 0u64;
-    let mut dropped = false;
-    let exit = loop {
-        let read = exec.read(&proc, cursor, READ_BYTES, Duration::from_secs(5)).await?;
-        dropped |= read.dropped_before.is_some();
-        for chunk in read.chunks {
-            cursor = chunk.seq;
-            output.push(&chunk.data.into_bytes());
+        let mut output = HeadTail::new();
+        let mut cursor = 0u64;
+        let mut dropped = false;
+        let exit = loop {
+            let read = exec.read(&proc, cursor, READ_BYTES, Duration::from_secs(5)).await?;
+            dropped |= read.dropped_before.is_some();
+            for chunk in read.chunks {
+                cursor = chunk.seq;
+                output.push(&chunk.data.into_bytes());
+            }
+            if let Some(exit) = read.exit {
+                break exit;
+            }
+        };
+        let mut text = output.render();
+        if text.is_empty() {
+            text.push_str("(no output)");
         }
-        if let Some(exit) = read.exit {
-            break exit;
+        if let Some(status) = describe_exit(exit, timeout_ms) {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&status);
         }
-    };
-    let mut text = output.render();
-    if text.is_empty() {
-        text.push_str("(no output)");
-    }
-    if let Some(status) = describe_exit(exit, timeout_ms) {
-        if !text.ends_with('\n') {
-            text.push('\n');
+        let is_error = !matches!(exit, ExitStatus::Exited { code: 0 });
+        if output.truncated() || dropped {
+            let _ = write!(text, "\n[output was {} bytes; the full output is kept as handle {proc} (BashOutput/exec.read)]", output.total);
+            return Ok(ToolResult { is_error, truncated: true, handle: Some(OutputHandle::new(proc.as_str())), ..ToolResult::text(text) });
         }
-        text.push_str(&status);
+        ctx.procs.remove(&proc);
+        if let Err(err) = exec.release(&proc).await {
+            tracing::debug!(%err, "releasing a finished command failed");
+        }
+        Ok(ToolResult { is_error, ..ToolResult::text(text) })
     }
-    let is_error = !matches!(exit, ExitStatus::Exited { code: 0 });
-    if output.truncated() || dropped {
-        let _ = write!(text, "\n[output was {} bytes; the full output is kept as handle {proc} (BashOutput/exec.read)]", output.total);
-        return Ok(ToolResult { is_error, truncated: true, handle: Some(OutputHandle::new(proc.as_str())), ..ToolResult::text(text) });
-    }
-    ctx.procs.remove(&proc);
-    if let Err(err) = exec.release(&proc).await {
-        tracing::debug!(%err, "releasing a finished command failed");
-    }
-    Ok(ToolResult { is_error, ..ToolResult::text(text) })
+    .await;
+    Ok(outcome)
 }
 
 #[derive(Deserialize)]

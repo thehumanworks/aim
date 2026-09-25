@@ -263,17 +263,26 @@ pub fn spawns_processes(name: &str) -> bool {
 /// `not_found` for an unknown tool; policy (`denied`) and backend (`unavailable`, `internal`)
 /// failures. Failures the model should handle are `Ok` results with `is_error` set.
 pub async fn call(ctx: &ToolCtx, name: &str, arguments: Value) -> Outcome<ToolResult> {
+    match call_admitted(ctx, name, arguments).await {
+        Ok(outcome) => outcome,
+        Err(err) => model_error(err),
+    }
+}
+
+/// The outer error means admission failed before execution, so its key may be retried.
+/// Backend outcomes, including limit errors after effects, stay in the inner result.
+pub(crate) async fn call_admitted(ctx: &ToolCtx, name: &str, arguments: Value) -> Result<Outcome<ToolResult>, ProtoError> {
     match name {
-        "Read" => files::read(ctx, arguments).await,
-        "Write" => files::write(ctx, arguments).await,
-        "Edit" => files::edit(ctx, arguments).await,
-        "LS" => files::ls(ctx, arguments).await,
-        "Glob" => search::glob(ctx, arguments).await,
-        "Grep" => search::grep(ctx, arguments).await,
+        "Read" => Ok(files::read(ctx, arguments).await),
+        "Write" => Ok(files::write(ctx, arguments).await),
+        "Edit" => Ok(files::edit(ctx, arguments).await),
+        "LS" => Ok(files::ls(ctx, arguments).await),
+        "Glob" => Ok(search::glob(ctx, arguments).await),
+        "Grep" => Ok(search::grep(ctx, arguments).await),
         "Bash" => shell::bash(ctx, arguments).await,
-        "BashOutput" => shell::bash_output(ctx, arguments).await,
-        "KillShell" => shell::kill_shell(ctx, arguments).await,
-        _ => Err(ProtoError::new(ErrorCode::NotFound, format!("unknown tool `{name}`"))),
+        "BashOutput" => Ok(shell::bash_output(ctx, arguments).await),
+        "KillShell" => Ok(shell::kill_shell(ctx, arguments).await),
+        _ => Ok(Err(ProtoError::new(ErrorCode::NotFound, format!("unknown tool `{name}`")))),
     }
 }
 
