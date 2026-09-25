@@ -419,7 +419,13 @@ mod tests {
             .await
             .expect("reply");
         assert_eq!(scoped_write["result"]["isError"], true);
-        assert_eq!(std::fs::read_to_string(dir.path().join("sample.txt")).expect("unchanged file"), "through MCP");
+        let after = mcp
+            .dispatch(
+                &json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read","arguments":{"file_path":"sample.txt"}}}),
+            )
+            .await
+            .expect("reply");
+        assert!(after["result"]["content"][0]["text"].as_str().is_some_and(|text| text.contains("through MCP")));
         server.shutdown().await;
     }
 

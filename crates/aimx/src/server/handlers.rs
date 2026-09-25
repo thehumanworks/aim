@@ -147,7 +147,7 @@ impl Conn {
     fn policy_limits(&self) -> PolicyLimits {
         PolicyLimits {
             max_processes: u32::from(self.state.config.max_procs_per_session),
-            max_output_bytes: self.state.config.max_read_bytes,
+            max_output_bytes: self.state.config.max_message_bytes,
         }
     }
 
@@ -310,7 +310,7 @@ impl Conn {
         let (session, ws) = self.workspace(&params.workspace)?;
         let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
         let path = grant.path(&params.path, Access::Read)?;
-        let cap = output_cap(&grant)?;
+        let cap = output_cap(&grant)?.min(self.state.config.max_read_bytes.max(1));
         ws.backend.fs().read(&path, params.range, cap, params.hash).await
     }
 
@@ -396,7 +396,7 @@ impl Conn {
         if params.paths.len() > READ_MANY_MAX {
             return Err(ProtoError::new(ErrorCode::LimitExceeded, format!("at most {READ_MANY_MAX} paths per fs.read_many")));
         }
-        let cap = output_cap(&grant)?;
+        let cap = output_cap(&grant)?.min(self.state.config.max_read_bytes.max(1));
         let per_file = params.max_bytes_per_file.unwrap_or(cap).clamp(1, cap);
         let mut budget = cap;
         let mut entries = Vec::with_capacity(params.paths.len());
@@ -489,7 +489,8 @@ impl Conn {
         let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
         grant.exec_path(&cwd)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
-        let max_bytes = params.max_bytes.unwrap_or(EXEC_READ_DEFAULT).clamp(1, output_cap(&grant)?);
+        let max_bytes =
+            params.max_bytes.unwrap_or(EXEC_READ_DEFAULT).clamp(1, output_cap(&grant)?.min(self.state.config.max_read_bytes.max(1)));
         let wait = Duration::from_millis(params.wait_ms).min(EXEC_WAIT_MAX);
         exec.read(&params.proc, params.after_seq, max_bytes, wait).await
     }
@@ -611,7 +612,7 @@ impl Conn {
             grant: grant.clone(),
             procs: Arc::clone(&session.procs),
             key: params.idempotency_key.clone(),
-            max_read_bytes: output_cap(&grant)?,
+            max_read_bytes: output_cap(&grant)?.min(self.state.config.max_read_bytes.max(1)),
             max_processes: usize::try_from(grant.limits().map_or(u32::MAX, |limits| limits.max_processes)).unwrap_or(usize::MAX),
             cancelled: request.cancelled,
         };
