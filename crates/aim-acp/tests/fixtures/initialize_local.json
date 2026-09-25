@@ -1,0 +1,115 @@
+{
+  "protocolVersion": 1,
+  "agentCapabilities": {
+    "_meta": {
+      "claudeCode": {
+        "promptQueueing": true
+      },
+      "authStatus": {}
+    },
+    "promptCapabilities": {
+      "image": true,
+      "embeddedContext": true
+    },
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "auth": {
+      "logout": {}
+    },
+    "providers": {},
+    "loadSession": true,
+    "sessionCapabilities": {
+      "additionalDirectories": {},
+      "close": {},
+      "delete": {},
+      "fork": {},
+      "list": {},
+      "resume": {},
+      "subagents": {}
+    }
+  },
+  "agentInfo": {
+    "name": "@agentclientprotocol/claude-agent-acp",
+    "title": "Claude Agent",
+    "version": "0.81.2"
+  },
+  "authMethods": [
+    {
+      "description": "Use Claude subscription ",
+      "name": "Claude Subscription",
+      "id": "claude-ai-login",
+      "type": "terminal",
+      "args": [
+        "--cli",
+        "auth",
+        "login",
+        "--claudeai"
+      ],
+      "_meta": {
+        "terminal-auth": {
+          "command": "/home/user/.local/share/mise/installs/node/26.8.1/bin/node",
+          "args": [
+            "/home/user/.local/share/mise/installs/npm-agentclientprotocol-claude-agent-acp/0.81.2/bin/claude-agent-acp",
+            "--cli",
+            "auth",
+            "login",
+            "--claudeai"
+          ],
+          "label": "Claude Login"
+        }
+      }
+    },
+    {
+      "description": "Use Anthropic Console (API usage billing)",
+      "name": "Anthropic Console",
+      "id": "console-login",
+      "type": "terminal",
+      "args": [
+        "--cli",
+        "auth",
+        "login",
+        "--console"
+      ],
+      "_meta": {
+        "terminal-auth": {
+          "command": "/home/user/.local/share/mise/installs/node/26.8.1/bin/node",
+          "args": [
+            "/home/user/.local/share/mise/installs/npm-agentclientprotocol-claude-agent-acp/0.81.2/bin/claude-agent-acp",
+            "--cli",
+            "auth",
+            "login",
+            "--console"
+          ],
+          "label": "Anthropic Console Login"
+        }
+      }
+    }
+  ],
+  "_meta": {
+    "jetbrains": {
+      "air": {
+        "version": 1,
+        "capabilities": [
+          "sessionFailure",
+          "agentFileChangeReport",
+          "nativeSubagentSessions",
+          "asyncTasks",
+          "recommendedValue"
+        ]
+      }
+    },
+    "steering": {
+      "supported": true
+    },
+    "goal": {
+      "version": 1,
+      "controlMethod": "_session/goal",
+      "actions": [
+        "set",
+        "clear"
+      ]
+    }
+  }
+}
