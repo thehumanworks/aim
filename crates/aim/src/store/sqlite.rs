@@ -6,11 +6,11 @@
 use std::path::Path;
 use std::sync::mpsc;
 
-use aim_proto::event::{EVENT_SCHEMA, SessionEvent, SessionMeta};
+use aim_proto::event::{SessionEvent, SessionMeta};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use tokio::sync::oneshot;
 
-use super::{BoxFuture, SessionStore, StoreError, check_sequence};
+use super::{BoxFuture, MAX_FORK_DEPTH, SessionStore, StoreError, check_sequence};
 
 /// Schema version of the database itself (independent of the event schema).
 const DB_SCHEMA: i64 = 1;
@@ -77,6 +77,12 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
 }
 
 fn create(conn: &Connection, meta: &SessionMeta) -> Result<(), StoreError> {
+    if let Some(parent) = &meta.parent {
+        let (_, history) = load_with_depth(conn, &parent.session, 1)?;
+        if parent.seq > history.last().map_or(0, |event| event.seq) {
+            return Err(StoreError::Backend("fork point exceeds parent history".to_owned()));
+        }
+    }
     let json = serde_json::to_string(meta).map_err(backend)?;
     match conn.execute("INSERT INTO sessions (id, created_ms, meta) VALUES (?1, ?2, ?3)", params![meta.id, meta.created_ms, json]) {
         Ok(_) => Ok(()),
@@ -89,15 +95,15 @@ fn create(conn: &Connection, meta: &SessionMeta) -> Result<(), StoreError> {
 
 fn append(conn: &mut Connection, session: &str, events: &[SessionEvent]) -> Result<(), StoreError> {
     let tx = conn.transaction().map_err(backend)?;
-    let exists: bool =
-        tx.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)", params![session], |r| r.get(0)).map_err(backend)?;
-    if !exists {
-        return Err(StoreError::NotFound(session.to_owned()));
-    }
-    let last: u64 = tx
-        .query_row("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1", params![session], |r| r.get::<_, i64>(0))
-        .map_err(backend)
-        .map(|v| u64::try_from(v).unwrap_or(0))?;
+    let meta_json: Option<String> =
+        tx.query_row("SELECT meta FROM sessions WHERE id = ?1", params![session], |r| r.get(0)).optional().map_err(backend)?;
+    let meta = meta_of(&meta_json.ok_or_else(|| StoreError::NotFound(session.to_owned()))?)?;
+    let last_row: Option<i64> =
+        tx.query_row("SELECT MAX(seq) FROM events WHERE session_id = ?1", params![session], |r| r.get(0)).map_err(backend)?;
+    let last = match last_row {
+        Some(seq) => u64::try_from(seq).map_err(backend)?,
+        None => meta.parent.as_ref().map_or(0, |parent| parent.seq),
+    };
     check_sequence(session, last, events)?;
     {
         let mut insert = tx
@@ -117,10 +123,24 @@ fn meta_of(json: &str) -> Result<SessionMeta, StoreError> {
     serde_json::from_str(json).map_err(backend)
 }
 
-fn load(conn: &Connection, session: &str) -> Result<(SessionMeta, Vec<SessionEvent>), StoreError> {
+fn load_with_depth(conn: &Connection, session: &str, depth: usize) -> Result<(SessionMeta, Vec<SessionEvent>), StoreError> {
+    if depth >= MAX_FORK_DEPTH {
+        return Err(StoreError::Backend("fork ancestry exceeds the depth limit".to_owned()));
+    }
     let meta: Option<String> =
         conn.query_row("SELECT meta FROM sessions WHERE id = ?1", params![session], |r| r.get(0)).optional().map_err(backend)?;
     let meta = meta_of(&meta.ok_or_else(|| StoreError::NotFound(session.to_owned()))?)?;
+    let mut events = if let Some(parent) = &meta.parent {
+        let (_, mut prefix) = load_with_depth(conn, &parent.session, depth + 1)?;
+        let last = prefix.last().map_or(0, |event| event.seq);
+        if parent.seq > last {
+            return Err(StoreError::Backend("fork point exceeds parent history".to_owned()));
+        }
+        prefix.retain(|event| event.seq <= parent.seq);
+        prefix
+    } else {
+        Vec::new()
+    };
     let mut stmt =
         conn.prepare_cached("SELECT seq, turn, ts_ms, schema, body FROM events WHERE session_id = ?1 ORDER BY seq").map_err(backend)?;
     let rows = stmt
@@ -128,11 +148,10 @@ fn load(conn: &Connection, session: &str) -> Result<(SessionMeta, Vec<SessionEve
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?))
         })
         .map_err(backend)?;
-    let mut events = Vec::new();
     for row in rows {
         let (seq, turn, ts_ms, schema, body) = row.map_err(backend)?;
         events.push(SessionEvent {
-            schema: u16::try_from(schema).unwrap_or(EVENT_SCHEMA),
+            schema: u16::try_from(schema).map_err(backend)?,
             seq: u64::try_from(seq).map_err(backend)?,
             turn: u64::try_from(turn).map_err(backend)?,
             ts_ms,
@@ -140,6 +159,64 @@ fn load(conn: &Connection, session: &str) -> Result<(SessionMeta, Vec<SessionEve
         });
     }
     Ok((meta, events))
+}
+
+fn load(conn: &Connection, session: &str) -> Result<(SessionMeta, Vec<SessionEvent>), StoreError> {
+    load_with_depth(conn, session, 0)
+}
+
+#[cfg(unix)]
+fn private_store_files(path: &Path) -> Result<(), StoreError> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if !meta.file_type().is_dir() => {
+                return Err(StoreError::Backend("state directory is not a regular directory".to_owned()));
+            }
+            Ok(meta) if meta.permissions().mode() & 0o077 != 0 && dir.file_name() != Some(std::ffi::OsStr::new(".aim")) => {
+                return Err(StoreError::Backend("existing state directory is shared; use a private directory".to_owned()));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(backend(err)),
+        }
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(backend)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(backend)?;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => return Err(StoreError::Backend("database path is not a regular file".to_owned())),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(backend(err)),
+    }
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(path).map_err(backend)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(backend)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let journal = Path::new(&name);
+        match std::fs::symlink_metadata(journal) {
+            Ok(meta) if meta.file_type().is_file() => {
+                std::fs::set_permissions(journal, std::fs::Permissions::from_mode(0o600)).map_err(backend)?;
+            }
+            Ok(_) => return Err(StoreError::Backend("database journal is not a regular file".to_owned())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(backend(err)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn private_store_files(path: &Path) -> Result<(), StoreError> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(backend)?;
+    }
+    let _file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(backend)?;
+    Ok(())
 }
 
 fn list(conn: &Connection, limit: u32) -> Result<Vec<SessionMeta>, StoreError> {
@@ -161,16 +238,17 @@ fn serve(mut conn: Connection, rx: &mpsc::Receiver<Command>) {
 }
 
 impl SqliteStore {
-    /// Opens (creating if needed) the database at `path` and starts its actor thread.
+    /// Opens (creating if needed) the database at `path` and starts its actor thread. On Unix,
+    /// the parent is a private state directory. A loose existing `.aim` directory is tightened;
+    /// a loose directory with another name is rejected so a shared parent is never chmodded.
     ///
     /// # Errors
     /// [`StoreError::Backend`] when the database cannot be opened or migrated.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(backend)?;
-        }
+        private_store_files(path)?;
         let conn = Connection::open(path).map_err(backend)?;
         migrate(&conn)?;
+        private_store_files(path)?;
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new().name("aim-db".to_owned()).spawn(move || serve(conn, &rx)).map_err(backend)?;
         Ok(Self { tx })

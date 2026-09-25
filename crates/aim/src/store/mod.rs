@@ -2,8 +2,8 @@
 //!
 //! A [`SessionStore`] keeps session metadata and the append-only event log. [`SqliteStore`] is
 //! the default (one database, one owning thread, WAL); [`MemoryStore`] backs ephemeral and private
-//! sessions and never touches disk. Every store enforces the log's shape: `seq` starts at 1 and
-//! has no gaps or duplicates.
+//! sessions and never touches disk. Every store enforces the log's shape: `seq` starts at 1 (or
+//! the fork point plus one) and has no gaps or duplicates.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -85,6 +85,28 @@ pub fn check_sequence(session: &str, last: u64, events: &[SessionEvent]) -> Resu
 /// Sessions held in memory: metadata and log per id.
 type Sessions = BTreeMap<String, (SessionMeta, Vec<SessionEvent>)>;
 
+pub(super) const MAX_FORK_DEPTH: usize = 32;
+
+fn materialize(map: &Sessions, session: &str, depth: usize) -> Result<(SessionMeta, Vec<SessionEvent>), StoreError> {
+    if depth >= MAX_FORK_DEPTH {
+        return Err(StoreError::Backend("fork ancestry exceeds the depth limit".to_owned()));
+    }
+    let (meta, own) = map.get(session).ok_or_else(|| StoreError::NotFound(session.to_owned()))?;
+    let mut events = if let Some(parent) = &meta.parent {
+        let (_, mut prefix) = materialize(map, &parent.session, depth + 1)?;
+        let last = prefix.last().map_or(0, |event| event.seq);
+        if parent.seq > last {
+            return Err(StoreError::Backend("fork point exceeds parent history".to_owned()));
+        }
+        prefix.retain(|event| event.seq <= parent.seq);
+        prefix
+    } else {
+        Vec::new()
+    };
+    events.extend(own.iter().cloned());
+    Ok((meta.clone(), events))
+}
+
 /// A store that lives only in memory — for ephemeral and private sessions.
 #[derive(Default, Clone)]
 pub struct MemoryStore {
@@ -104,6 +126,12 @@ impl SessionStore for MemoryStore {
             if map.contains_key(&meta.id) {
                 return Err(StoreError::Exists(meta.id.clone()));
             }
+            if let Some(parent) = &meta.parent {
+                let (_, history) = materialize(map, &parent.session, 1)?;
+                if parent.seq > history.last().map_or(0, |event| event.seq) {
+                    return Err(StoreError::Backend("fork point exceeds parent history".to_owned()));
+                }
+            }
             map.insert(meta.id.clone(), (meta, Vec::new()));
             Ok(())
         });
@@ -112,8 +140,9 @@ impl SessionStore for MemoryStore {
 
     fn append(&self, session: String, events: Vec<SessionEvent>) -> BoxFuture<Result<(), StoreError>> {
         let result = self.with(|map| {
-            let (_, log) = map.get_mut(&session).ok_or_else(|| StoreError::NotFound(session.clone()))?;
-            check_sequence(&session, log.last().map_or(0, |e| e.seq), &events)?;
+            let (meta, log) = map.get_mut(&session).ok_or_else(|| StoreError::NotFound(session.clone()))?;
+            let start = meta.parent.as_ref().map_or(0, |parent| parent.seq);
+            check_sequence(&session, log.last().map_or(start, |e| e.seq), &events)?;
             log.extend(events);
             Ok(())
         });
@@ -121,7 +150,7 @@ impl SessionStore for MemoryStore {
     }
 
     fn load(&self, session: String) -> BoxFuture<Result<(SessionMeta, Vec<SessionEvent>), StoreError>> {
-        let result = self.with(|map| map.get(&session).cloned().ok_or(StoreError::NotFound(session)));
+        let result = self.with(|map| materialize(map, &session, 0));
         Box::pin(async move { result })
     }
 
