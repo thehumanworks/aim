@@ -567,11 +567,17 @@ fn strict_relay(
     use crate::coderun::mode;
     let daemon = code.as_ref().map_or(mode::CodeModeRequest::Unset, |code| mode::CodeModeRequest::Set(code.mode));
     // An ACP session has no named agent (refused above), so its ceiling permits `run_code`.
-    let available = code.is_some() && aim.is_some();
-    let exposure = mode::decide_for_session(session, daemon, available, code.is_some() || cfg!(target_os = "macos"), true);
-    let effective = mode::to_setting(exposure.mode);
-    let (Some(aim), Some(code)) = (aim, code.filter(|_| exposure.code)) else {
-        return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx, effective);
+    let exposure = mode::decide_for_session(session, daemon, code.is_some(), code.is_some() || cfg!(target_os = "macos"), true);
+    let Some(code) = code.filter(|_| exposure.code) else {
+        return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx, mode::to_setting(exposure.mode));
+    };
+    // The worker is there, but the relay is aim itself: without its executable there is none.
+    let Some(aim) = aim else {
+        tracing::warn!(
+            "code mode `{}` is off for this Claude session: aim's executable was not found for the code-mode relay (set AIM_BIN)",
+            mode::label(exposure.mode)
+        );
+        return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx, CodeModeSetting::Off);
     };
     // The relay serves the session's effective mode, not this process's.
     let code = crate::host::CodeConfig { mode: exposure.mode, ..code };
@@ -581,7 +587,7 @@ fn strict_relay(
     let relay = crate::mcp::proxy::CodeRelay { root: root.to_owned(), location: location.clone(), aimx: aimx.to_path_buf(), code };
     let spec =
         McpServerSpec::Stdio { name: aim_acp::AIM_MCP_SERVER.to_owned(), command: aim.to_path_buf(), args: relay.args(), env: relay.env() };
-    (spec, aim_acp::AimRoute::Code { direct }, effective)
+    (spec, aim_acp::AimRoute::Code { direct }, mode::to_setting(exposure.mode))
 }
 
 fn aimx_relay(aimx: &Path, root: &str, location: &Location) -> McpServerSpec {
@@ -847,6 +853,11 @@ mod tests {
         // Without the worker a request for `on` gets `aimx mcp`, and the session says it is off.
         let (_, route, effective) = super::strict_relay(Some(aim), aimx, "/w", &Location::Local, None, Some(CodeModeSetting::On));
         assert_eq!((route, effective), (aim_acp::AimRoute::Aimx, CodeModeSetting::Off));
+        // Without aim's own executable there is no relay either: `aimx mcp`, and the session is off.
+        let (relay, route, effective) =
+            super::strict_relay(None, aimx, "/w", &Location::Local, Some(code(Mode::Off)), Some(CodeModeSetting::On));
+        assert_eq!((route, effective), (aim_acp::AimRoute::Aimx, CodeModeSetting::Off));
+        assert!(matches!(relay, aim_acp::McpServerSpec::Stdio { command, .. } if command == aimx));
         // A session that asks for `off` gets `aimx mcp` from a daemon whose own mode is on.
         let asked_off = params(Some(code(Mode::On)), Some(CodeModeSetting::Off), &Location::Local);
         assert_eq!(asked_off["mcpServers"][0]["command"], "/opt/aim/aimx");

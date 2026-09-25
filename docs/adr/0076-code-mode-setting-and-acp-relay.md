@@ -345,7 +345,8 @@ client's shell, and nothing in the TUI showed which mode a session had.
   both stored and published:
   - **Stored:** written when the session is created.
   - **Published:** in a live summary, it is what the host gave the session after its guards. On
-    resume the in-memory value is replaced by what the guards give now; the stored record keeps
+    resume the in-memory value is replaced by what the new backend gives now, `None` for one
+    without code mode (codex review of T4c, B1); the stored record keeps
     the value from creation.
   - **`None`** for backends without code mode (and in older logs).
 

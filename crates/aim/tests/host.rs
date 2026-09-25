@@ -808,6 +808,15 @@ impl Backend for TwoStep {
 /// A host whose sessions run `TwoStep`, built once `gate` opens (open from the start when
 /// `None`); counts backend-session shutdowns.
 fn two_step_host(store: Arc<dyn SessionStore>, gate: Option<Arc<tokio::sync::Semaphore>>) -> (SessionHost, Arc<AtomicUsize>) {
+    two_step_host_with(store, gate, None)
+}
+
+/// [`two_step_host`] whose backends report `code_mode` (ADR 0076).
+fn two_step_host_with(
+    store: Arc<dyn SessionStore>,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+    code_mode: Option<aim_proto::event::CodeModeSetting>,
+) -> (SessionHost, Arc<AtomicUsize>) {
     let shutdowns = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&shutdowns);
     let backends: BackendFactory = Arc::new(move |request: BackendRequest| {
@@ -829,11 +838,34 @@ fn two_step_host(store: Arc<dyn SessionStore>, gate: Option<Arc<tokio::sync::Sem
                 location: "local".into(),
                 agent: None,
                 shutdown,
-                code_mode: None,
+                code_mode,
             })
         })
     });
     (SessionHost::new(HostConfig { store, backends, update_capacity: 256 }), shutdowns)
+}
+
+/// ADR 0076 §7 (codex review of T4c, B1): a resumed session reports the code mode its new backend
+/// gives it; a backend without code mode reports none, whatever the stored record says, and the
+/// stored record keeps what the session had.
+#[tokio::test]
+async fn a_resumed_session_reports_the_code_mode_its_new_backend_gives() {
+    use aim_proto::event::CodeModeSetting;
+
+    let store = Arc::new(MemoryStore::default());
+    let (first, _) = two_step_host_with(Arc::clone(&store) as Arc<dyn SessionStore>, None, Some(CodeModeSetting::On));
+    let created = first.create(spec(Persistence::Persistent)).await.unwrap();
+    assert_eq!(created.meta.code_mode, Some(CodeModeSetting::On));
+    let id = created.meta.id;
+    first.close(id.clone()).await.unwrap();
+    for (backend, shown) in [(None, None), (Some(CodeModeSetting::Off), Some(CodeModeSetting::Off))] {
+        let (host, _) = two_step_host_with(Arc::clone(&store) as Arc<dyn SessionStore>, None, backend);
+        let (resumed, _updates) = host.attach(id.clone()).await.unwrap();
+        assert_eq!(resumed.summary.meta.code_mode, shown, "the live summary follows the backend it resumed on");
+        host.close(id.clone()).await.unwrap();
+    }
+    let (stored, _) = store.load(id).await.unwrap();
+    assert_eq!(stored.code_mode, Some(CodeModeSetting::On), "the stored record keeps what the session had");
 }
 
 #[tokio::test]

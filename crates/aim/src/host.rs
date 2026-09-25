@@ -773,10 +773,9 @@ impl SessionHost {
             }
         };
         // What the session got now, after the guards (a resumed one may get less than it recorded,
-        // e.g. without the worker); the stored record keeps what it had (ADR 0076).
-        if code_mode.is_some() {
-            meta.code_mode = code_mode;
-        }
+        // e.g. without the worker, and a backend without code mode gives none); the stored record
+        // keeps what it had (ADR 0076).
+        meta.code_mode = code_mode;
         // Shutdown began while this session was starting: it must not go live.
         if self.closing.load(Ordering::SeqCst) {
             backend.shutdown().await;
