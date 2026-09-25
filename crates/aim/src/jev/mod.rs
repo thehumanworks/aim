@@ -152,45 +152,137 @@ fn ask(bundle: &Bundle) -> Option<Advice> {
     })
 }
 
-/// Create a bounded digest. Returns `None` if a known credential marker appears; no content is
-/// sent in that case. Native payloads, tool arguments and image bytes never enter `recent`.
+/// Create a bounded digest with credential-shaped text redacted. Native payloads, tool arguments
+/// and image bytes never enter `recent`.
 #[must_use]
 pub fn digest(goal: &str, recent: &[String], counts: (usize, usize)) -> Option<String> {
-    let mut state = format!("Goal: {}\nItems: {}, tool calls: {}\n", safe_text(goal, 800)?, counts.0, counts.1);
+    let (goal, mut redactions) = safe_text(goal, 800);
+    let mut state = format!("Goal: {goal}\nItems: {}, tool calls: {}\n", counts.0, counts.1);
     for item in recent.iter().rev().take(8).rev() {
-        state.push_str(&safe_text(item, 320)?);
+        let (safe, count) = safe_text(item, 320);
+        redactions += count;
+        state.push_str(&safe);
         state.push('\n');
+    }
+    if redactions > 0 {
+        tracing::debug!(redactions, "Jev digest redacted sensitive text");
     }
     Some(state)
 }
 
-fn safe_text(text: &str, limit: usize) -> Option<String> {
-    let lower = text.to_ascii_lowercase();
-    if [
-        "password",
-        "api_key",
-        "api key",
-        "secret",
-        "token",
-        "bearer",
-        "authorization",
-        "credential",
-        "private key",
-        "sk-",
-        "sk_",
-        "ghp_",
-        "akia",
-        "asia",
-        "eyj",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-        || text.split_whitespace().any(|word| word.chars().filter(char::is_ascii_alphanumeric).count() >= 24)
-    {
-        return None;
+fn safe_text(text: &str, limit: usize) -> (String, usize) {
+    let mut safe = String::new();
+    let mut redactions = 0;
+    for line in text.lines() {
+        if !safe.is_empty() {
+            safe.push(' ');
+        }
+        let mut redact_next = false;
+        for word in line.split_whitespace() {
+            if !safe.is_empty() && !safe.ends_with(' ') {
+                safe.push(' ');
+            }
+            let lower = word.to_ascii_lowercase();
+            let marker = lower.trim_start_matches(|ch: char| !ch.is_ascii_alphabetic()).replace(['"', '\''], "");
+            if marker.starts_with("authorization:") || marker.starts_with("authorization=") {
+                safe.push_str("[REDACTED_AUTHORIZATION]");
+                redactions += 1;
+                break;
+            }
+            if redact_next {
+                safe.push_str("[REDACTED]");
+                redactions += 1;
+                redact_next = false;
+                continue;
+            }
+            if marker == "bearer" || marker == "bearer:" || sensitive_label(&marker) {
+                safe.push_str(word);
+                redact_next = true;
+                continue;
+            }
+            if sensitive_assignment(&marker) || known_secret(word) || high_entropy_token(word) {
+                safe.push_str("[REDACTED]");
+                redactions += 1;
+                continue;
+            }
+            if let Some((_, rest)) = word.split_once("://") {
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+                safe.push_str("[URL:");
+                safe.push_str(host);
+                safe.push(']');
+                if authority.contains('@') {
+                    redactions += 1;
+                }
+            } else if word.contains('/') {
+                safe.push_str(word.rsplit('/').next().unwrap_or_default());
+            } else {
+                safe.push_str(word);
+            }
+        }
     }
-    let cut = text.char_indices().nth(limit).map_or(text.len(), |(index, _)| index);
-    Some(text.get(..cut)?.to_owned())
+    let cut = safe.char_indices().nth(limit).map_or(safe.len(), |(index, _)| index);
+    safe.truncate(cut);
+    (safe, redactions)
+}
+
+fn sensitive_label(word: &str) -> bool {
+    ["password", "api_key", "secret", "credential", "token"].iter().any(|label| word == format!("{label}:") || word == format!("{label}="))
+}
+
+fn sensitive_assignment(word: &str) -> bool {
+    ["password", "api_key", "secret", "credential", "token"]
+        .iter()
+        .any(|label| word.starts_with(&format!("{label}=")) || word.starts_with(&format!("{label}:")) && word.len() > label.len() + 1)
+}
+
+fn known_secret(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    for prefix in ["sk-", "sk_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"] {
+        for (index, _) in lower.match_indices(prefix) {
+            let boundary = index == 0 || lower.as_bytes().get(index.saturating_sub(1)).is_some_and(|byte| !byte.is_ascii_alphanumeric());
+            let tail = lower
+                .get(index + prefix.len()..)
+                .unwrap_or_default()
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
+                .count();
+            if boundary && tail >= 20 {
+                return true;
+            }
+        }
+    }
+    for prefix in ["AKIA", "ASIA"] {
+        if let Some(index) = word.find(prefix) {
+            let suffix = word
+                .get(index + 4..)
+                .unwrap_or_default()
+                .bytes()
+                .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                .count();
+            if suffix >= 16 {
+                return true;
+            }
+        }
+    }
+    word.contains("eyJ") && word.matches('.').count() >= 2
+}
+
+fn high_entropy_token(word: &str) -> bool {
+    let trimmed = word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-' && ch != '+' && ch != '/');
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 32 || bytes.iter().any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'/' | b'='))) {
+        return false;
+    }
+    let unique = bytes.iter().copied().collect::<std::collections::BTreeSet<_>>().len();
+    let has_lower = bytes.iter().any(u8::is_ascii_lowercase);
+    let has_upper = bytes.iter().any(u8::is_ascii_uppercase);
+    let has_digit = bytes.iter().any(u8::is_ascii_digit);
+    let hex = bytes.iter().all(u8::is_ascii_hexdigit);
+    if hex {
+        return bytes.len() >= 48 && unique >= 12;
+    }
+    unique >= 16 && has_digit && has_lower && has_upper
 }
 
 #[cfg(test)]
@@ -201,10 +293,52 @@ mod tests {
     async fn fallback_and_digest() {
         let bundle = super::Bundle { state: "goal".into(), ladder: vec!["low".into(), "high".into()] };
         assert!(FallbackDecider.decide(bundle).await.is_none());
-        assert!(digest("use Bearer abc", &[], (1, 0)).is_none());
+        let bearer = digest("use Bearer abc", &[], (1, 0));
+        assert!(bearer.as_deref().is_some_and(|text| text.contains("[REDACTED]")));
+        assert!(!bearer.as_deref().is_some_and(|text| text.contains("abc")));
         assert!(digest("goal", &["result metadata".into()], (2, 1)).is_some());
         assert_eq!(basis_points(1.2), Some(10_000));
         assert_eq!(basis_points(f64::NAN), None);
+    }
+
+    #[test]
+    fn digest_keeps_recorded_coding_context() {
+        // These task and assistant excerpts reproduce the recorded REV9 coding probe cases.
+        let corpus = [
+            ("fix the flaky task_runner test", "assistant: I edited crates/aim-llm-codex/src/media/mod.rs"),
+            ("reduce token usage in compaction", "assistant: see https://github.com/example/project/pull/12"),
+            ("rename the disk-cache module", "assistant: rerun cargo test -p aim"),
+            ("add Malaysia to the country list", "assistant: inspect /Users/dev/projects/aim/src/main.rs"),
+        ];
+        for (goal, item) in corpus {
+            let state = digest(goal, &[item.into()], (2, 0));
+            assert!(state.as_deref().is_some_and(|text| text.contains(goal)));
+        }
+        let state = digest("g", &[corpus[0].1.into()], (2, 0));
+        assert!(state.as_deref().is_some_and(|text| text.contains("mod.rs")));
+    }
+
+    #[test]
+    fn digest_redacts_credential_shapes_without_dropping_context() {
+        let aws_shape = format!("{}{}", "AKIA", "ABCDEFGHIJKLMNOP");
+        let github_shape = format!("{}{}", "ghp_", "abcdefghijklmnopqrstuvwxyz123456");
+        let mixed_shape = ["Qm5pK7xL9zT2", "rY4dW6fH8jN0", "vB3cD5eG"].concat();
+        let cases = [
+            (format!("use {}{}", "sk-live_", "abcdefghijklmnopqrstuvwx"), "sk-live_".to_owned()),
+            ("header Authorization: Bearer examplecredential".to_owned(), "examplecredential".to_owned()),
+            ("header \"Authorization\": \"Bearer examplecredential\"".to_owned(), "examplecredential".to_owned()),
+            ("Bearer examplecredential then continue".to_owned(), "examplecredential".to_owned()),
+            ("token: examplecredential then continue".to_owned(), "examplecredential".to_owned()),
+            ("see https://user:password@example.test/path".to_owned(), "user:password".to_owned()),
+            (format!("export {aws_shape}"), aws_shape),
+            (format!("use {github_shape}"), "ghp_".to_owned()),
+            (format!("value {mixed_shape}"), mixed_shape),
+        ];
+        for (goal, secret) in cases {
+            let state = digest(&goal, &[], (1, 0));
+            assert!(state.as_deref().is_some_and(|text| !text.contains(&secret)));
+            assert!(state.as_deref().is_some_and(|text| text.contains("Goal:")));
+        }
     }
 
     /// Calls the real hosted Jev service when `TYPESAFE_API_KEY` is available.
@@ -212,7 +346,15 @@ mod tests {
     #[ignore = "requires TYPESAFE_API_KEY and live TypeSafe service"]
     async fn live_jev_batched_bundle() {
         let bundle = super::Bundle {
-            state: "Goal: explain a short Rust function. Items: 1, tool calls: 1".into(),
+            state: digest(
+                "fix the flaky task_runner test and reduce token usage",
+                &[
+                    "assistant: I edited crates/aim-llm-codex/src/media/mod.rs".into(),
+                    "assistant: see https://github.com/example/project/pull/12".into(),
+                ],
+                (3, 1),
+            )
+            .unwrap_or_default(),
             ladder: vec!["low".into(), "medium".into(), "high".into()],
         };
         let advice = super::JevDecider.decide(bundle).await;

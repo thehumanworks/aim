@@ -18,11 +18,16 @@ use crate::{CodexProvider, error, send_error};
 
 /// Maximum accepted WAV size, before multipart encoding.
 pub const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
-const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
-const MAX_JSON_BYTES: usize = 35 * 1024 * 1024;
+/// Maximum generated image size accepted for an aimx write. An 11 MiB image
+/// expands to under 15 MiB as base64, leaving room for the JSON envelope
+/// inside aimx's 16 MiB RPC frame.
+pub const MAX_IMAGE_BYTES: usize = 11 * 1024 * 1024;
+const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
 
 /// Media capability choices and bounded call deadlines. A missing model disables that service.
+/// Defaults read `AIM_CODEX_SEARCH_MODEL` and `AIM_CODEX_IMAGE_MODEL` from the environment;
+/// unset or blank values disable the corresponding service.
 #[derive(Clone, Debug)]
 pub struct MediaConfig {
     /// Model used for standalone hosted search.
@@ -42,8 +47,8 @@ pub struct MediaConfig {
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
-            search_model: Some("gpt-6-luna".into()),
-            image_model: Some("gpt-image-2.5-sunburst".into()),
+            search_model: configured_model("AIM_CODEX_SEARCH_MODEL"),
+            image_model: configured_model("AIM_CODEX_IMAGE_MODEL"),
             transcription_enabled: true,
             search_timeout: Duration::from_secs(120),
             image_timeout: Duration::from_secs(300),
@@ -71,7 +76,8 @@ pub struct Citation {
 pub struct SearchAnswer {
     /// Assistant answer text.
     pub text: String,
-    /// Citation annotations supplied by the backend; callers should check cited pages.
+    /// Citation annotations supplied by the backend. An empty list means the answer is uncited;
+    /// callers should check cited pages before repeating factual claims.
     pub citations: Vec<Citation>,
     /// Search queries actually issued by the hosted tool.
     pub queries: Vec<String>,
@@ -182,7 +188,8 @@ impl MediaClient {
     /// Generate one image. Model, size, and quality are sent as data to the Codex image service.
     ///
     /// # Errors
-    /// Returns an auth, transport, HTTP, or protocol error. Output is capped at 25 MiB.
+    /// Returns an auth, transport, HTTP, or protocol error. Output is capped at 11 MiB so the
+    /// base64 payload fits the harness's 16 MiB write frame.
     pub async fn generate_image(&self, prompt: &str, size: Option<&str>, quality: Option<&str>) -> Result<Image, LlmError> {
         let model = self.config.image_model.as_deref().ok_or_else(|| unavailable("image generation"))?;
         if prompt.trim().is_empty() {
@@ -260,6 +267,17 @@ fn unavailable(capability: &str) -> LlmError {
     error(LlmErrorKind::Unavailable, &format!("Codex {capability} is unavailable"))
 }
 
+fn configured_model(key: &str) -> Option<String> {
+    std::env::var(key).ok().map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+}
+
+#[expect(clippy::print_stderr, reason = "opt-in debug log contains only static text and no provider data")]
+fn log_unknown_search_item() {
+    if std::env::var_os("AIM_CODEX_MEDIA_DEBUG").is_some() {
+        eprintln!("Codex web search ignored an unknown output item");
+    }
+}
+
 fn timeout(capability: &str) -> LlmError {
     error(LlmErrorKind::Transport, &format!("Codex {capability} timed out"))
 }
@@ -294,9 +312,12 @@ fn parse_image(bytes: &[u8]) -> Result<Image, LlmError> {
         .pointer("/data/0/b64_json")
         .and_then(Value::as_str)
         .ok_or_else(|| error(LlmErrorKind::Protocol, "Codex image response has no image"))?;
+    if encoded.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+        return Err(error(LlmErrorKind::Protocol, "Codex image is too large to store through the harness"));
+    }
     let image = STANDARD.decode(encoded).map_err(|_| error(LlmErrorKind::Protocol, "Codex image is not valid base64"))?;
     if image.is_empty() || image.len() > MAX_IMAGE_BYTES {
-        return Err(error(LlmErrorKind::Protocol, "Codex image exceeds size limit or is empty"));
+        return Err(error(LlmErrorKind::Protocol, "Codex image is too large to store through the harness or is empty"));
     }
     let media_type = match value.get("output_format").and_then(Value::as_str).unwrap_or("png") {
         "png" => "image/png",
@@ -365,11 +386,15 @@ fn parse_search_items(items: &[Item]) -> Result<SearchAnswer, LlmError> {
                 }
             }
             Item::Reasoning { .. } => {}
-            _ => return Err(error(LlmErrorKind::Protocol, "Codex web search returned an unexpected output item")),
+            _ => {
+                // Unknown provider output is not part of the answer. Opt-in diagnostics stay
+                // static so native provider items and their potentially private data are never logged.
+                log_unknown_search_item();
+            }
         }
     }
-    if !searched || text.trim().is_empty() || citations.is_empty() {
-        return Err(error(LlmErrorKind::Protocol, "Codex web search returned no completed cited answer"));
+    if !searched || text.trim().is_empty() {
+        return Err(error(LlmErrorKind::Protocol, "Codex web search returned no completed answer"));
     }
     Ok(SearchAnswer { text, citations, queries })
 }

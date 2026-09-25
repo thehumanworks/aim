@@ -15,7 +15,14 @@ fn client(server: &FakeServer) -> MediaClient {
     let store = MemoryStore::new(Some(fake::credentials(unix_now() + 3_600, Some("rt"))));
     let auth = Arc::new(AuthManager::with_config(http.clone(), store, &config));
     let provider = Arc::new(CodexProvider::with_auth(config, http, auth));
-    MediaClient::with_provider(provider, MediaConfig::default())
+    MediaClient::with_provider(
+        provider,
+        MediaConfig {
+            search_model: Some("gpt-6-luna".into()),
+            image_model: Some("gpt-image-2.5-sunburst".into()),
+            ..MediaConfig::default()
+        },
+    )
 }
 
 #[test]
@@ -48,6 +55,20 @@ async fn web_search_uses_isolated_hosted_turn() {
     assert_eq!(request.json()["tool_choice"], "required");
 }
 
+#[tokio::test]
+async fn web_search_accepts_uncited_answer_and_unknown_item() {
+    let server = FakeServer::start(|_, _| {
+        let mut events = include_bytes!("../../fixtures/media_search_uncited.sse").to_vec();
+        events.push(b'\n');
+        Reply::sse(&events)
+    })
+    .await;
+    let answer = client(&server).web_search("no results").await.unwrap();
+    assert_eq!(answer.text, "No results found.");
+    assert!(answer.citations.is_empty());
+    assert_eq!(answer.queries, ["no results"]);
+}
+
 #[test]
 fn search_citation_spans_are_extracted() {
     let items = [
@@ -62,14 +83,34 @@ fn search_citation_spans_are_extracted() {
             parts: vec![Part::Text { text: "Café source".into() }],
             native: Some(aim_proto::conversation::NativeItem {
                 provider: "codex".into(),
-                value: json!({"content":[{"text":"Café source","annotations":[{"type":"url_citation","url":"https://example.test","title":"Example","start_index":5,"end_index":11}]}]}),
+                value: json!({"content":[{"text":"Café ","annotations":[]},{"text":"source","annotations":[{"type":"url_citation","url":"https://example.test","title":"Example","start_index":0,"end_index":6}]}]}),
             }),
         },
     ];
     let answer = parse_search_items(&items).unwrap();
     assert_eq!(answer.citations, [Citation { url: "https://example.test".into(), title: "Example".into(), start: 5, end: 11 }]);
     let uncited = [items[0].clone(), Item::Assistant { id: None, parts: vec![Part::Text { text: "Uncited answer".into() }], native: None }];
-    assert_eq!(parse_search_items(&uncited).unwrap_err().kind, LlmErrorKind::Protocol);
+    let answer = parse_search_items(&uncited).unwrap();
+    assert_eq!(answer.text, "Uncited answer");
+    assert!(answer.citations.is_empty());
+    let mut with_unknown = uncited.to_vec();
+    with_unknown.push(Item::Hosted {
+        native: aim_proto::conversation::NativeItem {
+            provider: "codex".into(),
+            value: json!({"type":"future_hosted_call","status":"completed"}),
+        },
+    });
+    assert_eq!(parse_search_items(&with_unknown).unwrap().text, "Uncited answer");
+}
+
+#[test]
+fn image_limit_fits_one_harness_frame_after_base64() {
+    assert!(MAX_IMAGE_BYTES.div_ceil(3) * 4 < 16 * 1024 * 1024);
+    let encoded = STANDARD.encode(vec![0_u8; MAX_IMAGE_BYTES + 1]);
+    let payload = json!({"data":[{"b64_json":encoded}],"output_format":"png"}).to_string();
+    let error = parse_image(payload.as_bytes()).unwrap_err();
+    assert_eq!(error.kind, LlmErrorKind::Protocol);
+    assert!(error.message.contains("too large to store"));
 }
 
 #[tokio::test]
@@ -124,7 +165,6 @@ async fn live_codex_web_search() {
     let start = Instant::now();
     let answer = client.web_search("What is the capital of France? Cite a source.").await.unwrap();
     assert!(!answer.text.trim().is_empty() && !answer.queries.is_empty());
-    assert!(!answer.citations.is_empty());
     eprintln!("live_codex_web_search elapsed_ms={} citations={}", start.elapsed().as_millis(), answer.citations.len());
 }
 

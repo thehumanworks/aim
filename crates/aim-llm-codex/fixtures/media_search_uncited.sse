@@ -1,0 +1,14 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fixture"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws_fixture","status":"completed","action":{"type":"search","queries":["no results"]}}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"future_hosted_call","id":"other_fixture","status":"completed"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"message","id":"msg_fixture","role":"assistant","status":"completed","content":[{"type":"output_text","text":"No results found.","annotations":[]}]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fixture","status":"completed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}
