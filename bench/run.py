@@ -27,6 +27,7 @@ import tomllib
 from pathlib import Path
 
 from live_tasks import grade, prepare
+from port import fixed_port
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
@@ -57,15 +58,24 @@ def fixture_jwt() -> str:
 
 
 def free_port() -> int:
+    selected = fixed_port(os.environ.get("AIM_GATE_BENCH_PORT"))
+    if selected is not None:
+        return selected
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
 
-def wait_port(port: int, process: subprocess.Popen) -> None:
+def wait_port(port: int, process: subprocess.Popen, ready: Path) -> None:
     for _ in range(100):
         if process.poll() is not None:
             raise RuntimeError("recording proxy exited before listening")
+        try:
+            if int(ready.read_text()) != process.pid:
+                raise RuntimeError("recording proxy readiness came from another process")
+        except FileNotFoundError:
+            time.sleep(0.02)
+            continue
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.05):
                 return
@@ -194,7 +204,9 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
         incoming = "/backend-api/codex" if harness == "aim_codex" else "/v1"
         upstream_base = "/backend-api/codex" if harness == "aim_codex" else "/api/v1"
         recorder = root / "requests.jsonl"
+        ready = root / "proxy.ready"
         proxy_command = [sys.executable, "-B", str(PROXY), "--port", str(port), "--out", str(recorder),
+                         "--ready-file", str(ready),
                          "--mode", "mock" if mode == "wire" else "live", "--model", model,
                          "--scenario", case.get("scenario", "reply"), "--steps", str(case.get("steps", 0)),
                          "--command", case.get("command", "true"), "--harness", harness, "--upstream-host", upstream,
@@ -202,7 +214,7 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
         with (root / "proxy.stderr").open("wb") as proxy_stderr:
             proxy = subprocess.Popen(proxy_command, stdout=subprocess.DEVNULL, stderr=proxy_stderr)
             try:
-                wait_port(port, proxy)
+                wait_port(port, proxy, ready)
                 env, command = invocation(harness, paths, home, url, model, case["prompt"], "mock" if mode == "wire" else "live",
                                           effort, workspace)
                 start_ns = time.time_ns()

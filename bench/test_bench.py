@@ -2,14 +2,74 @@
 
 import tempfile
 import unittest
+from unittest.mock import patch
+import http.client
+import os
+import socket
+import subprocess
+import sys
 from pathlib import Path
 
 from live_tasks import TASKS, grade, prepare
 from proxy import SseUsage, has_generated_delta, request_shape, usage_fields
-from run import summary
+from run import PROXY, free_port, summary, wait_port
+from port import fixed_port, require_fixed_port
 
 
 class RecorderTests(unittest.TestCase):
+    def test_gate_fixed_port_is_validated_and_shared_with_proxy(self):
+        with patch.dict(os.environ, {"AIM_GATE_BENCH_PORT": "43117"}):
+            self.assertEqual(free_port(), 43117)
+            require_fixed_port(43117, os.environ["AIM_GATE_BENCH_PORT"])
+            with self.assertRaises(ValueError):
+                require_fixed_port(43118, os.environ["AIM_GATE_BENCH_PORT"])
+        for invalid in ("", "0", "65536", "-1", "1.5", " 43117", "４３１１７"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                fixed_port(invalid)
+        self.assertIsNone(fixed_port(None))
+
+    def test_occupied_fixed_port_never_accepts_another_server_as_recorder(self):
+        with socket.socket() as occupied, tempfile.TemporaryDirectory() as temp:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            port = occupied.getsockname()[1]
+            ready = Path(temp) / "proxy.ready"
+            with patch.dict(os.environ, {"AIM_GATE_BENCH_PORT": str(port)}):
+                proxy = subprocess.Popen(
+                    [sys.executable, "-B", str(PROXY), "--port", str(port), "--out", str(Path(temp) / "rows.jsonl"),
+                     "--ready-file", str(ready), "--mode", "mock", "--harness", "aim_openrouter"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                try:
+                    with self.assertRaises(RuntimeError):
+                        wait_port(port, proxy, ready)
+                    self.assertFalse(ready.exists())
+                finally:
+                    proxy.wait(timeout=3)
+
+    def test_fixed_port_proxy_listens_and_answers_on_that_port(self):
+        with socket.socket() as selector:
+            selector.bind(("127.0.0.1", 0))
+            port = selector.getsockname()[1]
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"AIM_GATE_BENCH_PORT": str(port)}):
+            ready = Path(temp) / "proxy.ready"
+            proxy = subprocess.Popen(
+                [sys.executable, "-B", str(PROXY), "--port", str(port), "--out", str(Path(temp) / "rows.jsonl"),
+                 "--ready-file", str(ready), "--mode", "mock", "--harness", "aim_openrouter"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            try:
+                wait_port(port, proxy, ready)
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                connection.request("GET", "/v1/models")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                response.read()
+                connection.close()
+            finally:
+                proxy.terminate()
+                proxy.wait(timeout=3)
+
     def test_chat_usage_is_read_from_provider_fields(self):
         usage = usage_fields({"prompt_tokens": 100, "completion_tokens": 8,
                               "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 5},

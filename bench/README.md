@@ -21,6 +21,12 @@ paths explicitly. The W22 optional artifacts came from the read-only references 
 oh-my-pi `4a7b586821a4df0afcea657717247f6ec9db8f88` and Unreal Agent
 `1b9f778453f411c029b39b85102aaefb95e7e48d`; the result records executable hashes:
 
+The trusted gate can set `AIM_GATE_BENCH_PORT` to one decimal TCP port (1–65535). Every sequential
+mock proxy uses that port and announces readiness only after binding it; a mismatch or occupied
+port aborts rather than accepting another local service as the recorder. Without the variable,
+the benchmark retains its ephemeral-port behavior. The gate's Seatbelt profile permits only the
+selected loopback port.
+
 ```sh
 python3 -B bench/run.py wire --out bench/history/all-peers.json \
   --harnesses aim_openrouter,codex,pi,omp,unreal \

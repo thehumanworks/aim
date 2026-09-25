@@ -13,11 +13,14 @@ import gzip
 import hashlib
 import http.client
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from port import require_fixed_port
 
 MAX_REQUEST = 16 * 1024 * 1024
 HOP_HEADERS = {"connection", "proxy-connection", "keep-alive", "transfer-encoding", "content-length", "content-encoding", "host", "accept-encoding"}
@@ -328,6 +331,7 @@ class BenchServer(ThreadingHTTPServer):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--mode", choices=["mock", "live"], required=True)
     parser.add_argument("--model", default="gpt-5.5")
@@ -339,8 +343,17 @@ def main() -> None:
     parser.add_argument("--incoming-base", default="/v1")
     parser.add_argument("--upstream-base", default="/api/v1")
     args = parser.parse_args()
-    BenchServer(args.port, Recorder(args.out, args.scenario, args.steps, args.command, args.harness), args.mode,
-                args.model, args.upstream_host, args.incoming_base, args.upstream_base).serve_forever()
+    try:
+        require_fixed_port(args.port, os.environ.get("AIM_GATE_BENCH_PORT"))
+    except ValueError as error:
+        parser.error(str(error))
+    server = BenchServer(args.port, Recorder(args.out, args.scenario, args.steps, args.command, args.harness), args.mode,
+                         args.model, args.upstream_host, args.incoming_base, args.upstream_base)
+    if args.ready_file is not None:
+        temporary = args.ready_file.with_suffix(".ready.tmp")
+        temporary.write_text(str(os.getpid()))
+        temporary.replace(args.ready_file)
+    server.serve_forever()
 
 
 if __name__ == "__main__":
