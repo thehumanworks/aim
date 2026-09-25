@@ -190,3 +190,58 @@ async fn retried_stdin_writes_send_their_bytes_once() {
     }
     assert_eq!(out, "once\n");
 }
+
+/// A process belongs to the session that spawned it: replaying its id to a fresh session (a
+/// reconnect without the resume token) would hand out an id that session cannot read, signal,
+/// wait for or release, so the retry answers `unknown_outcome` instead (REV4-A finding 5). A
+/// resumed session is the same session and still gets the process.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_is_replayed_only_to_its_own_session() {
+    use aim_proto::harness::{ExecRead, ExecReadParams, ExecRelease, ExecReleaseParams, ExecWait, ExecWaitParams};
+
+    let env = env().await;
+    let k = key();
+    let bash = key();
+    let background = |ws: &aim_proto::ids::WorkspaceId| ToolsCallParams {
+        workspace: ws.clone(),
+        name: "Bash".into(),
+        arguments: json!({"command": "sleep 30", "run_in_background": true}),
+        idempotency_key: Some(bash.clone()),
+    };
+    let (first, token, first_tool) = {
+        let (client, init, ws) = session(&env).await;
+        let proc = client.peer.call::<ExecSpawn>(spawn_params(&ws, "sleep 30", &key())).await.unwrap().proc;
+        let first = client.peer.call::<ExecSpawn>(spawn_params(&ws, "sleep 30", &k)).await.unwrap().proc;
+        client.peer.call::<ExecRelease>(ExecReleaseParams { proc }).await.unwrap();
+        let tool = client.peer.call::<ToolsCall>(background(&ws)).await.unwrap();
+        client.peer.close();
+        (first, init.resume_token, tool)
+    };
+
+    // A fresh session (no resume token) retrying the same keys.
+    let fresh = connect(&env.socket).await;
+    assert!(!initialize(&fresh, None).await.resumed);
+    let ws = open(&fresh, &env.root).await;
+    match fresh.peer.call::<ExecSpawn>(spawn_params(&ws, "sleep 30", &k)).await {
+        Err(err) => assert_eq!(err.code, ErrorCode::UnknownOutcome, "{err:?}"),
+        Ok(retry) => {
+            // Whatever it returns must be usable by this session.
+            let read = ExecReadParams { proc: retry.proc.clone(), after_seq: 0, max_bytes: None, wait_ms: 0 };
+            fresh.peer.call::<ExecRead>(read).await.unwrap();
+            fresh.peer.call::<ExecWait>(ExecWaitParams { proc: retry.proc.clone(), timeout_ms: Some(10) }).await.unwrap();
+            fresh.peer.call::<ExecRelease>(ExecReleaseParams { proc: retry.proc }).await.unwrap();
+        }
+    }
+    let err = fresh.peer.call::<ToolsCall>(background(&ws)).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::UnknownOutcome, "a background Bash handle belongs to its session");
+    fresh.peer.close();
+
+    // The original session, resumed, still gets its process, and can use it.
+    let resumed = connect(&env.socket).await;
+    assert!(initialize(&resumed, Some(token)).await.resumed);
+    let ws = open(&resumed, &env.root).await;
+    let again = resumed.peer.call::<ExecSpawn>(spawn_params(&ws, "sleep 30", &k)).await.unwrap().proc;
+    assert_eq!(again, first);
+    assert_eq!(resumed.peer.call::<ToolsCall>(background(&ws)).await.unwrap(), first_tool);
+    resumed.peer.call::<ExecRelease>(ExecReleaseParams { proc: again }).await.unwrap();
+}

@@ -207,6 +207,13 @@ pub fn annotations_of(name: &str) -> Option<ToolAnnotations> {
     TOOLS.iter().find(|def| def.name == name).map(|def| def.annotations)
 }
 
+/// Whether a tool's result can name a process of the calling session (`Bash`: a background id or
+/// a large-output handle), so a recorded result is only valid for that session.
+#[must_use]
+pub fn spawns_processes(name: &str) -> bool {
+    name == "Bash"
+}
+
 /// Runs a tool.
 ///
 /// # Errors

@@ -144,7 +144,7 @@ pub(crate) struct State {
     protected: Arc<ProtectedPaths>,
     started: Instant,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    dedup: Mutex<DedupTable<Result<Value, ProtoError>>>,
+    dedup: Mutex<DedupTable<Recorded>>,
     dedup_done: watch::Sender<u64>,
     next_conn: AtomicU64,
     active_connections: AtomicU64,
@@ -155,6 +155,15 @@ impl std::fmt::Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("State").field("principal", &self.principal.id).finish_non_exhaustive()
     }
+}
+
+/// An idempotent request's recorded outcome. An outcome that names session state (a process id)
+/// is scoped to the session that produced it: another session could not use that id.
+#[derive(Clone, Debug)]
+struct Recorded {
+    result: Result<Value, ProtoError>,
+    /// The resume token of the owning session, for session-scoped outcomes.
+    session: Option<String>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -170,7 +179,17 @@ impl State {
     /// an in-flight duplicate, and answers `unknown_outcome` once the outcome expired. The work
     /// runs on its own task, so a dropped connection cannot cancel a mutation halfway or lose its
     /// outcome.
-    async fn idempotent<F>(self: &Arc<Self>, scoped_key: String, fingerprint: u64, work: F) -> Result<Value, ProtoError>
+    ///
+    /// `session` is the caller's resume token when the outcome names session state (a process):
+    /// it is then replayed only to that session (or its resumption), and any other session gets
+    /// `unknown_outcome`, since the id would be useless to it.
+    async fn idempotent<F>(
+        self: &Arc<Self>,
+        scoped_key: String,
+        fingerprint: u64,
+        session: Option<String>,
+        work: F,
+    ) -> Result<Value, ProtoError>
     where
         F: Future<Output = Result<Value, ProtoError>> + Send + 'static,
     {
@@ -187,16 +206,24 @@ impl State {
                     let state = Arc::clone(self);
                     let key = scoped_key.clone();
                     let task = tokio::spawn(async move {
-                        let outcome = tokio::spawn(work)
+                        let result = tokio::spawn(work)
                             .await
                             .unwrap_or_else(|err| Err(ProtoError::new(ErrorCode::Internal, format!("request failed: {err}"))));
-                        lock(&state.dedup).complete(&key, outcome.clone(), state.now_ms());
+                        lock(&state.dedup).complete(&key, Recorded { result: result.clone(), session }, state.now_ms());
                         state.dedup_done.send_modify(|v| *v = v.wrapping_add(1));
-                        outcome
+                        result
                     });
                     return task.await.unwrap_or_else(|err| Err(ProtoError::new(ErrorCode::Internal, format!("request failed: {err}"))));
                 }
-                Begin::Replay(outcome) => return outcome,
+                Begin::Replay(recorded) => {
+                    if recorded.session.is_some() && recorded.session != session {
+                        return Err(ProtoError::new(
+                            ErrorCode::UnknownOutcome,
+                            "this idempotency key started a process in another session, which was not resumed; its outcome cannot be handed to this session",
+                        ));
+                    }
+                    return recorded.result;
+                }
                 Begin::InFlight => {
                     if done.changed().await.is_err() {
                         return Err(ProtoError::new(ErrorCode::Unavailable, "server shutting down"));
