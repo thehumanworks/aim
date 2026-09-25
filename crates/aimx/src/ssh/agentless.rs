@@ -72,9 +72,10 @@ impl AgentlessWorkspace {
             ("unknown", "unknown")
         };
         let native_search = connection.run("command -v rg >/dev/null 2>&1", &[]).await.is_ok();
+        let isolated_processes = connection.run("command -v perl >/dev/null 2>&1 || command -v setsid >/dev/null 2>&1", &[]).await.is_ok();
         let caps = Caps {
-            exec: true,
-            pty: true,
+            exec: isolated_processes,
+            pty: isolated_processes,
             watch: false,
             native_search,
             atomic_rename: true,
@@ -376,7 +377,7 @@ impl Workspace for AgentlessWorkspace {
         self
     }
     fn exec(&self) -> Option<&dyn Exec> {
-        Some(self)
+        self.caps.exec.then_some(self)
     }
     fn search(&self) -> &dyn Search {
         self
@@ -574,7 +575,7 @@ fn process_script(home: &str, spec: &SpawnSpec<'_>, cwd: &str, marker: &str) -> 
     );
     let _ = write!(
         script,
-        " if command -v perl >/dev/null 2>&1; then exec perl -MPOSIX -e 'POSIX::setpgid(0,0); exec(\"/bin/sh\", \"-c\", $ARGV[0])' -- {}; else exec sh -c {}; fi",
+        " if command -v perl >/dev/null 2>&1; then exec perl -MPOSIX -e 'POSIX::setpgid(0,0) == 0 or exit 127; exec(\"/bin/sh\", \"-c\", $ARGV[0])' -- {}; elif command -v setsid >/dev/null 2>&1; then exec setsid sh -c {}; else exit 127; fi",
         quote(&inner),
         quote(&inner)
     );
