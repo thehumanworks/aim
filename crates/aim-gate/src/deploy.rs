@@ -1,5 +1,6 @@
 //! Exact Git-tree staging and gate-owned trial pointer swaps (ADR 0062).
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -98,15 +99,19 @@ fn tree_entries(source: &Path, sha: &str) -> Result<Vec<(PathBuf, String, u32)>>
     for record in output.split(|byte| *byte == 0).filter(|record| !record.is_empty()) {
         let separator = record.iter().position(|byte| *byte == b'\t').context("malformed Git tree entry")?;
         let (header, with_separator) = record.split_at(separator);
-        let path = &with_separator[1..];
-        let fields: Vec<_> = header.split(|byte| *byte == b' ').collect();
-        ensure!(fields.len() == 3 && fields[1] == b"blob", "Git tree contains a non-file entry");
-        let mode = match fields[0] {
+        let path = with_separator.get(1..).context("malformed Git tree path")?;
+        let mut fields = header.split(|byte| *byte == b' ');
+        let mode_field = fields.next().context("missing Git tree mode")?;
+        let kind = fields.next().context("missing Git tree kind")?;
+        let oid_field = fields.next().context("missing Git tree blob id")?;
+        ensure!(fields.next().is_none() && kind == b"blob", "Git tree contains a non-file entry");
+        let mode = match mode_field {
             b"100644" => 0o644,
             b"100755" => 0o755,
-            _ => bail!("Git tree contains a symlink or unsupported file mode"),
+            b"120000" => 0,
+            _ => bail!("Git tree contains a gitlink or unsupported file mode"),
         };
-        let oid = std::str::from_utf8(fields[2]).context("non-UTF-8 blob id")?;
+        let oid = std::str::from_utf8(oid_field).context("non-UTF-8 blob id")?;
         validate_sha(oid)?;
         let relative = PathBuf::from(OsStr::from_bytes(path));
         ensure!(relative.components().all(|part| matches!(part, Component::Normal(_))), "Git tree path escapes staging root");
@@ -119,10 +124,61 @@ fn tree_entries(source: &Path, sha: &str) -> Result<Vec<(PathBuf, String, u32)>>
     Ok(entries)
 }
 
+fn validate_links(links: &HashMap<PathBuf, PathBuf>, files: &HashSet<PathBuf>, directories: &HashSet<PathBuf>) -> Result<()> {
+    for (link, target) in links {
+        let mut pending = VecDeque::new();
+        if let Some(parent) = link.parent() {
+            pending.extend(parent.components().map(|component| component.as_os_str().to_owned()));
+        }
+        pending.extend(target.components().map(|component| component.as_os_str().to_owned()));
+        let mut resolved = PathBuf::new();
+        let mut visited = HashSet::new();
+        while let Some(component) = pending.pop_front() {
+            if component == OsStr::new(".") {
+                continue;
+            }
+            if component == OsStr::new("..") {
+                ensure!(resolved.pop(), "symlink target escapes artifact");
+                continue;
+            }
+            resolved.push(component);
+            if let Some(next) = links.get(&resolved) {
+                ensure!(visited.insert(resolved.clone()), "symlink cycle in artifact");
+                resolved.pop();
+                for part in next.components().map(|part| part.as_os_str().to_owned()).rev() {
+                    pending.push_front(part);
+                }
+            } else if files.contains(&resolved) {
+                ensure!(pending.is_empty(), "symlink target traverses through a file");
+            } else if !pending.is_empty() {
+                ensure!(directories.contains(&resolved), "symlink target traverses through a missing directory");
+            }
+        }
+        ensure!(files.contains(&resolved) || directories.contains(&resolved), "symlink target is missing from artifact");
+        ensure!(!directories.contains(&resolved) || !link.starts_with(&resolved), "symlink target contains its own link");
+    }
+    Ok(())
+}
+
+fn safe_parent(root: &Path, relative: &Path) -> Result<PathBuf> {
+    let parent = relative.parent().context("staged path has no parent")?;
+    let mut path = root.to_path_buf();
+    for component in parent.components() {
+        path.push(component.as_os_str());
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => ensure!(metadata.is_dir() && !metadata.file_type().is_symlink(), "staged parent is not a real directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&path).context("create staged parent")?,
+            Err(error) => return Err(error).context("inspect staged parent"),
+        }
+    }
+    Ok(path)
+}
+
 /// Stage exactly the requested commit's raw Git blobs under `root/<sha>`.
 ///
 /// `source_clone` must be a fresh checkout at `sha`. Candidate checkout filters and untracked
-/// files are ignored; symlink and gitlink entries are refused. The caller owns `root`.
+/// files are ignored. Relative symlinks must resolve inside the staged tree; gitlinks are refused.
+/// The caller owns `root`.
 ///
 /// # Errors
 /// Invalid root, SHA/tree, clone, tree entry, or write failure.
@@ -134,20 +190,44 @@ pub fn stage_exact(root: &Path, source_clone: &Path, sha: &str, expected_tree: &
     ensure!(!root.starts_with(&source) && !source.starts_with(&root), "source clone overlaps deployment root");
     exact_source(source_clone, sha, expected_tree)?;
     let entries = tree_entries(&source, sha)?;
+    let mut links = HashMap::new();
+    let mut files = HashSet::new();
+    let mut directories = HashSet::from([PathBuf::new()]);
+    for (relative, oid, mode) in &entries {
+        for ancestor in relative.ancestors().skip(1) {
+            directories.insert(ancestor.to_path_buf());
+        }
+        if *mode == 0 {
+            let bytes = git(&source, &["cat-file", "blob", oid])?;
+            ensure!(!bytes.is_empty() && !bytes.contains(&0), "invalid symlink target");
+            let target = PathBuf::from(OsStr::from_bytes(&bytes));
+            ensure!(!target.is_absolute(), "absolute symlink target escapes artifact");
+            links.insert(relative.clone(), target);
+        } else {
+            files.insert(relative.clone());
+        }
+    }
+    validate_links(&links, &files, &directories)?;
     let _guard = lock(&root)?;
     let expected_current = read_current(&root)?;
     let destination = root.join(sha);
     no_existing(&destination)?;
     let temporary = tempfile::Builder::new().prefix(".stage-").tempdir_in(&root).context("create staging directory")?;
-    for (relative, oid, mode) in entries {
-        let path = temporary.path().join(&relative);
-        let parent = path.parent().context("staged path has no parent")?;
-        fs::create_dir_all(parent).context("create staged parent")?;
-        let bytes = git(&source, &["cat-file", "blob", &oid])?;
+    for (relative, oid, mode) in entries.iter().filter(|(_, _, mode)| *mode != 0) {
+        let path = temporary.path().join(relative);
+        safe_parent(temporary.path(), relative)?;
+        let bytes = git(&source, &["cat-file", "blob", oid])?;
         let mut file = OpenOptions::new().write(true).create_new(true).open(&path).context("create staged file")?;
         file.write_all(&bytes).context("write staged blob")?;
-        file.set_permissions(fs::Permissions::from_mode(mode)).context("set staged mode")?;
+        file.set_permissions(fs::Permissions::from_mode(*mode)).context("set staged mode")?;
         file.sync_all().context("sync staged blob")?;
+    }
+    for (relative, _, _) in entries.iter().filter(|(_, _, mode)| *mode == 0) {
+        safe_parent(temporary.path(), relative)?;
+        let path = temporary.path().join(relative);
+        no_existing(&path)?;
+        let target = links.get(relative).context("validated symlink target missing")?;
+        symlink(target, &path).context("create staged symlink")?;
     }
     let temporary_path = temporary.keep();
     if let Err(error) = fs::rename(&temporary_path, &destination) {
@@ -309,7 +389,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_symlinks_in_tree_and_pointer_escape() -> Result<()> {
+    fn stages_safe_relative_symlinks() -> Result<()> {
+        let (temporary, repository, root) = fixture()?;
+        fs::write(repository.join("AGENTS.md"), "instructions")?;
+        fs::create_dir(repository.join("docs"))?;
+        symlink("AGENTS.md", repository.join("CLAUDE.md"))?;
+        symlink("../CLAUDE.md", repository.join("docs/GUIDE.md"))?;
+        run_git(&repository, &["add", "-A"])?;
+        run_git(&repository, &["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture"])?;
+        let sha = run_git(&repository, &["rev-parse", "HEAD"])?;
+        let tree = run_git(&repository, &["rev-parse", "HEAD^{tree}"])?;
+        let clone = temporary.path().join("clone");
+        clone_at(&repository, &clone)?;
+        let artifact = stage_exact(&root, &clone, &sha, &tree)?;
+        assert_eq!(fs::read_link(artifact.path.join("CLAUDE.md"))?, Path::new("AGENTS.md"));
+        assert_eq!(fs::read_link(artifact.path.join("docs/GUIDE.md"))?, Path::new("../CLAUDE.md"));
+        assert_eq!(fs::read_to_string(artifact.path.join("docs/GUIDE.md"))?, "instructions");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_escaping_symlinks_and_pointer_escape() -> Result<()> {
         let (temporary, repository, root) = fixture()?;
         fs::write(repository.join("app.txt"), "safe")?;
         symlink("../outside", repository.join("escape"))?;
@@ -322,6 +422,31 @@ mod tests {
         assert!(stage_exact(&root, &clone, &sha, &tree).is_err());
         symlink("../outside", root.join("current"))?;
         assert!(read_current(&root).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_absolute_chain_and_cycle() -> Result<()> {
+        for (target, chained) in [("/tmp/outside", false), ("../outside", true), ("cycle", false)] {
+            let (temporary, repository, root) = fixture()?;
+            fs::write(repository.join("app.txt"), "safe")?;
+            if chained {
+                symlink(target, repository.join("second"))?;
+                symlink("second", repository.join("first"))?;
+            } else {
+                symlink(target, repository.join("first"))?;
+            }
+            if target == "cycle" {
+                symlink("first", repository.join("cycle"))?;
+            }
+            run_git(&repository, &["add", "-A"])?;
+            run_git(&repository, &["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture"])?;
+            let sha = run_git(&repository, &["rev-parse", "HEAD"])?;
+            let tree = run_git(&repository, &["rev-parse", "HEAD^{tree}"])?;
+            let clone = temporary.path().join("clone");
+            clone_at(&repository, &clone)?;
+            assert!(stage_exact(&root, &clone, &sha, &tree).is_err());
+        }
         Ok(())
     }
 }
