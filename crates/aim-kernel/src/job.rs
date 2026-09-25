@@ -1,279 +1,519 @@
-//! Blackboard job lifecycle ("fiverr for agents").
+//! Fenced job attempts and independent result review.
 //!
-//! Status: DRAFT decision (seeded from the Verus lab, docs/research/verus.md). The swarm milestone
-//! extends it with attempt generations and claim tokens (docs/research/swarm.md) and then marks
-//! [`next`] as LOCKED with its ADR.
-//!
-//! Decision, stated once as the spec function [`next`]:
-//! `Open -> Claimed(w) -> Running(w) -> Done(w)`; `Fail(w)`/`Expire` send a held job back to
-//! `Open` while retry budget remains, else to `Failed`; `Cancel` ends any live job; terminal
-//! states (`Done`, `Failed`, `Cancelled`) absorb every event.
+//! DRAFT(M5a): the lead will lock this decision after reviewing the ledger contract.
+//! Lease expiry fences an attempt but does not prove its process stopped.
+#![expect(clippy::match_like_matches_macro, reason = "Verus proves these explicit pattern matches against enum predicates")]
 use vstd::prelude::*;
 
 verus! {
 
-/// Identity of a worker agent on the blackboard.
+/// Worker identity supplied by the service.
 pub type WorkerId = u64;
 
-/// Lifecycle state of one job.
+/// Execution state; acceptance is separate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JobState {
-    /// Posted and waiting for a worker.
-    Open,
-    /// Claimed by `worker`, not started yet.
-    Claimed {
-        /// The claimant; the only worker that may start the job.
-        worker: WorkerId,
-    },
-    /// Being worked on by `worker`.
-    Running {
-        /// The holder; the only worker that may complete or fail the job.
-        worker: WorkerId,
-    },
-    /// Completed by `worker` (terminal).
-    Done {
-        /// The worker that completed the job.
-        worker: WorkerId,
-    },
-    /// Permanently failed after exhausting its retries (terminal).
+    /// Awaiting a claim.
+    Posted,
+    /// Claimed, awaiting launch.
+    Claimed,
+    /// Executing.
+    Running,
+    /// Result delivered, awaiting review.
+    Succeeded,
+    /// Attempt failed or expired.
     Failed,
-    /// Cancelled by the lead (terminal).
+    /// Cancelled by the lead.
     Cancelled,
 }
 
-/// Something that happens to a job.
+/// Independent review decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReviewState {
+    /// No review decision.
+    Pending,
+    /// Evidence accepted.
+    Accepted,
+    /// Result rejected.
+    Rejected,
+}
+
+/// Process ownership after an attempt changes state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CleanupState {
+    /// No process remains.
+    Confirmed,
+    /// Current attempt owns a live slot.
+    Active,
+    /// The old process may still run; its slot remains reserved.
+    Pending,
+}
+
+/// Current or last attempt identity. The service authenticates the secret token separately.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Claim {
+    /// Worker that owns the attempt.
+    pub worker: WorkerId,
+    /// Nonsecret identifier bound to the hashed token in the ledger.
+    pub claim_id: u64,
+    /// Exclusive lease deadline in service-supplied time.
+    pub lease_until: u64,
+}
+
+/// A job transition request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Event {
-    /// `worker` claims an open job.
+    /// Reserve this generation.
     Claim {
-        /// The claiming worker.
+        /// Claiming worker.
         worker: WorkerId,
+        /// Nonsecret claim identity.
+        claim_id: u64,
+        /// Exclusive lease deadline.
+        lease_until: u64,
     },
-    /// The claimant starts working.
+    /// Launch the current attempt.
     Start {
-        /// The worker that must hold the claim.
-        worker: WorkerId,
+        /// Current generation.
+        generation: u32,
+        /// Current claim identity.
+        claim_id: u64,
     },
-    /// The holder delivers the job.
+    /// Extend the current lease.
+    Heartbeat {
+        /// Current generation.
+        generation: u32,
+        /// Current claim identity.
+        claim_id: u64,
+        /// Extended exclusive lease deadline.
+        lease_until: u64,
+    },
+    /// Deliver a result without accepting it.
     Complete {
-        /// The worker that must hold the job.
-        worker: WorkerId,
+        /// Current generation.
+        generation: u32,
+        /// Current claim identity.
+        claim_id: u64,
     },
-    /// The holder reports failure; retried while budget remains.
+    /// Fail and report whether cleanup was confirmed.
     Fail {
-        /// The worker that must hold the job.
-        worker: WorkerId,
+        /// Current generation.
+        generation: u32,
+        /// Current claim identity.
+        claim_id: u64,
+        /// Whether the old process was confirmed stopped.
+        cleanup_confirmed: bool,
     },
-    /// The holder's lease timed out (worker vanished); retried while budget remains.
-    Expire,
-    /// The lead cancels the job.
+    /// Fence an attempt whose lease expired.
+    Expire {
+        /// Current generation.
+        generation: u32,
+    },
+    /// Confirm an old process has stopped.
+    ConfirmCleanup,
+    /// Open a new generation within the retry budget.
+    Retry,
+    /// Cancel an open or active job.
     Cancel,
+    /// Review a delivered result.
+    Review {
+        /// Reviewer's decision.
+        accepted: bool,
+        /// Evidence reference was validated.
+        evidence_present: bool,
+    },
 }
 
-/// Why an event was rejected (the job is left unchanged).
+/// Why an event or persisted snapshot was rejected.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LifecycleError {
-    /// The job is finished; terminal states absorb every event.
-    Terminal,
-    /// The event names a worker that does not hold the job.
-    NotHolder,
-    /// The event is not valid in the job's current state.
+    /// Invalid in this execution state.
     WrongState,
+    /// An older or different attempt.
+    StaleClaim,
+    /// Missing or nonadvancing lease.
+    InvalidLease,
+    /// No retry remains.
+    RetryExhausted,
+    /// The previous process may still run.
+    CleanupPending,
+    /// Acceptance requires evidence.
+    MissingEvidence,
+    /// Persisted fields do not form a valid state.
+    InvalidSnapshot,
 }
 
-/// Abstract view of a job. All public specifications are stated over this.
+/// Abstract persisted job state.
 pub struct JobView {
-    /// Current lifecycle state.
+    /// Execution state.
     pub state: JobState,
-    /// Retries consumed so far.
-    pub retries: nat,
-    /// Retry budget fixed when the job was posted.
+    /// Review decision.
+    pub review: ReviewState,
+    /// Attempt generation, initially zero.
+    pub generation: nat,
+    /// Maximum retry count.
     pub max_retries: nat,
+    /// Current or last attempt identity.
+    pub claim: Option<Claim>,
+    /// Process cleanup status.
+    pub cleanup: CleanupState,
+    /// Review evidence was present.
+    pub evidence_present: bool,
 }
 
-/// Finished states: they absorb every later event.
-pub open spec fn is_terminal(s: JobState) -> bool {
-    s is Done || s is Failed || s is Cancelled
-}
-
-/// The worker currently holding the job, if any (claimed or running).
-pub open spec fn holder(s: JobState) -> Option<WorkerId> {
-    match s {
-        JobState::Claimed { worker } => Some(worker),
-        JobState::Running { worker } => Some(worker),
-        _ => None,
-    }
-}
-
-/// `v` with its lifecycle state replaced by `s`.
-pub open spec fn with_state(v: JobView, s: JobState) -> JobView {
-    JobView { state: s, retries: v.retries, max_retries: v.max_retries }
-}
-
-/// A held job is lost (failure or expiry): retry while budget remains, else fail permanently.
-pub open spec fn retry_or_fail(v: JobView) -> JobView {
-    if v.retries < v.max_retries {
-        JobView { state: JobState::Open, retries: v.retries + 1, max_retries: v.max_retries }
-    } else {
-        with_state(v, JobState::Failed)
-    }
-}
-
-/// DRAFT(swarm) decision: the complete transition function. `None` = rejected, job unchanged.
-pub open spec fn next(pre: JobView, ev: Event) -> Option<JobView> {
-    if is_terminal(pre.state) {
-        None
-    } else {
-        match ev {
-            Event::Claim { worker } => if pre.state is Open {
-                Some(with_state(pre, JobState::Claimed { worker }))
-            } else {
-                None
-            },
-            Event::Start { worker } => if pre.state == (JobState::Claimed { worker }) {
-                Some(with_state(pre, JobState::Running { worker }))
-            } else {
-                None
-            },
-            Event::Complete { worker } => if pre.state == (JobState::Running { worker }) {
-                Some(with_state(pre, JobState::Done { worker }))
-            } else {
-                None
-            },
-            Event::Fail { worker } => if pre.state == (JobState::Running { worker }) {
-                Some(retry_or_fail(pre))
-            } else {
-                None
-            },
-            Event::Expire => if holder(pre.state) is Some {
-                Some(retry_or_fail(pre))
-            } else {
-                None
-            },
-            Event::Cancel => Some(with_state(pre, JobState::Cancelled)),
-        }
-    }
-}
-
-/// Well-formed: the retry counter never exceeds the budget.
+/// Valid persisted state.
 pub open spec fn wf(v: JobView) -> bool {
-    v.retries <= v.max_retries
+    &&& v.generation <= v.max_retries
+    &&& (v.state == JobState::Posted ==> v.claim is None && v.cleanup == CleanupState::Confirmed
+        && v.review == ReviewState::Pending && !v.evidence_present)
+    &&& ((v.state == JobState::Claimed || v.state == JobState::Running) ==> v.claim is Some
+        && v.cleanup == CleanupState::Active && v.review == ReviewState::Pending
+        && !v.evidence_present)
+    &&& (v.state == JobState::Succeeded ==> v.claim is Some && v.cleanup == CleanupState::Confirmed)
+    &&& ((v.state == JobState::Failed || v.state == JobState::Cancelled) ==> v.review
+        == ReviewState::Pending && (v.claim is Some || v.cleanup == CleanupState::Confirmed))
+    &&& (v.review == ReviewState::Accepted ==> v.state == JobState::Succeeded && v.evidence_present)
+    &&& (v.review == ReviewState::Rejected ==> v.state == JobState::Succeeded)
 }
 
-/// Events a job can still accept before the end of its current attempt.
-pub open spec fn phase_rank(s: JobState) -> nat {
-    match s {
-        JobState::Open => 3,
-        JobState::Claimed { .. } => 2,
-        JobState::Running { .. } => 1,
-        _ => 0,
+/// Fresh posted state.
+pub open spec fn fresh(max_retries: u32) -> JobView {
+    JobView {
+        state: JobState::Posted,
+        review: ReviewState::Pending,
+        generation: 0,
+        max_retries: max_retries as nat,
+        claim: None,
+        cleanup: CleanupState::Confirmed,
+        evidence_present: false,
     }
 }
 
-/// Upper bound on how many more events this job can accept.
-pub open spec fn remaining_steps(v: JobView) -> int {
-    (v.max_retries - v.retries) * 4 + phase_rank(v.state)
+/// Current, unexpired attempt identity.
+pub open spec fn current(v: JobView, generation: u32, claim_id: u64, now: u64) -> bool {
+    v.generation == generation as nat && v.claim is Some && v.claim->0.claim_id == claim_id && now
+        < v.claim->0.lease_until
 }
 
-// ---------------------------------------------------------------------------------------------
-// Theorems about the decision itself (erased at compile time; they document *why* it is safe).
-// ---------------------------------------------------------------------------------------------
-/// Terminal states are absorbing.
-pub proof fn lemma_terminal_absorbing(pre: JobView, ev: Event)
-    requires
-        is_terminal(pre.state),
-    ensures
-        next(pre, ev) is None,
-{
+/// Whether this job reserves a worker slot, including uncertain cleanup.
+pub open spec fn holds_capacity(v: JobView, worker: WorkerId) -> bool {
+    v.claim is Some && v.claim->0.worker == worker && (v.cleanup == CleanupState::Active
+        || v.cleanup == CleanupState::Pending)
 }
 
-/// Only the worker holding the job may start, complete or fail it, and `Done` records that worker.
-pub proof fn lemma_only_holder_progresses(pre: JobView, ev: Event)
-    requires
-        next(pre, ev) is Some,
-    ensures
-        ev matches Event::Start { worker } ==> holder(pre.state) == Some(worker),
-        ev matches Event::Complete { worker } ==> holder(pre.state) == Some(worker),
-        ev matches Event::Fail { worker } ==> holder(pre.state) == Some(worker),
-        next(pre, ev)->0.state matches JobState::Done { worker } ==> pre.state == (
-        JobState::Running { worker }),
-{
+/// Accepted evidence available to dependent jobs.
+pub open spec fn accepted(v: JobView) -> bool {
+    v.state == JobState::Succeeded && v.review == ReviewState::Accepted && v.evidence_present
 }
 
-/// The holder can only change by claiming an unheld (Open) job: a job is never claimed by two
-/// workers at once, and no worker can take over another's claim.
-pub proof fn lemma_holder_changes_only_by_claim(pre: JobView, ev: Event)
-    requires
-        next(pre, ev) is Some,
-        holder(next(pre, ev)->0.state) is Some,
-        holder(next(pre, ev)->0.state) != holder(pre.state),
-    ensures
-        pre.state is Open,
-        ev == (Event::Claim { worker: holder(next(pre, ev)->0.state)->0 }),
-{
+/// DRAFT(M5a): a complete transition or `None` when rejected.
+pub open spec fn next(pre: JobView, ev: Event, now: u64) -> Option<JobView> {
+    match ev {
+        Event::Claim { worker, claim_id, lease_until } => if pre.state == JobState::Posted && now
+            < lease_until {
+            Some(
+                JobView {
+                    state: JobState::Claimed,
+                    claim: Some(Claim { worker, claim_id, lease_until }),
+                    cleanup: CleanupState::Active,
+                    ..pre
+                },
+            )
+        } else {
+            None
+        },
+        Event::Start { generation, claim_id } => if pre.state == JobState::Claimed && current(
+            pre,
+            generation,
+            claim_id,
+            now,
+        ) {
+            Some(JobView { state: JobState::Running, ..pre })
+        } else {
+            None
+        },
+        Event::Heartbeat { generation, claim_id, lease_until } => if (pre.state == JobState::Claimed
+            || pre.state == JobState::Running) && current(pre, generation, claim_id, now)
+            && lease_until > pre.claim->0.lease_until {
+            Some(JobView { claim: Some(Claim { lease_until, ..pre.claim->0 }), ..pre })
+        } else {
+            None
+        },
+        Event::Complete { generation, claim_id } => if pre.state == JobState::Running && current(
+            pre,
+            generation,
+            claim_id,
+            now,
+        ) {
+            Some(JobView { state: JobState::Succeeded, cleanup: CleanupState::Confirmed, ..pre })
+        } else {
+            None
+        },
+        Event::Fail { generation, claim_id, cleanup_confirmed } => if pre.state == JobState::Running
+            && current(pre, generation, claim_id, now) {
+            Some(
+                JobView {
+                    state: JobState::Failed,
+                    cleanup: if cleanup_confirmed {
+                        CleanupState::Confirmed
+                    } else {
+                        CleanupState::Pending
+                    },
+                    ..pre
+                },
+            )
+        } else {
+            None
+        },
+        Event::Expire { generation } => if (pre.state == JobState::Claimed || pre.state
+            == JobState::Running) && pre.generation == generation as nat && pre.claim is Some && now
+            >= pre.claim->0.lease_until {
+            Some(JobView { state: JobState::Failed, cleanup: CleanupState::Pending, ..pre })
+        } else {
+            None
+        },
+        Event::ConfirmCleanup => if (pre.state == JobState::Failed || pre.state
+            == JobState::Cancelled) && pre.cleanup == CleanupState::Pending {
+            Some(JobView { cleanup: CleanupState::Confirmed, ..pre })
+        } else {
+            None
+        },
+        Event::Retry => if (pre.state == JobState::Failed || pre.state == JobState::Cancelled || (
+        pre.state == JobState::Succeeded && pre.review == ReviewState::Rejected)) && pre.cleanup
+            == CleanupState::Confirmed && pre.generation < pre.max_retries {
+            Some(
+                JobView {
+                    state: JobState::Posted,
+                    review: ReviewState::Pending,
+                    generation: pre.generation + 1,
+                    claim: None,
+                    evidence_present: false,
+                    ..pre
+                },
+            )
+        } else {
+            None
+        },
+        Event::Cancel => if pre.state == JobState::Posted || pre.state == JobState::Claimed
+            || pre.state == JobState::Running {
+            Some(
+                JobView {
+                    state: JobState::Cancelled,
+                    cleanup: if pre.state == JobState::Posted {
+                        CleanupState::Confirmed
+                    } else {
+                        CleanupState::Pending
+                    },
+                    ..pre
+                },
+            )
+        } else {
+            None
+        },
+        Event::Review { accepted: decision, evidence_present } => if pre.state
+            == JobState::Succeeded && pre.review == ReviewState::Pending && (!decision
+            || evidence_present) {
+            Some(
+                JobView {
+                    review: if decision {
+                        ReviewState::Accepted
+                    } else {
+                        ReviewState::Rejected
+                    },
+                    evidence_present,
+                    ..pre
+                },
+            )
+        } else {
+            None
+        },
+    }
 }
 
-/// Every accepted event keeps the retry budget bounded and strictly consumes progress.
-pub proof fn lemma_step_bounded(pre: JobView, ev: Event)
+/// Every accepted transition preserves the snapshot invariant.
+pub proof fn lemma_step_wf(pre: JobView, ev: Event, now: u64)
     requires
         wf(pre),
-        next(pre, ev) is Some,
+        next(pre, ev, now) is Some,
     ensures
-        wf(next(pre, ev)->0),
-        next(pre, ev)->0.max_retries == pre.max_retries,
-        next(pre, ev)->0.retries <= pre.retries + 1,
-        0 <= remaining_steps(next(pre, ev)->0) < remaining_steps(pre),
+        wf(next(pre, ev, now)->0),
 {
 }
 
-/// Replays an event sequence; returns the final view and how many events were accepted.
-pub open spec fn run(v: JobView, evs: Seq<Event>) -> (JobView, nat)
-    decreases evs.len(),
-{
-    if evs.len() == 0 {
-        (v, 0)
-    } else {
-        match next(v, evs[0]) {
-            Some(post) => {
-                let (fin, n) = run(post, evs.drop_first());
-                (fin, n + 1)
-            },
-            None => run(v, evs.drop_first()),
-        }
-    }
-}
-
-/// Retries are bounded, therefore every job accepts at most `4 * max_retries + 3` events in any
-/// history, whatever the workers and the lead do.
-pub proof fn theorem_bounded_lifecycle(v: JobView, evs: Seq<Event>)
+/// Completing work alone cannot accept it.
+pub proof fn lemma_completion_needs_review(pre: JobView, generation: u32, claim_id: u64, now: u64)
     requires
-        wf(v),
+        wf(pre),
+        next(pre, Event::Complete { generation, claim_id }, now) is Some,
     ensures
-        wf(run(v, evs).0),
-        run(v, evs).1 <= remaining_steps(v),
-    decreases evs.len(),
+        next(pre, Event::Complete { generation, claim_id }, now)->0.review is Pending,
 {
-    if evs.len() > 0 {
-        match next(v, evs[0]) {
-            Some(post) => {
-                lemma_step_bounded(v, evs[0]);
-                theorem_bounded_lifecycle(post, evs.drop_first());
-            },
-            None => {
-                theorem_bounded_lifecycle(v, evs.drop_first());
-            },
-        }
+}
+
+/// An old generation, wrong claim id, or expired lease cannot mutate an active attempt.
+pub proof fn lemma_stale_attempt_fenced(pre: JobView, generation: u32, claim_id: u64, now: u64)
+    requires
+        wf(pre),
+        !current(pre, generation, claim_id, now),
+    ensures
+        next(pre, Event::Start { generation, claim_id }, now) is None,
+        next(pre, Event::Heartbeat { generation, claim_id, lease_until: u64::MAX }, now) is None,
+        next(pre, Event::Complete { generation, claim_id }, now) is None,
+        next(pre, Event::Fail { generation, claim_id, cleanup_confirmed: true }, now) is None,
+{
+}
+
+/// Retrying advances exactly one generation, never past the fixed bound.
+pub proof fn lemma_retry_bounded(pre: JobView, now: u64)
+    requires
+        wf(pre),
+        next(pre, Event::Retry, now) is Some,
+    ensures
+        next(pre, Event::Retry, now)->0.generation == pre.generation + 1,
+        next(pre, Event::Retry, now)->0.generation <= pre.max_retries,
+        next(pre, Event::Retry, now)->0.claim is None,
+{
+}
+
+/// An uncertain cleanup blocks retry.
+pub proof fn lemma_pending_cleanup_fences_retry(pre: JobView, now: u64)
+    requires
+        wf(pre),
+        pre.cleanup == CleanupState::Pending,
+    ensures
+        next(pre, Event::Retry, now) is None,
+{
+}
+
+fn is_posted(s: JobState) -> (b: bool)
+    ensures
+        b == (s == JobState::Posted),
+{
+    match s {
+        JobState::Posted => true,
+        _ => false,
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Executable implementation, proven to refine `next`.
-// ---------------------------------------------------------------------------------------------
-/// A job on the blackboard. Fields are private; the type invariant bounds the retry counter.
+fn is_claimed(s: JobState) -> (b: bool)
+    ensures
+        b == (s == JobState::Claimed),
+{
+    match s {
+        JobState::Claimed => true,
+        _ => false,
+    }
+}
+
+fn is_running(s: JobState) -> (b: bool)
+    ensures
+        b == (s == JobState::Running),
+{
+    match s {
+        JobState::Running => true,
+        _ => false,
+    }
+}
+
+fn is_succeeded(s: JobState) -> (b: bool)
+    ensures
+        b == (s == JobState::Succeeded),
+{
+    match s {
+        JobState::Succeeded => true,
+        _ => false,
+    }
+}
+
+fn is_failed(s: JobState) -> (b: bool)
+    ensures
+        b == (s == JobState::Failed),
+{
+    match s {
+        JobState::Failed => true,
+        _ => false,
+    }
+}
+
+fn is_cancelled(s: JobState) -> (b: bool)
+    ensures
+        b == (s == JobState::Cancelled),
+{
+    match s {
+        JobState::Cancelled => true,
+        _ => false,
+    }
+}
+
+fn is_review_pending(s: ReviewState) -> (b: bool)
+    ensures
+        b == (s == ReviewState::Pending),
+{
+    match s {
+        ReviewState::Pending => true,
+        _ => false,
+    }
+}
+
+fn is_review_accepted(s: ReviewState) -> (b: bool)
+    ensures
+        b == (s == ReviewState::Accepted),
+{
+    match s {
+        ReviewState::Accepted => true,
+        _ => false,
+    }
+}
+
+fn is_review_rejected(s: ReviewState) -> (b: bool)
+    ensures
+        b == (s == ReviewState::Rejected),
+{
+    match s {
+        ReviewState::Rejected => true,
+        _ => false,
+    }
+}
+
+fn is_cleanup_confirmed(s: CleanupState) -> (b: bool)
+    ensures
+        b == (s == CleanupState::Confirmed),
+{
+    match s {
+        CleanupState::Confirmed => true,
+        _ => false,
+    }
+}
+
+fn is_cleanup_active(s: CleanupState) -> (b: bool)
+    ensures
+        b == (s == CleanupState::Active),
+{
+    match s {
+        CleanupState::Active => true,
+        _ => false,
+    }
+}
+
+fn is_cleanup_pending(s: CleanupState) -> (b: bool)
+    ensures
+        b == (s == CleanupState::Pending),
+{
+    match s {
+        CleanupState::Pending => true,
+        _ => false,
+    }
+}
+
+/// A job with private fields maintaining `wf`.
 pub struct Job {
     state: JobState,
-    retries: u32,
+    review: ReviewState,
+    generation: u32,
     max_retries: u32,
+    claim: Option<Claim>,
+    cleanup: CleanupState,
+    evidence_present: bool,
 }
 
 impl View for Job {
@@ -282,33 +522,93 @@ impl View for Job {
     closed spec fn view(&self) -> JobView {
         JobView {
             state: self.state,
-            retries: self.retries as nat,
+            review: self.review,
+            generation: self.generation as nat,
             max_retries: self.max_retries as nat,
+            claim: self.claim,
+            cleanup: self.cleanup,
+            evidence_present: self.evidence_present,
         }
     }
 }
 
 impl Job {
-    #[verifier::type_invariant]
-    spec fn inv(self) -> bool {
-        self.retries <= self.max_retries
-    }
-
-    /// The view of a freshly posted job.
-    pub open spec fn new_view(max_retries: u32) -> JobView {
-        JobView { state: JobState::Open, retries: 0, max_retries: max_retries as nat }
-    }
-
-    /// Posts a fresh open job with a retry budget of `max_retries`.
+    /// Post a fresh job with a fixed retry budget.
     #[must_use]
     pub const fn new(max_retries: u32) -> (job: Self)
         ensures
-            job@ == Self::new_view(max_retries),
+            job@ == fresh(max_retries),
     {
-        Self { state: JobState::Open, retries: 0, max_retries }
+        Self {
+            state: JobState::Posted,
+            review: ReviewState::Pending,
+            generation: 0,
+            max_retries,
+            claim: None,
+            cleanup: CleanupState::Confirmed,
+            evidence_present: false,
+        }
     }
 
-    /// The job's current lifecycle state.
+    /// Rehydrate a persisted snapshot after checking its structure.
+    ///
+    /// # Errors
+    /// Returns `InvalidSnapshot` for inconsistent fields.
+    pub fn restore(
+        state: JobState,
+        review: ReviewState,
+        generation: u32,
+        claim: Option<Claim>,
+        cleanup: CleanupState,
+        max_retries: u32,
+        evidence_present: bool,
+    ) -> (r: Result<Self, LifecycleError>)
+        ensures
+            match r {
+                Ok(job) => wf(job@) && job@.state == state && job@.review == review
+                    && job@.generation == generation as nat && job@.claim == claim && job@.cleanup
+                    == cleanup && job@.max_retries == max_retries as nat && job@.evidence_present
+                    == evidence_present,
+                Err(_) => true,
+            },
+    {
+        proof {
+            reveal(<Job as View>::view);
+        }
+        if generation > max_retries {
+            return Err(LifecycleError::InvalidSnapshot);
+        }
+        match state {
+            JobState::Posted => {
+                if claim.is_some() || !is_cleanup_confirmed(cleanup) || !is_review_pending(review)
+                    || evidence_present {
+                    return Err(LifecycleError::InvalidSnapshot);
+                }
+            },
+            JobState::Claimed | JobState::Running => {
+                if claim.is_none() || !is_cleanup_active(cleanup) || !is_review_pending(review)
+                    || evidence_present {
+                    return Err(LifecycleError::InvalidSnapshot);
+                }
+            },
+            JobState::Succeeded => {
+                if claim.is_none() || !is_cleanup_confirmed(cleanup) || (is_review_accepted(review)
+                    && !evidence_present) {
+                    return Err(LifecycleError::InvalidSnapshot);
+                }
+            },
+            JobState::Failed | JobState::Cancelled => {
+                if !is_review_pending(review) || (claim.is_none() && !is_cleanup_confirmed(
+                    cleanup,
+                )) {
+                    return Err(LifecycleError::InvalidSnapshot);
+                }
+            },
+        }
+        Ok(Self { state, review, generation, max_retries, claim, cleanup, evidence_present })
+    }
+
+    /// Execution state.
     #[must_use]
     pub const fn state(&self) -> (s: JobState)
         ensures
@@ -317,117 +617,271 @@ impl Job {
         self.state
     }
 
-    /// Retries consumed so far (never above the budget).
+    /// Review state.
     #[must_use]
-    pub const fn retries(&self) -> (r: u32)
+    pub const fn review(&self) -> (s: ReviewState)
         ensures
-            r as nat == self@.retries,
-            wf(self@),
+            s == self@.review,
     {
-        proof {
-            use_type_invariant(self);
-        }
-        self.retries
+        self.review
     }
 
-    /// Private fast path: its `requires` is an assumption about the caller, so it must never be
-    /// reachable from unverified code. Public callers go through [`Job::apply`].
-    const fn complete_unchecked(&mut self, worker: WorkerId)
-        requires
-            old(self)@.state == (JobState::Running { worker }),
+    /// Current generation.
+    #[must_use]
+    pub const fn generation(&self) -> (g: u32)
         ensures
-            final(self)@ == with_state(old(self)@, JobState::Done { worker }),
+            g as nat == self@.generation,
     {
-        proof {
-            use_type_invariant(&*self);
-        }
-        self.state = JobState::Done { worker };
+        self.generation
     }
 
-    const fn retry_or_fail(&mut self)
-        requires
-            holder(old(self)@.state) is Some,
+    /// Fixed retry budget.
+    #[must_use]
+    pub const fn max_retries(&self) -> (g: u32)
         ensures
-            final(self)@ == retry_or_fail(old(self)@),
+            g as nat == self@.max_retries,
     {
-        proof {
-            use_type_invariant(&*self);
-        }
-        if self.retries < self.max_retries {
-            // No overflow: the type invariant plus this branch give retries + 1 <= max_retries.
-            self.retries += 1;
-            self.state = JobState::Open;
-        } else {
-            self.state = JobState::Failed;
+        self.max_retries
+    }
+
+    /// Current or last claim.
+    #[must_use]
+    pub const fn claim(&self) -> (c: Option<Claim>)
+        ensures
+            c == self@.claim,
+    {
+        self.claim
+    }
+
+    /// Cleanup status.
+    #[must_use]
+    pub const fn cleanup(&self) -> (c: CleanupState)
+        ensures
+            c == self@.cleanup,
+    {
+        self.cleanup
+    }
+
+    /// Whether review evidence was present.
+    #[must_use]
+    pub const fn evidence_present(&self) -> (e: bool)
+        ensures
+            e == self@.evidence_present,
+    {
+        self.evidence_present
+    }
+
+    /// Accepted evidence may unblock dependent jobs.
+    #[must_use]
+    pub fn is_accepted(&self) -> (b: bool)
+        ensures
+            b == accepted(self@),
+    {
+        match self.state {
+            JobState::Succeeded => match self.review {
+                ReviewState::Accepted => self.evidence_present,
+                _ => false,
+            },
+            _ => false,
         }
     }
 
-    /// The only mutation entry point. Total: no `requires`, so unverified callers cannot break it.
+    /// Whether this worker still has a capacity hold.
+    #[must_use]
+    pub fn holds_capacity(&self, worker: WorkerId) -> (b: bool)
+        ensures
+            b == holds_capacity(self@, worker),
+    {
+        match self.claim {
+            Some(c) => match self.cleanup {
+                CleanupState::Active | CleanupState::Pending => c.worker == worker,
+                CleanupState::Confirmed => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Whether a message or other attempt-scoped write has a live claim.
+    #[must_use]
+    pub fn authorizes_attempt(&self, generation: u32, claim_id: u64, now: u64) -> (b: bool)
+        ensures
+            b == current(self@, generation, claim_id, now),
+    {
+        self.check_claim(generation, claim_id, now)
+    }
+
+    /// Apply an event, preserving the snapshot on rejection.
     ///
     /// # Errors
-    /// The event is rejected (and the job left unchanged) exactly when [`next`] returns `None`.
-    pub const fn apply(&mut self, ev: Event) -> (r: Result<(), LifecycleError>)
+    /// Invalid state, claim, lease, retry, cleanup, or review.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::needless_return,
+        clippy::nonminimal_bool,
+        reason = "one independently proved return path per lifecycle event"
+    )]
+    pub fn apply(&mut self, ev: Event, now: u64) -> (r: Result<(), LifecycleError>)
         ensures
-            match next(old(self)@, ev) {
-                Some(post) => r is Ok && final(self)@ == post,
-                None => r is Err && final(self)@ == old(self)@,
-            },
+            r is Ok ==> next(old(self)@, ev, now) == Some(final(self)@),
+            r is Err ==> final(self)@ == old(self)@,
+            next(old(self)@, ev, now) is None ==> r is Err,
     {
         proof {
-            use_type_invariant(&*self);
-        }
-        match self.state {
-            JobState::Done { .. } | JobState::Failed | JobState::Cancelled => {
-                return Err(LifecycleError::Terminal);
-            },
-            _ => {},
+            reveal(<Job as View>::view);
         }
         match ev {
-            Event::Claim { worker } => match self.state {
-                JobState::Open => {
-                    self.state = JobState::Claimed { worker };
-                    Ok(())
-                },
-                _ => Err(LifecycleError::WrongState),
+            Event::Claim { worker, claim_id, lease_until } => {
+                if !is_posted(self.state) {
+                    proof {
+                        assert(old(self)@.state != JobState::Posted);
+                    }
+                    return Err(LifecycleError::WrongState);
+                }
+                if now >= lease_until {
+                    return Err(LifecycleError::InvalidLease);
+                }
+                self.state = JobState::Claimed;
+                self.claim = Some(Claim { worker, claim_id, lease_until });
+                self.cleanup = CleanupState::Active;
+                return Ok(());
             },
-            Event::Start { worker } => match self.state {
-                JobState::Claimed { worker: h } => if h == worker {
-                    self.state = JobState::Running { worker };
-                    Ok(())
+            Event::Start { generation, claim_id } => {
+                if !is_claimed(self.state) {
+                    return Err(LifecycleError::WrongState);
+                }
+                if !self.check_claim(generation, claim_id, now) {
+                    return Err(LifecycleError::StaleClaim);
+                }
+                self.state = JobState::Running;
+                return Ok(());
+            },
+            Event::Heartbeat { generation, claim_id, lease_until } => {
+                if !is_claimed(self.state) && !is_running(self.state) {
+                    return Err(LifecycleError::WrongState);
+                }
+                if !self.check_claim(generation, claim_id, now) {
+                    return Err(LifecycleError::StaleClaim);
+                }
+                if let Some(c) = self.claim {
+                    if lease_until <= c.lease_until {
+                        return Err(LifecycleError::InvalidLease);
+                    }
+                    self.claim = Some(Claim { lease_until, ..c });
+                }
+                return Ok(());
+            },
+            Event::Complete { generation, claim_id } => {
+                if !is_running(self.state) {
+                    return Err(LifecycleError::WrongState);
+                }
+                if !self.check_claim(generation, claim_id, now) {
+                    return Err(LifecycleError::StaleClaim);
+                }
+                self.state = JobState::Succeeded;
+                self.cleanup = CleanupState::Confirmed;
+                return Ok(());
+            },
+            Event::Fail { generation, claim_id, cleanup_confirmed } => {
+                if !is_running(self.state) {
+                    return Err(LifecycleError::WrongState);
+                }
+                if !self.check_claim(generation, claim_id, now) {
+                    return Err(LifecycleError::StaleClaim);
+                }
+                self.state = JobState::Failed;
+                self.cleanup = if cleanup_confirmed {
+                    CleanupState::Confirmed
                 } else {
-                    Err(LifecycleError::NotHolder)
-                },
-                _ => Err(LifecycleError::WrongState),
+                    CleanupState::Pending
+                };
+                return Ok(());
             },
-            Event::Complete { worker } => match self.state {
-                JobState::Running { worker: h } => if h == worker {
-                    self.complete_unchecked(worker);
-                    Ok(())
+            Event::Expire { generation } => {
+                if !is_claimed(self.state) && !is_running(self.state) {
+                    return Err(LifecycleError::WrongState);
+                }
+                if self.generation != generation {
+                    return Err(LifecycleError::StaleClaim);
+                }
+                if let Some(c) = self.claim {
+                    if now < c.lease_until {
+                        return Err(LifecycleError::InvalidLease);
+                    }
                 } else {
-                    Err(LifecycleError::NotHolder)
-                },
-                _ => Err(LifecycleError::WrongState),
+                    return Err(LifecycleError::StaleClaim);
+                }
+                self.state = JobState::Failed;
+                self.cleanup = CleanupState::Pending;
+                return Ok(());
             },
-            Event::Fail { worker } => match self.state {
-                JobState::Running { worker: h } => if h == worker {
-                    self.retry_or_fail();
-                    Ok(())
-                } else {
-                    Err(LifecycleError::NotHolder)
-                },
-                _ => Err(LifecycleError::WrongState),
+            Event::ConfirmCleanup => {
+                if (!is_failed(self.state) && !is_cancelled(self.state)) || !is_cleanup_pending(
+                    self.cleanup,
+                ) {
+                    return Err(LifecycleError::WrongState);
+                }
+                self.cleanup = CleanupState::Confirmed;
+                return Ok(());
             },
-            Event::Expire => match self.state {
-                JobState::Claimed { .. } | JobState::Running { .. } => {
-                    self.retry_or_fail();
-                    Ok(())
-                },
-                _ => Err(LifecycleError::WrongState),
+            Event::Retry => {
+                if !is_failed(self.state) && !is_cancelled(self.state) && !(is_succeeded(self.state)
+                    && is_review_rejected(self.review)) {
+                    return Err(LifecycleError::WrongState);
+                }
+                if !is_cleanup_confirmed(self.cleanup) {
+                    return Err(LifecycleError::CleanupPending);
+                }
+                if self.generation >= self.max_retries {
+                    return Err(LifecycleError::RetryExhausted);
+                }
+                self.generation += 1;
+                self.state = JobState::Posted;
+                self.review = ReviewState::Pending;
+                self.claim = None;
+                self.evidence_present = false;
+                return Ok(());
             },
             Event::Cancel => {
+                match self.state {
+                    JobState::Posted => {
+                        self.cleanup = CleanupState::Confirmed;
+                    },
+                    JobState::Claimed | JobState::Running => {
+                        self.cleanup = CleanupState::Pending;
+                    },
+                    _ => return Err(LifecycleError::WrongState),
+                }
                 self.state = JobState::Cancelled;
-                Ok(())
+                return Ok(());
             },
+            Event::Review { accepted, evidence_present } => {
+                if !is_succeeded(self.state) || !is_review_pending(self.review) {
+                    return Err(LifecycleError::WrongState);
+                }
+                if accepted && !evidence_present {
+                    return Err(LifecycleError::MissingEvidence);
+                }
+                self.review = if accepted {
+                    ReviewState::Accepted
+                } else {
+                    ReviewState::Rejected
+                };
+                self.evidence_present = evidence_present;
+                return Ok(());
+            },
+        }
+    }
+
+    fn check_claim(&self, generation: u32, claim_id: u64, now: u64) -> (ok: bool)
+        ensures
+            ok == current(self@, generation, claim_id, now),
+    {
+        if generation != self.generation {
+            return false;
+        }
+        match self.claim {
+            Some(c) => c.claim_id == claim_id && now < c.lease_until,
+            None => false,
         }
     }
 }
