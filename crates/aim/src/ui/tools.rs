@@ -132,16 +132,30 @@ fn ops_arg(arguments: &Value) -> Result<Vec<DataOp>, ProtoError> {
     }
 }
 
-/// Forgiving at the model boundary: when no component is called `root`, the first component no
-/// other one contains becomes the root (renaming it needs no reference rewrite).
-fn ensure_root(components: &mut [Component]) {
+/// Forgiving at the model boundary: when no component is called `root`, a lone top-level
+/// component (one no other contains) becomes the root — renaming it needs no reference rewrite —
+/// and several top-level components are stacked under a new root `Column`, in order.
+fn ensure_root(components: &mut Vec<Component>) {
     if components.iter().any(|c| c.id == ROOT_ID) {
         return;
     }
     let contained: Vec<String> = components.iter().flat_map(|c| c.child_ids().into_iter().map(str::to_owned)).collect();
-    if let Some(top) = components.iter_mut().find(|c| !contained.contains(&c.id)) {
-        ROOT_ID.clone_into(&mut top.id);
+    let tops: Vec<String> = components.iter().filter(|c| !contained.contains(&c.id)).map(|c| c.id.clone()).collect();
+    match tops.as_slice() {
+        [] => {}
+        [single] => {
+            if let Some(top) = components.iter_mut().find(|c| c.id == *single) {
+                ROOT_ID.clone_into(&mut top.id);
+            }
+        }
+        several => components.push(Component::new(ROOT_ID, "Column").with("children", json!(several))),
     }
+}
+
+/// A surface id for a `ui_show` that gave none: `ui1`, `ui2`, … (the first that is free).
+fn fresh_surface_id() -> String {
+    // A session holds at most a few dozen surfaces, so one of the first thousand ids is free.
+    (1_u32..=1_000).map(|n| format!("ui{n}")).find(|id| current(id).is_none()).unwrap_or_else(|| "ui".to_owned())
 }
 
 fn summary(verb: &str, surface: &str, notes: &Notes) -> ToolResult {
@@ -154,7 +168,8 @@ fn summary(verb: &str, surface: &str, notes: &Notes) -> ToolResult {
 }
 
 fn show(arguments: &Value) -> Result<ToolResult, ProtoError> {
-    let surface_id = surface_arg(arguments)?;
+    // A new surface needs no id from the model: the result names the one it got.
+    let surface_id = surface_arg(arguments).unwrap_or_else(|_| fresh_surface_id());
     let placement = match arguments.get("placement").and_then(Value::as_str) {
         Some(name) => Placement::parse(name)
             .ok_or_else(|| invalid(format!("unknown placement `{name}` (one of {}, tool(<call_id>))", Placement::NAMES.join(", "))))?,
@@ -315,6 +330,21 @@ mod tests {
         let ids: Vec<&str> = surface.components.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["c0.0", "b.0", "b", "root"]);
         assert_eq!(surface.root().unwrap().prop("children"), Some(&json!(["c0.0", "b"])));
+    }
+
+    #[tokio::test]
+    async fn siblings_without_a_root_are_stacked_and_a_missing_id_is_made_up() {
+        let ui = Arc::new(SessionUi::new("A"));
+        let flat = json!({"components": [
+            {"id": "t", "component": "Table", "columns": ["a"], "rows": [["1"]]},
+            {"id": "p", "component": "Progress", "value": {"path": "/progress"}}
+        ], "data": {"progress": 20}});
+        let (shown, _) = run(&ui, SHOW, flat).await;
+        assert!(text(&shown.unwrap()).contains("`ui1`"), "the result names the surface");
+        let surface = ui.accepted("ui1").unwrap();
+        assert_eq!(surface.root().and_then(|r| r.prop("children")), Some(&json!(["t", "p"])));
+        let (second, _) = run(&ui, SHOW, json!({"components": [{"id": "x", "component": "Divider"}]})).await;
+        assert!(text(&second.unwrap()).contains("`ui2`"));
     }
 
     #[tokio::test]
