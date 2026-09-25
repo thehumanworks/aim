@@ -91,7 +91,8 @@ fn complete(mut command: Command, timeout: Duration) -> Result<CommandResult> {
     }
     leader_done.store(true, Ordering::Release);
     let captured = output.join().map_err(|_| anyhow::anyhow!("sandbox output reader failed"))??;
-    ensure!(status.success(), "sandbox command failed with {status}");
+    let diagnostic: String = captured.chars().take(8192).collect();
+    ensure!(status.success(), "sandbox command failed with {status}: {diagnostic}");
     Ok(CommandResult { output: captured })
 }
 

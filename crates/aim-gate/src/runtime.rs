@@ -2,6 +2,7 @@
 
 use std::fs::{self, File};
 use std::io::Read as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use aim_gate_validators::{ProtectedManifest, ValidationConfig, validate};
@@ -172,7 +173,8 @@ impl GateRuntime {
         let base_sha = trusted("git", &["rev-parse", &base_ref], &self.config.repository)?;
         validate_sha(&base_sha)?;
         let temp = tempfile::Builder::new().prefix("aim-gate-propose-").tempdir().context("create private proposal root")?;
-        let candidate = temp.path().join("candidate");
+        let temp_root = fs::canonicalize(temp.path()).context("canonicalize private proposal root")?;
+        let candidate = temp_root.join("candidate");
         fresh_checkout(&self.config.repository, &base_sha, &candidate, &self.home, &self.config)?;
         let branch = format!("gate/cand/{id}");
         let offline = Sandbox::new(&candidate, &self.home, &self.config, Network::Off)?;
@@ -206,14 +208,22 @@ impl GateRuntime {
                 aimx.to_str().context("candidate aimx path is not UTF-8")?.into(),
                 "--ephemeral".into(),
                 "--max-requests".into(),
-                "8".into(),
+                "16".into(),
                 prompt,
             ],
         };
         let result = sandbox.run_proposal(&command, &broker.base_url());
         broker.stop()?;
         let spent = broker.spent_cents();
-        result.context("candidate proposal agent failed")?;
+        let usage = broker.usage();
+        writeln!(
+            std::io::stderr().lock(),
+            "gate broker: {} requests; {} billed micro-USD; {} reserved micro-USD",
+            usage.requests,
+            usage.billed_micro_usd,
+            usage.reserved_micro_usd
+        )?;
+        result.with_context(|| format!("candidate proposal agent failed; broker charged or reserved at most {spent} cents"))?;
         ensure!(spent <= self.config.paid_spend_cap_cents, "proposal spend exceeded configured cap");
         sandbox.clean_scratch()?;
         let dirty = offline
@@ -234,21 +244,16 @@ impl GateRuntime {
             .output;
         if !dirty.trim().is_empty() {
             offline.clean_scratch()?;
-            offline.run(&crate::formats::CommandSpec::new(
-                "git",
-                &[
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "add",
-                    "-A",
-                    "--",
-                    ".",
-                    ":(exclude).gate-home",
-                    ":(exclude).gate-tmp",
-                    ":(exclude).gate-mise",
-                    ":(exclude)target",
-                ],
-            ))?;
+            offline.run(&crate::formats::CommandSpec::new("git", &["-c", "core.hooksPath=/dev/null", "add", "-A", "--", "."]))?;
+            let staged = offline.run(&crate::formats::CommandSpec::new("git", &["diff", "--cached", "--name-only", "-z"]))?.output;
+            ensure!(
+                staged.split('\0').filter(|name| !name.is_empty()).all(|name| {
+                    !["target", ".gate-home", ".gate-tmp", ".gate-mise", ".gate-candidate.bundle"]
+                        .iter()
+                        .any(|scratch| name == *scratch || name.starts_with(&format!("{scratch}/")))
+                }),
+                "proposal tried to commit gate scratch or build output"
+            );
             offline.run(&crate::formats::CommandSpec::new(
                 "git",
                 &[
@@ -283,8 +288,8 @@ impl GateRuntime {
             open(&bundle_path, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()).context("open candidate bundle without symlink")?,
         );
         ensure!(input.metadata()?.is_file(), "candidate bundle is not a regular file");
-        let mut private_bundle = tempfile::NamedTempFile::new_in(temp.path()).context("create private gate bundle")?;
-        let copied = std::io::copy(&mut input.by_ref().take(MAX_BUNDLE_BYTES + 1), private_bundle.as_file_mut())?;
+        let mut private_bundle = tempfile::NamedTempFile::new_in(&temp_root).context("create private gate bundle")?;
+        let copied = std::io::copy(&mut std::io::Read::by_ref(&mut input).take(MAX_BUNDLE_BYTES + 1), private_bundle.as_file_mut())?;
         ensure!(copied <= MAX_BUNDLE_BYTES, "candidate bundle exceeds gate limit");
         private_bundle.as_file().sync_all().context("sync private gate bundle")?;
         let private_path = private_bundle.path().to_str().context("private bundle path is not UTF-8")?;
@@ -316,8 +321,9 @@ impl GateRuntime {
         fs::set_permissions(&receipts, std::os::unix::fs::PermissionsExt::from_mode(0o700)).context("protect receipt directory")?;
         ensure!(!receipts.join(format!("{id}.json")).exists(), "candidate already has a receipt");
         let temp = tempfile::Builder::new().prefix("aim-gate-evaluate-").tempdir().context("create private evaluation root")?;
-        let base = temp.path().join("base");
-        let candidate = temp.path().join("candidate");
+        let temp_root = fs::canonicalize(temp.path()).context("canonicalize private evaluation root")?;
+        let base = temp_root.join("base");
+        let candidate = temp_root.join("candidate");
         fresh_checkout(&self.config.repository, &base_sha, &base, &self.home, &self.config)?;
         fresh_checkout(&self.config.repository, sha, &candidate, &self.home, &self.config)?;
         let _reused_baseline = cache::restore(&self.home, &base_sha, &self.config.evaluator_digest, &base.join("target"))?;
