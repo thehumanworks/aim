@@ -164,9 +164,12 @@ async fn parallel_calls_run_concurrently_and_results_follow_in_dispatch_order() 
     let seen = provider.seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
     assert_eq!(kinds(&seen[1].items), ["user", "call:a", "call:b", "result:a", "result:b"]);
-    // Idempotency keys are stable per call.
+    // Every dispatched call gets its own idempotency key (never derived from provider call ids).
     let keys: Vec<String> = tools.calls.lock().unwrap().iter().map(|(_, _, k)| k.to_string()).collect();
-    assert_eq!(keys, ["s1/a", "s1/b"]);
+    assert_eq!(keys.len(), 2);
+    assert_ne!(keys[0], keys[1]);
+    // Every request of the turn carries the same turn id.
+    assert!(seen.iter().all(|r| r.turn_id.as_deref() == Some("s1.1")));
 }
 
 #[tokio::test]
@@ -225,4 +228,122 @@ async fn provider_errors_mid_stream_settle_the_turn() {
     let err = agent.run_turn(user("go"), &tx, &CancellationToken::new()).await.unwrap_err();
     assert!(matches!(err, AgentError::Provider(e) if e.kind == LlmErrorKind::Transport));
     assert_eq!(kinds(agent.items()), ["user", "call:c", "result:c"]);
+}
+
+#[tokio::test]
+async fn steering_continues_the_turn_and_is_delivered_with_the_next_request() {
+    // First response: a slow call; the user steers while it runs.
+    let provider =
+        Scripted::new(vec![vec![call("a", "echo", r#"{"text":"x","delay_ms":80}"#), completed(StopReason::ToolUse)], text("adjusted")]);
+    let mut agent = agent(Arc::clone(&provider), Arc::new(Fake { calls: Mutex::default() }));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        steer_tx.send(user("also check tests")).unwrap();
+    });
+    let stop = agent.run_turn_steered(user("go"), &tx, &CancellationToken::new(), &mut steer_rx).await.unwrap();
+    assert_eq!(stop, StopReason::EndTurn);
+    let seen = provider.seen.lock().unwrap();
+    assert_eq!(kinds(&seen[1].items), ["user", "call:a", "result:a", "user"], "the steer went with the next request");
+    let mut delivered = false;
+    while let Ok(ev) = rx.try_recv() {
+        delivered |= matches!(ev, AgentEvent::SteerDelivered { count: 1 });
+    }
+    assert!(delivered);
+}
+
+#[tokio::test]
+async fn a_steer_during_the_final_answer_continues_the_turn() {
+    let provider = Scripted::new(vec![text("first answer"), text("answer to the steer")]);
+    let mut agent = agent(Arc::clone(&provider), Arc::new(Fake { calls: Mutex::default() }));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
+    steer_tx.send(user("one more thing")).unwrap();
+    agent.run_turn_steered(user("go"), &tx, &CancellationToken::new(), &mut steer_rx).await.unwrap();
+    assert_eq!(provider.seen.lock().unwrap().len(), 2, "the queued steer earned another request");
+    assert_eq!(kinds(agent.items()), ["user", "assistant", "user", "assistant"]);
+}
+
+#[tokio::test]
+async fn freeform_tools_receive_the_raw_text() {
+    struct Patch(Mutex<Vec<Value>>);
+    impl ToolHost for Patch {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "apply_patch".into(),
+                description: "patch".into(),
+                input_schema: json!({}),
+                input: aim_proto::tool::ToolInput::Freeform { syntax: Some("lark".into()), definition: None },
+                annotations: ToolAnnotations::default(),
+            }]
+        }
+        fn call(&self, _name: String, arguments: Value, _key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
+            self.0.lock().unwrap().push(arguments);
+            Box::pin(async { Ok(ToolResult::text("applied")) })
+        }
+    }
+    let provider =
+        Scripted::new(vec![vec![call("p", "apply_patch", "*** Begin Patch\n*** End Patch"), completed(StopReason::ToolUse)], text("ok")]);
+    let host = Arc::new(Patch(Mutex::default()));
+    let mut agent = Agent::new(
+        provider,
+        Arc::clone(&host) as Arc<dyn ToolHost>,
+        AgentConfig {
+            model: "m".into(),
+            instructions: String::new(),
+            effort: None,
+            tier: None,
+            session_id: "s".into(),
+            cache_key: None,
+            parallel_tool_calls: false,
+            max_requests: 4,
+        },
+    );
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.run_turn(user("patch it"), &tx, &CancellationToken::new()).await.unwrap();
+    assert_eq!(host.0.lock().unwrap().as_slice(), [Value::String("*** Begin Patch\n*** End Patch".into())]);
+}
+
+#[tokio::test]
+async fn a_reused_provider_call_id_fails_the_turn_safely() {
+    let provider = Scripted::new(vec![vec![call("same", "echo", "{}"), call("same", "echo", "{}"), completed(StopReason::ToolUse)]]);
+    let mut agent = agent(provider, Arc::new(Fake { calls: Mutex::default() }));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let err = agent.run_turn(user("go"), &tx, &CancellationToken::new()).await.unwrap_err();
+    assert!(matches!(err, AgentError::Protocol(_)));
+    assert_eq!(kinds(agent.items()), ["user", "call:same", "result:same"], "the first call is still answered");
+    let mut failed = 0;
+    while let Ok(ev) = rx.try_recv() {
+        failed += usize::from(matches!(ev, AgentEvent::TurnFailed { .. }));
+    }
+    assert_eq!(failed, 1, "exactly one terminal event");
+}
+
+#[tokio::test]
+async fn a_filtered_response_ends_the_turn_after_answering_its_calls() {
+    let provider = Scripted::new(vec![vec![call("c", "echo", r#"{"text":"q","delay_ms":5000}"#), completed(StopReason::ContentFilter)]]);
+    let mut agent = agent(provider, Arc::new(Fake { calls: Mutex::default() }));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let stop = agent.run_turn(user("go"), &tx, &CancellationToken::new()).await.unwrap();
+    assert_eq!(stop, StopReason::ContentFilter);
+    assert_eq!(kinds(agent.items()), ["user", "call:c", "result:c"]);
+}
+
+#[tokio::test]
+async fn a_dropped_turn_is_repaired_before_the_next() {
+    let provider =
+        Scripted::new(vec![vec![call("slow", "echo", r#"{"text":"z","delay_ms":10000}"#), completed(StopReason::ToolUse)], text("fresh")]);
+    let mut agent = agent(Arc::clone(&provider), Arc::new(Fake { calls: Mutex::default() }));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    // Drop the turn future while its tool runs (e.g. a daemon timeout).
+    let dropped = tokio::time::timeout(Duration::from_millis(30), agent.run_turn(user("go"), &tx, &CancellationToken::new())).await;
+    assert!(dropped.is_err());
+    assert_eq!(kinds(agent.items()), ["user", "call:slow"], "left dangling by the drop");
+    agent.run_turn(user("again"), &tx, &CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        kinds(&provider.seen.lock().unwrap()[1].items),
+        ["user", "call:slow", "result:slow", "user"],
+        "repaired before the next request"
+    );
 }

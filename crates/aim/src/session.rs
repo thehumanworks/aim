@@ -86,11 +86,15 @@ impl Recorder {
             AgentEvent::Usage { usage } => EventBody::Usage { usage: usage.clone(), model: self.model.clone() },
             AgentEvent::RateLimits { limits } => EventBody::RateLimits { limits: limits.clone() },
             AgentEvent::TurnEnded { stop } => EventBody::TurnEnded { stop: stop.clone() },
+            AgentEvent::TurnFailed { message } => EventBody::TurnFailed { message: message.clone() },
             AgentEvent::RequestStarted { .. }
             | AgentEvent::TextDelta { .. }
             | AgentEvent::ReasoningDelta { .. }
             | AgentEvent::ToolStarted { .. }
-            | AgentEvent::ToolFinished { .. } => return Ok(()),
+            | AgentEvent::ToolFinished { .. }
+            | AgentEvent::SteerQueued
+            | AgentEvent::SteerDelivered { .. }
+            | AgentEvent::SteersReturned { .. } => return Ok(()),
         };
         self.record(body).await
     }
