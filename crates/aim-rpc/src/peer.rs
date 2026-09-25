@@ -24,7 +24,8 @@ pub trait Handler: Send + Sync + 'static {
     /// Handles a request. Runs on its own task; `ctx.cancelled` fires on `$/cancel` or disconnect.
     fn request(&self, ctx: RequestCtx, method: String, params: Value) -> BoxFuture<Result<Value, ProtoError>>;
 
-    /// Handles a notification (other than `$/cancel`, which the peer handles itself).
+    /// Handles a notification (other than `$/cancel`, which the peer handles itself). The peer
+    /// awaits each notification future before delivering the next one on this connection.
     fn notification(&self, _ctx: NotificationCtx, _method: String, _params: Value) -> BoxFuture<()> {
         Box::pin(async {})
     }
@@ -70,8 +71,8 @@ pub struct PeerConfig {
     pub outgoing_capacity: usize,
     /// Maximum active request handlers on this connection.
     pub max_inflight_requests: usize,
-    /// Maximum active notification handlers on this connection.
-    pub max_notification_tasks: usize,
+    /// Maximum notifications waiting behind this connection's ordered handler.
+    pub notification_queue_capacity: usize,
 }
 
 impl Default for PeerConfig {
@@ -80,7 +81,7 @@ impl Default for PeerConfig {
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             outgoing_capacity: 1024,
             max_inflight_requests: 128,
-            max_notification_tasks: 64,
+            notification_queue_capacity: 64,
         }
     }
 }
@@ -94,6 +95,11 @@ struct OutboundFrame {
     body: String,
     sent: Option<Arc<AtomicBool>>,
     delivered: Option<oneshot::Sender<()>>,
+}
+
+struct QueuedNotification {
+    method: String,
+    params: Value,
 }
 
 impl OutboundFrame {
@@ -111,7 +117,8 @@ struct Inner {
     control: mpsc::Sender<OutboundFrame>,
     max_outgoing_bytes: AtomicUsize,
     request_slots: Arc<Semaphore>,
-    notification_slots: Arc<Semaphore>,
+    notification_queue: mpsc::Sender<QueuedNotification>,
+    notification_limit: usize,
     closed: CancellationToken,
 }
 
@@ -155,6 +162,7 @@ impl Peer {
     {
         let (tx, rx) = mpsc::channel(config.outgoing_capacity.max(1));
         let (control_tx, control_rx) = mpsc::channel(config.outgoing_capacity.clamp(1, 32));
+        let (notification_tx, notification_rx) = mpsc::channel(config.notification_queue_capacity.max(1));
         let peer = Self {
             inner: Arc::new(Inner {
                 next_id: AtomicI64::new(1),
@@ -164,12 +172,15 @@ impl Peer {
                 control: control_tx,
                 max_outgoing_bytes: AtomicUsize::new(config.max_message_bytes),
                 request_slots: Arc::new(Semaphore::new(config.max_inflight_requests)),
-                notification_slots: Arc::new(Semaphore::new(config.max_notification_tasks)),
+                notification_queue: notification_tx,
+                notification_limit: config.notification_queue_capacity,
                 closed: CancellationToken::new(),
             }),
         };
+        let handler: Arc<dyn Handler> = Arc::new(handler);
         tokio::spawn(write_loop(FrameWriter::new(writer), control_rx, rx, peer.inner.closed.clone()));
-        tokio::spawn(read_loop(peer.clone(), FrameReader::new(reader, config.max_message_bytes), Arc::new(handler)));
+        tokio::spawn(notification_loop(peer.clone(), Arc::clone(&handler), notification_rx));
+        tokio::spawn(read_loop(peer.clone(), FrameReader::new(reader, config.max_message_bytes), handler));
         peer
     }
 
@@ -392,6 +403,23 @@ async fn read_loop<R: AsyncRead + Unpin>(peer: Peer, mut reader: FrameReader<R>,
     peer.close();
 }
 
+async fn notification_loop(peer: Peer, handler: Arc<dyn Handler>, mut queue: mpsc::Receiver<QueuedNotification>) {
+    loop {
+        let notice = tokio::select! {
+            biased;
+            () = peer.inner.closed.cancelled() => break,
+            notice = queue.recv() => notice,
+        };
+        let Some(QueuedNotification { method, params }) = notice else { break };
+        let future = handler.notification(NotificationCtx { peer: peer.clone() }, method, params);
+        tokio::select! {
+            biased;
+            () = peer.inner.closed.cancelled() => break,
+            () = future => {},
+        }
+    }
+}
+
 fn dispatch(peer: &Peer, handler: &Arc<dyn Handler>, frame: &str) {
     let raw: Value = match serde_json::from_str(frame) {
         Ok(raw) => raw,
@@ -438,16 +466,11 @@ fn dispatch(peer: &Peer, handler: &Arc<dyn Handler>, frame: &str) {
                 }
                 return;
             }
-            let Ok(permit) = Arc::clone(&peer.inner.notification_slots).try_acquire_owned() else {
-                tracing::warn!(reason = "limit_exceeded", "too many active notification handlers; closing connection");
+            if peer.inner.notification_limit == 0 || peer.inner.notification_queue.try_send(QueuedNotification { method, params }).is_err()
+            {
+                tracing::warn!(reason = "limit_exceeded", "ordered notification queue is full; closing connection");
                 peer.close();
-                return;
-            };
-            let fut = handler.notification(NotificationCtx { peer: peer.clone() }, method, params);
-            tokio::spawn(async move {
-                let _permit = permit;
-                fut.await;
-            });
+            }
         }
         // An error with `"id": null` is the other side failing to parse something we sent: it
         // cannot be correlated with a request, so it is only logged.

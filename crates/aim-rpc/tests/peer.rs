@@ -84,6 +84,37 @@ notification!(
     /// Holds a notification handler open for admission testing.
     SlowNotice = "test.slow_notice" (())
 );
+notification!(
+    /// One of two notification methods used to test connection-wide order.
+    OrderedOutput = "test.ordered_output" (u32)
+);
+notification!(
+    /// The second notification method in the ordered sequence.
+    OrderedUpdate = "test.ordered_update" (u32)
+);
+
+#[derive(Default)]
+struct OrderState {
+    seen: Mutex<Vec<u32>>,
+    complete: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct BlockingState {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+async fn record_order(state: Arc<OrderState>, sequence: u32) {
+    if sequence == 0 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let mut seen = state.seen.lock().unwrap();
+    seen.push(sequence);
+    if seen.len() == 32 {
+        state.complete.notify_one();
+    }
+}
 
 struct DropFlag {
     state: Arc<State>,
@@ -160,6 +191,51 @@ async fn notifications_are_delivered() {
     client.call::<Add>(AddParams { a: 0, b: 0 }).await.unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(state.pings.load(Ordering::SeqCst), 7);
+}
+
+#[tokio::test]
+async fn rapid_notifications_from_multiple_methods_reach_handlers_in_wire_order() {
+    let (a, b) = tokio::io::duplex(1 << 16);
+    let (ar, aw) = tokio::io::split(a);
+    let (br, bw) = tokio::io::split(b);
+    let router = Router::new(OrderState::default())
+        .notification::<OrderedOutput, _, _>(|state, _, seq| async move { record_order(state, seq).await })
+        .notification::<OrderedUpdate, _, _>(|state, _, seq| async move { record_order(state, seq).await });
+    let state = Arc::clone(router.state());
+    let server = Peer::spawn(br, bw, router, PeerConfig::default());
+    let client = Peer::spawn(ar, aw, NoHandler, PeerConfig::default());
+    for seq in 0..32 {
+        if seq % 2 == 0 {
+            client.notify::<OrderedOutput>(seq).await.unwrap();
+        } else {
+            client.notify::<OrderedUpdate>(seq).await.unwrap();
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(1), state.complete.notified()).await.unwrap();
+    assert_eq!(*state.seen.lock().unwrap(), (0..32).collect::<Vec<_>>());
+    server.close();
+}
+
+#[tokio::test]
+async fn requests_remain_concurrent_with_an_ordered_notification_handler() {
+    let (a, b) = tokio::io::duplex(1 << 16);
+    let (ar, aw) = tokio::io::split(a);
+    let (br, bw) = tokio::io::split(b);
+    let router = Router::new(BlockingState::default())
+        .notification::<SlowNotice, _, _>(|state, _, ()| async move {
+            state.started.notify_one();
+            state.release.notified().await;
+        })
+        .method::<Add, _, _>(|_, _, params| async move { Ok(params.a + params.b) });
+    let state = Arc::clone(router.state());
+    let server = Peer::spawn(br, bw, router, PeerConfig::default());
+    let client = Peer::spawn(ar, aw, NoHandler, PeerConfig::default());
+    client.notify::<SlowNotice>(()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), state.started.notified()).await.unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(1), client.call::<Add>(AddParams { a: 2, b: 40 })).await.unwrap().unwrap();
+    assert_eq!(answer, 42);
+    state.release.notify_one();
+    server.close();
 }
 
 #[tokio::test]
@@ -329,16 +405,16 @@ async fn outgoing_request_and_response_limits_are_enforced() {
 }
 
 #[tokio::test]
-async fn notification_handler_cap_closes_a_flooding_peer() {
+async fn notification_queue_cap_closes_a_flooding_peer() {
     let (a, b) = tokio::io::duplex(1 << 16);
     let (ar, aw) = tokio::io::split(a);
     let (br, bw) = tokio::io::split(b);
     let router = Router::new(()).notification::<SlowNotice, _, _>(|_, _, ()| async move {
         tokio::time::sleep(Duration::from_secs(10)).await;
     });
-    let server = Peer::spawn(br, bw, router, PeerConfig::default());
+    let server = Peer::spawn(br, bw, router, PeerConfig { notification_queue_capacity: 4, ..PeerConfig::default() });
     let client = Peer::spawn(ar, aw, NoHandler, PeerConfig::default());
-    for _ in 0..65 {
+    for _ in 0..6 {
         let _sent = client.notify::<SlowNotice>(()).await;
     }
     tokio::time::timeout(Duration::from_secs(1), server.closed()).await.unwrap();
