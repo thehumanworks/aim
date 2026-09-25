@@ -10,19 +10,101 @@ use crate::auth::AuthManager;
 use crate::fake::{self, FakeServer, MemoryStore, Reply, unix_now};
 
 fn client(server: &FakeServer) -> MediaClient {
-    let config = server.config();
-    let http = fake::client(&config);
-    let store = MemoryStore::new(Some(fake::credentials(unix_now() + 3_600, Some("rt"))));
-    let auth = Arc::new(AuthManager::with_config(http.clone(), store, &config));
-    let provider = Arc::new(CodexProvider::with_auth(config, http, auth));
-    MediaClient::with_provider(
-        provider,
+    client_with(
+        server,
         MediaConfig {
             search_model: Some("gpt-6-luna".into()),
             image_model: Some("gpt-image-2.5-sunburst".into()),
             ..MediaConfig::default()
         },
     )
+}
+
+fn client_with(server: &FakeServer, media: MediaConfig) -> MediaClient {
+    let config = server.config();
+    let http = fake::client(&config);
+    let store = MemoryStore::new(Some(fake::credentials(unix_now() + 3_600, Some("rt"))));
+    let auth = Arc::new(AuthManager::with_config(http.clone(), store, &config));
+    let provider = Arc::new(CodexProvider::with_auth(config, http, auth));
+    MediaClient::with_provider(provider, media)
+}
+
+fn catalog_media() -> MediaConfig {
+    MediaConfig { search_model: None, search_from_catalog: true, image_model: Some(DEFAULT_IMAGE_MODEL.into()), ..MediaConfig::default() }
+}
+
+#[tokio::test]
+async fn preflight_chooses_visible_tools_capable_catalog_default() {
+    let catalog = json!({"models":[
+        {"slug":"hidden-default","is_default":true,"visibility":"hide"},
+        {"slug":"no-tools","is_default":true,"visibility":"list","tool_mode":"none"},
+        {"slug":"code-only","is_default":true,"visibility":"list","tool_mode":"code_mode_only"},
+        {"slug":"first-visible","visibility":"list"},
+        {"slug":"chosen-default","is_default":true,"visibility":"list"}
+    ]});
+    let server = FakeServer::start(move |request, _| match request.path() {
+        "/backend-api/codex/models" => Reply::json(200, &catalog),
+        "/backend-api/codex/responses" => {
+            let mut events = include_bytes!("../../fixtures/media_search.sse").to_vec();
+            events.push(b'\n');
+            Reply::sse(&events)
+        }
+        _ => Reply::text(404, "missing"),
+    })
+    .await;
+    let media = client_with(&server, catalog_media());
+    assert!(!media.search_enabled());
+    assert!(media.image_enabled());
+    assert!(media.has_credentials().await);
+    assert!(media.search_enabled());
+    media.web_search("capital of France").await.unwrap();
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path(), "/backend-api/codex/models");
+    assert_eq!(requests[1].json()["model"], "chosen-default");
+}
+
+#[tokio::test]
+async fn direct_search_falls_back_to_first_usable_catalog_model() {
+    let catalog = json!({"models":[
+        {"slug":"hidden","visibility":"hide"},
+        {"slug":"no-tools","visibility":"list","tool_mode":"none"},
+        {"slug":"first-usable","visibility":"list"},
+        {"slug":"second-usable","visibility":"list"}
+    ]});
+    let server = FakeServer::start(move |request, _| match request.path() {
+        "/backend-api/codex/models" => Reply::json(200, &catalog),
+        "/backend-api/codex/responses" => {
+            let mut events = include_bytes!("../../fixtures/media_search.sse").to_vec();
+            events.push(b'\n');
+            Reply::sse(&events)
+        }
+        _ => Reply::text(404, "missing"),
+    })
+    .await;
+    let media = client_with(&server, catalog_media());
+    media.web_search("capital of France").await.unwrap();
+    assert!(media.search_enabled());
+    let requests = server.requests().await;
+    assert_eq!(requests[1].json()["model"], "first-usable");
+}
+
+#[tokio::test]
+async fn failed_catalog_disables_only_search() {
+    let server = FakeServer::start(|_, _| Reply::json(500, &json!({"error":{"message":"unavailable"}}))).await;
+    let media = client_with(&server, catalog_media());
+    assert!(media.has_credentials().await);
+    assert!(!media.search_enabled());
+    assert!(media.image_enabled());
+    assert_eq!(media.web_search("test").await.unwrap_err().kind, LlmErrorKind::Unavailable);
+}
+
+#[test]
+fn blank_configured_model_disables_capability() {
+    let config =
+        MediaConfig { search_model: nonblank("  "), search_from_catalog: false, image_model: nonblank(" "), ..MediaConfig::default() };
+    assert!(config.search_model.is_none() && config.image_model.is_none());
+    assert!(!config.search_from_catalog);
 }
 
 #[test]

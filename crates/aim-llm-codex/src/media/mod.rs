@@ -3,15 +3,16 @@
 //! Transcription uploads audio to ChatGPT, where the observed retention is 30 days
 //! (docs/research/live-probes.md). Callers must disclose this before uploading.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use aim_llm::{LlmError, LlmErrorKind, StreamEvent};
+use aim_llm::{LlmError, LlmErrorKind, ModelInfo, StreamEvent};
 use aim_proto::conversation::{Item, Part};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt as _;
 use reqwest::header::ACCEPT;
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 use crate::stream::drive;
 use crate::{CodexProvider, error, send_error};
@@ -24,14 +25,19 @@ pub const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 pub const MAX_IMAGE_BYTES: usize = 11 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
+/// Last live-verified ChatGPT image generation model (docs/research/live-probes.md,
+/// 2026-09-25). Runtime `AIM_CODEX_IMAGE_MODEL` overrides or disables this value.
+pub const DEFAULT_IMAGE_MODEL: &str = "gpt-image-2.5-sunburst";
 
-/// Media capability choices and bounded call deadlines. A missing model disables that service.
-/// Defaults read `AIM_CODEX_SEARCH_MODEL` and `AIM_CODEX_IMAGE_MODEL` from the environment;
-/// unset or blank values disable the corresponding service.
+/// Media capability choices and bounded call deadlines. Search discovers a catalog model by
+/// default, while images use the last live-verified model. `AIM_CODEX_SEARCH_MODEL` and
+/// `AIM_CODEX_IMAGE_MODEL` override these defaults; an explicitly blank value disables a service.
 #[derive(Clone, Debug)]
 pub struct MediaConfig {
-    /// Model used for standalone hosted search.
+    /// Explicit model used for standalone hosted search. Takes precedence over catalog discovery.
     pub search_model: Option<String>,
+    /// Discover a search model from the authenticated Codex catalog when no explicit model exists.
+    pub search_from_catalog: bool,
     /// Model used for image generation.
     pub image_model: Option<String>,
     /// Whether the transcription endpoint is enabled.
@@ -46,9 +52,11 @@ pub struct MediaConfig {
 
 impl Default for MediaConfig {
     fn default() -> Self {
+        let (search_model, search_from_catalog) = configured_search_model();
         Self {
-            search_model: configured_model("AIM_CODEX_SEARCH_MODEL"),
-            image_model: configured_model("AIM_CODEX_IMAGE_MODEL"),
+            search_model,
+            search_from_catalog,
+            image_model: configured_image_model(),
             transcription_enabled: true,
             search_timeout: Duration::from_secs(120),
             image_timeout: Duration::from_secs(300),
@@ -99,6 +107,9 @@ pub struct Image {
 pub struct MediaClient {
     provider: Arc<CodexProvider>,
     config: MediaConfig,
+    // Account-scoped: catalog visibility can differ after a credential switch.
+    resolved_search_model: Arc<RwLock<Option<(String, String)>>>,
+    search_resolution: Arc<Mutex<()>>,
 }
 
 impl MediaClient {
@@ -113,18 +124,25 @@ impl MediaClient {
     /// Share the provider's credentials and HTTP client with another caller.
     #[must_use]
     pub fn with_provider(provider: Arc<CodexProvider>, config: MediaConfig) -> Self {
-        Self { provider, config }
+        Self { provider, config, resolved_search_model: Arc::new(RwLock::new(None)), search_resolution: Arc::new(Mutex::new(())) }
     }
 
     /// Whether usable ChatGPT credentials can currently be acquired without exposing them.
     pub async fn has_credentials(&self) -> bool {
-        self.provider.auth.credentials().await.is_ok()
+        if self.provider.auth.credentials().await.is_err() {
+            return false;
+        }
+        if self.config.search_model.is_none() && self.config.search_from_catalog && self.resolve_search_model().await.is_err() {
+            log_search_catalog_unavailable();
+        }
+        true
     }
 
     /// Whether standalone web search is configured.
     #[must_use]
     pub fn search_enabled(&self) -> bool {
-        self.config.search_model.is_some()
+        self.config.search_model.as_ref().is_some_and(|model| !model.trim().is_empty())
+            || self.resolved_search_model.read().is_ok_and(|selected| selected.is_some())
     }
 
     /// Whether image generation is configured.
@@ -133,13 +151,43 @@ impl MediaClient {
         self.config.image_model.is_some()
     }
 
+    fn cached_search_model(&self, account_id: &str) -> Option<String> {
+        self.resolved_search_model
+            .read()
+            .ok()
+            .and_then(|selected| selected.as_ref().filter(|(account, _)| account == account_id).map(|(_, model)| model.clone()))
+    }
+
+    async fn resolve_search_model(&self) -> Result<String, LlmError> {
+        if let Some(model) = self.config.search_model.as_ref().filter(|model| !model.trim().is_empty()) {
+            return Ok(model.clone());
+        }
+        if !self.config.search_from_catalog {
+            return Err(unavailable("web search"));
+        }
+        let account_id = self.provider.auth.credentials().await?.account_id;
+        if let Some(model) = self.cached_search_model(&account_id) {
+            return Ok(model);
+        }
+        let _resolution = self.search_resolution.lock().await;
+        if let Some(model) = self.cached_search_model(&account_id) {
+            return Ok(model);
+        }
+        let models = self.provider.fetch_catalog().await.map_err(|_| unavailable("web search: catalog discovery failed"))?;
+        let model = select_search_model(&models).ok_or_else(|| unavailable("web search: no visible tools-capable catalog model"))?;
+        if let Ok(mut selected) = self.resolved_search_model.write() {
+            *selected = Some((account_id, model.clone()));
+        }
+        Ok(model)
+    }
+
     /// Run one hosted web search without conversation history or session affinity.
     ///
     /// # Errors
     /// Returns an auth, transport, HTTP, or protocol error. A response without a completed
     /// hosted search and nonempty answer is rejected.
     pub async fn web_search(&self, query: &str) -> Result<SearchAnswer, LlmError> {
-        let model = self.config.search_model.as_deref().ok_or_else(|| unavailable("web search"))?;
+        let model = self.resolve_search_model().await?;
         if query.trim().is_empty() {
             return Err(error(LlmErrorKind::InvalidRequest, "web search query is empty"));
         }
@@ -267,8 +315,40 @@ fn unavailable(capability: &str) -> LlmError {
     error(LlmErrorKind::Unavailable, &format!("Codex {capability} is unavailable"))
 }
 
-fn configured_model(key: &str) -> Option<String> {
-    std::env::var(key).ok().map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+fn configured_search_model() -> (Option<String>, bool) {
+    match std::env::var("AIM_CODEX_SEARCH_MODEL") {
+        Ok(value) => (nonblank(&value), false),
+        Err(std::env::VarError::NotPresent) => (None, true),
+        Err(std::env::VarError::NotUnicode(_)) => (None, false),
+    }
+}
+
+fn configured_image_model() -> Option<String> {
+    match std::env::var("AIM_CODEX_IMAGE_MODEL") {
+        Ok(value) => nonblank(&value),
+        Err(std::env::VarError::NotPresent) => Some(DEFAULT_IMAGE_MODEL.into()),
+        Err(std::env::VarError::NotUnicode(_)) => None,
+    }
+}
+
+fn nonblank(value: &str) -> Option<String> {
+    let value = value.trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn select_search_model(models: &[ModelInfo]) -> Option<String> {
+    let usable = |model: &ModelInfo| {
+        !model.hidden
+            && model.tools
+            && model.native.as_ref().and_then(|entry| entry.get("tool_mode")).and_then(Value::as_str) != Some("code_mode_only")
+    };
+    models
+        .iter()
+        .find(|model| {
+            usable(model) && model.native.as_ref().and_then(|entry| entry.get("is_default")).and_then(Value::as_bool) == Some(true)
+        })
+        .or_else(|| models.iter().find(|model| usable(model)))
+        .map(|model| model.id.clone())
 }
 
 #[expect(clippy::print_stderr, reason = "opt-in debug log contains only static text and no provider data")]
@@ -276,6 +356,11 @@ fn log_unknown_search_item() {
     if std::env::var_os("AIM_CODEX_MEDIA_DEBUG").is_some() {
         eprintln!("Codex web search ignored an unknown output item");
     }
+}
+
+#[expect(clippy::print_stderr, reason = "diagnostic contains only static text and no catalog or credential data")]
+fn log_search_catalog_unavailable() {
+    eprintln!("Codex web search unavailable: catalog did not yield a usable model");
 }
 
 fn timeout(capability: &str) -> LlmError {

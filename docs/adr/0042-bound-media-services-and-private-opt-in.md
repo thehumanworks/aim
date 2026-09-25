@@ -14,7 +14,8 @@ The same review found that ephemeral sessions currently offer media tools with a
 
 ## Decision
 
-- Media model IDs come from runtime configuration: `AIM_CODEX_SEARCH_MODEL` and `AIM_CODEX_IMAGE_MODEL`. An unset or empty value disables that capability. The service does not embed model IDs as defaults.
+- The search model comes from the authenticated Codex catalog: use a visible tools-capable entry marked as default, else the first visible tools-capable entry. `AIM_CODEX_SEARCH_MODEL` overrides it. If the catalog has no suitable answer, omit search with an unavailable diagnostic. An explicitly blank override disables it. Catalog tool support is the available proxy for hosted-search acceptance; a live search still tests that acceptance.
+- The image model defaults to `gpt-image-2.5-sunburst` as versioned media configuration data, because the live generation probe in `docs/research/live-probes.md` observed that ID succeeding (31.6 s at 1024², 2026-09-25) and the Codex model catalog does not establish image-endpoint models. `AIM_CODEX_IMAGE_MODEL` overrides the default; an explicitly blank value disables image generation. Availability remains account-specific and is checked by the service call.
 - A completed hosted search may return no citations. Its tool result marks `uncited: true`; unknown hosted output items are ignored with a debug record. Callers must not present an uncited answer as sourced.
 - A generated image is limited to 11 MiB decoded so its base64 payload fits the current 16 MiB harness frame with room for the JSON envelope. The tool result records the workspace path and media type as text, not image bytes in the persistent transcript. The model may use the workspace `Read` tool to inspect the image when needed.
 - `fs.write` retains `IfAbsent`. A path collision after generation saves to a fresh path with a fresh idempotency key, never overwriting the old file. Other write failures tell the model that generation succeeded but the image was not saved.
@@ -23,7 +24,7 @@ The same review found that ephemeral sessions currently offer media tools with a
 
 ## Consequences
 
-Image bytes no longer inflate later model requests, daemon notifications or stored transcripts. An image may require one later workspace read when the model needs pixels. Unconfigured services are unavailable until the runtime environment supplies model IDs. A filesystem failure can still waste one generation until the preflight API is wired. The private-session gate must be completed before this ADR can replace ADR 0029.
+Image bytes no longer inflate later model requests, daemon notifications or stored transcripts. An image may require one later workspace read when the model needs pixels. Search adds one catalog lookup when no override is configured; a catalog failure omits only search, while image generation keeps its independently configured default. A filesystem failure can still waste one generation until the preflight API is wired. The private-session gate must be completed before this ADR can replace ADR 0029.
 
 ## Verification
 
