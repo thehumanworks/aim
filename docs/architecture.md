@@ -165,6 +165,20 @@ JSON-RPC over the unix socket locally, WebSocket remotely (web UI, remote TUI). 
 daemon-wide session index and search, the blackboard, plugin UI surfaces, completion, login flows,
 dictation, evolution.
 
+**Hosting** (`aim::host`). Serving sessions is not tied to the transport. A `SessionHost` runs
+each live session as an actor that alone owns the session's agent and recorder. A prompt while the
+session is idle starts a turn. A prompt during a turn steers it, and steering that arrives as the
+turn ends is handed back (`steers_returned`). `set_config` applies at once when idle, otherwise from
+the next turn. Each update is recorded, mirrored into the transcript and broadcast under one lock.
+`session.attach` therefore returns a snapshot plus a subscription with no finished item missed or
+repeated. Attaching to a stored session resumes it exactly once and continues its log without gaps.
+
+UIs program against the `SessionClient` trait. The in-process host implements it (`--ephemeral`,
+tests), and so does the daemon client over this protocol, so a UI cannot tell which one it has.
+
+Providers and workspaces are injected as factories, so SSH workspaces and test fakes plug in
+without changes to the host.
+
 ### 4.3 Edges
 
 | Edge | Implementation | Notes |
