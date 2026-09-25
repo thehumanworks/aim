@@ -1,22 +1,23 @@
-//! Lexical path confinement (docs/adr/0008): the pure decision of which absolute path a
-//! user-supplied path names inside a workspace root, or why it may not.
+//! Lexical path confinement (docs/adr/0008): which absolute path a user-supplied path names
+//! inside a workspace root, or why it may not.
 //!
-//! Kernel candidate: this module does no I/O and uses only `&str`, so it can move into
-//! `aim-kernel` with a Verus proof unchanged in meaning. Symlinks are invisible to it; the backend
-//! resolves them afterwards and refuses real locations outside the root.
+//! The decision itself is `aim_kernel::path::confine`, verified with Verus and `LOCKED(ADR-0008)`;
+//! this module is its shell: it splits strings into segments, calls the kernel and maps the
+//! answer to protocol errors. Symlinks are invisible here; the backend resolves them afterwards and
+//! refuses real locations outside the root.
 //!
-//! Rules, for a root `R` and a user path `p`:
-//! - `R` must be absolute; it is normalised first.
-//! - `p` must not contain NUL.
-//! - An empty `p` (or `.`) names `R` itself.
-//! - A relative `p` is normalised on its own (`.` and empty segments dropped, `..` pops the
-//!   previous segment); a `..` with nothing left to pop climbs above `R` → `denied`. The result is
-//!   appended to `R`.
-//! - An absolute `p` is normalised (`..` at `/` stays at `/`, as POSIX does) and must then be `R`
-//!   or lie below it at a segment boundary (`/ab` is not inside `/a`) → otherwise `denied`.
+//! The rules (the kernel's `confined` spec), for a root `R` and a user path `p`:
+//! - `R` must be absolute; it is normalised lexically first.
+//! - `p` is split at `/`; empty segments are dropped (so `//` and a trailing `/` are harmless).
+//! - A relative `p` starts at `R` and may never climb above it: a `..` with nothing of `p` left
+//!   to pop → `denied`, even if the path would come back inside.
+//! - An absolute `p` starts at `/` (a `..` above `/` → `denied`) and must end at `R` or below it
+//!   (at a segment boundary: `/ab` is not inside `/a`).
+//! - A name containing NUL → `invalid_params`.
 //! - The result is normalised: absolute, no `.`/`..`/empty segments, no trailing `/` except for
 //!   `/` itself.
 
+use aim_kernel::path::{PathError, Segment};
 use aim_proto::error::{ErrorCode, ProtoError};
 
 /// Normalises an absolute POSIX path lexically. `None` when `path` is not absolute.
@@ -34,21 +35,6 @@ pub fn normalize(path: &str) -> Option<String> {
         }
     }
     Some(join_absolute(&segments))
-}
-
-/// Normalises a relative path; `None` when a `..` climbs above its start.
-fn normalize_relative(path: &str) -> Option<Vec<&str>> {
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop()?;
-            }
-            name => segments.push(name),
-        }
-    }
-    Some(segments)
 }
 
 fn join_absolute(segments: &[&str]) -> String {
@@ -84,30 +70,40 @@ pub fn relative_to<'a>(path: &'a str, base: &str) -> Option<&'a str> {
     path.strip_prefix(base).map(|rest| rest.strip_prefix('/').unwrap_or(rest))
 }
 
-/// Confines `user_path` to `root`: the normalised absolute path it names, or `denied` when it
-/// would leave the root (`invalid_params` for a relative root or a NUL byte).
+/// The kernel's segments of a path (empty segments dropped).
+fn segments(path: &str) -> Vec<Segment> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| match segment {
+            "." => Segment::Current,
+            ".." => Segment::Parent,
+            name => Segment::Name(name.as_bytes().to_vec()),
+        })
+        .collect()
+}
+
+/// Confines `user_path` to `root` with the kernel's verified decision: the normalised absolute
+/// path it names, or `denied` when it would leave the root.
 ///
 /// # Errors
-/// `denied` when the path escapes the root; `invalid_params` for malformed input.
+/// `denied` when the path escapes the root; `invalid_params` for a relative root or a NUL byte.
 pub fn confine(root: &str, user_path: &str) -> Result<String, ProtoError> {
-    if user_path.contains('\0') || root.contains('\0') {
-        return Err(ProtoError::new(ErrorCode::InvalidParams, "path contains a NUL byte"));
-    }
     let root = normalize(root).ok_or_else(|| ProtoError::new(ErrorCode::InvalidParams, "workspace root must be absolute"))?;
-    if user_path.starts_with('/') {
-        let path = normalize(user_path).unwrap_or_default();
-        if is_within(&path, &root) { Ok(path) } else { Err(denied(user_path)) }
-    } else {
-        let segments = normalize_relative(user_path).ok_or_else(|| denied(user_path))?;
-        if segments.is_empty() {
-            return Ok(root);
+    let root_names: Vec<Vec<u8>> = root.split('/').filter(|name| !name.is_empty()).map(|name| name.as_bytes().to_vec()).collect();
+    match aim_kernel::path::confine(&root_names, &segments(user_path), user_path.starts_with('/')) {
+        Ok(names) => {
+            let mut out = String::with_capacity(names.iter().map(|n| n.len() + 1).sum::<usize>().max(1));
+            for name in &names {
+                out.push('/');
+                out.push_str(&String::from_utf8_lossy(name));
+            }
+            if out.is_empty() {
+                out.push('/');
+            }
+            Ok(out)
         }
-        let mut out = if root == "/" { String::new() } else { root };
-        for segment in segments {
-            out.push('/');
-            out.push_str(segment);
-        }
-        Ok(out)
+        Err(PathError::Escapes) => Err(denied(user_path)),
+        Err(PathError::InvalidName) => Err(ProtoError::new(ErrorCode::InvalidParams, "path contains a NUL byte")),
     }
 }
 
@@ -142,7 +138,7 @@ mod tests {
         assert_eq!(ok("/w", "/w/"), "/w");
         assert_eq!(ok("/w", "/w/a/../b"), "/w/b");
         assert_eq!(ok("/", "a"), "/a");
-        assert_eq!(ok("/", "/a/../../b"), "/b");
+        assert_eq!(ok("/", "/a/../b"), "/b");
         assert_eq!(ok("/", ""), "/");
         assert_eq!(ok("/w", "..."), "/w/...");
         assert_eq!(ok("/w", ".hidden"), "/w/.hidden");
@@ -158,6 +154,9 @@ mod tests {
         assert_eq!(code("/w", "/wx"), ErrorCode::Denied);
         assert_eq!(code("/w", "/wx/a"), ErrorCode::Denied);
         assert_eq!(code("/w", "/"), ErrorCode::Denied);
+        // `..` above `/` is an escape too (the kernel's rule), even when the path comes back.
+        assert_eq!(code("/", "/a/../../b"), ErrorCode::Denied);
+        assert_eq!(code("/w", "/../w/a"), ErrorCode::Denied);
     }
 
     #[test]
@@ -244,14 +243,23 @@ mod tests {
             }
         }
 
-        /// An absolute path is accepted exactly when its normalisation lies within the root.
+        /// An accepted absolute path is its own normalisation; one whose normalisation lies
+        /// outside the root is denied; one that never climbs above `/` is accepted exactly when
+        /// its normalisation lies within the root.
         #[test]
-        fn absolute_iff_within(root in root(), path in absolute()) {
+        fn absolute_agrees_with_normalisation(root in root(), path in absolute()) {
             let root_n = normalize(&root).unwrap();
             let norm = normalize(&path).unwrap();
-            prop_assert_eq!(confine(&root, &path).is_ok(), is_within(&norm, &root_n));
             if let Ok(out) = confine(&root, &path) {
-                prop_assert_eq!(out, norm);
+                prop_assert_eq!(&out, &norm);
+            } else {
+                let climbs = path.split('/').filter(|s| !s.is_empty() && *s != ".").try_fold(0usize, |depth, s| {
+                    if s == ".." { depth.checked_sub(1) } else { Some(depth + 1) }
+                }).is_none();
+                prop_assert!(climbs || !is_within(&norm, &root_n), "{path} denied under {root}");
+            }
+            if !is_within(&norm, &root_n) {
+                prop_assert!(confine(&root, &path).is_err());
             }
         }
 

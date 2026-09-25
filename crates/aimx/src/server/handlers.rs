@@ -317,9 +317,15 @@ impl Conn {
     async fn exec_write_stdin(self: Arc<Self>, params: ExecWriteStdinParams) -> Outcome<()> {
         let ws = self.session()?.proc_workspace(&params.proc)?;
         ws.grant.exec()?;
-        let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
-        let data = params.data.into_bytes();
-        exec.write_stdin(&params.proc, &data, params.eof).await
+        let work_params = params.clone();
+        let target = Arc::clone(&ws);
+        self.idempotent(&ws, &params.idempotency_key, ExecWriteStdin::NAME, &params, async move {
+            let p = work_params;
+            let exec =
+                target.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
+            exec.write_stdin(&p.proc, &p.data.into_bytes(), p.eof).await
+        })
+        .await
     }
 
     async fn exec_resize(self: Arc<Self>, params: ExecResizeParams) -> Outcome<()> {

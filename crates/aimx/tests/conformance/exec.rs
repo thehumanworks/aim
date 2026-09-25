@@ -156,7 +156,7 @@ async fn stdin_pipes() {
     params.stdin = true;
     let proc = spawn(&client, params).await;
     let write = |data: &str, eof: bool| {
-        let params = ExecWriteStdinParams { proc: proc.clone(), data: text(data), eof };
+        let params = ExecWriteStdinParams { proc: proc.clone(), data: text(data), eof, idempotency_key: key() };
         let peer = client.peer.clone();
         async move { peer.call::<ExecWriteStdin>(params).await }
     };
@@ -182,7 +182,11 @@ async fn pty_processes() {
     let proc = spawn(&client, params).await;
     let first = read(&client, &proc, 0, 5000).await;
     assert!(first.chunks.iter().all(|c| c.stream == OutputStream::Pty));
-    client.peer.call::<ExecWriteStdin>(ExecWriteStdinParams { proc: proc.clone(), data: text("hello\n"), eof: false }).await.unwrap();
+    client
+        .peer
+        .call::<ExecWriteStdin>(ExecWriteStdinParams { proc: proc.clone(), data: text("hello\n"), eof: false, idempotency_key: key() })
+        .await
+        .unwrap();
     let (chunks, exit) = run_to_exit(&client, &proc).await;
     assert_eq!(exit, ExitStatus::Exited { code: 0 });
     let out = joined(&chunks, OutputStream::Pty);

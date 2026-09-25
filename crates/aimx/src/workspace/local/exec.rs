@@ -31,6 +31,13 @@ use crate::ring::OutputRing;
 use crate::workspace::{BoxFuture, Exec, Outcome, SpawnSpec};
 
 const READ_BLOCK: usize = 32 * 1024;
+
+/// Serialises everything that creates inheritable descriptors and forks. On macOS the standard
+/// library creates pipes with `pipe` + `fcntl(FD_CLOEXEC)`, so a child forked by another thread in
+/// between inherits the pipe's write end — and the first process then never sees end of file on
+/// its stdin (observed in this crate's conformance suite under load). Spawning is short; this lock
+/// only orders spawns against each other.
+static SPAWN: Mutex<()> = Mutex::new(());
 /// How long output readers may keep draining after the process exited.
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
@@ -136,10 +143,20 @@ impl Proc {
         let Some(pgid) = self.pgid else {
             return Err(ProtoError::new(ErrorCode::Unavailable, "the process has no process group"));
         };
-        self.last_signal.store(signal.as_raw(), Ordering::SeqCst);
+        let already_killed = self.last_signal.swap(signal.as_raw(), Ordering::SeqCst) == rustix::process::Signal::KILL.as_raw();
         match kill_group(pgid, signal) {
             Ok(()) => Ok(()),
+            // The group is gone.
             Err(err) if err.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => Ok(()),
+            // macOS answers EPERM for a group whose members are all zombies (killed, not yet
+            // reaped); otherwise a member changed its credentials (setuid) and cannot be signalled.
+            Err(err) if err.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error()) => {
+                if already_killed {
+                    Ok(())
+                } else {
+                    Err(ProtoError::new(ErrorCode::Denied, format!("not permitted to signal process group {pgid}")))
+                }
+            }
             Err(err) => Err(ProtoError::new(ErrorCode::Internal, format!("signalling process group {pgid}: {err}"))),
         }
     }
@@ -310,7 +327,11 @@ fn spawn_pipes(cwd: PathBuf, spec: &SpawnSpec<'_>, ring_bytes: usize) -> Outcome
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|err| spawn_error(&err, &program))?;
+    let spawned = {
+        let _spawning = lock(&SPAWN);
+        command.spawn()
+    };
+    let mut child = spawned.map_err(|err| spawn_error(&err, &program))?;
     let pgid = child.id().and_then(|id| i32::try_from(id).ok());
     let input = child.stdin.take().map_or(Input::Closed, Input::Pipe);
     let proc = Arc::new(Proc::new(pgid, ring_bytes, input, None));
@@ -326,10 +347,6 @@ fn spawn_pipes(cwd: PathBuf, spec: &SpawnSpec<'_>, ring_bytes: usize) -> Outcome
 }
 
 fn spawn_pty(cwd: PathBuf, spec: &SpawnSpec<'_>, size: PtySize, ring_bytes: usize) -> Outcome<Arc<Proc>> {
-    let system = portable_pty::native_pty_system();
-    let pair = system
-        .openpty(portable_pty::PtySize { rows: size.rows, cols: size.cols, pixel_width: 0, pixel_height: 0 })
-        .map_err(|err| pty_error(&err))?;
     let mut builder = match spec.command {
         Command::Argv { argv } => {
             if argv.is_empty() {
@@ -351,19 +368,26 @@ fn spawn_pty(cwd: PathBuf, spec: &SpawnSpec<'_>, size: PtySize, ring_bytes: usiz
     for (key, value) in spec.env {
         builder.env(key, value);
     }
-    let mut child = pair.slave.spawn_command(builder).map_err(|err| {
-        let message = err.to_string();
-        if message.contains("No such file") {
-            ProtoError::new(ErrorCode::NotFound, format!("program not found: {message}"))
-        } else {
-            pty_error(&err)
-        }
-    })?;
-    drop(pair.slave);
+    let (mut child, master, mut reader, writer) = {
+        let _spawning = lock(&SPAWN);
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize { rows: size.rows, cols: size.cols, pixel_width: 0, pixel_height: 0 })
+            .map_err(|err| pty_error(&err))?;
+        let child = pair.slave.spawn_command(builder).map_err(|err| {
+            let message = err.to_string();
+            if message.contains("No such file") {
+                ProtoError::new(ErrorCode::NotFound, format!("program not found: {message}"))
+            } else {
+                pty_error(&err)
+            }
+        })?;
+        drop(pair.slave);
+        let reader = pair.master.try_clone_reader().map_err(|err| pty_error(&err))?;
+        let writer = pair.master.take_writer().map_err(|err| pty_error(&err))?;
+        (child, pair.master, reader, writer)
+    };
     let pgid = child.process_id().and_then(|id| i32::try_from(id).ok());
-    let mut reader = pair.master.try_clone_reader().map_err(|err| pty_error(&err))?;
-    let writer = pair.master.take_writer().map_err(|err| pty_error(&err))?;
-    let proc = Arc::new(Proc::new(pgid, ring_bytes, Input::Pty(Arc::new(Mutex::new(writer))), Some(pair.master)));
+    let proc = Arc::new(Proc::new(pgid, ring_bytes, Input::Pty(Arc::new(Mutex::new(writer))), Some(master)));
 
     let (drained_tx, drained_rx) = oneshot::channel();
     let reading = Arc::clone(&proc);
@@ -526,7 +550,11 @@ impl Exec for LocalExec {
             let Some(proc) = removed else {
                 return Err(ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")));
             };
-            proc.signal(rustix::process::Signal::KILL)
+            // Best effort: the process is forgotten either way.
+            if let Err(err) = proc.signal(rustix::process::Signal::KILL) {
+                tracing::debug!(%err, "killing a released process failed");
+            }
+            Ok(())
         })
     }
 }

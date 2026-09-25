@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::ids::{IdempotencyKey, ProcId, WorkspaceId};
-use aim_proto::tool::{ToolAnnotations, ToolLocation, ToolResult, ToolSpec};
+use aim_proto::tool::{ToolAnnotations, ToolInput, ToolLocation, ToolResult, ToolSpec};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -196,6 +196,7 @@ fn spec_of(def: &ToolDef) -> ToolSpec {
         name: def.name.to_owned(),
         description: def.description.to_owned(),
         input_schema: (def.schema)(),
+        input: ToolInput::Json,
         annotations: def.annotations,
     }
 }
