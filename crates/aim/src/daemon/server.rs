@@ -11,20 +11,20 @@ use std::time::{Duration, Instant};
 
 use aim_kernel::negotiate::{Generations, negotiate};
 use aim_proto::daemon::{
-    DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeResult, PromptOutcome, SessionAttach, SessionCancel, SessionClose,
-    SessionConfigParams, SessionCreate, SessionDetach, SessionList, SessionListResult, SessionPrompt, SessionPromptParams, SessionRef,
-    SessionSetConfig, SessionUpdateNotification, SessionUpdateParams,
+    DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeResult, DetachReason, PromptOutcome, SessionAttach, SessionCancel, SessionClose,
+    SessionConfigParams, SessionCreate, SessionDetach, SessionDetachedNotification, SessionDetachedParams, SessionList, SessionListResult,
+    SessionPrompt, SessionPromptParams, SessionSetConfig, SessionState, SessionUpdate, SessionUpdateNotification, SessionUpdateParams,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::PeerInfo;
 use aim_proto::ids::IdempotencyKey;
-use aim_rpc::{Handler, NotificationCtx, Peer, PeerConfig, RequestCtx, Router};
+use aim_rpc::{Handler, Peer, PeerConfig, RequestCtx, Router};
 use futures_util::StreamExt as _;
 use serde_json::Value;
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::host::SessionClient;
+use crate::host::{SessionClient, UpdateStream};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -40,14 +40,41 @@ fn io_error(action: &str, cause: &std::io::Error) -> ProtoError {
 
 struct Forwarder {
     cancel: CancellationToken,
-    ready: CancellationToken,
 }
 
 struct Connection {
     initialized: AtomicBool,
-    forwarders: Mutex<HashMap<String, Forwarder>>,
+    forwarders: Mutex<HashMap<String, Arc<Forwarder>>>,
+    ordering: Arc<tokio::sync::Mutex<()>>,
     host: Arc<dyn SessionClient>,
     dedup: Arc<Dedup>,
+}
+
+/// Removes a prepared attachment when its request is cancelled or no reply is queued.
+struct PendingForwarder {
+    connection: Arc<Connection>,
+    session: String,
+    forwarder: Arc<Forwarder>,
+    started: bool,
+}
+
+impl PendingForwarder {
+    fn start(mut self, peer: Peer, updates: UpdateStream) {
+        self.started = true;
+        tokio::spawn(forward_updates(Arc::clone(&self.connection), peer, self.session.clone(), Arc::clone(&self.forwarder), updates));
+    }
+}
+
+impl Drop for PendingForwarder {
+    fn drop(&mut self) {
+        if !self.started {
+            let mut forwarders = lock(&self.connection.forwarders);
+            if forwarders.get(&self.session).is_some_and(|active| Arc::ptr_eq(active, &self.forwarder)) {
+                forwarders.remove(&self.session);
+            }
+            self.forwarder.cancel.cancel();
+        }
+    }
 }
 
 struct GuardedRouter {
@@ -67,18 +94,38 @@ impl Handler for GuardedRouter {
         }
         self.router.request(ctx, method, params)
     }
+}
 
-    fn notification(&self, _ctx: NotificationCtx, method: String, params: Value) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
-        let connection = Arc::clone(&self.connection);
-        Box::pin(async move {
-            if method == "session.ready"
-                && connection.initialized.load(Ordering::Acquire)
-                && let Ok(reference) = serde_json::from_value::<SessionRef>(params)
-                && let Some(forwarder) = lock(&connection.forwarders).get(&reference.session)
-            {
-                forwarder.ready.cancel();
-            }
-        })
+async fn forward_updates(connection: Arc<Connection>, peer: Peer, session: String, forwarder: Arc<Forwarder>, mut updates: UpdateStream) {
+    let mut reason = DetachReason::Lagged;
+    loop {
+        let update = tokio::select! {
+            biased;
+            () = forwarder.cancel.cancelled() => return,
+            () = peer.closed() => return,
+            update = updates.next() => update,
+        };
+        let Some(update) = update else { break };
+        if matches!(update, SessionUpdate::StateChanged { state: SessionState::Closed }) {
+            reason = DetachReason::Closed;
+        }
+        let sent = tokio::select! {
+            biased;
+            () = forwarder.cancel.cancelled() => return,
+            () = peer.closed() => return,
+            sent = peer.notify::<SessionUpdateNotification>(SessionUpdateParams { session: session.clone(), update }) => sent,
+        };
+        if sent.is_err() {
+            return;
+        }
+    }
+    // Serialize the terminal notification against a concurrent re-attach. It must describe
+    // the forwarder that is still current, and precede a later attach response on the wire.
+    let _ordered = connection.ordering.lock().await;
+    let current = lock(&connection.forwarders).get(&session).is_some_and(|active| Arc::ptr_eq(active, &forwarder));
+    if current {
+        lock(&connection.forwarders).remove(&session);
+        let _sent = peer.notify::<SessionDetachedNotification>(SessionDetachedParams { session, reason }).await;
     }
 }
 
@@ -150,8 +197,8 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
                 .ok_or_else(|| error(ErrorCode::Internal, "invalid server generations"))?;
             let theirs = Generations::new(params.generations.min, params.generations.max)
                 .ok_or_else(|| error(ErrorCode::InvalidParams, "empty generation range"))?;
-            let generation = negotiate(ours, theirs)
-                .ok_or_else(|| error(ErrorCode::UnsupportedGeneration, "no shared daemon generation"))?;
+            let generation =
+                negotiate(ours, theirs).ok_or_else(|| error(ErrorCode::UnsupportedGeneration, "no shared daemon generation"))?;
             if state.initialized.swap(true, Ordering::AcqRel) {
                 return Err(error(ErrorCode::Conflict, "already initialized"));
             }
@@ -163,51 +210,47 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
             })
         })
         .method::<SessionCreate, _, _>(|state, _, spec| async move { state.host.create(spec).await })
-        .method::<SessionList, _, _>(|state, _, params| async move {
-            Ok(SessionListResult { sessions: state.host.list(params).await? })
-        })
+        .method::<SessionList, _, _>(|state, _, params| async move { Ok(SessionListResult { sessions: state.host.list(params).await? }) })
         .method::<SessionAttach, _, _>(|state, ctx, reference| async move {
-            let (snapshot, mut updates) = state.host.attach(reference.session.clone()).await?;
-            let forwarder = Forwarder { cancel: CancellationToken::new(), ready: CancellationToken::new() };
-            let cancel = forwarder.cancel.clone();
-            let ready = forwarder.ready.clone();
-            if let Some(old) = lock(&state.forwarders).insert(reference.session.clone(), forwarder) {
+            let (snapshot, updates) = state.host.attach(reference.session.clone()).await?;
+            let forwarder = Arc::new(Forwarder { cancel: CancellationToken::new() });
+            let ordered = Arc::clone(&state.ordering).lock_owned().await;
+            let old = { lock(&state.forwarders).insert(reference.session.clone(), Arc::clone(&forwarder)) };
+            let registration =
+                PendingForwarder { connection: Arc::clone(state.as_ref()), session: reference.session.clone(), forwarder, started: false };
+            if let Some(old) = old {
                 old.cancel.cancel();
+                let peer = ctx.peer.clone();
+                let session = reference.session.clone();
+                // The notifier owns the ordering gate. Even if the request is cancelled while
+                // waiting for writer capacity, the old attachment receives its terminal event
+                // before a later attach can queue its response.
+                tokio::spawn(async move {
+                    let _ordered = ordered;
+                    peer.notify::<SessionDetachedNotification>(SessionDetachedParams { session, reason: DetachReason::Replaced }).await
+                })
+                .await
+                .map_err(|_| error(ErrorCode::Internal, "replacement notifier stopped"))??;
+            } else {
+                drop(ordered);
             }
-            let session = reference.session;
-            tokio::spawn(async move {
-                tokio::select! {
-                    () = ready.cancelled() => {},
-                    () = cancel.cancelled() => return,
-                    () = ctx.peer.closed() => return,
+            let peer = ctx.peer.clone();
+            let cancelled = ctx.cancelled.clone();
+            ctx.after_reply(move || {
+                if !cancelled.is_cancelled() {
+                    registration.start(peer, updates);
                 }
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => break,
-                        () = ctx.peer.closed() => break,
-                        update = updates.next() => match update {
-                            Some(update) => {
-                                if ctx.peer.notify::<SessionUpdateNotification>(SessionUpdateParams { session: session.clone(), update }).await.is_err() {
-                                    break;
-                                }
-                            }
-                            None => break,
-                        },
-                    }
-                }
-            });
+            })?;
             Ok(snapshot)
         })
         .method::<SessionDetach, _, _>(|state, _, reference| async move {
+            let _ordered = state.ordering.lock().await;
             if let Some(forwarder) = lock(&state.forwarders).remove(&reference.session) {
                 forwarder.cancel.cancel();
             }
             Ok(())
         })
-        .method::<SessionPrompt, _, _>(|state, _, params| async move {
-            state.dedup.prompt(Arc::clone(&state.host), params).await
-        })
+        .method::<SessionPrompt, _, _>(|state, _, params| async move { state.dedup.prompt(Arc::clone(&state.host), params).await })
         .method::<SessionCancel, _, _>(|state, _, reference| async move { state.host.cancel(reference.session).await })
         .method::<SessionSetConfig, _, _>(|state, _, params: SessionConfigParams| async move { state.host.set_config(params).await })
         .method::<SessionClose, _, _>(|state, _, reference| async move { state.host.close(reference.session).await });
@@ -272,7 +315,13 @@ fn serve_connection(stream: UnixStream, host: Arc<dyn SessionClient>, dedup: Arc
     if credentials.uid() != nix::unistd::Uid::current().as_raw() {
         return Err(error(ErrorCode::Denied, "socket peer has a different uid"));
     }
-    let connection = Arc::new(Connection { initialized: AtomicBool::new(false), forwarders: Mutex::new(HashMap::new()), host, dedup });
+    let connection = Arc::new(Connection {
+        initialized: AtomicBool::new(false),
+        forwarders: Mutex::new(HashMap::new()),
+        ordering: Arc::new(tokio::sync::Mutex::new(())),
+        host,
+        dedup,
+    });
     let (read, write) = stream.into_split();
     Ok(Peer::spawn(read, write, routes(connection), PeerConfig::default()))
 }
@@ -323,7 +372,7 @@ where
             _ = tick.tick(), if idle_exit.is_some() => {
                 let sessions = host.list(aim_proto::daemon::SessionListParams { limit: Some(u32::MAX), workspace: None }).await?;
                 let busy = connections.load(Ordering::Acquire) != 0
-                    || sessions.iter().any(|s| matches!(s.state, aim_proto::daemon::SessionState::Running | aim_proto::daemon::SessionState::RequiresAction));
+                    || sessions.iter().any(|s| matches!(s.state, SessionState::Running | SessionState::RequiresAction));
                 if busy {
                     idle_since = Instant::now();
                 } else if idle_exit.is_some_and(|limit| idle_since.elapsed() >= limit) {
@@ -336,7 +385,7 @@ where
     }
     let sessions = host.list(aim_proto::daemon::SessionListParams { limit: Some(u32::MAX), workspace: None }).await?;
     for summary in sessions {
-        if summary.state != aim_proto::daemon::SessionState::Closed {
+        if summary.state != SessionState::Closed {
             let _ignored = host.close(summary.meta.id).await;
         }
     }

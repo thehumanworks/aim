@@ -39,7 +39,8 @@ use crate::store::{MemoryStore, SessionStore};
 
 /// A boxed, sendable, owned future.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-/// A session's live updates.
+/// A session's live updates. The in-process stream ends on broadcast lag or closure; daemon
+/// clients receive a `session.detached` notification with the corresponding reason.
 pub type UpdateStream = Pin<Box<dyn Stream<Item = SessionUpdate> + Send>>;
 /// Builds a provider and resolves its default model.
 pub type ProviderFactory = Arc<dyn Fn(&str, Option<&str>) -> Result<(Arc<dyn ModelProvider>, String), String> + Send + Sync>;
@@ -190,8 +191,8 @@ pub struct HostConfig {
     pub store: Arc<dyn SessionStore>,
     /// Builds sessions' backends ([`native_backends`], ACP, …).
     pub backends: BackendFactory,
-    /// Capacity of each session's update broadcast (slow clients past it lose updates and are
-    /// told to re-attach).
+    /// Capacity of each session's update broadcast (a lagging client's stream ends and it must
+    /// re-attach).
     pub update_capacity: usize,
 }
 
@@ -551,16 +552,17 @@ impl SessionClient for SessionHost {
         Box::pin(async move {
             let live: HashMap<String, SessionSummary> =
                 lock(&host.sessions).iter().map(|(id, l)| (id.clone(), lock(&l.summary).clone())).collect();
-            let stored = host.config.store.list(params.limit.unwrap_or(50)).await.map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
+            let stored_limit = if params.workspace.is_some() { u32::MAX } else { params.limit.unwrap_or(50) };
+            let stored = host.config.store.summarize(stored_limit).await.map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
             let mut out: Vec<SessionSummary> = live.values().cloned().collect();
-            for meta in stored {
-                if !live.contains_key(&meta.id) {
+            for stored in stored {
+                if !live.contains_key(&stored.meta.id) {
                     out.push(SessionSummary {
-                        last_activity_ms: meta.created_ms,
-                        meta,
-                        state: SessionState::Closed,
+                        last_activity_ms: stored.last_activity_ms,
+                        meta: stored.meta,
+                        state: stored.state,
                         persistence: Persistence::Persistent,
-                        turns: 0,
+                        turns: stored.turns,
                     });
                 }
             }

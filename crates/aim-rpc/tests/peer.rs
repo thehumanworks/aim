@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aim_proto::error::ErrorCode;
+use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::{method, notification};
 use aim_rpc::{NoHandler, Peer, PeerConfig, Router};
 use schemars::JsonSchema;
@@ -75,6 +75,18 @@ method!(
 method!(
     /// Returns more bytes than a constrained peer allows.
     LargeReply = "test.large_reply" (()) -> String
+);
+method!(
+    /// Registers a notification after its response.
+    AfterReplyMethod = "test.after_reply" (u32) -> u32
+);
+method!(
+    /// Returns an error after registering a reply hook.
+    ErrorAfterReply = "test.error_after_reply" (()) -> ()
+);
+method!(
+    /// Waits for cancellation after registering a reply hook.
+    CancelAfterReply = "test.cancel_after_reply" (()) -> ()
 );
 notification!(
     /// Adds to the server's ping counter.
@@ -443,6 +455,153 @@ async fn a_connection_that_takes_no_notifications_closes_on_the_first() {
     let client = Peer::spawn(ar, aw, NoHandler, PeerConfig::default());
     let _sent = client.notify::<SlowNotice>(()).await;
     tokio::time::timeout(Duration::from_secs(1), server.closed()).await.unwrap();
+}
+
+#[tokio::test]
+async fn hook_notifications_follow_their_responses_on_the_wire_under_load() {
+    let (raw, server_side) = tokio::io::duplex(1024);
+    let (sr, sw) = tokio::io::split(server_side);
+    let router = Router::new(()).method::<AfterReplyMethod, _, _>(|_, ctx, n| async move {
+        let peer = ctx.peer.clone();
+        ctx.after_reply(move || {
+            tokio::spawn(async move { peer.notify_raw("test.after_reply_notice", serde_json::json!(n)).await.unwrap() });
+        })?;
+        Ok(n)
+    });
+    let server = Peer::spawn(sr, sw, router, PeerConfig { outgoing_capacity: 1, ..PeerConfig::default() });
+    let (rr, mut rw) = tokio::io::split(raw);
+    let mut lines = BufReader::new(rr).lines();
+    let count = 128_u32;
+    let sender = tokio::spawn(async move {
+        for n in 0..count {
+            rw.write_all(format!("{{\"jsonrpc\":\"2.0\",\"id\":{n},\"method\":\"test.after_reply\",\"params\":{n}}}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut responses = std::collections::HashSet::new();
+        let mut notices = std::collections::HashSet::new();
+        for _ in 0..(count * 2) {
+            let frame: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            if let Some(id) = frame.get("id") {
+                let id = id.as_u64().unwrap();
+                assert_eq!(frame["result"], id);
+                assert!(responses.insert(id));
+            } else {
+                assert_eq!(frame["method"], "test.after_reply_notice");
+                let n = frame["params"].as_u64().unwrap();
+                assert!(responses.contains(&n), "notification {n} overtook its response");
+                assert!(notices.insert(n));
+            }
+        }
+        assert_eq!(responses.len(), count as usize);
+        assert_eq!(notices.len(), count as usize);
+    })
+    .await
+    .unwrap();
+    sender.await.unwrap();
+    server.close();
+}
+
+#[tokio::test]
+async fn hooks_run_after_error_and_cancelled_replies() {
+    let (raw, server_side) = tokio::io::duplex(1024);
+    let (sr, sw) = tokio::io::split(server_side);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let router = Router::new(Arc::clone(&started))
+        .method::<ErrorAfterReply, _, _>(|_, ctx, ()| async move {
+            let peer = ctx.peer.clone();
+            ctx.after_reply(move || {
+                tokio::spawn(async move { peer.notify_raw("test.error_notice", serde_json::Value::Null).await.unwrap() });
+            })?;
+            Err(ProtoError::new(ErrorCode::Internal, "expected error"))
+        })
+        .method::<CancelAfterReply, _, _>(|started, ctx, ()| async move {
+            let peer = ctx.peer.clone();
+            ctx.after_reply(move || {
+                tokio::spawn(async move { peer.notify_raw("test.cancel_notice", serde_json::Value::Null).await.unwrap() });
+            })?;
+            started.notify_one();
+            std::future::pending::<Result<(), ProtoError>>().await
+        });
+    let server = Peer::spawn(sr, sw, router, PeerConfig::default());
+    let (rr, mut rw) = tokio::io::split(raw);
+    let mut lines = BufReader::new(rr).lines();
+    rw.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"test.error_after_reply\"}\n").await.unwrap();
+    let error: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(error["id"], 1);
+    assert_eq!(error["error"]["data"]["kind"], "internal");
+    let notice: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(notice["method"], "test.error_notice");
+
+    rw.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"test.cancel_after_reply\"}\n").await.unwrap();
+    started.notified().await;
+    rw.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"$/cancel\",\"params\":{\"id\":2}}\n").await.unwrap();
+    let cancelled: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(cancelled["id"], 2);
+    assert_eq!(cancelled["error"]["data"]["kind"], "cancelled");
+    let notice: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(notice["method"], "test.cancel_notice");
+    server.close();
+}
+
+#[tokio::test]
+async fn disconnect_discards_hooks_before_a_reply_can_be_queued() {
+    let (raw, server_side) = tokio::io::duplex(1024);
+    let (sr, sw) = tokio::io::split(server_side);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let ran = Arc::new(AtomicBool::new(false));
+    let router = Router::new((Arc::clone(&started), Arc::clone(&ran))).method::<CancelAfterReply, _, _>(|state, ctx, ()| async move {
+        let ran = Arc::clone(&state.1);
+        ctx.after_reply(move || ran.store(true, Ordering::SeqCst))?;
+        state.0.notify_one();
+        std::future::pending::<Result<(), ProtoError>>().await
+    });
+    let server = Peer::spawn(sr, sw, router, PeerConfig::default());
+    let (_rr, mut rw) = tokio::io::split(raw);
+    rw.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"test.cancel_after_reply\"}\n").await.unwrap();
+    started.notified().await;
+    server.close();
+    server.closed().await;
+    tokio::task::yield_now().await;
+    assert!(!ran.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_full_output_queue_delays_the_hook_until_the_reply_is_queued() {
+    let (raw, server_side) = tokio::io::duplex(64);
+    let (sr, sw) = tokio::io::split(server_side);
+    let registered = Arc::new(tokio::sync::Notify::new());
+    let ran = Arc::new(AtomicBool::new(false));
+    let router = Router::new((Arc::clone(&registered), Arc::clone(&ran))).method::<AfterReplyMethod, _, _>(|state, ctx, n| async move {
+        let ran = Arc::clone(&state.1);
+        ctx.after_reply(move || ran.store(true, Ordering::SeqCst))?;
+        state.0.notify_one();
+        Ok(n)
+    });
+    let server = Peer::spawn(sr, sw, router, PeerConfig { outgoing_capacity: 1, ..PeerConfig::default() });
+    let (rr, mut rw) = tokio::io::split(raw);
+    let mut lines = BufReader::new(rr).lines();
+    server.notify_raw("test.bulk", serde_json::json!("x".repeat(500))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    server.notify_raw("test.bulk", serde_json::json!("y".repeat(500))).await.unwrap();
+    rw.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"test.after_reply\",\"params\":1}\n").await.unwrap();
+    registered.notified().await;
+    assert!(!ran.load(Ordering::SeqCst), "hook ran while the response was blocked by backpressure");
+    let _first_bulk = lines.next_line().await.unwrap().unwrap();
+    let _second_bulk = lines.next_line().await.unwrap().unwrap();
+    let response: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(response["result"], 1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !ran.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(ran.load(Ordering::SeqCst));
+    server.close();
 }
 
 #[tokio::test]

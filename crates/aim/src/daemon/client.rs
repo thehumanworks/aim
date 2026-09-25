@@ -9,10 +9,10 @@ use std::task::{Context, Poll};
 
 use aim_proto::conversation::Part;
 use aim_proto::daemon::{
-    DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeParams, DaemonInitializeResult, PromptOutcome, SessionAttach,
-    SessionAttachResult, SessionCancel, SessionClose, SessionConfigParams, SessionCreate, SessionDetach, SessionList, SessionListParams,
-    SessionPrompt, SessionPromptParams, SessionRef, SessionSetConfig, SessionSpec, SessionState, SessionSummary, SessionUpdate,
-    SessionUpdateParams,
+    DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeParams, DaemonInitializeResult, DetachReason, PromptOutcome, SessionAttach,
+    SessionAttachResult, SessionCancel, SessionClose, SessionConfigParams, SessionCreate, SessionDetach, SessionDetachedParams,
+    SessionList, SessionListParams, SessionPrompt, SessionPromptParams, SessionRef, SessionSetConfig, SessionSpec, SessionSummary,
+    SessionUpdate, SessionUpdateParams,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{GenerationRange, PeerInfo};
@@ -22,6 +22,7 @@ use futures_core::Stream;
 use serde_json::Value;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::host::{BoxFuture, SessionClient, UpdateStream};
 
@@ -29,9 +30,40 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-type Subscribers = Arc<Mutex<HashMap<String, (u64, mpsc::Sender<SessionUpdate>)>>>;
+struct Subscriber {
+    serial: u64,
+    sender: Option<mpsc::Sender<SessionUpdate>>,
+    ready: CancellationToken,
+}
 
-struct UpdateHandler(Subscribers);
+#[derive(Default)]
+struct Attachments {
+    active: Option<Subscriber>,
+    pending: Option<Subscriber>,
+    detaching: Option<CancellationToken>,
+}
+
+type Subscribers = Arc<Mutex<HashMap<String, Attachments>>>;
+type DetachReasons = Arc<Mutex<HashMap<String, DetachReason>>>;
+
+fn clear_subscribers(subscribers: &Subscribers) {
+    for (_, mut attachments) in lock(subscribers).drain() {
+        if let Some(active) = attachments.active.take() {
+            active.ready.cancel();
+        }
+        if let Some(pending) = attachments.pending.take() {
+            pending.ready.cancel();
+        }
+        if let Some(detaching) = attachments.detaching.take() {
+            detaching.cancel();
+        }
+    }
+}
+
+struct UpdateHandler {
+    subscribers: Subscribers,
+    reasons: DetachReasons,
+}
 
 struct ClientLifetime(Peer);
 
@@ -47,19 +79,38 @@ impl Handler for UpdateHandler {
     }
 
     fn notification(&self, _ctx: NotificationCtx, method: String, params: Value) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let subscribers = Arc::clone(&self.0);
+        let subscribers = Arc::clone(&self.subscribers);
+        let reasons = Arc::clone(&self.reasons);
         Box::pin(async move {
-            if method == "session.update"
-                && let Ok(SessionUpdateParams { session, update }) = serde_json::from_value(params)
-            {
-                let mut attached = lock(&subscribers);
-                let closed = matches!(update, SessionUpdate::StateChanged { state: SessionState::Closed });
-                let failed = attached.get(&session).is_some_and(|(_, sender)| sender.try_send(update).is_err());
-                if failed || closed {
-                    // A lagging UI must reattach for a fresh snapshot. Never hold up the
-                    // ordered RPC notification reader or grow a queue without bound.
-                    attached.remove(&session);
+            match method.as_str() {
+                "session.update" => {
+                    if let Ok(SessionUpdateParams { session, update }) = serde_json::from_value(params) {
+                        let mut attached = lock(&subscribers);
+                        if let Some(active) = attached.get_mut(&session).and_then(|slot| slot.active.as_mut())
+                            && active.sender.as_ref().is_some_and(|sender| sender.try_send(update).is_err())
+                        {
+                            // End only this lagging stream; retain its attachment identity so
+                            // a later re-attach still consumes the server's detached signal.
+                            active.sender = None;
+                            lock(&reasons).insert(session, DetachReason::Lagged);
+                        }
+                    }
                 }
+                "session.detached" => {
+                    if let Ok(SessionDetachedParams { session, reason }) = serde_json::from_value(params) {
+                        let mut attached = lock(&subscribers);
+                        lock(&reasons).insert(session.clone(), reason);
+                        if let Some(slot) = attached.get_mut(&session) {
+                            slot.active = slot.pending.take();
+                            if let Some(active) = &slot.active {
+                                active.ready.cancel();
+                            } else if slot.detaching.is_none() {
+                                attached.remove(&session);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         })
     }
@@ -72,7 +123,9 @@ pub struct DaemonClient {
     peer: Peer,
     init: DaemonInitializeResult,
     subscribers: Subscribers,
+    detach_reasons: DetachReasons,
     serial: Arc<std::sync::atomic::AtomicU64>,
+    attach_gate: Arc<tokio::sync::Mutex<()>>,
     lifetime: Arc<ClientLifetime>,
 }
 
@@ -85,8 +138,14 @@ impl DaemonClient {
         let stream =
             UnixStream::connect(socket).await.map_err(|e| ProtoError::new(ErrorCode::Unavailable, format!("connecting daemon: {e}")))?;
         let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
+        let detach_reasons: DetachReasons = Arc::new(Mutex::new(HashMap::new()));
         let (read, write) = stream.into_split();
-        let peer = Peer::spawn(read, write, UpdateHandler(Arc::clone(&subscribers)), PeerConfig::default());
+        let peer = Peer::spawn(
+            read,
+            write,
+            UpdateHandler { subscribers: Arc::clone(&subscribers), reasons: Arc::clone(&detach_reasons) },
+            PeerConfig::default(),
+        );
         let (min, max) = DAEMON_GENERATIONS;
         let init = peer
             .call::<DaemonInitialize>(DaemonInitializeParams {
@@ -106,14 +165,16 @@ impl DaemonClient {
         let watched = peer.clone();
         tokio::spawn(async move {
             watched.closed().await;
-            lock(&to_clear).clear();
+            clear_subscribers(&to_clear);
         });
         Ok(Self {
             lifetime: Arc::new(ClientLifetime(peer.clone())),
             peer,
             init,
             subscribers,
+            detach_reasons,
             serial: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            attach_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -126,7 +187,14 @@ impl DaemonClient {
     /// Ends this connection and every attached stream.
     pub fn disconnect(&self) {
         self.peer.close();
-        lock(&self.subscribers).clear();
+        clear_subscribers(&self.subscribers);
+    }
+
+    /// Takes the most recent reason why a session's attachment ended, if notified.
+    /// A full local update queue also reports [`DetachReason::Lagged`].
+    #[must_use]
+    pub fn take_detach_reason(&self, session: &str) -> Option<DetachReason> {
+        lock(&self.detach_reasons).remove(session)
     }
 
     /// Sends a prompt with a caller-provided key, useful when a caller must retry.
@@ -162,13 +230,43 @@ impl Stream for AttachedUpdates {
 
 impl Drop for AttachedUpdates {
     fn drop(&mut self) {
-        let remove = lock(&self.subscribers).get(&self.session).is_some_and(|(serial, _)| *serial == self.serial);
-        if remove {
-            lock(&self.subscribers).remove(&self.session);
+        let detaching = {
+            let mut attached = lock(&self.subscribers);
+            let Some(slot) = attached.get_mut(&self.session) else { return };
+            if slot.active.as_ref().is_none_or(|active| active.serial != self.serial) {
+                return;
+            }
+            if let Some(active) = slot.active.as_mut() {
+                active.sender = None;
+            }
+            if slot.pending.is_some() {
+                None // The new attach will replace this forwarder.
+            } else {
+                let token = CancellationToken::new();
+                slot.detaching = Some(token.clone());
+                Some(token)
+            }
+        };
+        if let Some(detaching) = detaching {
             let peer = self.peer.clone();
-            let reference = SessionRef { session: self.session.clone() };
+            let session = self.session.clone();
+            let reference = SessionRef { session: session.clone() };
+            let subscribers = Arc::clone(&self.subscribers);
+            let serial = self.serial;
             tokio::spawn(async move {
                 let _ignored = peer.call::<SessionDetach>(reference).await;
+                let mut attached = lock(&subscribers);
+                if let Some(slot) = attached.get_mut(&session)
+                    && slot.detaching.is_some()
+                    && slot.active.as_ref().is_none_or(|active| active.serial == serial)
+                {
+                    slot.active = None;
+                    slot.detaching = None;
+                    if slot.pending.is_none() {
+                        attached.remove(&session);
+                    }
+                }
+                detaching.cancel();
             });
         }
     }
@@ -190,18 +288,47 @@ impl SessionClient for DaemonClient {
         let subscribers = Arc::clone(&self.subscribers);
         let serial = self.serial.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let lifetime = Arc::clone(&self.lifetime);
+        let gate = Arc::clone(&self.attach_gate);
         Box::pin(async move {
-            let snapshot = peer.call::<SessionAttach>(SessionRef { session: session.clone() }).await?;
+            let _one_at_a_time = gate.lock().await;
+            let detaching = lock(&subscribers).get(&session).and_then(|slot| slot.detaching.clone());
+            if let Some(detaching) = detaching {
+                tokio::select! {
+                    () = detaching.cancelled() => {},
+                    () = peer.closed() => return Err(ProtoError::new(ErrorCode::Unavailable, "connection closed")),
+                }
+            }
             let (sender, receiver) = mpsc::channel(1024);
-            lock(&subscribers).insert(session.clone(), (serial, sender));
-            // The server holds updates until this notification, which is sent only after the
-            // attach response has been received and the local stream is registered.
-            peer.notify_raw(
-                "session.ready",
-                serde_json::to_value(SessionRef { session: session.clone() })
-                    .map_err(|e| ProtoError::new(ErrorCode::Internal, format!("encoding ready: {e}")))?,
-            )
-            .await?;
+            let ready = CancellationToken::new();
+            {
+                let mut attached = lock(&subscribers);
+                let slot = attached.entry(session.clone()).or_default();
+                let next = Subscriber { serial, sender: Some(sender), ready: ready.clone() };
+                if slot.active.is_some() {
+                    slot.pending = Some(next);
+                } else {
+                    ready.cancel();
+                    slot.active = Some(next);
+                }
+            }
+            let snapshot = match peer.call::<SessionAttach>(SessionRef { session: session.clone() }).await {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    let mut attached = lock(&subscribers);
+                    if let Some(slot) = attached.get_mut(&session) {
+                        if slot.pending.as_ref().is_some_and(|pending| pending.serial == serial) {
+                            slot.pending = None;
+                        } else if slot.active.as_ref().is_some_and(|active| active.serial == serial) {
+                            attached.remove(&session);
+                        }
+                    }
+                    return Err(err);
+                }
+            };
+            tokio::select! {
+                () = ready.cancelled() => {},
+                () = peer.closed() => return Err(ProtoError::new(ErrorCode::Unavailable, "connection closed")),
+            }
             Ok((snapshot, Box::pin(AttachedUpdates { session, serial, subscribers, peer, _lifetime: lifetime, receiver }) as UpdateStream))
         })
     }

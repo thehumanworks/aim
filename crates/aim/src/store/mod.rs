@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use aim_proto::daemon::SessionState;
 use aim_proto::event::{SessionEvent, SessionMeta};
 
 mod sqlite;
@@ -52,6 +53,19 @@ impl core::fmt::Display for StoreError {
 
 impl core::error::Error for StoreError {}
 
+/// A durable session's current listing projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredSessionSummary {
+    /// Session metadata.
+    pub meta: SessionMeta,
+    /// Maximum turn number in the effective log, including a fork's shared prefix.
+    pub turns: u64,
+    /// Timestamp of the last effective event, or creation time for an empty log.
+    pub last_activity_ms: i64,
+    /// Stored sessions have no running actor and are closed until resumed.
+    pub state: SessionState,
+}
+
 /// Persistence for sessions.
 pub trait SessionStore: Send + Sync {
     /// Registers a new session.
@@ -65,6 +79,9 @@ pub trait SessionStore: Send + Sync {
 
     /// The most recently created sessions, newest first.
     fn list(&self, limit: u32) -> BoxFuture<Result<Vec<SessionMeta>, StoreError>>;
+
+    /// Durable listing projections for the most recently active sessions, newest first.
+    fn summarize(&self, limit: u32) -> BoxFuture<Result<Vec<StoredSessionSummary>, StoreError>>;
 }
 
 /// Checks that `events` continue a log whose last `seq` is `last`.
@@ -159,5 +176,26 @@ impl SessionStore for MemoryStore {
         metas.sort_by_key(|m| core::cmp::Reverse(m.created_ms));
         metas.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         Box::pin(async move { Ok(metas) })
+    }
+
+    fn summarize(&self, limit: u32) -> BoxFuture<Result<Vec<StoredSessionSummary>, StoreError>> {
+        let result = self.with(|map| {
+            let mut summaries = map
+                .keys()
+                .map(|id| {
+                    let (meta, events) = materialize(map, id, 0)?;
+                    Ok(StoredSessionSummary {
+                        last_activity_ms: events.last().map_or(meta.created_ms, |event| event.ts_ms),
+                        turns: events.iter().map(|event| event.turn).max().unwrap_or(0),
+                        meta,
+                        state: SessionState::Closed,
+                    })
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            summaries.sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms).then_with(|| a.meta.id.cmp(&b.meta.id)));
+            summaries.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            Ok(summaries)
+        });
+        Box::pin(async move { result })
     }
 }

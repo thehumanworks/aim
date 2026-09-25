@@ -53,6 +53,49 @@ pub struct RequestCtx {
     /// is **dropped** (so every handler stops, cooperative or not); use this token only to stop
     /// work the handler spawned elsewhere, and put cleanup in `Drop` guards.
     pub cancelled: CancellationToken,
+    after_reply: Arc<AfterReply>,
+}
+
+type ReplyHook = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Default)]
+struct AfterReply {
+    // None means the reply was queued or the request ended without a reply.
+    hooks: Mutex<Option<Vec<ReplyHook>>>,
+}
+
+impl std::fmt::Debug for AfterReply {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("AfterReply").finish_non_exhaustive()
+    }
+}
+
+impl AfterReply {
+    fn finish(&self, queued: bool) {
+        let hooks = lock(&self.hooks).take();
+        if queued && let Some(hooks) = hooks {
+            for hook in hooks {
+                hook();
+            }
+        }
+    }
+}
+
+impl RequestCtx {
+    /// Registers work to run once the response has entered the connection's FIFO output queue.
+    /// This includes error and cancellation replies. Hooks are discarded if the connection ends
+    /// before a response can be queued. A hook may spawn asynchronous notifications through
+    /// [`Peer`]; those notifications follow this response on the wire. Registration fails once
+    /// the request has finished. Hooks should return promptly to avoid delaying cleanup.
+    ///
+    /// # Errors
+    /// `unavailable` if the response was already queued or the request ended without one.
+    pub fn after_reply(&self, work: impl FnOnce() + Send + 'static) -> Result<(), ProtoError> {
+        let mut hooks = lock(&self.after_reply.hooks);
+        let registered = hooks.as_mut().ok_or_else(closed_error)?;
+        registered.push(Box::new(work));
+        Ok(())
+    }
 }
 
 /// Context of an incoming notification.
@@ -531,7 +574,8 @@ fn serve_request(peer: &Peer, handler: &Arc<dyn Handler>, id: RequestId, method:
     let token = peer.inner.closed.child_token();
     inflight.insert(id.clone(), token.clone());
     drop(inflight);
-    let ctx = RequestCtx { id: id.clone(), peer: peer.clone(), cancelled: token.clone() };
+    let after_reply = Arc::new(AfterReply { hooks: Mutex::new(Some(Vec::new())) });
+    let ctx = RequestCtx { id: id.clone(), peer: peer.clone(), cancelled: token.clone(), after_reply: Arc::clone(&after_reply) };
     let fut = handler.request(ctx, method, params);
     let peer = peer.clone();
     let guard = InflightGuard { peer: peer.clone(), id: id.clone() };
@@ -544,17 +588,21 @@ fn serve_request(peer: &Peer, handler: &Arc<dyn Handler>, id: RequestId, method:
         };
         if peer.is_closed() {
             // Cancelled by the connection ending: the caller learns `unavailable` from its own side.
+            after_reply.finish(false);
             return;
         }
         let Some(frame) = peer.encode_bounded_response(id, outcome.map_err(ErrorObject::from)) else {
+            after_reply.finish(false);
             peer.close();
             return;
         };
         let (delivered, written) = oneshot::channel();
         if peer.inner.outgoing.send(OutboundFrame { body: frame, sent: None, delivered: Some(delivered) }).await.is_err() {
+            after_reply.finish(false);
             tracing::debug!("connection closed before a response could be queued");
             return;
         }
+        after_reply.finish(true);
         let _written = written.await;
     });
 }
