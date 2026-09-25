@@ -27,7 +27,7 @@ client still builds.
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged; scheduler verified; live runs show overlapping calls (native and ACP) | — | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | in progress | Worker running | Review its report, merge, then T4b | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | todo | Waits for T4a | Wire gate: 31 regressions on the merged base + 4 from T3's prompt | — |
-| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | done | Merged; kernel 263 verified; live: `-m opus` → `opus[1m]`, usage `claude-opus-5-5` | Open: adapter resets mode/effort when switching model (see log) | `agent/claude/acp-models` · `../aim-wt/acp-models` |
+| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | review | Merged; codex REV-T5: MERGE AFTER FIXES (B1–B5); worker fixing on the same branch | Merge the fix commits; re-check | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
 | T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
 
@@ -81,3 +81,8 @@ client still builds.
   every codex/pi row), plus 4 from T3's prompt (+139 B/request). Belongs to T4b.
 - 2026-09-25 — `mise run verify` recipe now tags target/verus (fresh-worktree failure). Merged tree
   (base + T5 + T3): 302 verified, 0 errors.
+- 2026-09-25 — Codex REV-T5 (gpt-6-sol, high; auth.json hash unchanged): MERGE AFTER FIXES.
+  B1 bare family picks an older generation when two are advertised; B2 a request naming two
+  families picks one silently; B3 `AcpBackend::set_config` re-echoes the unredacted request;
+  B4 option lookup and resolution depth classify options differently; B5 the `[1m]`/`-1m` variant
+  syntax applies to every ACP profile (should be capability data). Sent back to the T5 worker.
