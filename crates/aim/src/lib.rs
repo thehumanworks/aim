@@ -5,6 +5,7 @@
 //! - [`store`] — session persistence (SQLite by default, memory for ephemeral sessions).
 //! - [`session`] — recording agent events into the durable session log.
 //! - [`context`] — instructions and environment given to the model.
+//! - [`resources`] — project and user resources: instructions, rules, skills, agents, prompts, memory.
 //! - [`cli`] — the headless `aim run`.
 //! - [`host`] — hosting live sessions (the daemon's core; also used in process).
 //! - [`providers`] — model providers by id.
@@ -22,5 +23,6 @@ pub mod jev;
 pub mod login;
 pub mod providers;
 pub mod remote;
+pub mod resources;
 pub mod session;
 pub mod store;

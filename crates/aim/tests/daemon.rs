@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture as ToolFuture, ToolHost};
 use aim::daemon::{client::DaemonClient, server, socket_path, spawn};
-use aim::host::{BoxFuture, Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends};
+use aim::host::{BoxFuture, Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends_with};
 use aim::store::MemoryStore;
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
@@ -117,7 +117,12 @@ fn host(deltas: usize, delay: Duration) -> (Arc<dyn SessionClient>, Arc<Scripted
     });
     let host = Arc::new(SessionHost::new(HostConfig {
         store: Arc::new(MemoryStore::default()),
-        backends: native_backends(Arc::new(move |_, _| Ok((Arc::clone(&cloned) as Arc<dyn ModelProvider>, "m".into()))), workspaces, 4),
+        backends: native_backends_with(
+            Arc::new(move |_, _| Ok((Arc::clone(&cloned) as Arc<dyn ModelProvider>, "m".into()))),
+            workspaces,
+            4,
+            aim::resources::ResourceConfig::default(),
+        ),
         update_capacity: 4096,
     }));
     (host, provider)
