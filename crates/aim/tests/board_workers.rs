@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -166,7 +166,7 @@ impl SessionClient for Scripted {
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git").args(args).current_dir(repo).output().unwrap();
+    let output = std::process::Command::new("git").args(args).current_dir(repo).output().unwrap();
     assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
@@ -455,7 +455,7 @@ async fn live_board_worker_codex_end_to_end() {
         .job;
     let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("aim");
     let mut daemon = ChildGuard(
-        Command::new(&binary)
+        std::process::Command::new(&binary)
             .arg("daemon")
             .env("AIM_HOME", &home)
             .stdin(Stdio::null())
