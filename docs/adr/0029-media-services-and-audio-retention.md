@@ -1,6 +1,6 @@
 # ADR 0029: Expose media services through the agent daemon
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-25
 - Baseline: 0006, 0007, 0009, 0022
 - Scope: Hosted Codex media services and the `media.transcribe` daemon contract; not recording audio or implementing a TUI microphone.

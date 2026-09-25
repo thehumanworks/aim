@@ -2,4 +2,4 @@
 
 mod dispatcher;
 
-pub use dispatcher::Dispatcher;
+pub use dispatcher::{Dispatcher, MediaService};
