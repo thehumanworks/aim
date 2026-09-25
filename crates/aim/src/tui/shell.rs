@@ -411,7 +411,13 @@ impl Runner {
         self.forwarder = Some(tokio::spawn(async move {
             match client.attach(session.clone()).await {
                 Ok((result, mut updates)) => {
-                    let attached = Input::Attached { summary: result.summary, transcript: result.transcript, resync, attempt };
+                    let attached = Input::Attached {
+                        summary: result.summary,
+                        transcript: result.transcript,
+                        surfaces: result.surfaces,
+                        resync,
+                        attempt,
+                    };
                     if inputs.send(attached).is_err() {
                         return;
                     }

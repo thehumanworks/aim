@@ -405,7 +405,13 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
             let total_bytes = u64::try_from(bytes.len()).map_err(|_| error(ErrorCode::LimitExceeded, "transcript is too large"))?;
             let first_chunk = Base64Bytes(bytes.iter().take(TRANSCRIPT_CHUNK_BYTES).copied().collect());
             let snapshot_id = uuid::Uuid::new_v4().simple().to_string();
-            let result = SessionAttachPagedResult { summary: snapshot.summary, snapshot_id: snapshot_id.clone(), total_bytes, first_chunk };
+            let result = SessionAttachPagedResult {
+                summary: snapshot.summary,
+                snapshot_id: snapshot_id.clone(),
+                total_bytes,
+                first_chunk,
+                surfaces: snapshot.surfaces,
+            };
             let encoded = serde_json::to_vec(&result).map_err(|_| error(ErrorCode::Internal, "encoding paged attachment failed"))?;
             if encoded.len() >= MAX_DAEMON_MESSAGE_BYTES.saturating_sub(1024) {
                 return Err(error(ErrorCode::LimitExceeded, "attachment metadata exceeds the message limit"));

@@ -64,7 +64,7 @@ impl SessionClient for ProbeHost {
                 SessionUpdate::TextDelta { delta: "one".into() },
                 SessionUpdate::TextDelta { delta: "two".into() },
             ]));
-            Ok((SessionAttachResult { summary: summary(), transcript: vec![] }, stream))
+            Ok((SessionAttachResult { summary: summary(), transcript: vec![], surfaces: vec![] }, stream))
         })
     }
     fn prompt(&self, _: String, _: Vec<Part>) -> BoxFuture<Result<PromptOutcome, ProtoError>> {

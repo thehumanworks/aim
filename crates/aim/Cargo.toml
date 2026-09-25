@@ -71,6 +71,7 @@ aim = { path = ".", features = ["test-support"] }
 aimx = { path = "../aimx" }
 async-stream = "0.3"
 portable-pty = "0.9"
+proptest = "1.9"
 vt100 = "0.16"
 
 [lints]

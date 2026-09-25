@@ -15,6 +15,7 @@
 //! - [`tool`] — tool descriptors and results, shared by aimx, the agent layer and MCP.
 //! - [`conversation`] — provider-neutral conversation items, usage and rate limits.
 //! - [`event`] — durable session events (the append-only session log).
+//! - [`ui`] — declarative UI surfaces in the A2UI v1.0 shape, their fold and the terminal catalog.
 pub mod board;
 pub mod content;
 pub mod conversation;
@@ -25,6 +26,7 @@ pub mod harness;
 pub mod ids;
 pub mod rpc;
 pub mod tool;
+pub mod ui;
 
 /// Protocol generations of `aim-harness` this build can speak (inclusive range).
 ///

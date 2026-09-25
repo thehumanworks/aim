@@ -100,7 +100,8 @@ pub fn build(id: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, S
 /// - Codex media tools (web search, image generation), when codex credentials exist at a
 ///   session's start;
 /// - Jev effort advice (ADR 0013), when `TYPESAFE_API_KEY` is set; the host attaches it to
-///   persistent sessions only.
+///   persistent sessions only;
+/// - the UI tools (`ui_show`, `ui_update`, `ui_close`, `ui_catalog`; ADR 0064).
 #[must_use]
 pub fn services() -> crate::host::NativeServices {
     let media: crate::host::MediaFactory = Arc::new(|| {
@@ -113,7 +114,12 @@ pub fn services() -> crate::host::NativeServices {
     let decider = std::env::var_os("TYPESAFE_API_KEY")
         .is_some_and(|value| !value.is_empty())
         .then(|| Arc::new(crate::jev::JevDecider) as Arc<dyn crate::jev::Decider>);
-    crate::host::NativeServices { media: Some(media), decider, tools: vec![search_tools(), board_tools(), mcp_tools()], code: code_mode() }
+    crate::host::NativeServices {
+        media: Some(media),
+        decider,
+        tools: vec![search_tools(), board_tools(), mcp_tools(), crate::ui::tools_factory()],
+        code: code_mode(),
+    }
 }
 
 /// Code mode, when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this

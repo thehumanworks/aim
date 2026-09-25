@@ -16,7 +16,9 @@
 //!
 //! Each entry of `responses` answers one model request. `echo` returns its `text` after
 //! `delay_ms` (an error result when `error` is true). `seed_items` stores a session with that many
-//! items and attaches it at start (for the transcript-size measurements).
+//! items and attaches it at start (for the transcript-size measurements). A `{"kind":
+//! "echo_input"}` step answers with the request's last user text, so a test can see what reached
+//! the model. Scripted sessions get the UI tools (`ui_show`, …; ADR 0064).
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -71,6 +73,8 @@ pub enum Step {
         /// How long.
         ms: u64,
     },
+    /// Assistant text: the request's last user text, verbatim (what reached the model).
+    EchoInput,
 }
 
 /// A completion source delay.
@@ -110,7 +114,29 @@ struct Scripted {
     counter: Mutex<u64>,
 }
 
-fn events_of(steps: Vec<Step>, id: u64) -> Vec<(u64, StreamEvent)> {
+/// The request's last user text.
+fn last_user_text(request: &LlmRequest) -> String {
+    request
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            Item::User { parts } => Some(
+                parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        Part::Text { text } => Some(text.as_str()),
+                        Part::Image { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn events_of(steps: Vec<Step>, id: u64, input: &str) -> Vec<(u64, StreamEvent)> {
     let mut out = Vec::new();
     let mut calls = false;
     for (index, step) in steps.into_iter().enumerate() {
@@ -136,6 +162,12 @@ fn events_of(steps: Vec<Step>, id: u64) -> Vec<(u64, StreamEvent)> {
                 out.push((0, StreamEvent::ItemDone { item }));
             }
             Step::Sleep { ms } => out.push((ms, StreamEvent::Created { response_id: None })),
+            Step::EchoInput => {
+                let text = format!("heard: {input}");
+                out.push((0, StreamEvent::TextDelta { item_id: item_id.clone(), delta: text.clone() }));
+                let item = Item::Assistant { id: Some(item_id), parts: vec![Part::Text { text }], native: None };
+                out.push((0, StreamEvent::ItemDone { item }));
+            }
         }
     }
     let stop = if calls { StopReason::ToolUse } else { StopReason::EndTurn };
@@ -153,7 +185,8 @@ impl ModelProvider for Scripted {
         Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn stream(&self, _request: LlmRequest) -> LlmFuture<'_, Result<EventStream, LlmError>> {
+    fn stream(&self, request: LlmRequest) -> LlmFuture<'_, Result<EventStream, LlmError>> {
+        let input = last_user_text(&request);
         let next = self.responses.lock().unwrap_or_else(PoisonError::into_inner).pop_front();
         let id = {
             let mut counter = self.counter.lock().unwrap_or_else(PoisonError::into_inner);
@@ -162,7 +195,7 @@ impl ModelProvider for Scripted {
         };
         Box::pin(async move {
             let steps = next.ok_or_else(|| LlmError::new(LlmErrorKind::InvalidRequest, "the script has no more responses"))?;
-            let events = events_of(steps, id);
+            let events = events_of(steps, id, &input);
             let stream: EventStream = Box::pin(futures_util::stream::unfold(events.into_iter(), |mut events| async move {
                 let (delay, event) = events.next()?;
                 if delay > 0 {
@@ -293,13 +326,13 @@ pub async fn run(path: &Path, args: &TuiArgs) -> Result<i32, String> {
         Arc::new(move |_name, _model| Ok((Arc::clone(&provider) as Arc<dyn ModelProvider>, "scripted-model".to_owned())));
     let host = SessionHost::new(HostConfig {
         store: store as Arc<dyn SessionStore>,
-        // A scripted session gets no machine services (no credentials, no Jev).
+        // A scripted session gets no machine services (no credentials, no Jev), only the UI tools.
         backends: native_backends_with(
             providers,
             workspaces(),
             args.max_requests,
             crate::resources::ResourceConfig::user(crate::cli::aim_home()),
-            NativeServices::default(),
+            NativeServices { tools: vec![crate::ui::tools_factory()], ..NativeServices::default() },
         ),
         update_capacity: 4096,
     });

@@ -527,6 +527,9 @@ struct Live {
     /// Cancelled before `Control::Close` is queued, so a config change already in progress
     /// cannot keep the actor from reading the close.
     close_requested: CancellationToken,
+    /// The session's UI surfaces (ADR 0064): published under the transcript lock, reached by the
+    /// `ui_*` tools through the outlet each turn runs in.
+    ui: Arc<crate::ui::SessionUi>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -614,6 +617,7 @@ impl SessionHost {
             return Err(shutting_down());
         }
         let session_id = resume.as_ref().map_or_else(session::new_session_id, |r| r.meta.id.clone());
+        let ui = Arc::new(crate::ui::SessionUi::restore(&session_id, resume.as_ref().map_or(&[], |r| r.events.as_slice())));
         // The user sees the whole history; the model continues from its compacted context.
         let transcript = resume.as_ref().map(|r| items_of(&r.events)).unwrap_or_default();
         let context = resume.as_ref().map(|r| model_items_of(&r.events)).unwrap_or_default();
@@ -694,6 +698,7 @@ impl SessionHost {
             updates,
             control,
             close_requested: CancellationToken::new(),
+            ui,
         });
         lock(&self.sessions).insert(meta.id.clone(), Arc::clone(&live));
         let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location, announced };
@@ -825,6 +830,13 @@ async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<Strin
     if let SessionUpdate::ItemAdded { item } = &update {
         let mut transcript = lock(&live.transcript);
         transcript.push(item.clone());
+        let _unwatched = live.updates.send(update);
+        return;
+    }
+    if let SessionUpdate::Ui { message } = &update {
+        // Under the transcript lock, like items: attach sees it in its snapshot or its stream.
+        let transcript = lock(&live.transcript);
+        live.ui.published(message, u64::try_from(transcript.len()).unwrap_or(u64::MAX));
         let _unwatched = live.updates.send(update);
         return;
     }
@@ -971,8 +983,9 @@ impl Actor {
         let cancel = CancellationToken::new();
         let mut closing = false;
         {
-            // The turn borrows only `backend`; recording and fan-out use `recorder` and `live`.
-            let turn = backend.run_turn(input, &events_tx, &cancel, &mut steer_rx);
+            // The turn borrows only `backend`; its tools reach `live.ui` through the scope (ADR 0064).
+            let turn =
+                crate::ui::scope(Arc::clone(&live.ui), events_tx.clone(), backend.run_turn(input, &events_tx, &cancel, &mut steer_rx));
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -1161,7 +1174,8 @@ impl SessionClient for SessionHost {
             let live = host.live_or_resume(&session).await?;
             let transcript = lock(&live.transcript);
             let rx = live.updates.subscribe();
-            let result = SessionAttachResult { summary: lock(&live.summary).clone(), transcript: transcript.clone() };
+            let result =
+                SessionAttachResult { summary: lock(&live.summary).clone(), transcript: transcript.clone(), surfaces: live.ui.snapshot() };
             drop(transcript);
             Ok((result, updates_of(rx)))
         })

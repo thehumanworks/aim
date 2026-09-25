@@ -8,10 +8,13 @@
 
 use aim_proto::conversation::{Item, Part};
 use aim_proto::tool::{ToolContent, ToolResult};
+use aim_proto::ui::UiAction;
+use aim_proto::ui::model::Surface;
 use ratatui::style::Style;
 use serde_json::Value;
 
 use super::markdown::{self, RenderOpts};
+use super::surfaces::{self, Look};
 use super::text::{Row, Run, Wrap, clamp, sanitize, truncate, wrap_text};
 use super::theme::Theme;
 
@@ -62,6 +65,12 @@ pub enum Entry {
         /// Finished without a result (the turn settled without answering it).
         settled: bool,
     },
+    /// An agent-authored surface shown in the transcript, as it was when this entry was made
+    /// (ADR 0064).
+    Surface {
+        /// The surface.
+        surface: Box<Surface>,
+    },
     /// A message from the UI itself (errors, command output, session changes).
     Notice {
         /// Severity.
@@ -105,12 +114,19 @@ pub fn user_text(parts: &[Part]) -> String {
     out.join("\n")
 }
 
+/// Most in-place edits remembered for the fullscreen row cache (older ones rebuild it all).
+const EDIT_LOG: usize = 64;
+
 /// The session's transcript as the UI shows it.
 #[derive(Default, Debug)]
 pub struct Transcript {
     entries: Vec<Entry>,
     committed: usize,
     items: usize,
+    /// Serial of the latest in-place edit, and the recent edits (serial, entry index), so the
+    /// fullscreen row cache re-renders exactly what changed.
+    edit_serial: u64,
+    edits: Vec<(u64, usize)>,
 }
 
 impl Transcript {
@@ -132,6 +148,68 @@ impl Transcript {
     /// Adds a UI entry.
     pub fn push(&mut self, entry: Entry) {
         self.entries.push(entry);
+    }
+
+    /// How many entries are in scrollback (inline).
+    pub fn committed(&self) -> usize {
+        self.committed
+    }
+
+    /// Adds a surface snapshot after the entry of tool call `call_id` when that entry is not in
+    /// scrollback yet; returns whether it did.
+    pub fn insert_after_tool(&mut self, call_id: &str, surface: Surface) -> bool {
+        let at = self.entries.iter().rposition(|e| matches!(e, Entry::Tool { call_id: id, .. } if id == call_id));
+        match at {
+            Some(at) if at >= self.committed => {
+                self.entries.insert(at + 1, Entry::Surface { surface: Box::new(surface) });
+                self.note_edit(at + 1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Index of the latest snapshot of surface `id`.
+    pub fn latest_surface(&self, id: &str) -> Option<usize> {
+        self.entries.iter().rposition(|e| matches!(e, Entry::Surface { surface } if surface.id == id))
+    }
+
+    /// Replaces the snapshot at `index` (not yet in scrollback) with `surface`'s current state.
+    pub fn replace_surface(&mut self, index: usize, surface: Surface) {
+        if index < self.committed {
+            return;
+        }
+        if let Some(Entry::Surface { surface: slot }) = self.entries.get_mut(index) {
+            **slot = surface;
+            self.note_edit(index);
+        }
+    }
+
+    fn note_edit(&mut self, index: usize) {
+        self.edit_serial = self.edit_serial.saturating_add(1);
+        self.edits.push((self.edit_serial, index));
+        if self.edits.len() > EDIT_LOG {
+            self.edits.remove(0);
+        }
+    }
+
+    /// The latest edit's serial.
+    pub fn edit_serial(&self) -> u64 {
+        self.edit_serial
+    }
+
+    /// The first entry edited after serial `seen`: `Some(0)` when the log no longer reaches back
+    /// that far, `None` when nothing changed.
+    pub fn edited_since(&self, seen: u64) -> Option<usize> {
+        if seen >= self.edit_serial {
+            return None;
+        }
+        match self.edits.first() {
+            Some((oldest, _)) if *oldest <= seen.saturating_add(1) => {
+                self.edits.iter().filter(|(serial, _)| *serial > seen).map(|(_, index)| *index).min()
+            }
+            _ => Some(0),
+        }
     }
 
     /// Applies one finished session item.
@@ -326,9 +404,17 @@ pub fn render_entry(entry: &Entry, theme: &Theme, opts: EntryOpts) -> Vec<Row> {
     let width = opts.render.width;
     let mut rows = match entry {
         Entry::User { text } => {
-            let first = [Run::new("› ", theme.prompt_mark)];
             let rest = [Run::new("  ", Style::new())];
-            wrap_text(&sanitize(text), theme.user, width, &first, &rest, Wrap::Words)
+            if let Some(action) = UiAction::from_input_text(text) {
+                // A pressed button, sent as user input: shown as what it was, not as its envelope.
+                wrap_text(&surfaces::action_line(&action), theme.accent, width, &[], &rest, Wrap::Words)
+            } else {
+                let first = [Run::new("› ", theme.prompt_mark)];
+                wrap_text(&sanitize(text), theme.user, width, &first, &rest, Wrap::Words)
+            }
+        }
+        Entry::Surface { surface } => {
+            surfaces::render(surface, theme, width, Look { hyperlinks: opts.render.hyperlinks, ..Look::default() })
         }
         Entry::Assistant { text, interrupted } => {
             let mut rows = markdown::render(text, theme, opts.render, theme.text);

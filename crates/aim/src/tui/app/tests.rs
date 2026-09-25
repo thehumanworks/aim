@@ -58,8 +58,13 @@ fn attached() -> App {
     assert_eq!(app.start(None), [Effect::Create { spec: spec(Persistence::Ephemeral), attempt: 1 }]);
     let effects = app.handle(Input::Created { attempt: 1, result: Ok(summary("s1", SessionState::Idle)) });
     assert_eq!(effects, [Effect::Attach { session: "s1".into(), resync: false, attempt: 2 }]);
-    let effects =
-        app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript: Vec::new(), resync: false, attempt: 2 });
+    let effects = app.handle(Input::Attached {
+        summary: summary("s1", SessionState::Idle),
+        transcript: Vec::new(),
+        surfaces: Vec::new(),
+        resync: false,
+        attempt: 2,
+    });
     assert!(effects.is_empty());
     app
 }
@@ -278,7 +283,13 @@ fn a_failed_prompt_puts_its_text_back() {
 fn commands_set_the_config_and_are_remembered() {
     let mut app = new_app(Persistence::Persistent);
     app.start(None);
-    app.handle(Input::Attached { summary: persistent_summary("s1"), transcript: Vec::new(), resync: false, attempt: app.attempt });
+    app.handle(Input::Attached {
+        summary: persistent_summary("s1"),
+        transcript: Vec::new(),
+        surfaces: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
     typed(&mut app, "/model gpt-x");
     let effects = app.handle(press(KeyCode::Enter));
     assert!(effects.contains(&Effect::SaveHistory("/model gpt-x".into())));
@@ -376,7 +387,13 @@ fn the_environment_block_never_shows_on_attach() {
         Item::User { parts: vec![Part::Text { text: format!("{ENV}\n\nfrom aim run") }] },
         Item::User { parts: vec![Part::Text { text: ENV.into() }] },
     ];
-    app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript, resync: false, attempt: app.attempt });
+    app.handle(Input::Attached {
+        summary: summary("s1", SessionState::Idle),
+        transcript,
+        surfaces: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
     let users: Vec<&Entry> = app.transcript.entries().iter().filter(|e| matches!(e, Entry::User { .. })).collect();
     assert_eq!(users, [&Entry::User { text: "first".into() }, &Entry::User { text: "from aim run".into() }]);
     let printed: Vec<String> = app.take_history(60).iter().map(Row::text).collect();
@@ -390,7 +407,13 @@ fn a_dropped_stream_reattaches_and_applies_only_new_items() {
     let effects = app.handle(Input::StreamEnded { session: "s1".into(), attempt: app.attempt });
     assert_eq!(effects, [Effect::Attach { session: "s1".into(), resync: true, attempt: app.attempt }]);
     let transcript = vec![user("a"), user("b")];
-    app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript, resync: true, attempt: app.attempt });
+    app.handle(Input::Attached {
+        summary: summary("s1", SessionState::Idle),
+        transcript,
+        surfaces: Vec::new(),
+        resync: true,
+        attempt: app.attempt,
+    });
     let users = app.transcript.entries().iter().filter(|e| matches!(e, Entry::User { .. })).count();
     assert_eq!(users, 2, "`a` once, then `b`");
     assert!(notices(&app).iter().any(|n| n.starts_with("reconnected")));
@@ -423,6 +446,7 @@ fn a_prompt_before_the_session_exists_is_sent_once_attached() {
     let effects = app.handle(Input::Attached {
         summary: summary("s1", SessionState::Idle),
         transcript: Vec::new(),
+        surfaces: Vec::new(),
         resync: false,
         attempt: app.attempt,
     });
@@ -453,7 +477,13 @@ fn the_picker_filters_and_attaches_another_session() {
     assert!(app.picker.is_none());
     let mut s2 = summary("s2", SessionState::Idle);
     s2.meta.workspace = "/elsewhere".into();
-    app.handle(Input::Attached { summary: s2, transcript: vec![user("old prompt")], resync: false, attempt: app.attempt });
+    app.handle(Input::Attached {
+        summary: s2,
+        transcript: vec![user("old prompt")],
+        surfaces: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
     assert_eq!(app.session.as_ref().unwrap().id, "s2");
     assert!(notices(&app).iter().any(|n| n.starts_with("session s2")));
     assert!(app.transcript.entries().contains(&Entry::User { text: "old prompt".into() }), "the attached transcript is replayed");
@@ -541,7 +571,13 @@ fn rev10_ephemeral_session_prompts_never_reach_disk_history() {
     let mut effects = app.start(Some("e1".into()));
     app.handle(press(KeyCode::Up));
     assert!(app.composer.is_empty(), "no disk history before the session's mode is known");
-    effects.extend(app.handle(Input::Attached { summary: eph_summary("e1"), transcript: Vec::new(), resync: false, attempt: app.attempt }));
+    effects.extend(app.handle(Input::Attached {
+        summary: eph_summary("e1"),
+        transcript: Vec::new(),
+        surfaces: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    }));
     assert!(!effects.contains(&Effect::LoadHistory), "the history file is not even read for an ephemeral session");
     app.handle(press(KeyCode::Up));
     assert!(app.composer.is_empty(), "disk history stays hidden in an ephemeral session");
@@ -556,8 +592,13 @@ fn rev10_ephemeral_session_prompts_never_reach_disk_history() {
     app.handle(press(KeyCode::Enter));
     app.handle(Input::Sessions(Ok(vec![persistent_summary("p1")])));
     app.handle(press(KeyCode::Enter));
-    let effects =
-        app.handle(Input::Attached { summary: persistent_summary("p1"), transcript: Vec::new(), resync: false, attempt: app.attempt });
+    let effects = app.handle(Input::Attached {
+        summary: persistent_summary("p1"),
+        transcript: Vec::new(),
+        surfaces: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
     assert_eq!(effects.iter().filter(|e| **e == Effect::LoadHistory).count(), 1);
     app.handle(Input::HistoryLoaded(vec!["old secret".into()]));
     app.handle(press(KeyCode::Up));
@@ -608,7 +649,13 @@ fn rev10_resync_reconciles_partial_text_and_steering() {
     assert_eq!(effects, [Effect::Attach { session: "s1".into(), resync: true, attempt: app.attempt }]);
     let answer = Item::Assistant { id: None, parts: vec![Part::Text { text: "the full answer".into() }], native: None };
     let snapshot = vec![user("go"), user("and this"), answer];
-    app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript: snapshot, resync: true, attempt: app.attempt });
+    app.handle(Input::Attached {
+        summary: summary("s1", SessionState::Idle),
+        transcript: snapshot,
+        surfaces: Vec::new(),
+        resync: true,
+        attempt: app.attempt,
+    });
     assert!(app.live_text.is_empty(), "no stale partial beside the snapshot");
     let answers: Vec<&Entry> = app.transcript.entries().iter().filter(|e| matches!(e, Entry::Assistant { .. })).collect();
     assert_eq!(answers, [&Entry::Assistant { text: "the full answer".into(), interrupted: false }]);
@@ -636,6 +683,7 @@ fn rev10_a_prompt_during_a_switch_goes_to_the_new_session() {
     let effects = app.handle(Input::Attached {
         summary: summary("s2", SessionState::Idle),
         transcript: Vec::new(),
+        surfaces: Vec::new(),
         resync: false,
         attempt: app.attempt,
     });
@@ -665,6 +713,7 @@ fn rev10_prompts_before_attach_are_all_kept() {
     let effects = app.handle(Input::Attached {
         summary: summary("s1", SessionState::Idle),
         transcript: Vec::new(),
+        surfaces: Vec::new(),
         resync: false,
         attempt: app.attempt,
     });
@@ -706,7 +755,7 @@ fn rev10_new_keeps_the_attached_provider_and_location() {
     remote.meta.provider = "openrouter".into();
     remote.meta.location = "ssh:box".into();
     remote.meta.workspace = "/srv/app".into();
-    app.handle(Input::Attached { summary: remote, transcript: Vec::new(), resync: false, attempt: app.attempt });
+    app.handle(Input::Attached { summary: remote, transcript: Vec::new(), surfaces: Vec::new(), resync: false, attempt: app.attempt });
     typed(&mut app, "/new");
     let effects = app.handle(press(KeyCode::Enter));
     let spec = effects
@@ -748,7 +797,7 @@ fn rev10_attaching_another_workspace_rebinds_completion() {
     assert!(!app.outbox.iter().any(|e| matches!(e, Effect::Rebind { .. })), "same workspace: no rebind");
     let mut other = persistent_summary("b1");
     other.meta.workspace = "/elsewhere".into();
-    app.handle(Input::Attached { summary: other, transcript: Vec::new(), resync: false, attempt: app.attempt });
+    app.handle(Input::Attached { summary: other, transcript: Vec::new(), surfaces: Vec::new(), resync: false, attempt: app.attempt });
     let old = app.attempt;
     typed(&mut app, "/sessions");
     app.handle(press(KeyCode::Enter));
@@ -758,7 +807,8 @@ fn rev10_attaching_another_workspace_rebinds_completion() {
     app.handle(Input::Sessions(Ok(vec![remote.clone()])));
     app.handle(press(KeyCode::Enter));
     assert!(app.attempt > old);
-    let effects = app.handle(Input::Attached { summary: remote, transcript: Vec::new(), resync: false, attempt: app.attempt });
+    let effects =
+        app.handle(Input::Attached { summary: remote, transcript: Vec::new(), surfaces: Vec::new(), resync: false, attempt: app.attempt });
     assert!(effects.contains(&Effect::Rebind { workspace: "/srv".into(), local: false }), "{effects:?}");
 }
 
@@ -769,7 +819,13 @@ fn rev10_attaching_another_workspace_rebinds_completion() {
 fn rev12_new_from_an_ephemeral_session_stays_ephemeral() {
     let mut app = new_app(Persistence::Persistent);
     app.start(Some("e1".into()));
-    app.handle(Input::Attached { summary: eph_summary("e1"), transcript: Vec::new(), resync: false, attempt: app.attempt });
+    app.handle(Input::Attached {
+        summary: eph_summary("e1"),
+        transcript: Vec::new(),
+        surfaces: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
     typed(&mut app, "/new");
     let effects = app.handle(press(KeyCode::Enter));
     let spec = effects
@@ -781,7 +837,13 @@ fn rev12_new_from_an_ephemeral_session_stays_ephemeral() {
         .unwrap();
     assert_eq!(spec.persistence, Persistence::Ephemeral, "the new session is as private as the attached one");
     app.handle(Input::Created { attempt: app.attempt, result: Ok(eph_summary("e2")) });
-    let effects = app.handle(Input::Attached { summary: eph_summary("e2"), transcript: Vec::new(), resync: false, attempt: app.attempt });
+    let effects = app.handle(Input::Attached {
+        summary: eph_summary("e2"),
+        transcript: Vec::new(),
+        surfaces: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
     assert!(saves(&effects).is_empty());
     typed(&mut app, "hi");
     assert!(saves(&app.handle(press(KeyCode::Enter))).is_empty());
@@ -809,6 +871,7 @@ fn rev12_config_commands_during_a_switch_go_to_the_new_session() {
         let effects = app.handle(Input::Attached {
             summary: summary("s2", SessionState::Idle),
             transcript: Vec::new(),
+            surfaces: Vec::new(),
             resync: false,
             attempt: app.attempt,
         });
@@ -843,4 +906,303 @@ fn rev12_a_finished_call_shows_behind_many_running_ones() {
     let block = view::block(&app, 60, 30);
     let text: Vec<String> = block.rows.iter().map(ToString::to_string).collect();
     assert!(text.iter().any(|r| r.contains("quick result")), "{text:#?}");
+}
+
+// ---- UI surfaces (ADR 0064) ----
+
+mod surfaces {
+    use aim_proto::ui::model::Surface;
+    use aim_proto::ui::{Component, UiEnvelope, UiMessage};
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn create(id: &str, placement: &str, components: Value) -> SessionUpdate {
+        let components: Vec<Component> = serde_json::from_value(components).unwrap();
+        SessionUpdate::Ui {
+            message: UiEnvelope::new(UiMessage::CreateSurface {
+                surface_id: id.into(),
+                replace: false,
+                catalog_id: aim_proto::ui::TERMINAL_CATALOG.into(),
+                placement: Placement::parse(placement).unwrap(),
+                components,
+                data: Some(json!({"done": 10})),
+            }),
+        }
+    }
+
+    fn data(id: &str, path: &str, value: Value) -> SessionUpdate {
+        SessionUpdate::Ui {
+            message: UiEnvelope::new(UiMessage::UpdateDataModel {
+                surface_id: id.into(),
+                ops: vec![aim_proto::ui::DataOp { path: path.into(), value }],
+            }),
+        }
+    }
+
+    fn delete(id: &str) -> SessionUpdate {
+        SessionUpdate::Ui { message: UiEnvelope::new(UiMessage::DeleteSurface { surface_id: id.into() }) }
+    }
+
+    fn label(text: &str) -> Value {
+        json!([{"id": "root", "component": "Text", "text": text}])
+    }
+
+    fn progress() -> Value {
+        json!([{"id": "root", "component": "Progress", "value": {"path": "/done"}, "label": "build"}])
+    }
+
+    fn button() -> Value {
+        json!([
+            {"id": "root", "component": "Column", "children": ["q", "ok"]},
+            {"id": "q", "component": "Text", "text": "Deploy now?"},
+            {"id": "ok", "component": "Button", "label": "Deploy", "action": {"name": "deploy", "context": {"env": "prod"}}}
+        ])
+    }
+
+    fn block_text(app: &App, width: u16) -> Vec<String> {
+        view::block(app, width, 40).rows.iter().map(|line| line.to_string().trim_end().to_owned()).collect()
+    }
+
+    fn history(app: &mut App) -> Vec<String> {
+        app.take_history(40).iter().map(|r| r.text().trim_end().to_owned()).collect()
+    }
+
+    #[test]
+    fn transcript_surfaces_commit_and_updates_after_commit_show_live_then_once() {
+        let mut app = running();
+        update(&mut app, create("files", "transcript", label("two files changed")));
+        assert!(history(&mut app).contains(&"two files changed".to_owned()), "committed like any finished entry");
+        update(&mut app, create("p", "transcript", progress()));
+        let printed = history(&mut app);
+        assert!(printed.iter().any(|r| r.contains(" 10% build")), "{printed:?}");
+        update(&mut app, data("p", "/done", json!(60)));
+        assert!(history(&mut app).is_empty(), "scrollback is never rewritten");
+        assert!(block_text(&app, 40).iter().any(|r| r.contains(" 60% build")), "the update shows live in the pinned block");
+        update(&mut app, SessionUpdate::StateChanged { state: SessionState::Idle });
+        let committed = history(&mut app);
+        assert_eq!(committed.iter().filter(|r| r.contains(" 60% build")).count(), 1, "committed once, final: {committed:?}");
+        assert!(!block_text(&app, 40).iter().any(|r| r.contains("build")));
+    }
+
+    #[test]
+    fn widgets_sit_above_and_below_the_editor_and_close() {
+        let mut app = attached();
+        update(&mut app, create("up", "widget.above_editor", label("ABOVE")));
+        update(&mut app, create("down", "widget.below_editor", label("BELOW")));
+        let rows = block_text(&app, 40);
+        let (above, composer, below) = (
+            rows.iter().position(|r| r == "ABOVE").unwrap(),
+            rows.iter().position(|r| r.starts_with("› ")).unwrap(),
+            rows.iter().position(|r| r == "BELOW").unwrap(),
+        );
+        assert!(above < composer && composer < below, "{rows:?}");
+        assert!(history(&mut app).iter().all(|r| !r.contains("ABOVE") && !r.contains("BELOW")), "pinned, not transcript");
+        update(&mut app, delete("up"));
+        assert!(!block_text(&app, 40).contains(&"ABOVE".to_owned()));
+    }
+
+    #[test]
+    fn status_surfaces_join_the_status_line_and_toasts_expire() {
+        let mut app = attached();
+        update(&mut app, create("l", "status.left", label("LEFT")));
+        update(&mut app, create("r", "status.right", label("RIGHT")));
+        update(&mut app, create("t", "toast", label("saved")));
+        let rows = block_text(&app, 80);
+        let status = rows.last().unwrap();
+        assert!(status.starts_with("LEFT · idle") && status.ends_with("· RIGHT"), "{status}");
+        assert!(rows.iter().any(|r| r == "◆ saved"), "{rows:?}");
+        for _ in 0..5 {
+            app.handle(Input::Tick);
+        }
+        assert!(!block_text(&app, 80).iter().any(|r| r.contains("saved")), "the toast expired");
+    }
+
+    #[test]
+    fn a_side_panel_is_fullscreen_only_and_other_placements_degrade_to_the_transcript() {
+        let mut app = attached();
+        update(&mut app, create("side", "panel.side", label("PANEL")));
+        assert!(block_text(&app, 60).contains(&"PANEL".to_owned()), "inline: a widget above the editor");
+        app.layout = Layout::Fullscreen;
+        app.size = (100, 30);
+        assert!(!block_text(&app, 99).contains(&"PANEL".to_owned()), "fullscreen: in the side panel, not the block");
+        let mut cache = view::RowCache::default();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                view::fullscreen(&app, &mut cache, frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+        let screen: Vec<String> = (0..30)
+            .map(|y| (0..100).map(|x| terminal.backend().buffer().cell((x, y)).map_or(" ", |c| c.symbol()).to_owned()).collect())
+            .collect();
+        assert!(screen.iter().any(|row| row.contains("│ PANEL")), "drawn in the right column");
+        app.layout = Layout::Inline;
+        for (id, placement) in [("o", "overlay"), ("t", "title"), ("x", "tool(unknown_call)")] {
+            update(&mut app, create(id, placement, label(&format!("degraded {id}"))));
+        }
+        let printed = history(&mut app);
+        for id in ["o", "t", "x"] {
+            assert!(printed.contains(&format!("degraded {id}")), "{id} shows in the transcript: {printed:?}");
+        }
+    }
+
+    #[test]
+    fn a_tool_placement_sits_under_its_call() {
+        let mut app = running();
+        update(
+            &mut app,
+            SessionUpdate::ItemAdded {
+                item: Item::ToolCall { call_id: "c1".into(), name: "exec".into(), arguments: "{}".into(), native: None },
+            },
+        );
+        update(&mut app, SessionUpdate::ItemAdded { item: user("later") });
+        update(&mut app, create("under", "tool(c1)", label("tool detail")));
+        update(&mut app, SessionUpdate::ItemAdded { item: Item::ToolResult { call_id: "c1".into(), result: ToolResult::text("ok") } });
+        let printed = history(&mut app);
+        let call = printed.iter().position(|r| r.starts_with("⏺ exec")).unwrap();
+        let detail = printed.iter().position(|r| r == "tool detail").unwrap();
+        let later = printed.iter().position(|r| r.starts_with("› later")).unwrap();
+        assert!(call < detail && detail < later, "{printed:?}");
+    }
+
+    /// ADR 0017's `unknown_component_fallback`: a component outside the catalog shows its fallback.
+    #[test]
+    fn unknown_component_fallback() {
+        let mut app = attached();
+        let spark = json!([{"id": "root", "component": "Sparkline", "values": [1, 2], "fallback": "trend up"}]);
+        update(&mut app, create("s", "transcript", spark));
+        assert!(history(&mut app).contains(&"trend up".to_owned()));
+    }
+
+    #[test]
+    fn a_dialog_button_press_sends_the_action_as_input() {
+        let mut app = attached();
+        update(&mut app, create("confirm", "dialog", button()));
+        assert_eq!(app.focus, Some(("confirm".into(), "ok".into())), "a dialog takes the focus when the editor is empty");
+        let rows = block_text(&app, 40);
+        assert!(rows.iter().any(|r| r.starts_with("╭")) && rows.iter().any(|r| r.contains("[ Deploy ]")), "{rows:?}");
+        let effects = app.handle(press(KeyCode::Enter));
+        let Some(Effect::Prompt { parts, .. }) = effects.first() else { panic!("{effects:?}") };
+        let action = UiAction::from_input_text(&text_of(parts)).unwrap();
+        assert_eq!((action.name.as_str(), action.surface_id.as_str(), action.source_component_id.as_str()), ("deploy", "confirm", "ok"));
+        assert_eq!(action.context.get("env"), Some(&json!("prod")));
+        assert!(app.composer.is_empty(), "nothing leaked into the editor");
+        // The session echoes it as a user item: shown as an action, not as its envelope.
+        update(&mut app, SessionUpdate::ItemAdded { item: user(&action.to_input_text()) });
+        let printed = history(&mut app);
+        assert!(printed.iter().any(|r| r.starts_with("⚡ deploy · confirm/ok")), "{printed:?}");
+        assert!(printed.iter().all(|r| !r.contains("<ui_action>")));
+    }
+
+    #[test]
+    fn tab_focuses_transcript_buttons_only_from_an_empty_editor() {
+        let mut app = attached();
+        update(&mut app, create("b", "transcript", button()));
+        typed(&mut app, "draft");
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.focus, None, "tab indents a draft");
+        app.handle(ctrl('u'));
+        app.handle(press(KeyCode::Tab));
+        assert_eq!(app.focus, Some(("b".into(), "ok".into())));
+        assert!(block_text(&app, 60).iter().any(|r| r.starts_with("▸ [ Deploy ] on b")), "a hint names the focused button");
+        typed(&mut app, "x");
+        assert_eq!((app.focus.clone(), app.composer.text()), (None, "x"), "typing leaves the focus and types");
+    }
+
+    fn reconnect(app: &mut App, state: SessionState, surfaces: Vec<Surface>) {
+        app.handle(Input::StreamEnded { session: "s1".into(), attempt: app.attempt });
+        app.handle(Input::Attached { summary: summary("s1", state), transcript: Vec::new(), surfaces, resync: true, attempt: app.attempt });
+    }
+
+    /// REV19 A5: a transcript surface that changed while the stream was down is reconciled on
+    /// resync: its current state is added once (idle), or shown live and committed once at the
+    /// turn's end (running); the printed rows stay as they were.
+    #[test]
+    fn rev19_resync_reconciles_a_changed_transcript_surface() {
+        let mut app = attached();
+        update(&mut app, create("p", "transcript", progress()));
+        assert!(history(&mut app).iter().any(|r| r.contains(" 10% build")));
+        let mut advanced = app.surfaces.get("p").unwrap().clone();
+        advanced.data = json!({"done": 60});
+        reconnect(&mut app, SessionState::Idle, vec![advanced.clone()]);
+        let printed = history(&mut app);
+        assert_eq!(printed.iter().filter(|r| r.contains(" 60% build")).count(), 1, "{printed:?}");
+        assert!(printed.iter().all(|r| !r.contains(" 10% build")), "scrollback is not rewritten, only added to");
+        reconnect(&mut app, SessionState::Idle, vec![advanced.clone()]);
+        assert!(history(&mut app).iter().all(|r| !r.contains("build")), "an unchanged surface adds nothing");
+
+        advanced.data = json!({"done": 90});
+        reconnect(&mut app, SessionState::Running, vec![advanced]);
+        assert!(history(&mut app).iter().all(|r| !r.contains("build")));
+        assert!(block_text(&app, 40).iter().any(|r| r.contains(" 90% build")), "live while the turn runs");
+        update(&mut app, SessionUpdate::StateChanged { state: SessionState::Idle });
+        assert_eq!(history(&mut app).iter().filter(|r| r.contains(" 90% build")).count(), 1);
+    }
+
+    /// REV19 A1 in the TUI: a replaced surface shows its new content once; a replaced dialog
+    /// takes the focus again.
+    #[test]
+    fn rev19_a_replaced_surface_shows_its_new_content() {
+        let mut app = attached();
+        update(&mut app, create("r", "transcript", label("first")));
+        assert!(history(&mut app).contains(&"first".to_owned()));
+        let replace = SessionUpdate::Ui {
+            message: UiEnvelope::new(UiMessage::CreateSurface {
+                surface_id: "r".into(),
+                replace: true,
+                catalog_id: aim_proto::ui::TERMINAL_CATALOG.into(),
+                placement: Placement::Transcript,
+                components: serde_json::from_value(label("second")).unwrap(),
+                data: None,
+            }),
+        };
+        update(&mut app, replace);
+        let printed = history(&mut app);
+        assert_eq!(printed.iter().filter(|r| *r == "second").count(), 1, "{printed:?}");
+        assert_eq!(app.surfaces.list.len(), 1);
+    }
+
+    /// The same session attached fresh renders the same transcript as the client that watched it
+    /// live: surfaces replay at their anchors.
+    #[test]
+    fn a_reattached_session_renders_the_same() {
+        let mut live = running();
+        let items =
+            [user("show it"), Item::ToolCall { call_id: "c1".into(), name: "ui_show".into(), arguments: "{}".into(), native: None }];
+        for item in &items {
+            update(&mut live, SessionUpdate::ItemAdded { item: item.clone() });
+        }
+        update(&mut live, create("files", "transcript", label("the table")));
+        update(&mut live, create("w", "widget", progress()));
+        let later = [
+            Item::ToolResult { call_id: "c1".into(), result: ToolResult::text("shown") },
+            Item::Assistant { id: None, parts: vec![Part::Text { text: "done".into() }], native: None },
+        ];
+        for item in &later {
+            update(&mut live, SessionUpdate::ItemAdded { item: item.clone() });
+        }
+        update(&mut live, SessionUpdate::StateChanged { state: SessionState::Idle });
+        let watched = history(&mut live);
+
+        let mut fresh = new_app(Persistence::Ephemeral);
+        fresh.start(Some("s1".into()));
+        let transcript: Vec<Item> = items.iter().chain(later.iter()).cloned().collect();
+        let surfaces: Vec<Surface> = live.surfaces.list.clone();
+        assert_eq!(surfaces.iter().map(|s| s.anchor).collect::<Vec<_>>(), [2, 2]);
+        fresh.handle(Input::Attached {
+            summary: summary("s1", SessionState::Idle),
+            transcript,
+            surfaces,
+            resync: false,
+            attempt: fresh.attempt,
+        });
+        let replayed: Vec<String> = history(&mut fresh).into_iter().skip_while(|r| !r.starts_with("› show it")).collect();
+        let watched: Vec<String> = watched.into_iter().skip_while(|r| !r.starts_with("› show it")).collect();
+        assert_eq!(replayed, watched);
+        let table = replayed.iter().position(|r| r == "the table").unwrap();
+        assert!(replayed.iter().position(|r| r.starts_with("⏺ ui_show")).unwrap() < table, "{replayed:?}");
+        assert!(replayed.iter().position(|r| r == "done").unwrap() > table);
+        assert_eq!(block_text(&fresh, 40).iter().find(|r| r.contains("build")), block_text(&live, 40).iter().find(|r| r.contains("build")));
+    }
 }
