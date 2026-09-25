@@ -444,3 +444,15 @@ fn the_picker_filters_and_attaches_another_session() {
     assert!(notices(&app).iter().any(|n| n.starts_with("session s2")));
     assert!(app.transcript.entries().contains(&Entry::User { text: "old prompt".into() }), "the attached transcript is replayed");
 }
+
+#[test]
+fn compaction_is_a_notice_and_the_transcript_keeps_everything() {
+    let mut app = attached();
+    update(&mut app, SessionUpdate::ItemAdded { item: user("early prompt") });
+    update(
+        &mut app,
+        SessionUpdate::Compacted { replaced: 1, items: Vec::new(), method: "remote".into(), tokens_before: 180_000, tokens_after: 12_500 },
+    );
+    assert!(app.transcript.entries().contains(&Entry::User { text: "early prompt".into() }));
+    assert_eq!(notices(&app), ["context compacted (remote): ~180.0k → ~12.5k tokens"]);
+}

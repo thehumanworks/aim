@@ -193,7 +193,7 @@ async fn tui(args: aim::tui::TuiArgs) -> Result<i32, String> {
         Arc::new(SqliteStore::open(&cli::aim_home().join("aim.db")).map_err(|e| e.to_string())?)
     };
     let backends = aim::providers::backends(cli::find_aimx(args.aimx.as_deref()), args.max_requests);
-    let host = aim::host::SessionHost::new(aim::host::HostConfig { store, backends, update_capacity: 4096 });
+    let host = SessionHost::new(HostConfig { store, backends, update_capacity: 4096 });
     aim::tui::run(Arc::new(host), options).await
 }
 

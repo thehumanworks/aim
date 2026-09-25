@@ -580,6 +580,11 @@ impl App {
                 let effort = effort.map(|e| format!(" · effort {e}")).unwrap_or_default();
                 self.notice(Level::Info, format!("model {model}{effort}"));
             }
+            SessionUpdate::Compacted { method, tokens_before, tokens_after, .. } => {
+                // The model's context was folded; the transcript shown keeps every item.
+                let (before, after) = (super::view::short_count(tokens_before), super::view::short_count(tokens_after));
+                self.notice(Level::Info, format!("context compacted ({method}): ~{before} → ~{after} tokens"));
+            }
             SessionUpdate::TurnEnded { stop } => self.on_turn_ended(&stop),
             SessionUpdate::TurnFailed { message } => {
                 self.flush_live();
