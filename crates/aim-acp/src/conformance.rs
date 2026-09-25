@@ -1,6 +1,7 @@
 //! Live conformance evidence. Advertised ACP capabilities alone do not establish tool authority
 //! or private storage behavior. Witnesses are bound to one running adapter connection.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -317,5 +318,99 @@ impl AcpClient {
             relay,
             evidence: AimAuthorityEvidence { agent: self.agent().clone(), probe, observed_tool: expected_tool.into(), response_confirmed },
         })
+    }
+
+    /// Challenges a strict local relay by reading a file whose contents are withheld from the
+    /// agent's prompt. The caller creates the file inside the relay's workspace and removes it
+    /// after this method returns.
+    ///
+    /// # Errors
+    /// The adapter did not route a completed aim read or did not report the file's contents.
+    pub async fn verify_local_aim_read_authority(
+        &self,
+        relay: McpServerSpec,
+        path: &Path,
+        expected_content: &str,
+    ) -> Result<VerifiedAimAuthority, AcpError> {
+        if expected_content.is_empty() {
+            return Err(AcpError::InvalidState("empty aim read challenge".into()));
+        }
+        let scratch = Scratch::new("aim-read")?;
+        let options = SessionOptions::strict_aim(&scratch.path, relay.clone())?;
+        let probe = self.probe_with(options.clone()).await?;
+        if !probe.supports(&ToolAuthority::Aim) {
+            return Err(AcpError::InvalidState("aim-tools capability probe failed".into()));
+        }
+        let mut session = self.new_session_unchecked(options).await?;
+        let prompt = format!("Use the mcp__aim__read tool to read {}. Reply with only the file contents.", path.display());
+        let events = session.prompt_text(prompt).await?.collect_all().await?;
+        session.close().await?;
+        let response_confirmed = events.iter().any(|event| {
+            matches!(event,
+                AcpEvent::Update { update: Update::ToolCall(call), .. }
+                    if call.name.as_deref() == Some("mcp__aim__read")
+                        && call.status == crate::events::ToolCallStatus::Completed
+                        && call.raw_output.as_ref().is_some_and(|value| value.to_string().contains(expected_content))
+            )
+        });
+        if !response_confirmed {
+            return Err(AcpError::InvalidState("aim read challenge did not prove the expected route".into()));
+        }
+        Ok(VerifiedAimAuthority {
+            connection: Arc::downgrade(&self.shared),
+            relay,
+            evidence: AimAuthorityEvidence {
+                agent: self.agent().clone(),
+                probe,
+                observed_tool: "mcp__aim__read".into(),
+                response_confirmed,
+            },
+        })
+    }
+
+    /// Challenges an SSH relay with a completed aim write, then checks the remote file through
+    /// the caller's independent harness read while a local sentinel remains unchanged.
+    ///
+    /// # Errors
+    /// The adapter, remote read, or local sentinel failed the challenge.
+    pub async fn verify_ssh_aim_authority<F, Fut>(
+        &self,
+        relay: McpServerSpec,
+        remote_path: &str,
+        local_sentinel: &Path,
+        content: &str,
+        verify_remote: F,
+    ) -> Result<VerifiedSshAuthority, AcpError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<bool, AcpError>>,
+    {
+        if remote_path.is_empty() || content.is_empty() {
+            return Err(AcpError::InvalidState("invalid SSH authority challenge".into()));
+        }
+        let before = std::fs::read(local_sentinel).map_err(|_| AcpError::InvalidState("cannot read local authority sentinel".into()))?;
+        let scratch = Scratch::new("aim-ssh")?;
+        let options = SessionOptions::strict_aim(&scratch.path, relay.clone())?;
+        let probe = self.probe_with(options.clone()).await?;
+        if !probe.supports(&ToolAuthority::Aim) {
+            return Err(AcpError::InvalidState("aim-tools capability probe failed".into()));
+        }
+        let mut session = self.new_session_unchecked(options).await?;
+        let prompt =
+            format!("Use mcp__aim__write to create {remote_path} with exactly this content: {content}. Do not use any other tool.");
+        let events = session.prompt_text(prompt).await?.collect_all().await?;
+        session.close().await?;
+        let called = events.iter().any(|event| {
+            matches!(event,
+                AcpEvent::Update { update: Update::ToolCall(call), .. }
+                    if call.name.as_deref() == Some("mcp__aim__write")
+                        && call.status == crate::events::ToolCallStatus::Completed
+            )
+        });
+        let local_untouched = std::fs::read(local_sentinel).is_ok_and(|after| after == before);
+        if !called || !local_untouched || !verify_remote().await? {
+            return Err(AcpError::InvalidState("SSH aim-tools route did not pass remote-write conformance".into()));
+        }
+        Ok(VerifiedSshAuthority { connection: Arc::downgrade(&self.shared), relay, agent: self.agent().clone() })
     }
 }

@@ -185,8 +185,9 @@ pub async fn run(options: RunOptions, factory: ProviderFactory) -> Result<i32, S
         (Arc::new(SqliteStore::open(&aim_home().join("aim.db")).map_err(|e| e.to_string())?), Persistence::Persistent)
     };
     let providers: host::ProviderFactory = Arc::new(move |name: &str, model: Option<&str>| factory(name, model));
-    let workspaces = host::aimx_workspaces(find_aimx(options.aimx.as_deref()));
-    let backends = crate::acp::with_acp(host::native_backends(providers, workspaces, options.max_requests));
+    let aimx = find_aimx(options.aimx.as_deref());
+    let workspaces = host::aimx_workspaces(aimx.clone());
+    let backends = crate::acp::with_acp_at(host::native_backends(providers, workspaces, options.max_requests), aimx);
     let host = SessionHost::new(HostConfig { store, backends, update_capacity: 4096 });
 
     let spec = SessionSpec {

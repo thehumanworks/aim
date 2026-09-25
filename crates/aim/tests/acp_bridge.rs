@@ -1,9 +1,12 @@
 //! The ACP → session-update bridge, offline, plus one live Claude Code session through the host.
 
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aim::acp::{Bridge, with_acp};
+use aim::acp::{Bridge, with_acp_at};
 use aim::host::{BackendFactory, BackendRequest, HostConfig, SessionClient, SessionHost};
 use aim::store::MemoryStore;
 use aim_acp::{AcpEvent, Chunk, ContentPart, ToolCallState, ToolCallStatus, TurnEnd, Update};
@@ -37,6 +40,81 @@ fn stopped(stop: StopReason) -> AcpEvent {
         usage: Some(Usage { input_tokens: 7, output_tokens: 3, ..Usage::default() }),
         raw: Value::Null,
     })
+}
+
+#[expect(clippy::expect_used, reason = "live fixture setup must stop if the aimx binary cannot be built")]
+fn aimx_binary() -> PathBuf {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            assert!(Command::new("cargo").args(["build", "-q", "-p", "aimx", "--bin", "aimx"]).status().expect("build aimx").success());
+            std::env::current_exe().expect("test executable").parent().expect("deps dir").parent().expect("target dir").join("aimx")
+        })
+        .clone()
+}
+
+struct Sshd {
+    dir: tempfile::TempDir,
+    child: Child,
+    config: PathBuf,
+}
+
+impl Sshd {
+    #[expect(clippy::expect_used, reason = "live fixture setup must stop if the private sshd cannot start")]
+    fn start() -> Self {
+        let dir = tempfile::Builder::new().prefix("aim-acp-ssh").tempdir_in("/private/tmp").expect("sshd tempdir");
+        let host = dir.path().join("host");
+        let client = dir.path().join("client");
+        for key in [&host, &client] {
+            assert!(
+                Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(key).status().expect("ssh-keygen").success()
+            );
+        }
+        std::fs::copy(client.with_extension("pub"), dir.path().join("authorized_keys")).expect("authorized keys");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ssh port");
+        let port = listener.local_addr().expect("listener address").port();
+        drop(listener);
+        let remote_home = dir.path().join("remote_home");
+        std::fs::create_dir(&remote_home).expect("remote home");
+        let sshd_config = dir.path().join("sshd_config");
+        std::fs::write(&sshd_config, format!(
+            "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nPidFile {}\nSetEnv HOME={} PATH=/usr/bin:/bin:/usr/sbin:/sbin\n",
+            host.display(), dir.path().join("authorized_keys").display(), dir.path().join("sshd.pid").display(), remote_home.display()
+        )).expect("sshd config");
+        let host_key = std::fs::read_to_string(host.with_extension("pub")).expect("host public key");
+        std::fs::write(dir.path().join("known_hosts"), format!("[127.0.0.1]:{port} {host_key}")).expect("known hosts");
+        let config = dir.path().join("ssh_config");
+        std::fs::write(&config, format!(
+            "Host aim-acp-test\n  HostName 127.0.0.1\n  Port {port}\n  User {}\n  IdentityFile {}\n  IdentitiesOnly yes\n  UserKnownHostsFile {}\n  StrictHostKeyChecking yes\n  LogLevel ERROR\n",
+            std::env::var("USER").expect("user"), client.display(), dir.path().join("known_hosts").display()
+        )).expect("SSH client config");
+        let check = Command::new("/usr/sbin/sshd").args(["-t", "-f"]).arg(&sshd_config).output().expect("sshd config check");
+        assert!(check.status.success());
+        let child = Command::new("/usr/sbin/sshd")
+            .args(["-D", "-e", "-f"])
+            .arg(&sshd_config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sshd");
+        let mut ready = false;
+        for _ in 0..30 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "private sshd did not start");
+        Self { dir, child, config }
+    }
+}
+
+impl Drop for Sshd {
+    fn drop(&mut self) {
+        drop(self.child.kill());
+        drop(self.child.wait());
+    }
 }
 
 fn run(bridge: &mut Bridge, events: Vec<AcpEvent>) -> (Vec<SessionUpdate>, Option<TurnEnd>) {
@@ -102,10 +180,10 @@ fn empty_chunks_and_other_updates_are_quiet() {
 }
 
 #[tokio::test]
-async fn acp_sessions_are_refused_where_their_tools_would_escape_aim() {
+async fn acp_sessions_require_authority_and_persistence_gates() {
     let native: BackendFactory =
         Arc::new(|_request: BackendRequest| Box::pin(async { Err(ProtoError::new(ErrorCode::Internal, "native")) }));
-    let factory = with_acp(native);
+    let factory = with_acp_at(native, PathBuf::from("/nonexistent/aimx"));
     let base = SessionSpec {
         workspace: "/tmp".into(),
         location: Location::Local,
@@ -121,6 +199,10 @@ async fn acp_sessions_are_refused_where_their_tools_would_escape_aim() {
     };
     let ssh = SessionSpec { location: Location::Ssh { destination: "host".into() }, ..base.clone() };
     assert_eq!(refuse(ssh, Vec::new()).await, Some(ErrorCode::Unavailable));
+    assert_eq!(refuse(base.clone(), Vec::new()).await, Some(ErrorCode::Unavailable), "strict local session requires a relay witness");
+    let native_ssh =
+        SessionSpec { provider: "acp:claude-native".into(), location: Location::Ssh { destination: "host".into() }, ..base.clone() };
+    assert_eq!(refuse(native_ssh, Vec::new()).await, Some(ErrorCode::Unavailable));
     let ephemeral = SessionSpec { persistence: Persistence::Ephemeral, ..base.clone() };
     assert_eq!(refuse(ephemeral, Vec::new()).await, Some(ErrorCode::Unavailable));
     let resumed = vec![Item::User { parts: vec![Part::Text { text: "hi".into() }] }];
@@ -136,10 +218,14 @@ async fn acp_sessions_are_refused_where_their_tools_would_escape_aim() {
 async fn live_acp_claude_session_through_the_host() {
     let dir = std::env::temp_dir().join(format!("aim-live-acp-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("secret-word.txt"), "periwinkle\n").unwrap();
+    std::fs::write(dir.join("probe.txt"), "before\n").unwrap();
     let native: BackendFactory =
         Arc::new(|_request: BackendRequest| Box::pin(async { Err(ProtoError::new(ErrorCode::Internal, "native")) }));
-    let host = SessionHost::new(HostConfig { store: Arc::new(MemoryStore::default()), backends: with_acp(native), update_capacity: 1024 });
+    let host = SessionHost::new(HostConfig {
+        store: Arc::new(MemoryStore::default()),
+        backends: with_acp_at(native, aimx_binary()),
+        update_capacity: 1024,
+    });
     let started = std::time::Instant::now();
     let summary = host
         .create(SessionSpec {
@@ -156,7 +242,14 @@ async fn live_acp_claude_session_through_the_host() {
     let created = started.elapsed();
     let id = summary.meta.id.clone();
     let (_, mut updates) = host.attach(id.clone()).await.unwrap();
-    host.prompt(id.clone(), vec![Part::Text { text: "Read secret-word.txt and reply with only the word in it.".into() }]).await.unwrap();
+    host.prompt(
+        id.clone(),
+        vec![Part::Text {
+            text: "Use Read on probe.txt, then Edit to replace before with after. Read it again and reply with only the new word.".into(),
+        }],
+    )
+    .await
+    .unwrap();
     let mut got = Vec::new();
     loop {
         let update = tokio::time::timeout(Duration::from_secs(180), updates.next()).await.unwrap().unwrap();
@@ -176,10 +269,54 @@ async fn live_acp_claude_session_through_the_host() {
         "live acp: model {}, created in {created:?}, turn done at {turn:?}, {tools} tool call(s), reply {text:?}",
         summary.meta.model
     );
-    assert!(text.to_lowercase().contains("periwinkle"));
+    assert!(text.to_lowercase().contains("after"));
+    assert_eq!(std::fs::read_to_string(dir.join("probe.txt")).unwrap(), "after\n");
     assert_eq!(terminal, 1, "exactly one terminal event");
     assert!(tools >= 1 && tools == finished, "every started tool finished");
+    assert!(
+        got.iter()
+            .filter_map(|u| match u {
+                SessionUpdate::ToolStarted { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .all(|name| name.starts_with("mcp__aim__")),
+        "strict authority must report only aim MCP tools"
+    );
     assert!(got.iter().any(|u| matches!(u, SessionUpdate::TurnEnded { stop: StopReason::EndTurn })));
     host.close(id).await.unwrap();
     let _cleanup = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+#[ignore = "live: runs Claude Code through aim MCP and a private user-space sshd"]
+async fn live_acp_claude_ssh_remote_changed_local_untouched() {
+    let sshd = Sshd::start();
+    let remote = sshd.dir.path().join("remote_workspace");
+    let local = sshd.dir.path().join("local_workspace");
+    std::fs::create_dir(&remote).unwrap();
+    std::fs::create_dir(&local).unwrap();
+    std::fs::write(remote.join("task.sh"), "#!/bin/sh\nprintf before\n").unwrap();
+    std::fs::write(local.join("task.sh"), "local sentinel\n").unwrap();
+    let aim_home = sshd.dir.path().join("aim_home");
+    std::fs::create_dir(&aim_home).unwrap();
+    std::fs::set_permissions(&aim_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let started = std::time::Instant::now();
+    let output = tokio::time::timeout(Duration::from_secs(240), tokio::process::Command::new(env!("CARGO_BIN_EXE_aim"))
+        .arg("run")
+        .args(["-p", "acp:claude", "--ssh", "aim-acp-test", "--json", "--aimx"])
+        .arg(aimx_binary())
+        .arg("-C").arg(&remote)
+        .arg("In order, use Read on task.sh; Edit to replace 'before' with 'remote-ok' in task.sh; Glob to find '*.sh'; Grep for 'remote-ok' in task.sh; then Bash to run 'sh task.sh'. Reply with the command output.")
+        .env("AIM_SSH_CONFIG", &sshd.config)
+        .env("AIM_HOME", &aim_home)
+        .kill_on_drop(true)
+        .output()).await.unwrap().unwrap();
+    eprintln!("live_acp_ssh_turn_ms={}", started.elapsed().as_millis());
+    assert!(output.status.success(), "aim CLI exited with {}", output.status);
+    assert_eq!(std::fs::read_to_string(remote.join("task.sh")).unwrap(), "#!/bin/sh\nprintf remote-ok\n");
+    assert_eq!(std::fs::read_to_string(local.join("task.sh")).unwrap(), "local sentinel\n");
+    let events: Vec<Value> = String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+    let names: Vec<_> = events.iter().filter_map(|event| event.get("name").and_then(Value::as_str)).collect();
+    assert!(!names.is_empty() && names.iter().all(|name| name.starts_with("mcp__aim__")), "only aim MCP tools may execute");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("remote-ok"));
 }

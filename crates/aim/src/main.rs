@@ -48,7 +48,7 @@ enum LoginTarget {
 enum Command {
     /// Run one turn headlessly in a workspace.
     Run {
-        /// Provider: codex, openrouter, ai-gateway (acp:claude as it lands).
+        /// Provider: codex, openrouter, ai-gateway, acp:claude (strict) or acp:claude-native.
         #[arg(short, long, default_value = "codex")]
         provider: String,
         /// Model id (the provider's default when omitted).
