@@ -524,9 +524,9 @@ struct Live {
     transcript: Mutex<Vec<Item>>,
     updates: broadcast::Sender<SessionUpdate>,
     control: mpsc::UnboundedSender<Control>,
-    /// Set when a close is requested, before `Control::Close` is queued, so work settled before
-    /// the actor reads the close (a pending config change) is cancelled rather than awaited.
-    close_requested: AtomicBool,
+    /// Cancelled before `Control::Close` is queued, so a config change already in progress
+    /// cannot keep the actor from reading the close.
+    close_requested: CancellationToken,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -693,7 +693,7 @@ impl SessionHost {
             transcript: Mutex::new(transcript),
             updates,
             control,
-            close_requested: AtomicBool::new(false),
+            close_requested: CancellationToken::new(),
         });
         lock(&self.sessions).insert(meta.id.clone(), Arc::clone(&live));
         let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location, announced };
@@ -853,7 +853,7 @@ impl Actor {
                     // Changes asked for during the turn apply now, before any later control, and
                     // each has an outcome on the stream (ADR 0038).
                     if let Some((model, effort)) = pending_config.take() {
-                        let closing = closing || self.live.close_requested.load(Ordering::SeqCst);
+                        let closing = closing || self.live.close_requested.is_cancelled();
                         self.settle_pending(model, effort, closing).await;
                     }
                     if closing {
@@ -862,7 +862,7 @@ impl Actor {
                 }
                 Control::Cancel => {}
                 Control::SetConfig { model, effort, reply } => {
-                    let applied = self.apply_config(model, effort).await;
+                    let applied = self.apply_config_until_close(model, effort).await;
                     let _gone = reply.send(applied);
                 }
                 Control::Close => break,
@@ -882,13 +882,27 @@ impl Actor {
         let message = if closing || self.broken.is_some() {
             "cancelled: the session closed before the change could apply".to_owned()
         } else {
-            match self.apply_config(model.clone(), effort.clone()).await {
+            match self.apply_config_until_close(model.clone(), effort.clone()).await {
                 Ok(()) => return,
                 Err(ConfigFailure::Refused(message) | ConfigFailure::Store(message)) => message,
             }
         };
         tracing::info!(session = self.recorder.session(), %message, "a deferred config change was not applied");
         publish(&self.live, &mut self.recorder, &mut self.broken, SessionUpdate::ConfigRejected { model, effort, message }).await;
+    }
+
+    /// A close request wins over a backend that never answers a config change. The backend
+    /// future is dropped, so the actor can consume `Control::Close` and finish shutdown.
+    async fn apply_config_until_close(&mut self, model: Option<String>, effort: Option<String>) -> Result<(), ConfigFailure> {
+        let close = self.live.close_requested.clone();
+        if close.is_cancelled() {
+            return Err(ConfigFailure::Refused("cancelled: the session closed before the change could apply".to_owned()));
+        }
+        tokio::select! {
+            biased;
+            () = close.cancelled() => Err(ConfigFailure::Refused("cancelled: the session closed before the change could apply".to_owned())),
+            applied = self.apply_config(model, effort) => applied,
+        }
     }
 
     /// Applies a config change and announces what is now in force. After a refusal it asks the
@@ -1189,7 +1203,7 @@ impl SessionClient for SessionHost {
         let live = self.live(&session);
         Box::pin(async move {
             let live = live?;
-            live.close_requested.store(true, Ordering::SeqCst);
+            live.close_requested.cancel();
             live.control.send(Control::Close).map_err(|_| err(ErrorCode::Unavailable, "session closed"))
         })
     }

@@ -39,6 +39,7 @@ struct Scripted {
     models: Vec<ModelInfo>,
     /// Once set, the catalog never answers (a stalled provider).
     stall_catalog: AtomicBool,
+    catalog_started: Arc<tokio::sync::Notify>,
 }
 
 impl ModelProvider for Scripted {
@@ -48,7 +49,11 @@ impl ModelProvider for Scripted {
 
     fn catalog(&self) -> LlmFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
         if self.stall_catalog.load(Ordering::SeqCst) {
-            return Box::pin(std::future::pending());
+            let started = Arc::clone(&self.catalog_started);
+            return Box::pin(async move {
+                started.notify_one();
+                std::future::pending().await
+            });
         }
         let models = self.models.clone();
         Box::pin(async move { Ok(models) })
@@ -151,8 +156,13 @@ fn fixture_services_root(
     services: NativeServices,
     connected_root: Option<String>,
 ) -> Fixture {
-    let provider =
-        Arc::new(Scripted { responses: Mutex::new(script.into()), seen: Mutex::default(), models, stall_catalog: AtomicBool::new(false) });
+    let provider = Arc::new(Scripted {
+        responses: Mutex::new(script.into()),
+        seen: Mutex::default(),
+        models,
+        stall_catalog: AtomicBool::new(false),
+        catalog_started: Arc::new(tokio::sync::Notify::new()),
+    });
     let connects = Arc::new(AtomicUsize::new(0));
     let shutdowns = Arc::new(AtomicUsize::new(0));
     let (c, s) = (Arc::clone(&connects), Arc::clone(&shutdowns));
@@ -877,7 +887,20 @@ async fn a_pending_config_is_cancelled_when_the_session_closes() {
     // Applying the change would now wait on a provider that never answers (REV8-17).
     f.provider.stall_catalog.store(true, Ordering::SeqCst);
     f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("high".into()) }).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), f.provider.catalog_started.notified())
+        .await
+        .expect("deferred set_config entered the stalled backend");
+    // Queue another change while the actor is stalled; it must be refused after close is flagged.
+    let queued = f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("low".into()) });
+    tokio::pin!(queued);
+    tokio::select! {
+        result = &mut queued => panic!("queued config unexpectedly finished: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(10)) => {}
+    }
     f.host.close(id).await.unwrap();
+    let refused = tokio::time::timeout(Duration::from_secs(5), queued).await.expect("queued config answered").unwrap_err();
+    assert_eq!(refused.code, ErrorCode::InvalidParams);
+    assert!(refused.message.starts_with("cancelled"));
     let rest: Vec<SessionUpdate> =
         tokio::time::timeout(Duration::from_secs(5), updates.collect()).await.expect("the session closed promptly");
     assert!(

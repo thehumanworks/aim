@@ -13,7 +13,10 @@
 //!   [`crate::acp::with_acp`].
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+
+use tokio_util::sync::CancellationToken;
 
 use aim_llm::ModelProvider;
 use aim_llm_codex::CodexProvider;
@@ -133,49 +136,81 @@ type SearchParts = (Arc<crate::search::SearchEngine>, Arc<crate::store::SqliteSt
 const SEARCH_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long after a failed open the next session may retry it.
 const SEARCH_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+/// Includes the pinned model's bounded download on a cold cache.
+const SEARCH_OPEN_LEASE: std::time::Duration = std::time::Duration::from_mins(11);
+
+type SearchOpener = Arc<dyn Fn(PathBuf, CancellationToken) -> Result<SearchParts, String> + Send + Sync>;
 
 /// The process's search index: opened in the background (a first open may download the
 /// embedding model), never on a session's start path; a failed open is retried later.
-#[derive(Default)]
 struct SearchIndex {
     ready: tokio::sync::watch::Sender<Option<SearchParts>>,
     state: Mutex<SearchOpen>,
+    generation: AtomicU64,
+    database: PathBuf,
+    opener: SearchOpener,
+    opening_lease: std::time::Duration,
+    retry_after: std::time::Duration,
 }
 
 #[derive(Default)]
 enum SearchOpen {
     #[default]
     NotStarted,
-    Opening,
+    Opening {
+        generation: u64,
+        started: std::time::Instant,
+        cancel: CancellationToken,
+    },
     Open,
     Failed(std::time::Instant),
+}
+
+impl Default for SearchIndex {
+    fn default() -> Self {
+        Self {
+            ready: tokio::sync::watch::Sender::new(None),
+            state: Mutex::new(SearchOpen::NotStarted),
+            generation: AtomicU64::new(0),
+            database: crate::cli::aim_home().join("aim.db"),
+            opener: Arc::new(|database, cancel| {
+                let engine = crate::search::SearchEngine::open_with_cancel(&database, &cancel)?;
+                let store = crate::store::SqliteStore::open(&database).map_err(|e| e.to_string())?;
+                Ok((Arc::new(engine), Arc::new(store)))
+            }),
+            opening_lease: SEARCH_OPEN_LEASE,
+            retry_after: SEARCH_RETRY_AFTER,
+        }
+    }
 }
 
 impl SearchIndex {
     /// Starts opening the index unless it is open, opening, or failed too recently.
     fn ensure_opening(self: &Arc<Self>) {
-        {
+        let (generation, cancel) = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            match *state {
-                SearchOpen::Opening | SearchOpen::Open => return,
-                SearchOpen::Failed(at) if at.elapsed() < SEARCH_RETRY_AFTER => return,
-                SearchOpen::NotStarted | SearchOpen::Failed(_) => *state = SearchOpen::Opening,
+            match &*state {
+                SearchOpen::Opening { started, .. } if started.elapsed() < self.opening_lease => return,
+                SearchOpen::Opening { cancel, .. } => cancel.cancel(),
+                SearchOpen::Open => return,
+                SearchOpen::Failed(at) if at.elapsed() < self.retry_after => return,
+                SearchOpen::NotStarted | SearchOpen::Failed(_) => {}
             }
-        }
+            let generation = self.generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            let cancel = CancellationToken::new();
+            *state = SearchOpen::Opening { generation, started: std::time::Instant::now(), cancel: cancel.clone() };
+            (generation, cancel)
+        };
         let index = Arc::clone(self);
         tokio::spawn(async move {
-            let database = crate::cli::aim_home().join("aim.db");
-            let engine = {
-                let database = database.clone();
-                tokio::task::spawn_blocking(move || crate::search::SearchEngine::open(&database)).await
-            };
-            let opened = if let (Ok(Ok(engine)), Ok(store)) = (engine, crate::store::SqliteStore::open(&database)) {
-                Some((Arc::new(engine), Arc::new(store)))
-            } else {
-                None
-            };
+            let database = index.database.clone();
+            let opener = Arc::clone(&index.opener);
+            let result = tokio::task::spawn_blocking(move || opener(database, cancel)).await.ok().and_then(Result::ok);
             let mut state = index.state.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(parts) = opened {
+            if !matches!(&*state, SearchOpen::Opening { generation: current, .. } if *current == generation) {
+                return;
+            }
+            if let Some(parts) = result {
                 *state = SearchOpen::Open;
                 index.ready.send_replace(Some(parts));
             } else {
@@ -314,5 +349,160 @@ mod tests {
             board.call("board_list".to_owned(), serde_json::json!({}), IdempotencyKey::new("list")).await.expect("real board list");
         assert!(!listed.is_error);
         assert!(aim_home.join("aim.db").exists());
+    }
+}
+
+#[cfg(test)]
+mod search_index_tests {
+    use super::{SearchIndex, SearchOpen};
+    use std::fs::{self, OpenOptions};
+    use std::io::Read as _;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct LockChild(Child);
+
+    impl Drop for LockChild {
+        fn drop(&mut self) {
+            drop(self.0.kill());
+            drop(self.0.wait());
+        }
+    }
+
+    #[test]
+    fn child_holds_model_lock() {
+        let Ok(path) = std::env::var("AIM_LOCK_TEST_PATH") else { return };
+        let Ok(ready) = std::env::var("AIM_LOCK_TEST_READY") else { return };
+        let file = OpenOptions::new().create(true).truncate(false).write(true).open(path).expect("lock file");
+        file.lock().expect("child lock");
+        fs::write(ready, b"ready").expect("ready marker");
+        drop(std::io::stdin().read(&mut [0_u8; 1]));
+    }
+
+    #[tokio::test]
+    async fn held_model_lock_retries_and_recovers_without_restart() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        #[cfg(unix)]
+        fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("private state directory");
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).expect("models directory");
+        let lock_path = models.join("potion-retrieval-32M.lock");
+        let ready_path = dir.path().join("child-ready");
+        let child = Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "providers::search_index_tests::child_holds_model_lock", "--nocapture"])
+            .env("AIM_LOCK_TEST_PATH", &lock_path)
+            .env("AIM_LOCK_TEST_READY", &ready_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("lock holder process");
+        let mut child = LockChild(child);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child acquired the lock");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiting = tokio::task::spawn_blocking({
+            let home = dir.path().to_path_buf();
+            let cancel = cancel.clone();
+            move || crate::search::embedding::acquire_lock(&home, &cancel, Duration::from_secs(2))
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel.cancel();
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(500), waiting).await.expect("lock wait was cancellable").expect("lock task joined");
+        assert!(matches!(cancelled, Err(crate::search::embedding::ModelOpenError::Interrupted(_))));
+
+        let database = dir.path().join("aim.db");
+        let _store = crate::store::SqliteStore::open(&database).expect("initialize session tables");
+        let opener = Arc::new(|database: PathBuf, cancel| {
+            let home = database.parent().ok_or_else(|| "database has no parent".to_owned())?;
+            let _lock = crate::search::embedding::acquire_lock(home, &cancel, Duration::from_millis(80)).map_err(|e| e.to_string())?;
+            let engine = crate::search::SearchEngine::open_without_model(&database)?;
+            let store = crate::store::SqliteStore::open(&database).map_err(|e| e.to_string())?;
+            Ok((Arc::new(engine), Arc::new(store)))
+        });
+        let index = Arc::new(SearchIndex {
+            ready: tokio::sync::watch::Sender::new(None),
+            state: std::sync::Mutex::new(SearchOpen::NotStarted),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            database,
+            opener,
+            opening_lease: Duration::from_secs(1),
+            retry_after: Duration::from_millis(20),
+        });
+        index.ensure_opening();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(*index.state.lock().expect("state"), SearchOpen::Failed(_)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("held lock causes bounded failed opening");
+        drop(child.0.stdin.take());
+        child.0.wait().expect("lock holder exited");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        index.ensure_opening();
+        let mut ready = index.ready.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), ready.wait_for(Option::is_some))
+            .await
+            .expect("search recovered after lock release")
+            .expect("ready sender open");
+        assert!(matches!(*index.state.lock().expect("state"), SearchOpen::Open));
+    }
+
+    #[tokio::test]
+    async fn expired_opening_cannot_publish_a_stale_failure() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        #[cfg(unix)]
+        fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("private state directory");
+        let _store = crate::store::SqliteStore::open(&dir.path().join("aim.db")).expect("initialize session tables");
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&attempts);
+        let opener = Arc::new(move |database: PathBuf, _cancel| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(150));
+                return Err("first opening expired".to_owned());
+            }
+            let engine = crate::search::SearchEngine::open_without_model(&database)?;
+            let store = crate::store::SqliteStore::open(&database).map_err(|e| e.to_string())?;
+            Ok((Arc::new(engine), Arc::new(store)))
+        });
+        let index = Arc::new(SearchIndex {
+            ready: tokio::sync::watch::Sender::new(None),
+            state: std::sync::Mutex::new(SearchOpen::NotStarted),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            database: dir.path().join("aim.db"),
+            opener,
+            opening_lease: Duration::from_millis(30),
+            retry_after: Duration::from_millis(20),
+        });
+        index.ensure_opening();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while attempts.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("first opening started");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        index.ensure_opening();
+        let mut ready = index.ready.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), ready.wait_for(Option::is_some))
+            .await
+            .expect("second opening finished")
+            .expect("ready sender open");
+        tokio::time::sleep(Duration::from_millis(170)).await;
+        assert!(matches!(*index.state.lock().expect("state"), SearchOpen::Open));
+        assert!(index.ready.borrow().is_some());
     }
 }

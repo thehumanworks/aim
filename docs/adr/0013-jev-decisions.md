@@ -39,6 +39,9 @@ reliably verified in the present toolchain (research/verus.md, Â§F5, lines 421â€
 Jev can improve decisions without becoming a permission source or adding a model turn
 to the critical path. Its quality and cost still require empirical measurement; the
 proof establishes controller bounds, not that Jev chose a good model or effort.
+Dropping an advice waiter does not cancel a Jev request already running in `spawn_blocking`.
+That request may finish after a turn ends, under the client's 1.5-second HTTP timeout
+(with a 500 ms connection timeout and no retries); the async waiter has a 2-second deadline.
 
 ## Verification
 

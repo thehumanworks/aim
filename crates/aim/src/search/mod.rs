@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::{Connection, params};
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 
 pub mod chunk;
 pub mod embedding;
@@ -69,15 +70,18 @@ fn error(err: impl core::fmt::Display) -> String {
     err.to_string()
 }
 
-fn drain_with_retry(conn: &mut Connection) -> Result<(), String> {
+fn drain_with_retry(conn: &mut Connection, cancel: &CancellationToken) -> Result<(), String> {
     for _ in 0..20 {
-        match index::drain_pending(conn) {
+        if cancel.is_cancelled() {
+            return Err("search index open cancelled".to_owned());
+        }
+        match index::drain_pending_with_cancel(conn, cancel) {
             Ok(()) => return Ok(()),
             Err(err) if err.to_string().contains("database is locked") => std::thread::sleep(std::time::Duration::from_millis(50)),
             Err(err) => return Err(error(err)),
         }
     }
-    index::drain_pending(conn).map_err(error)
+    index::drain_pending_with_cancel(conn, cancel).map_err(error)
 }
 
 fn decode_vector(bytes: &[u8]) -> Vec<f32> {
@@ -168,17 +172,31 @@ impl SearchEngine {
     }
 
     fn open_inner(path: &Path, load_model: bool) -> Result<Self, String> {
+        Self::open_inner_with_cancel(path, load_model, &CancellationToken::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_without_model(path: &Path) -> Result<Self, String> {
+        Self::open_inner(path, false)
+    }
+
+    pub(crate) fn open_with_cancel(path: &Path, cancel: &CancellationToken) -> Result<Self, String> {
+        Self::open_inner_with_cancel(path, true, cancel)
+    }
+
+    fn open_inner_with_cancel(path: &Path, load_model: bool, cancel: &CancellationToken) -> Result<Self, String> {
         let mut conn = Connection::open(path).map_err(error)?;
         conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(error)?;
         index::migrate(&conn).map_err(error)?;
-        drain_with_retry(&mut conn)?;
+        drain_with_retry(&mut conn, cancel)?;
         let embedder = if load_model {
             let home = path.parent().ok_or("search database has no parent directory")?;
-            match index::ensure_model(home) {
+            match index::ensure_model_with_cancel(home, cancel) {
                 Ok(model) => {
                     index::backfill_vectors(&mut conn, &model).map_err(error)?;
                     Some(model)
                 }
+                Err(embedding::ModelOpenError::Interrupted(message)) => return Err(message.to_owned()),
                 Err(err) => {
                     tracing::warn!(%err, "embedding model unavailable; conversation search uses FTS5 until reindex");
                     None
@@ -234,7 +252,7 @@ impl SearchEngine {
             return Ok(Vec::new());
         }
         let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        drain_with_retry(&mut conn)?;
+        drain_with_retry(&mut conn, &CancellationToken::new())?;
         self.refresh_vectors(&conn)?;
         let lexical = {
             let words = fts_query(query);
