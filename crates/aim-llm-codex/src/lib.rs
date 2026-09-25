@@ -15,6 +15,8 @@ mod wire;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
+mod live;
+#[cfg(test)]
 mod offline;
 
 use std::sync::Arc;
