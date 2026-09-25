@@ -21,13 +21,15 @@ client still builds.
 
 | ID | Task | Status | Now | Next | Branch / worktree |
 |---|---|---|---|---|---|
-| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider | investigating | Reading the TUI completion broker and the provider catalogs | Design, then a worker | — |
-| T2 | `/clear` (and `/new`) clears the chat and starts fresh | investigating | Checking what `/new` does to the transcript | Fold into T1's worker (same files) | — |
-| T3 | Parallel tool execution end to end; tools not MCP-only | investigating | Findings in (log): native path concurrent; code-mode supervisor serializes cells; prompts do not push batching; ACP gets aimx MCP only | Design with T4 | — |
-| T4 | `AIM_CODE_MODE`: aim's MCP server (and sessions) in code mode; default decided by a benchmark | blocked | Findings in (log); overlaps unmerged FIX16 and W26 | Maintainer decision: build on main or after FIX16/W26; ACP code mode via `aim` relay or not | — |
-| T5 | ACP Claude: selecting Opus (and any model) works | investigating | Root cause found (log) | Verified alias resolver + surface advertised models + live test | — |
-| T6 | Verus proofs for the decision logic of T1–T5 | todo | — | One kernel module per decision | — |
-| T7 | Merge the worker branches, gates, push, PR | todo | — | — | — |
+| T0 | Base: merge FIX16 (`agent/claude/fix16-coderun`) and W26 (`agent/perf/tokens`) as-is (maintainer decision) | in progress | Merged (`eda6444`, `36f1bd8`); conflicts resolved in event.rs, session.rs, agent/mod.rs, agent/tools.rs, host.rs; clippy and xtask green | Workspace tests on the merged tree | integration branch |
+| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | todo | Brief written | Launch worker | `agent/claude/tui-options` · `../aim-wt/tui-options` |
+| T2 | `/clear` clears the chat and starts fresh | todo | Folded into T1 (same files) | — | with T1 |
+| T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | todo | Brief written | Launch worker | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
+| T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | todo | Brief written | Launch worker | `agent/claude/code-mode` · `../aim-wt/code-mode` |
+| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default | todo | Waits for T4a | — | — |
+| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | todo | Brief written | Launch worker | `agent/claude/acp-models` · `../aim-wt/acp-models` |
+| T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
+| T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
 
 ## Log
 
@@ -54,3 +56,11 @@ client still builds.
   (10 commits, ADR 0066, REV21 fixes pending) rewrites the supervisor (per-session cell queue);
   `agent/perf/tokens` (W26, ADR 0056) adds `DirectCodeTools`, the compact index and
   `AIM_BENCH_CODE_MODE`. Both are 16 commits behind `main`.
+- 2026-09-25 — Maintainer decisions for T4: build on top of FIX16 and W26 as-is (their pending review
+  fixes stay open and are noted in the PR); aim serves a code-mode MCP proxy in front of aimx for
+  `acp:claude`; "not MCP tools exclusively" means code mode is preferred over individual calls.
+- 2026-09-25 — `.claude/agents/aim-worker.md` needs a session restart to load (new directory), so
+  workers run as `general-purpose` on Opus; nesting is blocked by the PreToolUse hook
+  `.claude/hooks/no-nested-agents.py` (verified live: a sub-agent's Agent call was refused).
+- 2026-09-25 — FIX16's scheduler runs at most one cell per session by design (REV13a H1); in code
+  mode, parallelism is `Promise.all` inside a cell. Kept; the scheduler moves to the kernel (T3).
