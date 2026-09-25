@@ -347,6 +347,10 @@ request (its env, else the default). A session asking for `on` from a daemon who
 - **Resume:** a resumed session asks for its recorded mode, so the tool list, and the prompt cache
   that depends on it, stays the same. The guards apply again: a resumed session can show
   `code:off` if the worker is gone.
+- **The stored mode is what the session got, not what it asked for.** A session that asked for
+  `on` but fell back to `off` (no worker at creation) resumes `off` even after the worker is
+  installed. Start a new session to ask again. This keeps a session's tools stable for its whole
+  life.
 - **Switches:** `/new`, `/clear` and `/provider` carry the attached session's mode, or the client's
   setting when none is attached. `aim_kernel::switch::Shape.code_mode` carries it, and
   `switches_keep_place_and_privacy` now says it is kept.
