@@ -177,13 +177,35 @@ class LiveTaskTests(unittest.TestCase):
         self.assertTrue(graded("todo_table", "\n".join(rows)), "theta.go's row may precede eta.go's")
         self.assertFalse(graded("todo_table", "\n".join(rows).replace("| src/kappa.py | 5 |", "| src/kappa.py | 4 |")))
         self.assertFalse(graded("todo_table", "\n".join(row for row in rows if "zeta" not in row)), "files with none are listed")
+        # Formats a right answer may take: decoration, paths relative to src/, a total row.
+        decorated = [row.replace("| src/", "| `./src/").replace(" | ", "` | ", 1) if "src/" in row else row for row in rows]
+        self.assertTrue(graded("todo_table", "\n".join(decorated)), "\n".join(decorated))
+        self.assertTrue(graded("todo_table", "\n".join(rows).replace("| src/", "| ")), "names relative to src/")
+        self.assertTrue(graded("todo_table", "\n".join([*rows, "| **Total** | 18 | 10 |"])), "a total row names no file")
+        # REV-T4b B1: the right counts under a wrong path passed the basename match.
+        self.assertFalse(graded("todo_table", "\n".join(rows).replace("src/", "wrongdir/")), "wrong directory")
+        self.assertFalse(graded("todo_table", "\n".join(rows).replace("src/alpha.py", "wrongdir/alpha.py")))
+        self.assertFalse(graded("todo_table", "\n".join([*rows, "| src/omega.py | 0 | 0 |"])), "an extra file")
+        self.assertFalse(graded("todo_table", "\n".join([*rows, rows[2]])), "a file listed twice")
+        self.assertFalse(graded("todo_table", "| file | TODO | FIXME |\n" + "\n".join(f"{name}: {todo}, {fixme}" for name, (todo, fixme) in counts.items())),
+                         "the counts must be in the table")
 
         callers = [f"{path}:{line} {name}" for path, line, name in CALLS]
         self.assertTrue(graded("callers", "\n".join(callers)))
-        self.assertTrue(graded("callers", "\n".join(f"- `/tmp/x/work/{line}`" for line in callers)), "absolute paths are fine")
+        self.assertTrue(graded("callers", "# Callers of load_config\n\n" + "\n".join(f"- `{line}`" for line in callers)), "decoration")
+        self.assertTrue(graded("callers", "\n".join(callers).replace(" setup", " Worker.setup")), "a method with its class")
+        self.assertTrue(graded("callers", "\n".join(f"./{line}" for line in callers)))
         for extra in ("app/cli.py:2 main (import)", "app/legacy.py:5 old_loader", "app/helpers.py:2 describe"):
             self.assertFalse(graded("callers", "\n".join([*callers, extra])), extra)
         self.assertFalse(graded("callers", "\n".join(callers[1:])))
+        # REV-T4b B1: a wrong function name at a real call site passed, as long as the right name
+        # appeared somewhere on a line naming that site.
+        self.assertFalse(graded("callers", "\n".join(callers).replace("app/cli.py:6 main", "app/cli.py:6 start_server")))
+        self.assertFalse(graded("callers", "\n".join([*callers, "app/cli.py:6 reload"])), "a second name at a real site")
+        self.assertFalse(graded("callers", "\n".join(callers).replace("app/server.py:10 reload", "app/server.py:10 start_server reload")))
+        self.assertFalse(graded("callers", "\n".join(callers).replace(" setup", " Server.setup")), "the wrong class")
+        self.assertFalse(graded("callers", "\n".join(f"/tmp/x/work/{line}" for line in callers)), "paths relative to the root")
+        self.assertFalse(graded("callers", "\n".join(callers).replace("app/cli.py:6", "cli.py:6")), "paths relative to the root")
 
         index = [f"- {path}: {heading}" for path, heading in HEADINGS.items()]
         self.assertTrue(graded("doc_index", "\n".join(index)))
@@ -191,6 +213,15 @@ class LiveTaskTests(unittest.TestCase):
         self.assertFalse(graded("doc_index", "\n".join(index).replace("Installing the tool", "Setup notes")))
         self.assertFalse(graded("doc_index", "\n".join(index).replace(": Changelog", ":")), "the path alone is no heading")
         self.assertFalse(graded("doc_index", "\n".join([*index, "- docs/notes.txt: Not a Markdown file"])))
+        self.assertTrue(graded("doc_index", "# Index\n\n" + "\n".join(f"- `{path}`: **{heading}**" for path, heading in HEADINGS.items())))
+        self.assertTrue(graded("doc_index", "\n".join(f"- [{path}]({path}): {heading}" for path, heading in HEADINGS.items())), "links")
+        # REV-T4b B1: headings under wrong paths passed the substring match.
+        self.assertFalse(graded("doc_index", "\n".join(index).replace("docs/setup.md", "wrongdir/setup.md")), "wrong directory")
+        self.assertFalse(graded("doc_index", "\n".join(index).replace("docs/api/auth.md", "docs/auth.md")), "wrong subdirectory")
+        swapped = "\n".join(index).replace("Installing the tool", "@@").replace("Writing tests", "Installing the tool").replace("@@", "Writing tests")
+        self.assertFalse(graded("doc_index", swapped), "headings under each other's paths")
+        self.assertFalse(graded("doc_index", "\n".join(index).replace(": Changelog", ": Changelog and more")), "the exact heading")
+        self.assertFalse(graded("doc_index", "\n".join([*index, index[0]])), "a file listed twice")
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp) / "work"
             prepare("doc_index", workspace)

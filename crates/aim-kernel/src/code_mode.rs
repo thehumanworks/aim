@@ -25,9 +25,10 @@ pub enum Mode {
     Only,
 }
 
-/// The default (ADR 0076), decided by T4b's benchmark (`bench/plans/code-mode.md`): neither `On`
-/// nor `Only` met the pre-registered efficiency rule against `Off`, so code mode is opt-in.
-pub const DEFAULT_MODE: Mode = Mode::Off;
+/// The default (ADR 0076 §6): the maintainer's decision that code mode is the preferred default,
+/// taken knowing T4b's benchmark rule found no efficiency gain over `Off` (`bench/plans/code-mode.md`).
+/// `AIM_CODE_MODE=off` opts out.
+pub const DEFAULT_MODE: Mode = Mode::On;
 
 /// What `AIM_CODE_MODE` asks for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

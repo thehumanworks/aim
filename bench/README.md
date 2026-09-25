@@ -123,9 +123,9 @@ conservative price bound from its numeric token usage and the published model ra
 
 `mise run bench:wire` failed on the integration branch with 35 regressions. Every one is
 attributed below; none was hidden by a bound alone. The gate now compares against
-`results/t4b-main-baseline.json` (named by the manifest's `[wire] baseline`), recorded with the
-decided default code mode, `off`: first at `d211f6a`, and again at `7afcf10` once the code-mode
-prompt section followed the exposure. The manifest's aim bounds changed with it, so
+`results/t4b-main-baseline.json` (named by the manifest's `[wire] baseline`), recorded at each
+default T4b shipped: `off` at `d211f6a`, `off` without the code-mode prompt section at `7afcf10`,
+and `on`, the maintainer's decision (ADR 0076 §6), at `477cdef`. The manifest's aim bounds changed with it, so
 this is a new cohort. `results/w26-main-baseline.json` stays as W26's evidence.
 
 **Codex CLI and pi (26 regressions): the measurement, not the peers.** Their pinned binaries hash
@@ -138,8 +138,8 @@ new baseline equal W26's byte for byte. A gated run also refuses a caller's `AIM
 `AIM_BENCH_CODE_MODE`), which would otherwise change what the arm-less aim harness measures.
 
 **aim (9 regressions): W1 grew from 5,844 bytes (W26's recorded candidate, code mode `on`) to
-8,353 (default `off`), then fell to 8,112 when the code-mode prompt section became conditional.**
-At the fixed `/tmp` root:
+7,745 at today's default, `on`.** The default was `off` in between (8,353, then 8,112 once the
+code-mode prompt section became conditional). At the fixed `/tmp` root:
 
 | Change | Commit (ADR) | W1 bytes | Tools | Instruction chars |
 |---|---|---|---|---|
@@ -156,12 +156,14 @@ At the fixed `/tmp` root:
 | one more tool separator | | +1 | | |
 | **first T4b baseline** | `d211f6a` | **8,353** | **15** | **1,820** |
 | "# Code mode" section only with a code tool (`prompts/code_mode.md`) | `7afcf10` (0076 §3) | −241 | | −241 |
-| **current baseline** | `7afcf10` | **8,112** | **15** | **1,579** |
+| **second T4b baseline** | `7afcf10` | **8,112** | **15** | **1,579** |
+| default `on` (maintainer): `run_code` 1,378 and program tools 937, the compact set without the five hidden tools (−2,495) and its short descriptions (−427), one separator less (−1), and the code-mode section again (+241) | `477cdef` (0076 §6) | −367 | −1 | +241 |
+| **current baseline** | `477cdef` | **7,745** | **14** | **1,820** |
 
 W2's model-visible Bash output is 11,191 characters (ceiling 12,088, unchanged) and aim makes one
-auxiliary request, as in W26. The manifest's `aim_expected_tools` is now 15 and
-`aim_w1_max_bytes` 8,160: 48 bytes of room, so a new tool or prompt line needs an explicit
-manifest change. (It was 8,400 at `d211f6a`.) The rest of the gate (no request growth against the baseline, append-only
+auxiliary request, as in W26. The manifest's `aim_expected_tools` is now 14 and
+`aim_w1_max_bytes` 7,793: 48 bytes of room, so a new tool or prompt line needs an explicit
+manifest change. (They were 15 and 8,400 at `d211f6a`, 15 and 8,160 at `7afcf10`.) The rest of the gate (no request growth against the baseline, append-only
 prompts, identical repetitions) is unchanged.
 
 **Real costs this keeps visible**, measured here and left for follow-ups because they are outside
@@ -184,8 +186,8 @@ ends at 12,434 / 12,067 / 10,760 bytes.
 
 ## Code-mode cohort (T4b)
 
-`plans/code-mode.md` pre-registers the benchmark that sets aim's default `AIM_CODE_MODE`
-(ADR 0076): arms, tasks, metrics and the decision rule, whose margins live in the manifest's
+`plans/code-mode.md` pre-registers the benchmark whose rule judges aim's default `AIM_CODE_MODE`
+(ADR 0076; the maintainer made the final call, below): arms, tasks, metrics and the decision rule, whose margins live in the manifest's
 `[code_mode]`. It adds three scripting tasks to the live tier (`todo_table`, `callers`,
 `doc_index`; hidden report graders in `live_tasks.py`), so this manifest starts a new cohort.
 `acp_trials.py` runs `acp:claude` trials, whose model requests bypass the proxy, and
@@ -199,14 +201,55 @@ mise exec -- python3 -B bench/acp_trials.py --cases todo_table,callers,doc_index
 python3 -B bench/code_mode.py bench/history/code-mode-*.json
 ```
 
-### Results and decision
+### Cohort 2: exact-entry graders (the deciding cohort)
+
+The codex review of T4b (REV-T4b B1) found that cohort 1's scripting graders accepted wrong
+reports (right counts under `wrongdir/` paths, a wrong function name at a real call site, headings
+under wrong paths). The graders now read exact entries, and a dated amendment to
+`plans/code-mode.md` registered cohort 2 (`b31a152`; manifest `[code_mode] cohort = 2`) before any
+of its runs. Re-grading every kept cohort 1 report offline (27 primary scripting and 12 codex
+trials) changed no verdict (`results/t4b-cohort1-regrade.json`); `acp_claude` trials kept no
+reports, so their pass counts are the lenient graders'.
+
+Cohort 2 reran the primary protocol on `33d1205` (clean tree), three rotated repetitions:
+`results/t4b-code-mode-c2-openrouter-r{1,2,3}.json`. Besides the graders, its tree differs from
+cohort 1's in that the `off` arm no longer carries the "# Code mode" prompt section (`7afcf10`)
+and code cells bound failures and nested errors (REV-T4a-b); every arm sets `AIM_CODE_MODE`.
+`python3 -B bench/code_mode.py bench/results/t4b-code-mode-c2-openrouter-r{1,2,3}.json` reproduces:
+
+| Arm | Tasks | Pass | Requests | Direct calls | Nested calls | ITE/passed | $/passed | p50 wall s |
+|---|---|---|---|---|---|---|---|---|
+| `aim_openrouter@off` | scripting | 5/9 | 5.56 | 10.89 | 0 | 13,355 | 0.0061 | 8.1 |
+| `aim_openrouter@on` | scripting | 6/9 | 7.33 | 13.11 | 1.22 | 15,553 | 0.0070 | 12.4 |
+| `aim_openrouter@only` | scripting | 2/9 | 11.56 | 16.44 | 24.89 | 126,621 | 0.0544 | 33.5 |
+| `aim_openrouter@off` | existing | 18/18 | 6.78 | 6.17 | 0 | 5,633 | 0.0026 | 11.3 |
+| `aim_openrouter@on` | existing | 18/18 | 6.78 | 5.78 | 0 | 4,979 | 0.0024 | 12.0 |
+| `aim_openrouter@only` | existing | 14/18 | 15.50 | 17.78 | 7.17 | 22,000 | 0.0101 | 32.9 |
+| `aim_openrouter@off` | all nine | 23/27 | 6.37 | 7.74 | 0 | 7,312 | 0.0034 | 11.1 |
+| `aim_openrouter@on` | all nine | 24/27 | 6.96 | 8.22 | 0.41 | 7,622 | 0.0035 | 12.1 |
+| `aim_openrouter@only` | all nine | 16/27 | 14.19 | 17.33 | 13.07 | 35,077 | 0.0156 | 33.5 |
+
+Wilson 95% intervals of the pass rates: `off` [0.68, 0.94], `on` [0.72, 0.96], `only` [0.41, 0.75].
+
+**Verdict of the rule, unchanged: `off`.** `on` passes (a) (24/27 against 23/27) and (c) (12% less
+ITE on the existing tasks) but fails (b): on the scripting tasks it took 32% more requests and 17%
+more ITE per passed task than `off`. gpt-4.1-mini called `run_code` in 1 of 27 `on` runs. `only`
+fails all three: 7 fewer passes, 121 of its 321 `run_code` calls failed (56 `ReferenceError`s),
+147 calls went to the program tools, and 5 runs hit the request cap.
+
+**Shipped default: `on`, the maintainer's decision** (2026-09-25, ADR 0076 §6): "code mode should
+be the preferred default", taken with these numbers. `AIM_CODE_MODE=off` opts out. The rule's
+verdict stays on record; the benchmark is not re-run to fit the decision.
+
+### Cohort 1 results (lenient graders)
 
 Pre-registered at `7a788e5`; the smoke led to one grader fix (`6b1878f`: a report may sit in the
 directory its prompt names, since every arm wrote `docs/INDEX.md`). Results, with no model text:
 `results/t4b-code-mode-openrouter-r{1,2,3}.json` (primary), `t4b-code-mode-codex.json`,
 `t4b-code-mode-acp.json` (secondary), the smoke files, and `t4b-spend-ledger.json`.
 `python3 -B bench/code_mode.py bench/results/t4b-code-mode-{openrouter-r1,openrouter-r2,openrouter-r3,codex,acp}.json`
-reproduces the tables and the verdict.
+reproduces the tables and the verdict. Its scripting pass counts used the lenient graders; the
+offline re-grade above found no verdict among its kept reports that the exact graders change.
 
 Scripting tasks (`todo_table`, `callers`, `doc_index`); requests are model requests per trial,
 calls are per trial, ITE and USD are per passed task with failed runs in the numerator:
@@ -235,8 +278,8 @@ All nine OpenRouter tasks: `off` 23/27 passes, 7,367 ITE per passed task; `on` 2
 **Verdict of the rule: `off`.** `on` passes (a) and (c) (12% *less* ITE on the existing tasks)
 but fails (b): 16% more requests and 22% more ITE on the scripting tasks. `only` fails all three.
 The secondary cohorts do not meet the per-provider bar: codex and Claude took the same number of
-requests in `on` as in `off`, with 3–4% more ITE. aim's `DEFAULT_MODE` is now `Off` (ADR 0076
-§6).
+requests in `on` as in `off`, with 3–4% more ITE. (`DEFAULT_MODE` was `Off` from `d211f6a` until
+the maintainer's decision for `on`, `477cdef`.)
 
 What the runs show beyond the rule:
 
@@ -256,6 +299,9 @@ What the runs show beyond the rule:
   W2 output where a direct `Bash` shows 11,191: ADR 0056's model view does not apply to nested
   results (wire tier, `--harnesses aim_openrouter@only`).
 
-Spend: $0.5275 of the $3 OpenRouter budget across six invocations (three smoke, three primary;
-provider-reported, no transport errors), 12 of 12 codex subscription runs, 13 of 16 Claude
-subscription runs. `~/.codex/auth.json` hashed `7315f3c9…91b0` before and after the codex runs.
+Spend: $0.9395 of the $3 OpenRouter budget across nine invocations: cohort 1 $0.5275 (three
+smoke, three primary), cohort 2 $0.4120 (three primary); provider-reported, no transport errors.
+12 of 12 codex subscription runs and 13 of 16 Claude subscription runs, all in cohort 1.
+`~/.codex/auth.json` hashed `7315f3c9…91b0` before and after the codex runs, and still does.
+Smoke 2 and 3 ran `--keep-outputs` and the report-location fix from the working tree before
+`6b1878f` committed them; results now record `source_dirty` (`t4b-spend-ledger.json`).

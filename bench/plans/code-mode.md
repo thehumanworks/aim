@@ -113,3 +113,55 @@ is recorded as a follow-up with the evidence.
 - A tweak re-runs every arm it affects with the full primary protocol, and the decision uses only
   the post-tweak runs of those arms. Earlier runs stay in `bench/results/` and in the report.
 - Tasks, graders, arms and margins do not change after the smoke.
+
+## Amendment, 2026-09-25: cohort 2 with exact-entry graders
+
+Registered after cohort 1's results and before any cohort 2 run. Cohort 1 is the set of results
+listed in `bench/README.md` ("Results and decision", `t4b-code-mode-*.json`).
+
+**Why.** The codex review of T4b (REV-T4b B1) found that the three scripting graders accepted wrong
+reports, because they matched basenames or substrings instead of whole entries: `todo_table`
+accepted the right counts under `wrongdir/` paths, `callers` accepted a wrong function name on a
+line naming a real call site, and `doc_index` accepted headings under wrong paths. This plan's
+last rule bars grader changes after the smoke, so the fix starts a new cohort instead of
+amending cohort 1.
+
+**The fix.** Each hidden test now reads its report as exact entries and requires every entry to be
+right, with none missing, extra or listed twice:
+
+- `todo_table`: the table's rows by column (`TODO`, `FIXME` from the header); each file named as
+  `src/NAME` (or `NAME`, relative to the `src/` the prompt names); a row that names no file, such
+  as a total, is ignored.
+- `callers`: each line with a `path:line` must be exactly `path:line function_name` with the path
+  relative to the repository root, as the prompt says; the method may be named `Worker.setup`.
+  The set of entries must equal the five calls.
+- `doc_index`: each bullet must be `path: heading`, the path relative to the root or to `docs/`,
+  and the heading equal to the first heading (ignoring case and Markdown decoration).
+
+Markdown decoration (bullets, backticks, bold, links, table pipes) is ignored, so the fix only
+rejects wrong answers. `test_scripting_graders_accept_a_right_report_and_reject_near_misses`
+reproduces the three false passes and shows they now fail.
+
+**Cohort 1 re-graded offline.** Every kept cohort 1 report (the 27 primary scripting trials and the
+12 codex trials; `run.py --keep-outputs`) was re-graded with the fixed graders: no verdict
+changed. `acp_claude` trials kept no reports, so their pass counts stay those of the lenient
+graders; their request, call and ITE numbers do not depend on grading.
+
+**What cohort 2 runs.** The primary protocol again, unchanged: `aim_openrouter@off|on|only`, all
+nine tasks, three repetitions, one `bench/run.py live` invocation per repetition with the same
+arm-order rotation, and `--keep-outputs`. No smoke. The secondary cohorts are not rerun: their
+subscription caps are spent (codex 12/12, Claude 13/16 against 12 needed).
+
+**What else differs from cohort 1.** Cohort 2 measures the current tree, which differs from cohort
+1's (`6b1878f`) beyond the graders; every difference is recorded here so none is mistaken for an
+effect of code mode:
+
+- `7afcf10`: the `off` arm no longer carries the 241-byte "# Code mode" prompt section.
+- The integration head's REV-T4a-b residuals (`3f4ee26`, `0c0a55c`, `ded3ab0`): code cells bound
+  a script's failure and nested errors like their output, with a 25-token floor.
+- `d211f6a` changed aim's default to `off`; every arm sets `AIM_CODE_MODE` explicitly, so this
+  does not change what an arm runs.
+
+**The decision** is recomputed with `bench/code_mode.py` from cohort 2's primary results alone, by
+the same rule and margins. Arms, tasks, prompts, metrics and margins are unchanged; the
+manifest's `[code_mode] cohort` names the cohort.
