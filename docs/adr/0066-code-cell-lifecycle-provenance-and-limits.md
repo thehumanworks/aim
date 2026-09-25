@@ -56,6 +56,13 @@ References are to `codex-rs/core/src/tools/code_mode/mod.rs` in the reference cl
   (`aim-proto/tests/contract.rs`).
 - **Idempotency keys.** A nested call's key is `<cell UUIDv7>:<n>`. It keeps the mint time that
   FIX4's dedup horizon parses (`aimx::dedup::minted_ms`); the old `code:` prefix hid it.
+- **Holding the turn's events.** A cell holds its turn's event sender **weakly**. The session
+  drains a turn's event channel to its end before it goes idle (`host.rs`, `Actor::run_turn`), so
+  a strong sender held by a running cell would keep that turn from ever ending. This was found
+  while wiring the change, and `a_session_ends_its_turn_while_a_cell_runs_…` times out without it.
+- **Grandchildren.** A nested call runs inside a `ToolCallContext` of its own, so a host it calls
+  (a subagent) names it as parent. That context's sender feeds a small relay, which holds the
+  turn's sender weakly; the relay ends with the call.
 
 ### 2. Lifetime: a cell runs only while a live turn observes it
 
@@ -66,8 +73,10 @@ References are to `codex-rs/core/src/tools/code_mode/mod.rs` in the reference cl
   code tool host handle. `host.rs` also closes code mode explicitly, and waits at most 2 s for the
   cells to go before it shuts the workspace down. A cell can never keep the harness alive.
 - **Normal turn end.** Cells survive a turn that ends normally, as in Codex. A nested call from a
-  cell whose turn is over (its event channel is closed) is held, not dispatched, until a later
-  `exec` or `wait` rebinds the cell. So no nested call ever runs unobserved.
+  cell whose turn is over is held, not dispatched, until a later `wait` on the cell rebinds
+  it. A turn is over when its weakly held sender cannot be upgraded, or nobody reads its events.
+  So no nested call ever runs unobserved. Unlike Codex, which dispatches held calls in whichever
+  turn comes next, aim resumes a held cell only when the model waits on it again.
 - **Direct callers.** Callers outside the agent loop (tests, embedders) have no context. Their
   nested calls run without events.
 
@@ -77,7 +86,8 @@ References are to `codex-rs/core/src/tools/code_mode/mod.rs` in the reference cl
   deadline starts at admission, so time spent queued counts against it.
 - **`run_code`.** It waits at most 10 s for the running slot, then returns `LimitExceeded` with the
   running cell and the queue length. It returns at once if the queue is full.
-- **`exec`.** With a full queue it is refused at once. Otherwise it returns its cell id as usual.
+- **`exec`.** With a full queue it is refused at once. Otherwise it returns its cell id as usual; a
+  queued cell's response also says how many cells are ahead of it.
 - **Termination.**
   - `wait {terminate}` ends exactly the named cell.
   - A queued cell leaves the queue and never runs.
@@ -122,9 +132,17 @@ processes' arguments. No temp directory is granted, because the worker writes no
 
 Project programs live in `.agents/programs/<slug>/` as plain files. They are read and written
 through the session's workspace, so aimx's scope, protected paths and deduplication apply. There
-is no nested Git repository: the project's own version control tracks them. User programs stay a
-local Git repository under `~/.aim/programs`, as ADR 0018 decided. Trust remains content-addressed
-outside both.
+is no nested Git repository: the project's own version control tracks them.
+- **Writing needs `Write`.** A session whose tools lack the workspace's `Write` cannot save a
+  project program.
+- **Remote workspaces** now have project programs too.
+- **Language changes.** Changing a program's language leaves the old source file in place. Loading
+  follows the manifest, so the file is inert, but it is not deleted: no workspace tool deletes files.
+- **aim's MCP service** reads project programs from its working directory and refuses to save
+  them, because it has no workspace.
+
+User programs stay a local Git repository under `~/.aim/programs`, as ADR 0018 decided. Trust
+remains content-addressed outside both.
 
 ## Consequences
 
@@ -154,5 +172,10 @@ outside both.
   - M9: busy.
 - **ADR 0018's named tests.** `coderun_nested_call_uses_dispatcher`,
   `coderun_timeout_and_crash_isolation`, `codex_exec_wait_contract`, `program_grants_only_narrow`.
-- **Live.** `crates/aim/tests/coderun_live.rs` (OpenRouter: a `run_code` turn with child events;
-  codex: `exec`/`wait` with `terminate`).
+- **The whole session path.** `a_session_ends_its_turn_while_a_cell_runs_and_closes_it_with_the_session`
+  drives a real `SessionHost` with a scripted Codex-style model.
+- **Live.** `crates/aim/tests/coderun_live.rs`:
+  - `live_openrouter_two_tools_one_cell`: a `run_code` turn whose two nested calls arrive as
+    children of the `run_code` call;
+  - `live_codex_exec_wait_terminate`: codex execs a never-ending cell, then terminates it with
+    `wait`.
