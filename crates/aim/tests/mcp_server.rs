@@ -153,6 +153,31 @@ async fn cancellation_drops_a_call_without_blocking_other_calls() {
     server.await.expect("server task").expect("server shutdown");
 }
 
+/// Codex review B2: a client that closes its input shuts the server down; a call still running
+/// gets a short grace, then is dropped, instead of holding the server until its deadline.
+#[tokio::test]
+async fn closing_the_input_ends_pending_calls_after_a_short_grace() {
+    let host = Arc::new(FakeHost::default());
+    let (mut client, server) = connection(AimMcpServer::new(Arc::<FakeHost>::clone(&host)).with_eof_grace(Duration::from_millis(100)));
+    send(&mut client, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hang"}})).await;
+    tokio::time::timeout(Duration::from_secs(2), host.started.notified()).await.expect("call started");
+    client.get_mut().shutdown().await.expect("close the client's input");
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), server).await.expect("the server returns").expect("server task").expect("clean end");
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_call_that_finishes_within_the_grace_still_replies() {
+    let host = Arc::new(FakeHost::default());
+    let (mut client, server) = connection(AimMcpServer::new(host));
+    send(&mut client, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"value":"piped"}}})).await;
+    client.get_mut().shutdown().await.expect("close the client's input");
+    let response = reply(&mut client).await;
+    assert_eq!(response["result"]["content"][0]["text"], "piped", "a piped one-shot call still gets its answer");
+    server.await.expect("server task").expect("clean end");
+}
+
 #[tokio::test]
 async fn timed_out_calls_return_tool_errors() {
     let host = Arc::new(FakeHost::default());

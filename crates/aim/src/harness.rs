@@ -32,6 +32,9 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::tools::{BoxFuture, ToolHost};
 
 const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
+/// How long a local aimx gets, once its connection closes, to release (kill) its processes and
+/// exit before it is killed itself.
+const CHILD_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 const HTTP_BRIDGE_CAPACITY: usize = 128;
 
 fn validate_network_url(raw: &str, cleartext: &str, encrypted: &str) -> Result<(), ProtoError> {
@@ -592,7 +595,10 @@ impl HarnessClient {
     /// Ends the connection and stops a spawned harness.
     pub async fn shutdown(mut self) {
         self.peer.close();
+        // aimx kills a closed connection's processes, then exits; killing it first would orphan
+        // a shell it started (codex review B2), so it is killed only if it does not exit in time.
         if let Some(mut child) = self.child.take()
+            && tokio::time::timeout(CHILD_EXIT_GRACE, child.wait()).await.is_err()
             && let Err(err) = child.kill().await
         {
             tracing::debug!(%err, "harness child already exited");

@@ -23,6 +23,9 @@ const PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_CALLS: usize = 32;
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long calls still running when the client closes its input may finish and reply before they
+/// are dropped (codex review B2): a client that closed its input has shut the server down.
+const EOF_GRACE: Duration = Duration::from_secs(2);
 /// A code tool's calls may run a cell to its longest deadline; this adds a margin for admission
 /// and the worker's start (ADR 0076).
 const CELL_CALL_TIMEOUT: Duration = Duration::from_millis(crate::coderun::MAX_TIMEOUT_MS + 30_000);
@@ -34,19 +37,27 @@ type Pending = Pin<Box<dyn Future<Output = (String, Option<Value>)> + Send>>;
 pub struct AimMcpServer {
     host: Arc<dyn ToolHost>,
     call_timeout: Duration,
+    eof_grace: Duration,
 }
 
 impl AimMcpServer {
     /// Creates an MCP adapter around the host's current tool catalog.
     #[must_use]
     pub fn new(host: Arc<dyn ToolHost>) -> Self {
-        Self { host, call_timeout: CALL_TIMEOUT }
+        Self { host, call_timeout: CALL_TIMEOUT, eof_grace: EOF_GRACE }
     }
 
     /// Sets the maximum time spent waiting for one tool call.
     #[must_use]
     pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
         self.call_timeout = timeout;
+        self
+    }
+
+    /// Sets how long pending calls may still reply after the client closes its input.
+    #[must_use]
+    pub fn with_eof_grace(mut self, grace: Duration) -> Self {
+        self.eof_grace = grace;
         self
     }
 
@@ -60,7 +71,9 @@ impl AimMcpServer {
     ///
     /// Requests may complete out of order. At most 32 calls run concurrently; each call has a
     /// 60-second default deadline (a code tool's, 330 s). `notifications/cancelled` drops the
-    /// corresponding call future.
+    /// corresponding call future. When the client closes its input, calls still running get two
+    /// seconds to reply; then they are dropped and this returns, so a disconnected client never
+    /// keeps the server (or what its calls hold, such as a cell or a shell) alive.
     ///
     /// # Errors
     /// Returns an I/O error when the transport fails or an inbound frame exceeds 16 MiB.
@@ -75,11 +88,18 @@ impl AimMcpServer {
         let mut active = HashMap::<String, AbortHandle>::new();
         let connection_id = uuid::Uuid::new_v4().to_string();
         let mut eof = false;
+        let mut closing: Option<tokio::time::Instant> = None;
 
         loop {
             if eof && pending.is_empty() {
                 return Ok(());
             }
+            let grace_over = async {
+                match closing {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 biased;
                 completion = pending.next(), if !pending.is_empty() => {
@@ -103,8 +123,18 @@ impl AimMcpServer {
                                 write_reply(&mut writer, &reply).await?;
                             }
                         }
-                        None => eof = true,
+                        None => {
+                            eof = true;
+                            closing = Some(tokio::time::Instant::now() + self.eof_grace);
+                        }
                     }
+                }
+                () = grace_over => {
+                    // Nobody will read these replies: end the calls (dropping `pending` drops them).
+                    for handle in active.values() {
+                        handle.abort();
+                    }
+                    return Ok(());
                 }
             }
         }

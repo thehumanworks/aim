@@ -118,6 +118,14 @@ impl Relay {
         reply.get("result").cloned().unwrap_or(Value::Null)
     }
 
+    /// Sends a request without waiting for its reply.
+    async fn start(&mut self, method: &str, params: Value) {
+        self.next += 1;
+        let mut bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":self.next,"method":method,"params":params})).expect("request");
+        bytes.push(b'\n');
+        self.stdin.write_all(&bytes).await.expect("send");
+    }
+
     async fn tools(&mut self) -> Vec<String> {
         self.request("initialize", json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0"}}))
             .await;
@@ -166,6 +174,69 @@ text(first(a) + " | " + first(b));"#;
     let direct = only.request("tools/call", json!({"name":"Read","arguments":{"file_path":"a.txt"}})).await;
     assert_eq!(direct["isError"], true, "only: a workspace tool is not callable directly: {direct}");
     only.close().await;
+}
+
+/// Every process below `root`, from `ps` (pid → parent).
+fn descendants(root: u32) -> Vec<u32> {
+    let listing = std::process::Command::new("ps").args(["-A", "-o", "pid=,ppid="]).output().expect("ps");
+    let pairs: Vec<(u32, u32)> = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(str::parse::<u32>);
+            Some((fields.next()?.ok()?, fields.next()?.ok()?))
+        })
+        .collect();
+    let mut found = vec![root];
+    let mut index = 0;
+    while let Some(&parent) = found.get(index) {
+        found.extend(pairs.iter().filter(|(_, ppid)| *ppid == parent).map(|(pid, _)| *pid));
+        index += 1;
+    }
+    found.remove(0);
+    found
+}
+
+fn alive(pid: u32) -> bool {
+    // A zombie waiting for its reaper has ended; `ps` shows it as `Z`.
+    let state = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().expect("ps");
+    let state = String::from_utf8_lossy(&state.stdout);
+    !state.trim().is_empty() && !state.trim().starts_with('Z')
+}
+
+/// Codex review B2: when the client closes the relay's input during a long call, the relay ends
+/// the call, its cells and its aimx (with the shell aimx started) within a few seconds, instead
+/// of living until the call's 630 s deadline.
+#[tokio::test]
+async fn closing_the_relay_s_input_ends_a_pending_call_and_its_processes() {
+    assert!(sibling("aimx").exists(), "build aimx first (`cargo build -p aimx`)");
+    let root = tempfile::tempdir().expect("workspace");
+    let mut relay = Relay::spawn(root.path(), Mode::On);
+    relay.tools().await;
+    relay.start("tools/call", json!({"name":"Bash","arguments":{"command":"sleep 30 && touch survived"}})).await;
+    let pid = relay.child.id().expect("relay pid");
+    let mut below = Vec::new();
+    for _ in 0..100 {
+        below = descendants(pid);
+        if below.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(below.len() >= 2, "aimx and the shell run below the relay: {below:?}");
+    let started = std::time::Instant::now();
+    drop(relay.stdin);
+    let status = tokio::time::timeout(Duration::from_secs(10), relay.child.wait()).await.expect("the relay exits").expect("status");
+    assert!(status.success(), "{status}");
+    assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+    for _ in 0..100 {
+        if below.iter().all(|pid| !alive(*pid)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let left: Vec<u32> = below.iter().copied().filter(|pid| alive(*pid)).collect();
+    assert!(left.is_empty(), "processes outlived the relay: {left:?}");
+    assert!(!root.path().join("survived").exists());
 }
 
 /// A small repository with four TODO comments (and a FIXME that is not one).
