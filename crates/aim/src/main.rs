@@ -1,5 +1,6 @@
 //! `aim` — the agent layer's binary.
 //!
+//! - `aim` (or `aim tui`) — chat in the terminal (milestone M3).
 //! - `aim run [PROMPT]` — one headless turn in the current workspace (milestone M2a).
 //! - `aim sessions` — recent sessions.
 //! - `aim daemon` — serve local sessions over `aim-daemon/1`.
@@ -23,10 +24,12 @@ use clap::{Parser, Subcommand};
 
 /// aim — Agent I am.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about, args_conflicts_with_subcommands = true)]
 struct Args {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+    #[command(flatten)]
+    tui: aim::tui::TuiArgs,
 }
 
 #[derive(Subcommand)]
@@ -108,6 +111,8 @@ enum Command {
         #[command(subcommand)]
         target: LoginTarget,
     },
+    /// Chat in the terminal (the default without a subcommand).
+    Tui(aim::tui::TuiArgs),
     /// List recent sessions.
     Sessions {
         /// How many.
@@ -175,8 +180,38 @@ async fn transcribe_cli(wav: &PathBuf) -> Result<i32, String> {
     Ok(0)
 }
 
+/// The TUI. Persistent sessions live in the daemon (auto-started), so they outlive the terminal
+/// and can be re-attached; `--ephemeral` (or an explicit `--aimx`) runs an in-process host.
+async fn tui(args: aim::tui::TuiArgs) -> Result<i32, String> {
+    #[cfg(feature = "test-support")]
+    if let Some(script) = &args.script {
+        return aim::tui::script::run(script, &args).await;
+    }
+    let mut options = args.options()?;
+    if !args.ephemeral && args.aimx.is_none() {
+        match aim::daemon::spawn::connect_or_spawn(&cli::aim_home()).await {
+            Ok(daemon) => {
+                // The session keeps running in the daemon when the TUI exits.
+                options.close_on_exit = false;
+                return aim::tui::run(Arc::new(daemon), options).await;
+            }
+            Err(e) => eprintln!("aim: the daemon is unavailable ({}); running in process", e.message),
+        }
+    }
+    let store: Arc<dyn SessionStore> = if args.ephemeral {
+        Arc::new(aim::store::MemoryStore::default())
+    } else {
+        Arc::new(SqliteStore::open(&cli::aim_home().join("aim.db")).map_err(|e| e.to_string())?)
+    };
+    let backends = aim::providers::backends(cli::find_aimx(args.aimx.as_deref()), args.max_requests);
+    let host = SessionHost::new(HostConfig { store, backends, update_capacity: 4096 });
+    aim::tui::run(Arc::new(host), options).await
+}
+
 async fn main_async(args: Args) -> Result<i32, String> {
-    match args.command {
+    let Some(command) = args.command else { return tui(args.tui).await };
+    match command {
+        Command::Tui(tui_args) => tui(tui_args).await,
         Command::Run { provider: p, model, effort, cwd, ssh, aimx, ephemeral, json, max_requests, prompt } => {
             let prompt = read_prompt(&prompt)?;
             if prompt.trim().is_empty() {

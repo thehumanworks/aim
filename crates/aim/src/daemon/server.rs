@@ -272,18 +272,31 @@ impl Drop for SocketFiles {
     }
 }
 
-fn prepare(home: &Path, socket: &Path) -> Result<(UnixListener, SocketFiles), ProtoError> {
-    let run = home.join("run");
-    fs::create_dir_all(&run).map_err(|e| io_error("creating daemon run directory", &e))?;
-    let metadata = fs::metadata(&run).map_err(|e| io_error("inspecting daemon run directory", &e))?;
+/// Creates (if needed) and verifies a private directory: a real directory (not a symlink), owned
+/// by this user, mode 0700.
+fn private_dir(dir: &Path) -> Result<(), ProtoError> {
+    fs::create_dir_all(dir).map_err(|e| io_error("creating daemon run directory", &e))?;
+    let metadata = fs::symlink_metadata(dir).map_err(|e| io_error("inspecting daemon run directory", &e))?;
     if !metadata.is_dir() || metadata.uid() != nix::unistd::Uid::current().as_raw() {
         return Err(error(ErrorCode::Denied, "daemon run directory has the wrong owner or type"));
     }
     if metadata.permissions().mode() & 0o077 != 0 {
-        fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).map_err(|e| io_error("securing daemon run directory", &e))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| io_error("securing daemon run directory", &e))?;
     }
-    if fs::metadata(&run).map_err(|e| io_error("verifying daemon run directory", &e))?.permissions().mode() & 0o077 != 0 {
+    if fs::symlink_metadata(dir).map_err(|e| io_error("verifying daemon run directory", &e))?.permissions().mode() & 0o077 != 0 {
         return Err(error(ErrorCode::Denied, "daemon run directory is too permissive"));
+    }
+    Ok(())
+}
+
+fn prepare(home: &Path, socket: &Path) -> Result<(UnixListener, SocketFiles), ProtoError> {
+    let run = home.join("run");
+    private_dir(&run)?;
+    // A long home puts the socket in a short per-user directory (see `socket_path`).
+    if let Some(parent) = socket.parent()
+        && parent != run
+    {
+        private_dir(parent)?;
     }
     let lock_path = run.join("daemon.lock");
     let lock_file = OpenOptions::new()

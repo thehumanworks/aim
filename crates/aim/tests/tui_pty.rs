@@ -1,0 +1,274 @@
+//! The TUI in a real pseudo-terminal (docs/adr/0015 Verification): the actual `aim` binary in
+//! `--script` mode (a scripted provider and a fake workspace), its output parsed by `vt100`.
+
+mod tui_support;
+
+use std::time::Duration;
+
+use serde_json::json;
+use tui_support::{Start, Tui, text};
+
+fn numbered(n: usize) -> String {
+    (1..=n).map(|i| format!("line {i:02} of the answer")).collect::<Vec<_>>().join("\n\n")
+}
+
+fn count(rows: &[String], needle: &str) -> usize {
+    rows.iter().filter(|r| r.contains(needle)).count()
+}
+
+/// Finished chat lands in native scrollback in order, exactly once, below what the terminal
+/// showed before aim started; streaming, a resize mid-stream, a popup and an overlay leave no
+/// residue in it.
+#[test]
+fn inline_scrollback_preserved() {
+    let script = json!({"responses": [[{"kind": "reasoning", "text": "Planning the answer."}, text(&numbered(40), 40, 15)]]});
+    let before = ["$ echo before", "before-1", "before-2"];
+    let tui = Tui::start(&script, &Start { before: &before, ..Start::default() });
+    tui.wait_for("idle");
+    tui.type_text("hello there");
+    tui.send("\r");
+    tui.wait_for("running");
+    std::thread::sleep(Duration::from_millis(150));
+    tui.resize(24, 100);
+    std::thread::sleep(Duration::from_millis(150));
+    tui.resize(24, 60);
+    tui.wait("the turn to end", Duration::from_secs(15), |s| s.contains("idle") && !s.contains("running"));
+    // A completion popup, then an overlay on the alternate screen.
+    tui.send("@");
+    tui.wait_for("src/");
+    tui.send("\x1b");
+    tui.send("\x15");
+    tui.send("/sessions\r");
+    tui.wait("the picker", Duration::from_secs(10), |s| s.contains("type to filter"));
+    tui.send("\x1b");
+    tui.wait("the inline view", Duration::from_secs(10), |s| s.contains("idle") && !s.contains("type to filter"));
+    let rows = tui.quit();
+
+    let first = rows.iter().position(|r| r == "before-1").expect("pre-existing output kept");
+    assert_eq!(rows.get(first + 1).map(String::as_str), Some("before-2"));
+    let prompt = rows.iter().position(|r| r.starts_with("› hello there")).expect("the prompt echoed");
+    assert!(prompt > first);
+    assert_eq!(count(&rows, "› hello there"), 1);
+    let mut last = prompt;
+    for i in 1..=40 {
+        let needle = format!("line {i:02} of the answer");
+        assert_eq!(count(&rows, &needle), 1, "{needle} appears exactly once:\n{}", rows.join("\n"));
+        let at = rows.iter().position(|r| r.contains(&needle)).unwrap();
+        assert!(at > last, "{needle} in order");
+        last = at;
+    }
+    assert_eq!(count(&rows, "Planning the answer."), 1);
+    for residue in ["running", "ask anything", "type to filter", "scripted-model"] {
+        assert_eq!(count(&rows, residue), 0, "no `{residue}` left in scrollback:\n{}", rows.join("\n"));
+    }
+}
+
+/// The session picker borrows the alternate screen and gives the inline view back unchanged.
+#[test]
+fn overlay_restores_inline() {
+    let script = json!({"responses": [[text("A short **answer**.", 1, 0)]]});
+    let tui = Tui::start(&script, &Start { before: &["$ aim"], ..Start::default() });
+    tui.wait_for("idle");
+    tui.type_text("first question");
+    tui.send("\r");
+    tui.wait_for("A short answer.");
+    tui.wait_for("idle");
+    std::thread::sleep(Duration::from_millis(100));
+    let inline = tui.rows();
+    tui.type_text("/sessions");
+    tui.send("\r");
+    tui.wait("the picker", Duration::from_secs(10), |s| s.contains("type to filter"));
+    assert!(tui.alternate(), "the picker is on the alternate screen");
+    tui.wait_for("1 turns  ");
+    tui.send("\x1b");
+    tui.wait("the inline view", Duration::from_secs(10), |s| !s.contains("type to filter"));
+    assert!(!tui.alternate());
+    tui.wait("the same screen", Duration::from_secs(5), |_| tui.rows() == inline);
+    assert!(inline.iter().any(|r| r.starts_with("› first question")), "{inline:?}");
+    tui.quit();
+}
+
+/// Fullscreen renders the same transcript rows the inline view printed into scrollback.
+#[test]
+fn fullscreen_transcript_parity() {
+    let answer = "## Result\n\n- one `code`\n- two\n\n> quoted\n\n```rust\nfn x() {}\n```\n\nDone.";
+    let script = json!({"responses": [
+        [{"kind": "call", "name": "echo", "arguments": {"text": "tool output\nsecond line"}}],
+        [{"kind": "reasoning", "text": "Thinking **briefly**."}, text(answer, 3, 10)]
+    ]});
+    let tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    tui.type_text("show me");
+    tui.send("\r");
+    tui.wait_for("Done.");
+    tui.wait("idle", Duration::from_secs(10), |s| s.contains("idle"));
+    std::thread::sleep(Duration::from_millis(100));
+    let inline: Vec<String> = {
+        let rows = tui.history();
+        let from = rows.iter().position(|r| r.starts_with("› show me")).unwrap();
+        let to = rows.iter().rposition(|r| r.contains("Done.")).unwrap();
+        rows[from..=to].to_vec()
+    };
+    tui.send("/fullscreen\r");
+    tui.wait("fullscreen", Duration::from_secs(10), |_| tui.alternate());
+    std::thread::sleep(Duration::from_millis(150));
+    let full: Vec<String> = {
+        let rows = tui.rows();
+        let from = rows.iter().position(|r| r.starts_with("› show me")).unwrap();
+        let to = rows.iter().rposition(|r| r.contains("Done.")).unwrap();
+        rows[from..=to].to_vec()
+    };
+    assert_eq!(full, inline, "fullscreen shows the rows scrollback holds");
+    assert!(inline.iter().any(|r| r.starts_with("⏺ echo tool output")), "{inline:?}");
+    tui.send("/fullscreen\r");
+    tui.wait("inline again", Duration::from_secs(10), |_| !tui.alternate());
+    tui.quit();
+}
+
+/// A slow completion for an old query never replaces the popup of the newer one, even when the
+/// broker lets it finish (only the app's generation fence stands in the way).
+#[test]
+fn completion_stale_result_fenced() {
+    let script = json!({"responses": [], "completion_delays": [{"query": "s", "ms": 1200}], "keep_superseded": true});
+    let tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    tui.send("@s");
+    std::thread::sleep(Duration::from_millis(50));
+    tui.send("rc/m");
+    tui.wait_for("src/main.rs");
+    std::thread::sleep(Duration::from_millis(1600));
+    let screen = tui.screen();
+    assert!(screen.contains("src/main.rs"), "{screen}");
+    assert!(!screen.contains("docs/guide.md"), "the stale `@s` answer was fenced:\n{screen}");
+    tui.send("\t");
+    tui.wait_for("› @src/main.rs");
+    tui.quit();
+}
+
+/// Typing while a tool runs steers the turn: a queued chip, then the text in the transcript, and an
+/// empty composer afterwards.
+#[test]
+fn steering_while_a_tool_runs() {
+    let script = json!({"responses": [
+        [{"kind": "call", "name": "echo", "arguments": {"text": "slow", "delay_ms": 1200}}],
+        [text("Steered answer.", 1, 0)]
+    ]});
+    let tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    tui.type_text("start");
+    tui.send("\r");
+    tui.wait_for("running…");
+    tui.type_text("also this");
+    tui.send("\r");
+    tui.wait_for("⧗ queued also this");
+    tui.wait("the turn to end", Duration::from_secs(15), |s| s.contains("Steered answer.") && s.contains("idle"));
+    let rows = tui.quit();
+    let tool = rows.iter().position(|r| r.starts_with("⏺ echo")).unwrap();
+    let steer = rows.iter().position(|r| r == "› also this").unwrap();
+    let answer = rows.iter().position(|r| r == "Steered answer.").unwrap();
+    assert!(tool < steer && steer < answer, "{rows:?}");
+    assert_eq!(count(&rows, "also this"), 1, "the chip left no trace in scrollback");
+}
+
+/// A large bracketed paste collapses into a chip in the composer and is sent in full.
+#[test]
+fn a_large_paste_is_a_chip_and_sends_in_full() {
+    let script = json!({"responses": [[text("Got it.", 1, 0)]]});
+    let tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    let pasted: Vec<String> = (1..=15).map(|n| format!("pasted row {n}")).collect();
+    tui.type_text("see: ");
+    tui.send(&format!("\x1b[200~{}\x1b[201~", pasted.join("\r\n")));
+    tui.wait_for("› see: [pasted 15 lines]");
+    tui.send("\r");
+    tui.wait_for("Got it.");
+    let rows = tui.quit();
+    assert!(rows.iter().any(|r| r == "› see: pasted row 1"), "{rows:?}");
+    assert!(rows.iter().any(|r| r == "  pasted row 15"), "every pasted row was sent and echoed");
+}
+
+/// Prompts are kept in `AIM_HOME/history` and come back with Up after a restart; ephemeral runs
+/// neither read nor write it.
+#[test]
+fn history_survives_a_restart_unless_ephemeral() {
+    let home = std::env::temp_dir().join(format!("aim-tui-history-{}", std::process::id()));
+    let _fresh = std::fs::remove_dir_all(&home);
+    let home_env = home.to_string_lossy().into_owned();
+    let script = json!({"responses": [[text("ok", 1, 0)]]});
+    let env = [("AIM_HOME", home_env.as_str())];
+    let tui = Tui::start(&script, &Start { env: &env, ..Start::default() });
+    tui.wait_for("idle");
+    tui.type_text("remember me");
+    tui.send("\r");
+    tui.wait_for("ok");
+    tui.quit();
+    assert_eq!(std::fs::read_to_string(home.join("history")).unwrap(), "remember me\n");
+
+    let tui = Tui::start(&script, &Start { env: &env, ..Start::default() });
+    tui.wait_for("idle");
+    tui.send("\x1b[A");
+    tui.wait_for("› remember me");
+    tui.quit();
+
+    let tui = Tui::start(&script, &Start { env: &env, args: &["--ephemeral"], ..Start::default() });
+    tui.wait_for("idle");
+    tui.send("\x1b[A");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!tui.screen().contains("› remember me"), "ephemeral runs do not read history");
+    tui.type_text("secret");
+    tui.send("\r");
+    tui.wait_for("ok");
+    tui.quit();
+    assert_eq!(std::fs::read_to_string(home.join("history")).unwrap(), "remember me\n", "nor write it");
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+/// Ctrl+C cancels a running turn; the partial answer stays, marked interrupted.
+#[test]
+fn ctrl_c_cancels_the_running_turn() {
+    let long = (0..400).fold(String::new(), |mut text, i| {
+        text.push_str("word");
+        text.push_str(&i.to_string());
+        text.push(' ');
+        text
+    });
+    let script = json!({"responses": [[text(&long, 400, 10)]]});
+    let tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    tui.type_text("talk");
+    tui.send("\r");
+    tui.wait_for("word20");
+    tui.send("\x03");
+    tui.wait("the cancel", Duration::from_secs(10), |s| s.contains("· cancelled") && s.contains("idle"));
+    let rows = tui.quit();
+    assert!(rows.iter().any(|r| r == "(interrupted)"), "{rows:?}");
+    assert!(!rows.iter().any(|r| r.contains("word399")), "the stream stopped");
+}
+
+/// SIGTERM ends the TUI through its normal exit: the block is erased and the transcript stays.
+#[test]
+fn sigterm_restores_the_terminal() {
+    let script = json!({"responses": [[text("Before the signal.", 1, 0)]]});
+    let mut tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    tui.type_text("hi");
+    tui.send("\r");
+    tui.wait_for("Before the signal.");
+    tui.wait_for("idle");
+    let pid = tui.pid().unwrap();
+    let killed = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().unwrap();
+    assert!(killed.success());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = tui.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "aim did not exit on SIGTERM");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.exit_code(), 143);
+    std::thread::sleep(Duration::from_millis(50));
+    let rows = tui.history();
+    assert!(rows.iter().any(|r| r == "Before the signal."), "{rows:?}");
+    assert!(!rows.iter().any(|r| r.contains("ask anything") || r.contains("idle ·")), "the block is gone: {rows:?}");
+}
