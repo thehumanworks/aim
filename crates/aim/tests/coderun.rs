@@ -113,6 +113,127 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+// Codex review B1 (ADR 0076): a script's failure is bounded like its output.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_huge_script_error_stays_within_run_code_s_budget() {
+    let (_, host) = host(CodeMode::RunCode);
+    let error = host
+        .call("run_code".into(), json!({"code": "throw new Error('x'.repeat(1_000_000));"}), IdempotencyKey::new("huge"))
+        .await
+        .expect_err("the script throws");
+    assert!(error.message.len() <= 40_000, "{} bytes", error.message.len());
+    assert!(
+        error.message.starts_with("Warning: truncated output") && error.message.contains("bytes truncated"),
+        "{}",
+        error.message.chars().take(200).collect::<String>()
+    );
+    assert!(error.message.contains("the script threw Error: xxx"), "the head names the failure");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_huge_exec_error_stays_within_the_response_budget() {
+    let (_, first) = host(CodeMode::Codex);
+    let started = exec(&first, "// @exec: {\"yield_time_ms\": 10}\ntext('before'); throw new Error('y'.repeat(1_000_000));").await;
+    // The cell may fail before the first answer, or be waited for.
+    let error = match started {
+        Err(error) => error,
+        Ok(output) => {
+            wait(&first, &cell_id(&output), json!({"yield_time_ms": 5000, "max_tokens": 1000})).await.expect_err("the cell fails")
+        }
+    };
+    assert!(error.message.len() <= 40_000, "{} bytes", error.message.len());
+    assert!(error.message.contains("bytes truncated"), "{}", error.message.chars().take(200).collect::<String>());
+    let (_, fresh) = host(CodeMode::Codex);
+    let started =
+        exec(&fresh, "// @exec: {\"yield_time_ms\": 5000, \"max_output_tokens\": 500}\nthrow new Error('z'.repeat(1_000_000));").await;
+    let error = started.expect_err("the cell fails within its first answer");
+    assert!(error.message.len() <= 2_000, "max_output_tokens bounds the failure too: {} bytes", error.message.len());
+    assert!(error.message.contains("bytes truncated"), "{error:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zero_token_exec_response_still_fits_its_truncation_notice() {
+    let (_, host) = host(CodeMode::Codex);
+    let first =
+        exec(&host, "// @exec: {\"yield_time_ms\": 5000, \"max_output_tokens\": 0}\ntext('a'.repeat(1000));").await.expect("the cell runs");
+    assert!(first.len() <= 100, "{} bytes: {first}", first.len());
+    assert!(first.contains("bytes truncated"), "{first}");
+    let running = exec(&host, "// @exec: {\"yield_time_ms\": 1}\nawait new Promise(r => setTimeout(r, 300)); text('b'.repeat(1000));")
+        .await
+        .expect("the cell runs");
+    if running.contains("Script running") {
+        let waited = wait(&host, &cell_id(&running), json!({"yield_time_ms": 5000, "max_tokens": 0})).await.expect("the cell finishes");
+        assert!(waited.len() <= 100 && waited.contains("bytes truncated"), "{} bytes: {waited}", waited.len());
+    }
+}
+
+/// Tools whose every call fails with a megabyte-long message.
+struct FailsHugely;
+
+impl ToolHost for FailsHugely {
+    fn specs(&self) -> Vec<ToolSpec> {
+        ["fail_hugely", "Write"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.to_owned(),
+                description: "Fails.".into(),
+                input_schema: json!({"type":"object","properties":{}}),
+                input: ToolInput::Json,
+                annotations: ToolAnnotations::default(),
+            })
+            .collect()
+    }
+
+    fn call(&self, _name: String, _arguments: Value, _key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
+        Box::pin(async { Err(ProtoError::new(ErrorCode::Unavailable, "e".repeat(1_000_000))) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_huge_nested_failure_is_recorded_within_the_cell_budget() {
+    let host = CodeToolHost::new(Arc::new(FailsHugely) as Arc<dyn ToolHost>, worker(), "test-session", CodeMode::RunCode);
+    let (turn, mut events) = context("call-run-code");
+    let code = "try { await tools.fail_hugely({}); } catch (e) { text('caught'); }";
+    let result = turn.scope(host.call("run_code".into(), json!({"code": code}), IdempotencyKey::new("k"))).await.expect("the cell runs");
+    assert_eq!(result_text(&result).trim(), "caught");
+    let mut recorded = None;
+    while let Ok(update) = events.try_recv() {
+        if let SessionUpdate::ToolFinished { name, result, parent: Some(_), .. } = update
+            && name == "fail_hugely"
+        {
+            recorded = Some(result);
+        }
+    }
+    let recorded = recorded.expect("the nested call finished as a child event");
+    let text = result_text(&recorded);
+    assert!(recorded.is_error && text.len() <= 64_000 && text.contains("bytes truncated"), "{} bytes", text.len());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_huge_project_write_failure_is_bounded() {
+    use aim::programs::project::ProjectPrograms;
+    use aim::resources::files::Files;
+
+    let user = tempfile::tempdir().expect("temporary user programs");
+    let tools: Arc<dyn ToolHost> = Arc::new(FailsHugely);
+    let files: Arc<dyn Files> = Arc::new(aim::resources::MemoryFiles::new(Vec::<(&str, String)>::new()));
+    let code = CodeToolHost::new(Arc::clone(&tools), worker(), "test-session", CodeMode::RunCode);
+    let host = ProgramToolHost::new(code, Arc::new(ProgramStore::new(user.path().join("programs"))))
+        .with_project(ProjectPrograms::new(files, tools));
+    let source = "export default async function main() { return 1; }";
+    let error = host
+        .call(
+            "save_program".into(),
+            json!({"scope":"project","slug":"big","manifest":manifest(&[]),"source":source}),
+            IdempotencyKey::new("save"),
+        )
+        .await
+        .expect_err("the workspace refuses the write");
+    assert!(error.message.len() <= 40_000, "{} bytes", error.message.len());
+    assert!(error.message.contains("bytes truncated"), "{}", error.message.chars().take(200).collect::<String>());
+}
+
 // ADR 0018's named tests.
 
 #[tokio::test]

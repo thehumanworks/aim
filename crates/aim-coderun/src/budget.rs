@@ -141,8 +141,7 @@ impl OutputBudget {
 /// (`codex-rs/core/src/tools/code_mode/mod.rs`, `truncate_code_mode_result`).
 ///
 /// Text within the budget is returned unchanged. Otherwise the result is at most `max_bytes`
-/// long, unless the budget is smaller than the warning and marker themselves; then only those
-/// are returned.
+/// long, always: a budget too small for the warning and marker gets a shorter notice, cut to fit.
 #[must_use]
 pub fn truncate_middle(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
@@ -151,6 +150,10 @@ pub fn truncate_middle(text: &str, max_bytes: usize) -> String {
     let warning = format!("Warning: truncated output (original length: {} bytes)\n", text.len());
     // The marker's length depends on how many bytes it names; the whole length bounds it.
     let longest_marker = format!("\n…{} bytes truncated…\n", text.len()).len();
+    if max_bytes < warning.len().saturating_add(longest_marker) {
+        let short = format!("[output truncated: {} bytes]", text.len());
+        return short.get(..short.floor_char_boundary(max_bytes)).unwrap_or_default().to_owned();
+    }
     let room = max_bytes.saturating_sub(warning.len()).saturating_sub(longest_marker);
     let head = text.floor_char_boundary(room / 2);
     let tail = text.ceil_char_boundary(text.len().saturating_sub(room.saturating_sub(head)));
@@ -264,5 +267,11 @@ mod tests {
         assert_eq!(truncate_middle("short", 200), "short");
         let multibyte = "é".repeat(100);
         assert!(truncate_middle(&multibyte, 120).contains("bytes truncated"));
+        // Codex re-check B1: however small the budget, the result stays within it.
+        for max in 0..120 {
+            assert!(truncate_middle(&text, max).len() <= max, "budget {max}");
+            assert!(truncate_middle(&multibyte, max).len() <= max, "budget {max}");
+        }
+        assert_eq!(truncate_middle(&text, 30), "[output truncated: 1000 bytes]");
     }
 }

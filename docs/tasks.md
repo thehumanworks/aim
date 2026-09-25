@@ -22,12 +22,12 @@ client still builds.
 | ID | Task | Status | Now | Next | Branch / worktree |
 |---|---|---|---|---|---|
 | T0 | Base: merge FIX16 (`agent/claude/fix16-coderun`) and W26 (`agent/perf/tokens`) as-is (maintainer decision) | done | Merged (`eda6444`, `36f1bd8`); conflicts resolved in event.rs, session.rs, agent/mod.rs, agent/tools.rs, host.rs; clippy, xtask and 963/963 tests green | — | integration branch |
-| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | review | Merged (`84bbbc4`); kernel `switch`; live completion checked on codex, openrouter, acp:claude; follow-ups running (effort case-fold, `auto` only where supported, stale model on reattach); codex REV-T1 running | Merge follow-ups and review fixes | `agent/claude/tui-options` · `../aim-wt/tui-options` |
-| T2 | `/clear` clears the chat and starts fresh | review | Merged with T1 (transcript, inline rows, row cache, screen + scrollback best effort, new session) | With T1 | with T1 |
+| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | done | Merged incl. follow-ups, REV-T1 and REV-T1b fixes (`147a5a9`); codex REV-T1c: MERGE | — | `agent/claude/tui-options` · `../aim-wt/tui-options` |
+| T2 | `/clear` clears the chat and starts fresh | done | Merged with T1 (transcript, inline rows, row cache, screen + scrollback best effort, new session) | With T1 | with T1 |
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
-| T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | in progress | Worker running | Review its report, merge, then T4b | `agent/claude/code-mode` · `../aim-wt/code-mode` |
-| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | todo | Waits for T4a | Wire gate: 31 regressions on the merged base + 4 from T3's prompt | — |
-| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | review | Merged incl. REV-T5 fixes (`c4a1b35`, merge `1deaa65`); kernel conflict rule proved; live re-run green; codex re-check running | Close on re-check verdict | `agent/claude/acp-models` · `../aim-wt/acp-models` |
+| T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | done | Merged incl. REV-T4a and REV-T4a-b fixes (`e569a5e`) | Residual in ADR 0076: aimx needs a SIGTERM handler (orphan shells if it ignores close) | `agent/claude/code-mode` · `../aim-wt/code-mode` |
+| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | in progress | Worker running (budget: OpenRouter ≤ $3, codex ≤ 12, acp:claude ≤ 16 runs) | Merge; decision into ADR 0076 | `agent/claude/code-mode-bench` · `../aim-wt/code-mode-bench` |
+| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | done | Merged incl. REV-T5 fixes (`c4a1b35`); codex re-check: MERGE | Follow-up (not in this batch): adapter resets mode/effort on model switch | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
 | T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
 
@@ -106,3 +106,37 @@ client still builds.
   generations/families refuse (kernel `Conflict`, 3 new theorems), errors never echo the request,
   one classification rule, variant spellings declared by the claude profile. Merged tree with T1:
   clippy clean, aim-acp+kernel 101/101, aim lib 277/277. Codex re-check started.
+- 2026-09-25 — T4a done (`6c65e75`, merged `58f857e`). Kernel `code_mode`; `AIM_CODE_MODE` in native
+  sessions, `aim mcp` (code tools 330 s timeout) and a hidden `aim code-mcp` relay for strict
+  acp:claude (harness protocol to aimx, local or SSH). Request bytes W1: on 7,650 (+947),
+  off 8,258, only 4,903. Live: gpt-4.1-mini in `on` ignored run_code; in `only` used it (2–16
+  requests, answers right after worker fixes); Claude used run_code in `on` and `only`, also
+  over SSH. Merged tree (T1+T3+T4a+T5): clippy clean, xtask ok, Verus 353 verified, 0 errors.
+- 2026-09-25 — Codex REV-T4a started; T4b launched (wire gate repair + pre-registered code-mode
+  benchmark + default decision).
+- 2026-09-25 — Codex REV-T4a (auth.json hash unchanged): MERGE AFTER FIXES. No ceiling-widening path
+  found; kernel matches ADR 0076 (254 verified on branch). B1: script error messages bypass the
+  cell output budget (runtime.rs:239, cells.rs:100). B2: on client EOF the relay waits for
+  pending calls (server.rs:79, proxy.rs:118), so aimx/ssh children can outlive the client by up
+  to 630 s. N1: an invalid AIM_CODE_MODE silently selects the default; `aim run` shows no
+  warning. Sent back to the T4a worker.
+- 2026-09-25 — T1 follow-ups + REV-T1 fixes merged (`d3a31a0`): case-folded choices, `auto_effort`,
+  generation-fenced option publishing, pinned candidate order, live summary model. Merged tree:
+  clippy clean; aim lib 286/286, host 30/30, acp_bridge 5/5. Codex re-check of T1 started.
+- 2026-09-25 — Codex REV-T1b (re-check; auth.json unchanged): B1 and N1 confirmed fixed (323
+  verified). New B2: `announce` broadcasts ConfigChanged before updating the summary's model
+  (host.rs:1045/1050), so a concurrent attach can pair the old model with the new ladder. Sent
+  back to the T1 worker.
+- 2026-09-25 — REV-T1b B2 fixed (`147a5a9`, merged): publish() updates the summary and broadcasts ConfigChanged under the transcript lock; deterministic + stress tests. Branch Verus 358 verified.
+- 2026-09-25 — REV-T4a fixes merged (`8c8ea26`): errors bounded at worker, parent and exec/wait;
+  `aim mcp` and the relay end pending calls 2 s after client EOF (relay test: aimx, bash and sleep
+  gone, no `survived` file); harness close lets aimx reap first; invalid AIM_CODE_MODE = off,
+  reported once on stderr, proved. Branch: 256 verified; 593 tests passed. Codex re-check started.
+- 2026-09-25 — Codex REV-T5b (re-check; auth.json unchanged): VERDICT MERGE — B1–B5 fixed, theorems meaningful, 277 verified. (First attempt hung on an open stdin; rerun with `< /dev/null`.)
+- 2026-09-25 — Codex REV-T4a-b (re-check; auth.json unchanged): main B1/B2/N1 paths closed (256
+  verified), residual gaps: exec/wait accept a zero-token limit smaller than the truncation note;
+  run_program/save_program workspace errors and nested observer events are not cut; a reply write
+  can block forever if the client stops reading; if aimx ignores close its shells can be orphaned;
+  the invalid-value warning echoes the whole env value. Sent back to the T4a worker.
+- 2026-09-25 — Codex REV-T1c (final re-check; auth.json unchanged): VERDICT MERGE. Note: the unit test's 50 ms wait makes its detection timing-dependent (the stress test backs it).
+- 2026-09-25 — REV-T4a-b residuals fixed (`e569a5e`, merged): 100-byte exec/wait floor, program + nested errors cut, MCP replies via bounded writer (test fails on the old server), env value not echoed. Residual documented: `aimx serve --stdio` has no SIGTERM handler.

@@ -1,7 +1,7 @@
 //! Code mode's exposure (ADR 0076): which tools a model is offered when code mode is off, on, or
 //! the only way to act.
 //!
-//! The shell parses `AIM_CODE_MODE` (an unset or invalid value is `None`) and learns whether the
+//! The shell parses `AIM_CODE_MODE` into a [`CodeModeRequest`] and learns whether the
 //! `aim-coderun` worker was found, whether this platform can sandbox it, and whether the session's
 //! tool ceiling permits `run_code`. [`decide`] turns those facts into an [`Exposure`]: the effective
 //! mode, whether the code and program tools are offered, which direct tools stay visible, and why
@@ -28,6 +28,17 @@ pub enum Mode {
 /// The default (ADR 0076), decided by T4b's benchmark (`bench/plans/code-mode.md`): neither `On`
 /// nor `Only` met the pre-registered efficiency rule against `Off`, so code mode is opt-in.
 pub const DEFAULT_MODE: Mode = Mode::Off;
+
+/// What `AIM_CODE_MODE` asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CodeModeRequest {
+    /// Not set: the default applies.
+    Unset,
+    /// Set to a value that names no mode: code mode is off (it fails closed).
+    Invalid,
+    /// Set to a mode.
+    Set(Mode),
+}
 
 /// Why a requested code mode fell back to `Off`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,11 +77,13 @@ pub struct Exposure {
     pub fallback: Option<Fallback>,
 }
 
-/// DRAFT(ADR-0076): an unset or invalid request means the default.
-pub open spec fn wanted_mode(requested: Option<Mode>, default: Mode) -> Mode {
+/// DRAFT(ADR-0076): an unset request means the default, and an invalid one means `Off`: a value
+/// that names no mode never enables code mode.
+pub open spec fn wanted_mode(requested: CodeModeRequest, default: Mode) -> Mode {
     match requested {
-        Some(mode) => mode,
-        None => default,
+        CodeModeRequest::Unset => default,
+        CodeModeRequest::Invalid => Mode::Off,
+        CodeModeRequest::Set(mode) => mode,
     }
 }
 
@@ -118,7 +131,7 @@ pub open spec fn mode_exposure(mode: Mode, fallback: Option<Fallback>) -> Exposu
 /// DRAFT(ADR-0076): the wanted mode applies when nothing blocks code mode; otherwise the session
 /// falls back to `Off`, and says why unless `Off` was what it wanted.
 pub open spec fn code_mode_decision(
-    requested: Option<Mode>,
+    requested: CodeModeRequest,
     default: Mode,
     worker: bool,
     platform: bool,
@@ -158,7 +171,7 @@ pub open spec fn direct_view(direct: Direct, hidden: Seq<u64>, tools: Seq<u64>) 
 /// Decides code mode's exposure: total, and exactly [`code_mode_decision`].
 #[must_use]
 pub fn decide(
-    requested: Option<Mode>,
+    requested: CodeModeRequest,
     default: Mode,
     worker: bool,
     platform: bool,
@@ -168,8 +181,9 @@ pub fn decide(
         out == code_mode_decision(requested, default, worker, platform, permitted),
 {
     let mode = match requested {
-        Some(mode) => mode,
-        None => default,
+        CodeModeRequest::Unset => default,
+        CodeModeRequest::Invalid => Mode::Off,
+        CodeModeRequest::Set(mode) => mode,
     };
     let fallback = if !platform {
         Some(Fallback::PlatformUnsupported)
@@ -313,7 +327,7 @@ proof fn lemma_direct_filter_none(s: Seq<u64>, pred: spec_fn(u64) -> bool)
     }
 }
 
-/// An unset or invalid request is exactly a request for the default.
+/// An unset request is exactly a request for the default.
 pub proof fn theorem_unset_means_default(
     default: Mode,
     worker: bool,
@@ -321,8 +335,9 @@ pub proof fn theorem_unset_means_default(
     permitted: bool,
 )
     ensures
-        code_mode_decision(None, default, worker, platform, permitted) == code_mode_decision(
-            Some(default),
+        code_mode_decision(CodeModeRequest::Unset, default, worker, platform, permitted)
+            == code_mode_decision(
+            CodeModeRequest::Set(default),
             default,
             worker,
             platform,
@@ -331,10 +346,19 @@ pub proof fn theorem_unset_means_default(
 {
 }
 
+/// An invalid request fails closed: no code or program tools and every direct tool, whatever the
+/// default, and it is not reported as a fallback (the shell warns about the value itself).
+pub proof fn theorem_invalid_means_off(default: Mode, worker: bool, platform: bool, permitted: bool)
+    ensures
+        code_mode_decision(CodeModeRequest::Invalid, default, worker, platform, permitted)
+            == mode_exposure(Mode::Off, None),
+{
+}
+
 /// Code and program tools are offered only when the worker was found, the platform sandboxes
 /// it, and the session's ceiling permits `run_code`.
 pub proof fn theorem_code_needs_worker_platform_and_permission(
-    requested: Option<Mode>,
+    requested: CodeModeRequest,
     default: Mode,
     worker: bool,
     platform: bool,
@@ -352,7 +376,7 @@ pub proof fn theorem_code_needs_worker_platform_and_permission(
 /// offered no code or program tools and keeps its full direct set, whatever was requested
 /// (so `Only` never applies to it).
 pub proof fn theorem_never_widens_a_ceiling(
-    requested: Option<Mode>,
+    requested: CodeModeRequest,
     default: Mode,
     worker: bool,
     platform: bool,
@@ -367,7 +391,7 @@ pub proof fn theorem_never_widens_a_ceiling(
 
 /// `Off` offers no code or program tools, and every direct tool.
 pub proof fn theorem_off_offers_no_code(
-    requested: Option<Mode>,
+    requested: CodeModeRequest,
     default: Mode,
     worker: bool,
     platform: bool,
@@ -396,7 +420,7 @@ pub proof fn theorem_off_offers_no_code(
 /// tool is offered. A request for `Only` that cannot run falls back to `Off` with every direct
 /// tool and names what blocked it.
 pub proof fn theorem_only_is_never_empty(
-    requested: Option<Mode>,
+    requested: CodeModeRequest,
     default: Mode,
     worker: bool,
     platform: bool,
@@ -419,7 +443,7 @@ pub proof fn theorem_only_is_never_empty(
 /// The wanted mode applies exactly when nothing blocks code mode; a fallback always names its
 /// cause, and only a mode that was not `Off` can fall back.
 pub proof fn theorem_fallback_names_its_cause(
-    requested: Option<Mode>,
+    requested: CodeModeRequest,
     default: Mode,
     worker: bool,
     platform: bool,

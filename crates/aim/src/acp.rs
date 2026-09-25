@@ -190,7 +190,15 @@ pub fn advertised_options(options: &[ConfigOption]) -> Option<aim_proto::daemon:
     if models.is_none() && efforts.is_none() {
         return None;
     }
-    Some(aim_proto::daemon::SessionOptions { models: models.unwrap_or_default(), efforts: efforts.unwrap_or_default() })
+    // `auto` is taken only when the agent advertises it (claude-agent-acp 0.81.2 does not); it is
+    // then reported as `auto_effort`, not as a level.
+    let (autos, efforts): (Vec<_>, Vec<_>) = efforts
+        .unwrap_or_default()
+        .into_iter()
+        .partition(|v| v.value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase() == aim_proto::daemon::AUTO_EFFORT);
+    let auto_effort =
+        autos.into_iter().next().map(|v| v.description.or(v.name).unwrap_or_else(|| "the agent's automatic effort".to_owned()));
+    Some(aim_proto::daemon::SessionOptions { models: models.unwrap_or_default(), efforts, auto_effort })
 }
 
 fn emit(events: &UnboundedSender<AgentEvent>, update: SessionUpdate) {
@@ -551,7 +559,7 @@ fn strict_relay(
 ) -> (McpServerSpec, aim_acp::AimRoute) {
     let (Some(aim), Some(code)) = (aim, code) else { return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx) };
     // An ACP session has no named agent (refused above), so its ceiling permits `run_code`.
-    let exposure = crate::coderun::mode::decide(Some(code.mode), true, true, true);
+    let exposure = crate::coderun::mode::decide(crate::coderun::mode::CodeModeRequest::Set(code.mode), true, true, true);
     if !exposure.code {
         return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx);
     }
@@ -754,7 +762,13 @@ mod tests {
         assert_eq!(options.models[0].description.as_deref(), Some("Opus (1M context)"));
         assert_eq!(options.models[1].name.as_deref(), Some("Opus 5.5"));
         assert_eq!(values(&options.efforts), ["default", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(options.auto_effort, None, "claude-agent-acp does not take `auto`");
         assert_eq!(super::advertised_options(&[]), None, "an agent without model or effort options offers none");
+        // An agent that advertises `auto` takes it; it is reported apart from the levels.
+        let with_auto = json!([{"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "Auto",
+                                "options": [{"value": "low", "name": "Low"}, {"value": "Auto", "name": "Auto", "description": "adaptive"}]}]);
+        let options = super::advertised_options(&aim_acp::parse_config_options(Some(&with_auto))).unwrap();
+        assert_eq!((values(&options.efforts), options.auto_effort.as_deref()), (vec!["low"], Some("adaptive")));
     }
 
     /// ADR 0076: with code mode on or only, a strict session's one `aim` MCP server is aim's

@@ -472,6 +472,15 @@ async fn mcp_command(
 
 #[expect(clippy::too_many_lines, reason = "the CLI command dispatcher keeps daemon status and stop adjacent")]
 async fn main_async(args: Args) -> Result<i32, String> {
+    // Where code mode is chosen from this process's environment, an invalid AIM_CODE_MODE is
+    // said on stderr: the CLI has no log subscriber (ADR 0076).
+    if matches!(
+        args.command,
+        None | Some(Command::Tui(_) | Command::Run { .. } | Command::Mcp { stdio: true, .. } | Command::Daemon { .. })
+    ) && let Some(warning) = aim::coderun::mode::invalid_env_warning()
+    {
+        eprintln!("aim: {warning}");
+    }
     let Some(command) = args.command else { return tui(args.tui).await };
     match command {
         Command::Tui(tui_args) => tui(tui_args).await,
