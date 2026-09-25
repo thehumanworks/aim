@@ -90,7 +90,7 @@ impl CodeRelay {
         let connected = crate::host::aimx_workspaces(self.aimx.clone())(&spec).await?;
         // A `CodeRelay` is built from a found worker on a sandboxing platform; an ACP session has
         // no named agent, so its ceiling permits `run_code`.
-        let exposure = mode::decide(Some(self.code.mode), self.code.worker.exists(), cfg!(target_os = "macos"), true);
+        let exposure = mode::decide(mode::CodeModeRequest::Set(self.code.mode), self.code.worker.exists(), cfg!(target_os = "macos"), true);
         if !exposure.code {
             return Ok((connected.tools, connected.shutdown));
         }

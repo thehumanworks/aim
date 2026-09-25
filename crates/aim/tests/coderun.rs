@@ -113,6 +113,45 @@ async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+// Codex review B1 (ADR 0076): a script's failure is bounded like its output.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_huge_script_error_stays_within_run_code_s_budget() {
+    let (_, host) = host(CodeMode::RunCode);
+    let error = host
+        .call("run_code".into(), json!({"code": "throw new Error('x'.repeat(1_000_000));"}), IdempotencyKey::new("huge"))
+        .await
+        .expect_err("the script throws");
+    assert!(error.message.len() <= 40_000, "{} bytes", error.message.len());
+    assert!(
+        error.message.starts_with("Warning: truncated output") && error.message.contains("bytes truncated"),
+        "{}",
+        error.message.chars().take(200).collect::<String>()
+    );
+    assert!(error.message.contains("the script threw Error: xxx"), "the head names the failure");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_huge_exec_error_stays_within_the_response_budget() {
+    let (_, first) = host(CodeMode::Codex);
+    let started = exec(&first, "// @exec: {\"yield_time_ms\": 10}\ntext('before'); throw new Error('y'.repeat(1_000_000));").await;
+    // The cell may fail before the first answer, or be waited for.
+    let error = match started {
+        Err(error) => error,
+        Ok(output) => {
+            wait(&first, &cell_id(&output), json!({"yield_time_ms": 5000, "max_tokens": 1000})).await.expect_err("the cell fails")
+        }
+    };
+    assert!(error.message.len() <= 40_000, "{} bytes", error.message.len());
+    assert!(error.message.contains("bytes truncated"), "{}", error.message.chars().take(200).collect::<String>());
+    let (_, fresh) = host(CodeMode::Codex);
+    let started =
+        exec(&fresh, "// @exec: {\"yield_time_ms\": 5000, \"max_output_tokens\": 500}\nthrow new Error('z'.repeat(1_000_000));").await;
+    let error = started.expect_err("the cell fails within its first answer");
+    assert!(error.message.len() <= 2_000, "max_output_tokens bounds the failure too: {} bytes", error.message.len());
+    assert!(error.message.contains("bytes truncated"), "{error:?}");
+}
+
 // ADR 0018's named tests.
 
 #[tokio::test]

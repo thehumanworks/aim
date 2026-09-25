@@ -113,6 +113,17 @@ async fn scripts_written_like_node_return_their_output_and_their_errors() {
     assert_eq!(returned.0.output, "7", "a top-level return still works");
 }
 
+/// A script may throw a message of any size; the worker bounds it like output (codex review B1).
+#[tokio::test]
+async fn a_huge_exception_is_bounded_like_output() {
+    for code in ["throw new Error('x'.repeat(1_000_000));", "throw 'é'.repeat(500_000);"] {
+        let error = execute(code, None, 1024, 5_000, 64 << 20).await.unwrap_err();
+        assert!(error.message.len() <= 1024, "{} bytes", error.message.len());
+        assert!(error.message.starts_with("Warning: truncated output"), "{}", error.message);
+        assert!(error.message.contains("bytes truncated"), "{}", error.message);
+    }
+}
+
 #[tokio::test]
 async fn global_this_exposes_tools_and_index() {
     let (result, _) = execute(

@@ -390,7 +390,7 @@ fn cells_first(
 /// ceiling without `run_code` never gets code tools, whatever the mode.
 fn code_exposure(code: Option<&CodeConfig>, permitted: bool) -> Option<(&CodeConfig, crate::coderun::mode::Exposure)> {
     let code = code?;
-    let exposure = crate::coderun::mode::decide(Some(code.mode), true, true, permitted);
+    let exposure = crate::coderun::mode::decide(crate::coderun::mode::CodeModeRequest::Set(code.mode), true, true, permitted);
     exposure.code.then_some((code, exposure))
 }
 

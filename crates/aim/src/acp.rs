@@ -559,7 +559,7 @@ fn strict_relay(
 ) -> (McpServerSpec, aim_acp::AimRoute) {
     let (Some(aim), Some(code)) = (aim, code) else { return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx) };
     // An ACP session has no named agent (refused above), so its ceiling permits `run_code`.
-    let exposure = crate::coderun::mode::decide(Some(code.mode), true, true, true);
+    let exposure = crate::coderun::mode::decide(crate::coderun::mode::CodeModeRequest::Set(code.mode), true, true, true);
     if !exposure.code {
         return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx);
     }

@@ -44,8 +44,20 @@ What existed (the integration branch at `36f1bd8`):
 ### 1. `AIM_CODE_MODE`: `off`, `on`, `only`
 
 The variable takes `off`, `on` or `only`, and also `0`, `1`, `false` or `true`, in any case
-(`coderun::mode::parse`). An unset variable means the default. An invalid value logs a warning
-and also means the default.
+(`coderun::mode::parse`). An unset variable means the default.
+
+**An invalid value means `off`.** Codex review N1 found that the first version quietly used the
+default for an invalid value, and a CLI user never saw why. Such a value now fails closed, as the
+conservative choice:
+- A value that names no mode is still a request to control code mode. Its intent is unknown, so
+  aim picks the mode that starts no worker and adds no code tools.
+- A typo meant as `off` (`of`, `0ff`) must never switch code mode on.
+- A typo meant as `on` loses only a convenience, and the user is told.
+
+aim says so on stderr, once per process, where code mode is chosen from the environment: `aim`
+(the TUI), `aim run`, `aim mcp --stdio` and `aim daemon`. The message is `aim:
+AIM_CODE_MODE="onn" is not off, on or only (or 0, 1, false, true); code mode is off`. The log gets
+the same warning once.
 
 - **`off`:** no code tool and no program tools. Every direct tool is offered.
 - **`on`:** the code tool(s) and the program tools, beside a compact direct set. In native
@@ -63,7 +75,7 @@ successor.
 
 `aim_kernel::code_mode` decides from five inputs:
 
-- the request (`None` for unset or invalid);
+- the request (`CodeModeRequest`: `Unset`, `Invalid` or `Set(mode)`);
 - the default;
 - whether the worker was found;
 - whether the platform sandboxes it (macOS);
@@ -128,6 +140,15 @@ The model answered that there were no TODOs, which was wrong. So the worker now:
 with an expression; await its promises". The `run_code` and `exec` descriptions add "Not Node: no
 require/import, fs or fetch".
 
+**A failure is bounded like output** (codex review B1). A script can throw a message of any size,
+and the model sees it. So:
+- the worker cuts a failure to the cell's output limit (40 KB for `run_code` and `run_program`,
+  64 KB for an `exec` cell);
+- the parent cuts it again, as defense in depth against a compromised worker;
+- an `exec` or `wait` failure shares its response's budget with the output before it.
+
+All three use the output's truncation: head and tail, UTF-8 safe, after a warning line.
+
 ### 4. Claude gets code mode through aim's relay
 
 When the effective mode is `on` or `only`, a strict `acp:claude` session's single `aim` MCP server
@@ -184,6 +205,19 @@ The relay serves every call with a 630 s timeout, because aimx's `Bash` may run 
 could not be established: the minified `claude` 2.1.282 binary defines its fallback name twice,
 once as `1e3` and once as `1e8`. So aim does not rely on it. `aimx mcp` sessions are unchanged.
 
+**A client that goes away ends its calls** (codex review B2). A client that closes its input has
+shut the server down (the MCP stdio lifecycle).
+- **The grace.** `AimMcpServer` gives calls still running two seconds to reply, so a piped
+  one-shot call still gets its answer. Then it drops them and returns.
+- **The relay** then ends its cells and its workspace. `aim mcp` ends its cells.
+- **aimx gets time to clean up.** Closing a local harness used to kill aimx at once, which
+  orphaned any shell it had started. aimx releases (kills) a closed connection's processes before
+  it exits, so it now gets two seconds to do that before it is killed. Native sessions closed
+  during a long `Bash` gain the same fix.
+- **Before the fix,** a disconnected Claude left the relay, aimx and a 600 s `Bash` running until
+  the call's deadline. `aimx mcp` still drains its calls on end of input (its
+  `end_of_input_drains_accepted_request_and_reply`).
+
 ### 5. Benchmark arms
 
 `bench/run.py` accepts an arm per aim harness: `aim_openrouter@off`, `@on` and `@only` set
@@ -236,18 +270,17 @@ named", because the mock does not know the mode. The live cohort, not the mock, 
   simple action costs a script. That is the tradeoff the benchmark weighs.
 - **Allowlist warnings.** An allowlisted agent in `only` warns that its allowed direct tools are
   not offered (`AllowedTools::unknown`). This is cosmetic.
-- **`aim run` shows no warning.** It installs no tracing subscriber, so an invalid
-  `AIM_CODE_MODE` there is silent. The daemon logs it.
 - **The relay's model is fixed.** It always uses portable `run_code`; there is no catalog there.
 
 ## Verification
 
-**Proofs:** `mise run verify` (`crates/aim-kernel/src/code_mode.rs`, 21 obligations). Each spec
+**Proofs:** `mise run verify` (`crates/aim-kernel/src/code_mode.rs`, 23 obligations). Each spec
 is `DRAFT(ADR-0076)` until the benchmark settles the default.
 
 | Theorem | What it proves |
 |---|---|
-| `theorem_unset_means_default` | An unset or invalid request is a request for the default. |
+| `theorem_unset_means_default` | An unset request is a request for the default. |
+| `theorem_invalid_means_off` | An invalid request offers no code or program tools and every direct tool, whatever the default. |
 | `theorem_code_needs_worker_platform_and_permission` | Code and program tools are offered only when all three facts hold. |
 | `theorem_never_widens_a_ceiling` | A ceiling without `run_code` gets no code tools and keeps `Full`, whatever was requested; `only` never applies to it. |
 | `theorem_off_offers_no_code` | `off` offers no code or program tools and every direct tool. |
@@ -273,8 +306,16 @@ A mutation that drops the permission check fails verification.
   `session/new` payload per mode.
 - `challenge_tests` (the conformance prompts), and `bench/test_bench.py`
   `test_aim_arms_select_aim_code_mode`.
-- `cells.rs`: `nested_results_expose_their_text_and_run_together` and
-  `scripts_written_like_node_return_their_output_and_their_errors`.
+- `cells.rs`: `nested_results_expose_their_text_and_run_together`,
+  `scripts_written_like_node_return_their_output_and_their_errors`, and
+  `a_huge_exception_is_bounded_like_output` (B1).
+- `coderun.rs`: `a_huge_script_error_stays_within_run_code_s_budget` and
+  `a_huge_exec_error_stays_within_the_response_budget` (B1).
+- `mcp_server.rs`: `closing_the_input_ends_pending_calls_after_a_short_grace` and
+  `a_call_that_finishes_within_the_grace_still_replies` (B2).
+- `code_mode.rs`: `closing_the_relay_s_input_ends_a_pending_call_and_its_processes` (B2: the
+  relay, its aimx and the shell are gone about 2 s after the client closes) and
+  `an_invalid_code_mode_is_reported_on_stderr_once` (N1).
 
 **Live** (ADR 0022): the two `live_*` smoke tests below, and the runs in "Live evidence".
 

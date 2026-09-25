@@ -114,6 +114,8 @@ impl CellRecord {
                             if !shown.is_empty() {
                                 error.message = format!("{}\nOutput before the failure:\n{shown}", error.message);
                             }
+                            // The failure and the output before it share the response's budget.
+                            error.message = truncate_middle(&error.message, max_bytes);
                             Err(error)
                         }
                         done => Ok((shown, done.is_some())),
