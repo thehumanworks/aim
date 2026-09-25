@@ -91,14 +91,14 @@ fn models() -> &'static Mutex<HashMap<PathBuf, Arc<Embedder>>> {
     MODELS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached_model(home: &Path) -> Result<Option<Arc<Embedder>>, StoreError> {
+fn cached_model(home: &Path, cancel: &tokio_util::sync::CancellationToken) -> Result<Option<Arc<Embedder>>, StoreError> {
     if let Some(model) = models().lock().unwrap_or_else(PoisonError::into_inner).get(home).cloned() {
         return Ok(Some(model));
     }
     if !Embedder::cached(home) {
         return Ok(None);
     }
-    let model = Arc::new(Embedder::open(home).map_err(backend)?);
+    let model = Arc::new(Embedder::open_with_cancel(home, cancel).map_err(backend)?);
     models().lock().unwrap_or_else(PoisonError::into_inner).insert(home.to_path_buf(), Arc::clone(&model));
     Ok(Some(model))
 }
@@ -108,10 +108,17 @@ fn cached_model(home: &Path) -> Result<Option<Arc<Embedder>>, StoreError> {
 /// # Errors
 /// The model cannot be downloaded or verified.
 pub(crate) fn ensure_model(home: &Path) -> Result<Arc<Embedder>, StoreError> {
+    ensure_model_with_cancel(home, &tokio_util::sync::CancellationToken::new()).map_err(backend)
+}
+
+pub(crate) fn ensure_model_with_cancel(
+    home: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Arc<Embedder>, super::embedding::ModelOpenError> {
     if let Some(model) = models().lock().unwrap_or_else(PoisonError::into_inner).get(home).cloned() {
         return Ok(model);
     }
-    let model = Arc::new(Embedder::open(home).map_err(backend)?);
+    let model = Arc::new(Embedder::open_with_cancel(home, cancel)?);
     models().lock().unwrap_or_else(PoisonError::into_inner).insert(home.to_path_buf(), Arc::clone(&model));
     Ok(model)
 }
@@ -204,12 +211,16 @@ fn project_chunks(conn: &Connection, session: &str, events: &[SessionEvent]) -> 
 /// # Errors
 /// A database or projection failure leaves the pending row in place for retry.
 pub(crate) fn drain_pending(conn: &mut Connection) -> Result<(), StoreError> {
+    drain_pending_with_cancel(conn, &tokio_util::sync::CancellationToken::new())
+}
+
+pub(crate) fn drain_pending_with_cancel(conn: &mut Connection, cancel: &tokio_util::sync::CancellationToken) -> Result<(), StoreError> {
     let pending: Option<i64> = conn.query_row("SELECT 1 FROM search_pending LIMIT 1", [], |row| row.get(0)).optional().map_err(backend)?;
     if pending.is_none() {
         return Ok(());
     }
     let home = home_of(conn)?;
-    let embedder = cached_model(&home)?;
+    let embedder = cached_model(&home, cancel)?;
     while let Some(PendingBatch { session, max_seq, meta, events }) = pending_batch(conn)? {
         let chunks = project_chunks(conn, &session, &events)?;
         let vectors = chunks

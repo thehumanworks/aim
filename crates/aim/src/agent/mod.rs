@@ -114,11 +114,12 @@ struct Response {
     /// Text or reasoning of this response was shown: it cannot be retried transparently.
     streamed: bool,
     /// Effort advice, requested as soon as the first tool call is complete so it overlaps the
-    /// tools (REV9 M2); aborted if the response is abandoned.
+    /// tools (REV9 M2); its waiter is aborted if the response is abandoned.
     decision: Option<PendingDecision>,
 }
 
-/// An advice request in flight; dropping it aborts the request.
+/// An advice waiter in flight. Dropping it aborts the waiter; a blocking Jev request already
+/// started by the waiter may continue until its HTTP timeout.
 struct PendingDecision(tokio::task::JoinHandle<Option<CompletedDecision>>);
 
 impl Drop for PendingDecision {
@@ -546,11 +547,12 @@ impl Agent {
                                 emit(ctx.events, AgentEvent::ToolStarted { call_id: call_id.clone(), name: name.clone(), arguments: arguments.clone() });
                                 response.running.push(self.start_call(specs, id, name, arguments));
                                 response.dispatched.push(Dispatched { id, call_id: call_id.clone(), name: name.clone() });
-                                if response.decision.is_none() {
-                                    response.decision = self.start_decision(&ctx.goal).map(PendingDecision);
-                                }
                             }
+                            let decide = matches!(&item, Item::ToolCall { .. }) && response.decision.is_none();
                             self.push(item, ctx.events);
+                            if decide {
+                                response.decision = self.start_decision(&ctx.goal).map(PendingDecision);
+                            }
                         }
                     },
                 },

@@ -98,11 +98,13 @@ struct ScriptedDecider {
     delay: Duration,
     fail: bool,
     calls: Arc<AtomicUsize>,
+    bundles: Arc<Mutex<Vec<Bundle>>>,
 }
 
 impl Decider for ScriptedDecider {
-    fn decide(&self, _bundle: Bundle) -> DecisionFuture {
+    fn decide(&self, bundle: Bundle) -> DecisionFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(bundle);
         let (delay, fail) = (self.delay, self.fail);
         Box::pin(async move {
             tokio::time::sleep(delay).await;
@@ -125,7 +127,7 @@ impl Decider for ScriptedDecider {
     }
 }
 
-async fn run(tool_ms: u64, decision_ms: u64, fail: bool, enabled: bool) -> (Vec<Request>, Vec<AgentEvent>, usize, Duration) {
+async fn run(tool_ms: u64, decision_ms: u64, fail: bool, enabled: bool) -> (Vec<Request>, Vec<AgentEvent>, Vec<Bundle>, usize, Duration) {
     run_with_tail(0, tool_ms, decision_ms, fail, enabled).await
 }
 
@@ -135,12 +137,13 @@ async fn run_with_tail(
     decision_ms: u64,
     fail: bool,
     enabled: bool,
-) -> (Vec<Request>, Vec<AgentEvent>, usize, Duration) {
+) -> (Vec<Request>, Vec<AgentEvent>, Vec<Bundle>, usize, Duration) {
     let mut provider = Provider::new();
     if let Some(p) = Arc::get_mut(&mut provider) {
         p.tail = Duration::from_millis(tail_ms);
     }
     let calls = Arc::new(AtomicUsize::new(0));
+    let bundles = Arc::new(Mutex::new(Vec::new()));
     let mut agent = Agent::new(
         Arc::clone(&provider) as Arc<dyn ModelProvider>,
         Arc::new(SlowTool(Duration::from_millis(tool_ms))),
@@ -156,8 +159,12 @@ async fn run_with_tail(
         },
     );
     if enabled {
-        agent =
-            agent.with_decider(Arc::new(ScriptedDecider { delay: Duration::from_millis(decision_ms), fail, calls: Arc::clone(&calls) }));
+        agent = agent.with_decider(Arc::new(ScriptedDecider {
+            delay: Duration::from_millis(decision_ms),
+            fail,
+            calls: Arc::clone(&calls),
+            bundles: Arc::clone(&bundles),
+        }));
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let start = Instant::now();
@@ -168,13 +175,17 @@ async fn run_with_tail(
         events.push(event);
     }
     let requests = provider.requests.lock().map_or_else(|_| Vec::new(), |requests| requests.clone());
-    (requests, events, calls.load(Ordering::SeqCst), elapsed)
+    let captured = bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    (requests, events, captured, calls.load(Ordering::SeqCst), elapsed)
 }
 
 #[tokio::test]
 async fn decision_overlaps_tool_and_applies_to_next_request() {
-    let (requests, events, calls, elapsed) = run(120, 30, false, true).await;
+    let (requests, events, bundles, calls, elapsed) = run(120, 30, false, true).await;
     assert_eq!(calls, 1);
+    assert_eq!(bundles.len(), 1);
+    assert!(bundles[0].state.contains("tool call: wait"), "the triggering call is in the Jev digest: {:?}", bundles[0]);
+    assert!(bundles[0].state.contains("tool calls: 1"), "the call count includes the trigger: {:?}", bundles[0]);
     assert!(elapsed < Duration::from_millis(175), "decision delayed the tool");
     assert_eq!(requests.len(), 2);
     assert_eq!(requests.first().and_then(|r| r.effort.as_deref()), None);
@@ -186,7 +197,7 @@ async fn decision_overlaps_tool_and_applies_to_next_request() {
 /// tool followed by a long stream tail still gets its advice applied.
 #[tokio::test]
 async fn advice_starts_at_the_first_tool_call_not_at_the_end_of_the_stream() {
-    let (requests, _events, calls, _elapsed) = run_with_tail(300, 10, 30, false, true).await;
+    let (requests, _events, _bundles, calls, _elapsed) = run_with_tail(300, 10, 30, false, true).await;
     assert_eq!(calls, 1, "the advice was requested during the stream");
     assert_eq!(requests.get(1).and_then(|r| r.effort.as_deref()), Some("medium"), "and applied to the next request");
 }
@@ -194,7 +205,7 @@ async fn advice_starts_at_the_first_tool_call_not_at_the_end_of_the_stream() {
 #[tokio::test]
 async fn late_or_failed_decision_keeps_effort() {
     for (delay, fail) in [(120, false), (10, true)] {
-        let (requests, events, calls, elapsed) = run(30, delay, fail, true).await;
+        let (requests, events, _bundles, calls, elapsed) = run(30, delay, fail, true).await;
         assert_eq!(calls, 1);
         assert!(elapsed < Duration::from_millis(100), "advice delayed the tool");
         assert_eq!(requests.get(1).and_then(|r| r.effort.as_deref()), None);
@@ -204,7 +215,7 @@ async fn late_or_failed_decision_keeps_effort() {
 
 #[tokio::test]
 async fn private_path_never_starts_advice() {
-    let (requests, events, calls, _) = run(30, 0, false, false).await;
+    let (requests, events, _bundles, calls, _) = run(30, 0, false, false).await;
     assert_eq!(calls, 0);
     assert_eq!(requests.get(1).and_then(|r| r.effort.as_deref()), None);
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Decision { .. })));

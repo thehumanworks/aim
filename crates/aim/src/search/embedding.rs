@@ -6,10 +6,56 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use model2vec_rs::model::StaticModel;
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
+
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+const LOCK_POLL: Duration = Duration::from_millis(25);
+
+#[derive(Debug)]
+pub(crate) enum ModelOpenError {
+    Interrupted(&'static str),
+    Other(String),
+}
+
+impl core::fmt::Display for ModelOpenError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Interrupted(message) => f.write_str(message),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+pub(crate) fn acquire_lock(home: &Path, cancel: &CancellationToken, wait: Duration) -> Result<File, ModelOpenError> {
+    let models = home.join("models");
+    fs::create_dir_all(&models).map_err(|e| ModelOpenError::Other(format!("cannot create model cache: {e}")))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(models.join("potion-retrieval-32M.lock"))
+        .map_err(|e| ModelOpenError::Other(format!("cannot open model cache lock: {e}")))?;
+    let deadline = Instant::now() + wait;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(ModelOpenError::Interrupted("model cache lock wait cancelled"));
+        }
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(ModelOpenError::Interrupted("model cache lock wait timed out"));
+                }
+                std::thread::sleep(LOCK_POLL.min(deadline.saturating_duration_since(Instant::now())));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(ModelOpenError::Other(format!("cannot lock model cache: {e}"))),
+        }
+    }
+}
 
 const REPO: &str = "minishlab/potion-retrieval-32M";
 const REVISION: &str = "6fc8051fab2a1e0ee76689cf08c853792ac285e7";
@@ -46,17 +92,15 @@ impl Embedder {
     /// # Errors
     /// Returns an error if the cache, download, checksum, license, or model load fails.
     pub fn open(home: &Path) -> Result<Self, String> {
-        let models = home.join("models");
-        fs::create_dir_all(&models).map_err(|e| format!("cannot create model cache: {e}"))?;
-        let lock_path = models.join("potion-retrieval-32M.lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(lock_path)
-            .map_err(|e| format!("cannot open model cache lock: {e}"))?;
-        lock.lock().map_err(|e| format!("cannot lock model cache: {e}"))?;
+        Self::open_with_cancel(home, &CancellationToken::new()).map_err(|e| e.to_string())
+    }
 
+    pub(crate) fn open_with_cancel(home: &Path, cancel: &CancellationToken) -> Result<Self, ModelOpenError> {
+        let lock = acquire_lock(home, cancel, LOCK_WAIT)?;
+        Self::open_locked(home, lock).map_err(ModelOpenError::Other)
+    }
+
+    fn open_locked(home: &Path, lock: File) -> Result<Self, String> {
         let directory = model_directory(home);
         fs::create_dir_all(&directory).map_err(|e| format!("cannot create model directory: {e}"))?;
         for artifact in &FILES {

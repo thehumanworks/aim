@@ -61,7 +61,8 @@ impl Decider for FallbackDecider {
     }
 }
 
-/// `TypeSafe`'s blocking Jev client, confined to `spawn_blocking`.
+/// `TypeSafe`'s blocking Jev client, confined to `spawn_blocking`. Dropping its async waiter
+/// cannot stop a request already in the blocking pool; the client HTTP timeout bounds that work.
 pub struct JevDecider;
 
 impl Decider for JevDecider {
