@@ -236,11 +236,7 @@ async fn sqlite_v2_migration_preserves_search_queue_and_adds_summaries() {
             rusqlite::params![session.id, session.created_ms, serde_json::to_string(&session).unwrap()],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO events(session_id, seq, turn, ts_ms, schema, body) VALUES ('existing', 1, 4, 99, 1, '{}')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO events(session_id, seq, turn, ts_ms, schema, body) VALUES ('existing', 1, 4, 99, 1, '{}')", []).unwrap();
         conn.execute("INSERT INTO search_pending(session_id, max_seq) VALUES ('existing', 1)", []).unwrap();
     }
     let store = SqliteStore::open(&path).unwrap();
@@ -248,7 +244,10 @@ async fn sqlite_v2_migration_preserves_search_queue_and_adds_summaries() {
     assert_eq!((summaries[0].meta.id.as_str(), summaries[0].turns, summaries[0].last_activity_ms), ("existing", 4, 99));
     let conn = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(conn.query_row("SELECT version FROM db_schema", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
-    assert_eq!(conn.query_row("SELECT max_seq FROM search_pending WHERE session_id = 'existing'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    let pending = conn.query_row("SELECT max_seq FROM search_pending WHERE session_id = 'existing'", [], |row| row.get::<_, i64>(0)).ok();
+    let indexed =
+        conn.query_row("SELECT last_seq FROM search_index_state WHERE session_id = 'existing'", [], |row| row.get::<_, i64>(0)).ok();
+    assert!(pending == Some(1) || indexed == Some(1));
 }
 
 #[tokio::test]

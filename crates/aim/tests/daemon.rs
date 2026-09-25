@@ -147,7 +147,8 @@ fn input() -> Vec<Part> {
 
 async fn wait_socket(path: &Path) {
     for _ in 0..100 {
-        if path.exists() {
+        if let Ok(stream) = UnixStream::connect(path).await {
+            drop(stream);
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -400,6 +401,13 @@ async fn duplicate_key_runs_one_turn_and_second_daemon_cannot_bind() {
     let (a, b) =
         tokio::join!(client.prompt_with_key(session.clone(), input(), key.clone()), other.prompt_with_key(session.clone(), input(), key),);
     assert_eq!(a.unwrap(), b.unwrap());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while provider.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     let conflict = server::serve(dir.path(), &socket, None, host).await.unwrap_err();
     assert_eq!(conflict.code, ErrorCode::Conflict);
