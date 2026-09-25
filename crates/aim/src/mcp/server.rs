@@ -111,22 +111,19 @@ impl AimMcpServer {
                     }
                 }
                 incoming = read_frame(&mut reader, &mut frame), if !eof => {
-                    match incoming? {
-                        Some(()) => {
-                            let request = serde_json::from_slice::<Value>(&frame);
-                            let reply = match request {
-                                Ok(request) => self.dispatch(&request, &connection_id, &mut pending, &mut active),
-                                Err(_) => Some(error(&Value::Null, -32700, "invalid JSON")),
-                            };
-                            frame.clear();
-                            if let Some(reply) = reply {
-                                write_reply(&mut writer, &reply).await?;
-                            }
+                    if incoming?.is_some() {
+                        let request = serde_json::from_slice::<Value>(&frame);
+                        let reply = match request {
+                            Ok(request) => self.dispatch(&request, &connection_id, &mut pending, &mut active),
+                            Err(_) => Some(error(&Value::Null, -32700, "invalid JSON")),
+                        };
+                        frame.clear();
+                        if let Some(reply) = reply {
+                            write_reply(&mut writer, &reply).await?;
                         }
-                        None => {
-                            eof = true;
-                            closing = Some(tokio::time::Instant::now() + self.eof_grace);
-                        }
+                    } else {
+                        eof = true;
+                        closing = Some(tokio::time::Instant::now() + self.eof_grace);
                     }
                 }
                 () = grace_over => {

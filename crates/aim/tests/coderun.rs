@@ -126,7 +126,7 @@ async fn a_huge_script_error_stays_within_run_code_s_budget() {
     assert!(
         error.message.starts_with("Warning: truncated output") && error.message.contains("bytes truncated"),
         "{}",
-        &error.message[..200]
+        error.message.chars().take(200).collect::<String>()
     );
     assert!(error.message.contains("the script threw Error: xxx"), "the head names the failure");
 }
@@ -143,7 +143,7 @@ async fn a_huge_exec_error_stays_within_the_response_budget() {
         }
     };
     assert!(error.message.len() <= 40_000, "{} bytes", error.message.len());
-    assert!(error.message.contains("bytes truncated"), "{}", &error.message[..200]);
+    assert!(error.message.contains("bytes truncated"), "{}", error.message.chars().take(200).collect::<String>());
     let (_, fresh) = host(CodeMode::Codex);
     let started =
         exec(&fresh, "// @exec: {\"yield_time_ms\": 5000, \"max_output_tokens\": 500}\nthrow new Error('z'.repeat(1_000_000));").await;
