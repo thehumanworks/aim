@@ -108,7 +108,7 @@ pub(super) fn router(state: Arc<State>, id: u64) -> Router<Conn> {
     let router = route!(router, ExecRelease, exec_release);
     let router = route!(router, Grep, search_grep);
     let router = route!(router, Glob, search_glob);
-    route!(router, ToolsCall, tools_call)
+    router.method::<ToolsCall, _, _>(|conn: Arc<Conn>, ctx: RequestCtx, params| async move { conn.tools_call(ctx, params).await })
 }
 
 impl Conn {
@@ -486,7 +486,7 @@ impl Conn {
         Ok(ToolsListResult { tools: tools::specs() })
     }
 
-    async fn tools_call(self: Arc<Self>, params: ToolsCallParams) -> Outcome<ToolResult> {
+    async fn tools_call(self: Arc<Self>, request: RequestCtx, params: ToolsCallParams) -> Outcome<ToolResult> {
         let (session, ws) = self.workspace(&params.workspace)?;
         let annotations = tools::annotations_of(&params.name)
             .ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("unknown tool `{}`", params.name)))?;
@@ -497,6 +497,7 @@ impl Conn {
             procs: Arc::clone(&session.procs),
             key: params.idempotency_key.clone(),
             max_read_bytes: self.state.config.max_read_bytes,
+            cancelled: request.cancelled,
         };
         if annotations.read_only {
             return tools::call(&ctx, &params.name, params.arguments).await;

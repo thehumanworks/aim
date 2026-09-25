@@ -139,6 +139,9 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Outcome<ToolResult>
         Err(result) => return Ok(result),
     };
     ctx.grant.exec()?;
+    if ctx.cancelled.is_cancelled() {
+        return Err(ProtoError::new(ErrorCode::Cancelled, "Bash request cancelled"));
+    }
     let exec = exec_of(ctx)?;
     let slot = match ctx.procs.reserve() {
         Ok(slot) => slot,
@@ -164,7 +167,16 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Outcome<ToolResult>
     let mut cursor = 0u64;
     let mut dropped = false;
     let exit = loop {
-        let read = exec.read(&proc, cursor, READ_BYTES, Duration::from_secs(5)).await?;
+        let read = tokio::select! {
+            read = exec.read(&proc, cursor, READ_BYTES, Duration::from_secs(5)) => read,
+            () = ctx.cancelled.cancelled() => {
+                match exec.release(&proc).await {
+                    Ok(()) => { ctx.procs.remove(&proc); }
+                    Err(err) => { tracing::debug!(%err, "releasing a cancelled command failed"); }
+                }
+                return Err(ProtoError::new(ErrorCode::Cancelled, "Bash request cancelled"));
+            }
+        }?;
         dropped |= read.dropped_before.is_some();
         for chunk in read.chunks {
             cursor = chunk.seq;

@@ -22,6 +22,7 @@ use aim_proto::tool::{ToolAnnotations, ToolInput, ToolLocation, ToolResult, Tool
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::authz::Grant;
 use crate::workspace::{Outcome, Workspace};
@@ -41,6 +42,8 @@ pub struct ToolCtx {
     pub key: Option<IdempotencyKey>,
     /// Largest file read, in bytes.
     pub max_read_bytes: u64,
+    /// Cancels detached tool work when the caller cancels its request.
+    pub cancelled: CancellationToken,
 }
 
 impl std::fmt::Debug for ToolCtx {
