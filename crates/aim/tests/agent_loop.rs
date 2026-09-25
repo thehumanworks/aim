@@ -1,4 +1,6 @@
 //! The native loop against a scripted provider and fake tools.
+#![expect(clippy::unwrap_used, reason = "test fakes lock uncontended mutexes")]
+#![expect(clippy::unnecessary_wraps, reason = "scripted streams are sequences of Results")]
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -83,9 +85,9 @@ impl ToolHost for Fake {
             if name == "fail" {
                 return Err(ProtoError::new(ErrorCode::Denied, "protected path"));
             }
-            let delay = arguments["delay_ms"].as_u64().unwrap_or(0);
+            let delay = arguments.get("delay_ms").and_then(Value::as_u64).unwrap_or(0);
             tokio::time::sleep(Duration::from_millis(delay)).await;
-            Ok(ToolResult::text(arguments["text"].as_str().unwrap_or_default()))
+            Ok(ToolResult::text(arguments.get("text").and_then(Value::as_str).unwrap_or_default()))
         })
     }
 }
@@ -127,7 +129,7 @@ fn kinds(items: &[Item]) -> Vec<String> {
 #[tokio::test]
 async fn a_plain_answer_settles_the_turn() {
     let provider = Scripted::new(vec![text("hi")]);
-    let mut agent = agent(provider.clone(), Arc::new(Fake { calls: Mutex::default() }));
+    let mut agent = agent(Arc::clone(&provider), Arc::new(Fake { calls: Mutex::default() }));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let stop = agent.run_turn(user("hello"), &tx, &CancellationToken::new()).await.unwrap();
     assert_eq!(stop, StopReason::EndTurn);
@@ -151,7 +153,7 @@ async fn parallel_calls_run_concurrently_and_results_follow_in_dispatch_order() 
         text("done"),
     ]);
     let tools = Arc::new(Fake { calls: Mutex::default() });
-    let mut agent = agent(provider.clone(), tools.clone());
+    let mut agent = agent(Arc::clone(&provider), Arc::clone(&tools));
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let started = std::time::Instant::now();
     agent.run_turn(user("go"), &tx, &CancellationToken::new()).await.unwrap();
