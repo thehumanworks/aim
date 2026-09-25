@@ -14,6 +14,42 @@ use serde_json::Value;
 /// A boxed, sendable, owned future.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+tokio::task_local! {
+    static TOOL_CALL: ToolCallContext;
+}
+
+/// The model's tool call a tool host is running, while it runs (ADR 0066). The agent loop runs
+/// each call future inside it, so a host whose call makes further calls (a code cell, a subagent)
+/// can name its parent in session events and stop when the turn is cancelled. It crosses the
+/// wrappers between the loop and a host because none of them spawns. `ToolHost::call` is unchanged.
+#[derive(Clone, Debug)]
+pub struct ToolCallContext {
+    /// The provider's call id.
+    pub call_id: String,
+    /// The turn's session updates.
+    pub events: tokio::sync::mpsc::UnboundedSender<aim_proto::daemon::SessionUpdate>,
+    /// Cancelled when the turn is interrupted or its session closes.
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+impl ToolCallContext {
+    /// The call being run by the current task, if any: `None` outside the agent loop.
+    #[must_use]
+    pub fn current() -> Option<Self> {
+        TOOL_CALL.try_with(Clone::clone).ok()
+    }
+
+    /// Runs `future` as this call.
+    pub fn scope<F: Future>(self, future: F) -> impl Future<Output = F::Output> {
+        TOOL_CALL.scope(self, future)
+    }
+
+    /// Runs `start` (which creates a call's future) as this call.
+    pub fn enter<R>(&self, start: impl FnOnce() -> R) -> R {
+        TOOL_CALL.sync_scope(self.clone(), start)
+    }
+}
+
 /// Offers tools to the model and runs their calls.
 pub trait ToolHost: Send + Sync {
     /// The tools, as advertised to the model.

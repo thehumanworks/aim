@@ -148,7 +148,10 @@ fn a_tool_call_starts_once_finishes_once_and_its_items_follow() {
     let started = updates.iter().filter(|u| matches!(u, SessionUpdate::ToolStarted { .. })).count();
     let finished: Vec<&SessionUpdate> = updates.iter().filter(|u| matches!(u, SessionUpdate::ToolFinished { .. })).collect();
     assert_eq!(started, 1);
-    assert_eq!(finished, [&SessionUpdate::ToolFinished { call_id: "t1".into(), name: "Read".into(), result: ToolResult::text("hello"), parent: None }]);
+    assert_eq!(
+        finished,
+        [&SessionUpdate::ToolFinished { call_id: "t1".into(), name: "Read".into(), result: ToolResult::text("hello"), parent: None }]
+    );
     let position = |wanted: &SessionUpdate| updates.iter().position(|u| u == wanted).unwrap();
     assert!(position(&SessionUpdate::ItemAdded { item: call }) < position(finished[0]));
     assert!(position(finished[0]) < position(&SessionUpdate::ItemAdded { item: result }));

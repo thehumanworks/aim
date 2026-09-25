@@ -242,8 +242,12 @@ mod before_adr_0066 {
     #[serde(tag = "kind", rename_all = "snake_case")]
     pub enum EventBody {
         TurnStarted,
-        Item { item: Value },
-        TurnEnded { stop: Value },
+        Item {
+            item: Value,
+        },
+        TurnEnded {
+            stop: Value,
+        },
         #[serde(untagged)]
         Unknown(Value),
     }
@@ -291,12 +295,8 @@ fn adr_0066_nested_tool_records_round_trip_and_old_readers_keep_them_as_unknown(
     // `parent` is additive on the wire: absent for the model's own calls, ignored by old clients.
     let own = SessionUpdate::ToolStarted { call_id: "c".into(), name: "Read".into(), arguments: "{}".into(), parent: None };
     assert_eq!(serde_json::to_value(&own).unwrap(), json!({"type": "tool_started", "call_id": "c", "name": "Read", "arguments": "{}"}));
-    let nested = SessionUpdate::ToolFinished {
-        call_id: "n".into(),
-        name: "Read".into(),
-        result: ToolResult::text("x"),
-        parent: Some("c".into()),
-    };
+    let nested =
+        SessionUpdate::ToolFinished { call_id: "n".into(), name: "Read".into(), result: ToolResult::text("x"), parent: Some("c".into()) };
     let wire = serde_json::to_value(&nested).unwrap();
     assert_eq!(wire["parent"], "c");
     assert_eq!(serde_json::from_value::<SessionUpdate>(wire.clone()).unwrap(), nested);

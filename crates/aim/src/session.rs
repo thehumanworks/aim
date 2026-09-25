@@ -115,6 +115,20 @@ impl Recorder {
                 EventBody::ConfigChanged { model: model.clone(), effort: effort.clone(), effort_source: *effort_source }
             }
             AgentEvent::Compacted { replaced, items, .. } => EventBody::Compacted { replaced: *replaced, items: items.clone() },
+            // A nested call (a code cell's) is recorded under its parent; the model's own calls
+            // are recorded as transcript items (ADR 0066).
+            AgentEvent::ToolStarted { call_id, name, arguments, parent: Some(parent) } => EventBody::NestedToolStarted {
+                parent: parent.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            },
+            AgentEvent::ToolFinished { call_id, name, result, parent: Some(parent) } => EventBody::NestedToolFinished {
+                parent: parent.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                result: result.clone(),
+            },
             AgentEvent::StateChanged { .. }
             | AgentEvent::TurnStarted { .. }
             | AgentEvent::RequestStarted { .. }
