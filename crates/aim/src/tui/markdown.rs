@@ -8,7 +8,7 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 use ratatui::style::{Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
-use super::text::{Row, Run, Wrap, sanitize, truncate, wrap};
+use super::text::{Row, Run, Wrap, clamp, sanitize, truncate, wrap};
 use super::theme::Theme;
 
 /// How rendering adapts to the terminal.
@@ -389,7 +389,7 @@ pub fn render(markdown: &str, theme: &Theme, opts: RenderOpts, base: Style) -> V
     while md.rows.last().is_some_and(|r| r.text().trim().is_empty()) {
         md.rows.pop();
     }
-    md.rows
+    md.rows.into_iter().map(|row| clamp(row, opts.width)).collect()
 }
 
 /// One-line plain rendering of Markdown-ish text for narrow places (chips, previews).

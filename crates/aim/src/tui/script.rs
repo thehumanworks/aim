@@ -97,6 +97,12 @@ pub struct Script {
     /// Keep superseded completion requests running (so only the app's fence stops them).
     #[serde(default)]
     pub keep_superseded: bool,
+    /// Create a live ephemeral session (as another client would) and attach to it at start.
+    #[serde(default)]
+    pub seed_ephemeral: bool,
+    /// Workspace of the seeded session, when not the launch directory.
+    #[serde(default)]
+    pub seed_workspace: Option<String>,
 }
 
 struct Scripted {
@@ -268,16 +274,18 @@ pub async fn run(path: &Path, args: &TuiArgs) -> Result<i32, String> {
     let mut options: Options = args.options()?;
     options.spec.provider = "scripted".into();
     options.keep_superseded_completions = script.keep_superseded;
-    let root = args.root()?;
-    let local = Sources::local(&root, None);
-    options.sources = Sources {
-        files: Arc::new(Delayed { inner: local.files, delays: script.completion_delays.clone() }),
-        skills: local.skills,
-        commands: local.commands,
-    };
+    let delays = script.completion_delays.clone();
+    options.sources = Arc::new(move |root: &Path, local: bool| {
+        let sources = if local { Sources::local(root, None) } else { Sources::remote(None) };
+        Sources { files: Arc::new(Delayed { inner: sources.files, delays: delays.clone() }), ..sources }
+    });
     let store = Arc::new(MemoryStore::default());
+    let mut seed_spec = options.spec.clone();
+    if let Some(workspace) = &script.seed_workspace {
+        seed_spec.workspace.clone_from(workspace);
+    }
     if script.seed_items > 0 {
-        options.attach = Some(seed(&store, &options.spec, script.seed_items).await?);
+        options.attach = Some(seed(&store, &seed_spec, script.seed_items).await?);
     }
     let provider = Arc::new(Scripted { responses: Mutex::new(script.responses.into()), counter: Mutex::new(0) });
     let providers: crate::host::ProviderFactory =
@@ -287,5 +295,10 @@ pub async fn run(path: &Path, args: &TuiArgs) -> Result<i32, String> {
         backends: native_backends(providers, workspaces(), args.max_requests),
         update_capacity: 4096,
     });
+    if script.seed_ephemeral {
+        let spec = SessionSpec { persistence: aim_proto::daemon::Persistence::Ephemeral, ..seed_spec };
+        let created = crate::host::SessionClient::create(&host, spec).await.map_err(|e| e.message)?;
+        options.attach = Some(created.meta.id);
+    }
     super::run(Arc::new(host), options).await
 }

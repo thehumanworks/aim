@@ -272,3 +272,61 @@ fn sigterm_restores_the_terminal() {
     assert!(rows.iter().any(|r| r == "Before the signal."), "{rows:?}");
     assert!(!rows.iter().any(|r| r.contains("ask anything") || r.contains("idle ·")), "the block is gone: {rows:?}");
 }
+
+// ---- REV10 regressions ----
+
+/// REV10 #1 (blocker): a normal (persistent) TUI attached to another client's ephemeral session
+/// neither shows disk history nor writes the session's prompts to it.
+#[test]
+fn rev10_ephemeral_session_keeps_disk_history_out() {
+    let home = std::env::temp_dir().join(format!("aim-tui-rev10-{}", std::process::id()));
+    let _fresh = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("history"), "old secret\n").unwrap();
+    let home_env = home.to_string_lossy().into_owned();
+    let script = json!({"responses": [[text("Private answer.", 1, 0)]], "seed_ephemeral": true});
+    let env = [("AIM_HOME", home_env.as_str())];
+    let tui = Tui::start(&script, &Start { env: &env, ..Start::default() });
+    tui.wait_for("ephemeral");
+    tui.wait_for("idle");
+    tui.send("\x1b[A");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!tui.screen().contains("old secret"), "disk history is hidden:\n{}", tui.screen());
+    tui.type_text("private words");
+    tui.send("\r");
+    tui.wait_for("Private answer.");
+    tui.quit();
+    assert_eq!(std::fs::read_to_string(home.join("history")).unwrap(), "old secret\n", "nothing was appended");
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+/// REV10 #15: `@` completes from the attached session's workspace, not the launch directory.
+#[test]
+fn rev10_completion_follows_the_attached_workspace() {
+    let other = std::env::temp_dir().join(format!("aim-tui-rev10-ws-{}", std::process::id()));
+    let _fresh = std::fs::remove_dir_all(&other);
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("only_in_b.txt"), "b").unwrap();
+    let workspace = other.to_string_lossy().into_owned();
+    let script = json!({"responses": [], "seed_items": 2, "seed_workspace": workspace});
+    let tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    tui.send("@only");
+    tui.wait("B's file", Duration::from_secs(10), |s| s.contains("only_in_b.txt"));
+    tui.quit();
+    std::fs::remove_dir_all(other).unwrap();
+}
+
+/// REV10 #16: a terminal that never answers the keyboard query does not stall the start or keys.
+#[test]
+fn rev10_a_silent_terminal_does_not_stall_startup_or_keys() {
+    let script = json!({"responses": []});
+    let tui = Tui::start(&script, &Start { silent: true, ..Start::default() });
+    let ready = tui.since_spawn_until(Duration::from_secs(10), |s| s.contains("idle")).unwrap();
+    assert!(ready < Duration::from_millis(1_500), "the session was ready after {ready:?}");
+    let sent = std::time::Instant::now();
+    tui.send("k");
+    tui.wait("the key", Duration::from_secs(5), |s| s.contains("› k"));
+    assert!(sent.elapsed() < Duration::from_millis(500), "the key painted after {:?}", sent.elapsed());
+    tui.quit();
+}

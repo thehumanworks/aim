@@ -7,7 +7,9 @@
 //! is never lost (the tny ADR 0013 lesson).
 
 use aim_proto::conversation::{Item, Part, RateLimits, StopReason};
-use aim_proto::daemon::{Persistence, PromptOutcome, SessionConfigParams, SessionSpec, SessionState, SessionSummary, SessionUpdate};
+use aim_proto::daemon::{
+    Location, Persistence, PromptOutcome, SessionConfigParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::commands::{self, COMMANDS};
@@ -31,11 +33,18 @@ pub enum Input {
     Update {
         /// Its session.
         session: String,
+        /// The attach attempt whose stream carried it.
+        attempt: u64,
         /// The update.
         update: SessionUpdate,
     },
     /// A session was created (or not).
-    Created(Result<SessionSummary, String>),
+    Created {
+        /// The attempt that asked for it.
+        attempt: u64,
+        /// The session, or why not.
+        result: Result<SessionSummary, String>,
+    },
     /// A session was attached: its state and transcript so far.
     Attached {
         /// The session.
@@ -44,13 +53,22 @@ pub enum Input {
         transcript: Vec<Item>,
         /// A re-attach after the update stream dropped (only new items are applied).
         resync: bool,
+        /// The attempt that asked for it.
+        attempt: u64,
     },
     /// Attaching failed.
-    AttachFailed(String),
+    AttachFailed {
+        /// The attempt that failed.
+        attempt: u64,
+        /// Why.
+        error: String,
+    },
     /// A session's update stream ended.
     StreamEnded {
         /// Its session.
         session: String,
+        /// The attach attempt whose stream it was.
+        attempt: u64,
     },
     /// A prompt was answered.
     PromptDone {
@@ -75,13 +93,27 @@ pub enum Input {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
     /// Create a session.
-    Create(SessionSpec),
+    Create {
+        /// What to create.
+        spec: SessionSpec,
+        /// Tags the answer, so a superseded one is ignored.
+        attempt: u64,
+    },
     /// Attach to a session.
     Attach {
         /// The session.
         session: String,
         /// Re-attach after a dropped stream.
         resync: bool,
+        /// Tags the snapshot and the stream, so a superseded one is ignored.
+        attempt: u64,
+    },
+    /// Complete paths and skills from this workspace from now on.
+    Rebind {
+        /// Workspace root.
+        workspace: String,
+        /// Whether it is on this machine (otherwise only non-workspace sources apply).
+        local: bool,
     },
     /// Send input to a session.
     Prompt {
@@ -117,6 +149,8 @@ pub struct SessionView {
     pub workspace: String,
     /// Provider id.
     pub provider: String,
+    /// Where the workspace is.
+    pub location: Location,
     /// Model id.
     pub model: String,
     /// Reasoning effort.
@@ -145,6 +179,8 @@ pub enum SteerState {
 pub struct Steer {
     /// The prompt's id.
     pub id: u64,
+    /// Sent while a turn ran (so most likely steering, not a turn's first prompt).
+    pub steering: bool,
     /// The text.
     pub text: String,
     /// Where it is.
@@ -257,6 +293,8 @@ pub struct AppConfig {
     pub hyperlinks: bool,
     /// The user's home directory (shown as `~`).
     pub home: Option<String>,
+    /// A prompt history file exists (prompts of persistent sessions are appended to it).
+    pub persist_history: bool,
 }
 
 /// The whole UI state.
@@ -306,9 +344,30 @@ pub struct App {
     quit_armed: bool,
     quitting: bool,
     next_prompt: u64,
-    queued_first: Option<String>,
+    /// Prompts submitted while no session was attached (or one was being switched to).
+    queued: Vec<String>,
+    /// The latest create or attach attempt; answers of older ones are ignored.
+    attempt: u64,
+    /// History from the file: shown only while a persistent session is attached.
+    disk_history: Vec<String>,
+    /// Prompts of ephemeral sessions in this run: memory only.
+    private_history: Vec<String>,
+    /// Workspace the completion sources are rooted in, and whether it is local.
+    bound: (String, bool),
+    /// `SteerDelivered` counts whose user items have not arrived yet.
+    pending_deliveries: usize,
+    /// Effects raised inside state changes, returned by the next `handle`.
+    outbox: Vec<Effect>,
     models: Vec<String>,
     efforts: Vec<String>,
+}
+
+/// `local` or `ssh:<destination>`, as session metadata records a location.
+fn location_of(text: &str) -> Location {
+    match text.strip_prefix("ssh:") {
+        Some(destination) => Location::Ssh { destination: destination.to_owned() },
+        None => Location::Local,
+    }
 }
 
 fn text_parts(text: String) -> Vec<Part> {
@@ -316,10 +375,11 @@ fn text_parts(text: String) -> Vec<Part> {
 }
 
 impl App {
-    /// A new app; `history` is past prompts, oldest first.
+    /// A new app; `history` is the history file's prompts, oldest first. They are offered only
+    /// once a persistent session is attached (never in an ephemeral one).
     pub fn new(theme: Theme, config: AppConfig, history: Vec<String>, fullscreen: bool) -> Self {
-        let mut composer = Composer::default();
-        composer.set_history(history);
+        let composer = Composer::default();
+        let bound = (config.spec.workspace.clone(), config.spec.location == Location::Local);
         let mut models = Vec::new();
         models.extend(config.spec.model.clone());
         let mut efforts = Vec::new();
@@ -349,7 +409,13 @@ impl App {
             quit_armed: false,
             quitting: false,
             next_prompt: 1,
-            queued_first: None,
+            queued: Vec::new(),
+            attempt: 0,
+            disk_history: history,
+            private_history: Vec::new(),
+            bound,
+            pending_deliveries: 0,
+            outbox: Vec::new(),
             models,
             efforts,
         }
@@ -357,11 +423,29 @@ impl App {
 
     /// The first effect: attach to `session`, or create one from the configured spec.
     pub fn start(&mut self, session: Option<String>) -> Vec<Effect> {
-        self.connecting = true;
-        match session {
-            Some(session) => vec![Effect::Attach { session, resync: false }],
-            None => vec![Effect::Create(self.config.spec.clone())],
+        if let Some(session) = session {
+            return vec![self.attach(session, false)];
         }
+        let spec = self.config.spec.clone();
+        vec![self.create(spec)]
+    }
+
+    /// A new attempt: any answer to an older create or attach is ignored from now on.
+    fn next_attempt(&mut self) -> u64 {
+        self.attempt = self.attempt.saturating_add(1);
+        self.attempt
+    }
+
+    fn create(&mut self, spec: SessionSpec) -> Effect {
+        self.connecting = true;
+        Effect::Create { spec, attempt: self.next_attempt() }
+    }
+
+    fn attach(&mut self, session: String, resync: bool) -> Effect {
+        if !resync {
+            self.connecting = true;
+        }
+        Effect::Attach { session, resync, attempt: self.next_attempt() }
     }
 
     /// Whether the app wants to exit.
@@ -378,6 +462,12 @@ impl App {
     #[cfg(test)]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The latest create or attach attempt.
+    #[cfg(test)]
+    pub fn attempt(&self) -> u64 {
+        self.attempt
     }
 
     /// Entry rendering options at `width`.
@@ -410,6 +500,12 @@ impl App {
 
     /// Applies one input.
     pub fn handle(&mut self, input: Input) -> Vec<Effect> {
+        let mut effects = self.apply(input);
+        effects.append(&mut self.outbox);
+        effects
+    }
+
+    fn apply(&mut self, input: Input) -> Vec<Effect> {
         match input {
             Input::Key(key) => self.on_key(key),
             Input::Paste(text) => {
@@ -425,20 +521,22 @@ impl App {
                 self.size = (width, height);
                 Vec::new()
             }
-            Input::Update { session, update } => {
-                if self.session.as_ref().is_some_and(|s| s.id == session) {
+            Input::Update { session, attempt, update } => {
+                // Only the current attachment's stream counts (a superseded one may still drain).
+                if attempt == self.attempt && self.session.as_ref().is_some_and(|s| s.id == session) {
                     self.on_update(update);
                 }
                 Vec::new()
             }
-            Input::Created(result) => self.on_created(result),
-            Input::Attached { summary, transcript, resync } => self.on_attached(&summary, &transcript, resync),
-            Input::AttachFailed(error) => {
-                self.connecting = false;
-                self.notice(Level::Error, format!("could not attach: {error}"));
+            Input::Created { attempt, result } if attempt == self.attempt => self.on_created(result),
+            Input::Attached { summary, transcript, resync, attempt } if attempt == self.attempt => {
+                self.on_attached(&summary, &transcript, resync)
+            }
+            Input::AttachFailed { attempt, error } if attempt == self.attempt => {
+                self.connection_failed(&format!("could not attach: {error}"));
                 Vec::new()
             }
-            Input::StreamEnded { session } => self.on_stream_ended(&session),
+            Input::StreamEnded { session, attempt } if attempt == self.attempt => self.on_stream_ended(&session),
             Input::PromptDone { id, result } => {
                 self.on_prompt_done(id, result);
                 Vec::new()
@@ -461,18 +559,58 @@ impl App {
                 }
                 Vec::new()
             }
-            Input::Noop => Vec::new(),
+            // Answers of superseded attempts, and acknowledgements with nothing to show.
+            Input::Created { .. } | Input::Attached { .. } | Input::AttachFailed { .. } | Input::StreamEnded { .. } | Input::Noop => {
+                Vec::new()
+            }
         }
     }
 
     fn on_created(&mut self, result: Result<SessionSummary, String>) -> Vec<Effect> {
         match result {
-            Ok(summary) => vec![Effect::Attach { session: summary.meta.id, resync: false }],
+            Ok(summary) => vec![self.attach(summary.meta.id, false)],
             Err(error) => {
-                self.connecting = false;
-                self.notice(Level::Error, format!("could not start a session: {error}"));
+                self.connection_failed(&format!("could not start a session: {error}"));
                 Vec::new()
             }
+        }
+    }
+
+    /// Creating or attaching failed: prompts waiting for it go back to the composer.
+    fn connection_failed(&mut self, message: &str) {
+        self.connecting = false;
+        let queued = std::mem::take(&mut self.queued);
+        if !queued.is_empty() {
+            self.refill(&queued);
+        }
+        self.hint = None;
+        self.notice(Level::Error, message);
+    }
+
+    /// Offers the history that fits the attached session: the file's for a persistent session,
+    /// this run's ephemeral prompts (memory only) for an ephemeral one.
+    fn expose_history(&mut self, persistence: Persistence) {
+        let history = match persistence {
+            Persistence::Persistent => self.disk_history.clone(),
+            Persistence::Ephemeral => self.private_history.clone(),
+        };
+        self.composer.set_history(history);
+    }
+
+    /// Records a prompt in the history of the session it goes to (the file only when that
+    /// session is persistent).
+    fn remember(&mut self, text: &str) {
+        if !self.composer.remember(text) {
+            return;
+        }
+        let persistent = self.session.as_ref().is_some_and(|s| s.persistence == Persistence::Persistent);
+        if persistent {
+            self.disk_history.push(text.to_owned());
+            if self.config.persist_history {
+                self.outbox.push(Effect::SaveHistory(text.to_owned()));
+            }
+        } else {
+            self.private_history.push(text.to_owned());
         }
     }
 
@@ -490,19 +628,19 @@ impl App {
     fn on_attached(&mut self, summary: &SessionSummary, items: &[Item], resync: bool) -> Vec<Effect> {
         self.connecting = false;
         let meta = &summary.meta;
-        if resync && self.session.as_ref().is_some_and(|s| s.id == meta.id) {
-            for item in items.iter().skip(self.transcript.items_seen()) {
-                self.transcript.push_item(item);
-            }
-            self.notice(Level::Warn, "reconnected to the session (some live updates were skipped)");
+        let same = self.session.as_ref().is_some_and(|s| s.id == meta.id);
+        if resync && same {
+            self.resync(items);
         } else {
             let switching = self.session.is_some();
             self.transcript.settle();
             self.live_text.clear();
             self.live_reasoning.clear();
             self.steers.clear();
+            self.pending_deliveries = 0;
             self.tokens = Tokens::default();
             self.limits = None;
+            self.jev_effort = None;
             // Entries already printed stay printed; a switch continues below them.
             if switching || !items.is_empty() {
                 let label = meta.title.clone().unwrap_or_else(|| meta.id.clone());
@@ -512,24 +650,50 @@ impl App {
             for item in items {
                 self.transcript.push_item(item);
             }
+            self.expose_history(summary.persistence);
         }
+        let location = location_of(&meta.location);
+        let local = location == Location::Local;
         self.session = Some(SessionView {
             id: meta.id.clone(),
             workspace: meta.workspace.clone(),
             provider: meta.provider.clone(),
+            location,
             model: meta.model.clone(),
             effort: self.session.as_ref().filter(|s| s.id == meta.id).and_then(|s| s.effort.clone()).or(self.config.spec.effort.clone()),
             state: summary.state,
             persistence: summary.persistence,
         });
         self.remember_config(&meta.model.clone(), None);
-        if summary.state != SessionState::Running {
-            self.transcript.settle();
+        if (meta.workspace.clone(), local) != self.bound {
+            self.bound = (meta.workspace.clone(), local);
+            self.outbox.push(Effect::Rebind { workspace: meta.workspace.clone(), local });
         }
-        match self.queued_first.take() {
-            Some(text) => self.send(text),
-            None => Vec::new(),
+        if !matches!(summary.state, SessionState::Running | SessionState::RequiresAction) {
+            self.settle_turn(summary.state);
         }
+        let mut effects = Vec::new();
+        self.hint = None;
+        for text in std::mem::take(&mut self.queued) {
+            effects.extend(self.dispatch(text));
+        }
+        effects
+    }
+
+    /// A re-attach after the stream dropped: the snapshot is the truth. New items are applied,
+    /// steering they contain counts as delivered, and streamed text is dropped (the finished item
+    /// is in the snapshot, or will arrive whole).
+    fn resync(&mut self, items: &[Item]) {
+        for item in items.iter().skip(self.transcript.items_seen()) {
+            self.transcript.push_item(item);
+            if let Item::User { parts } = item {
+                self.mark_delivered(&user_text(parts));
+            }
+        }
+        self.live_text.clear();
+        self.live_reasoning.clear();
+        self.pending_deliveries = 0;
+        self.notice(Level::Warn, "reconnected to the session (some live updates were skipped)");
     }
 
     fn on_stream_ended(&mut self, session: &str) -> Vec<Effect> {
@@ -537,7 +701,7 @@ impl App {
         if current.id != session || current.state == SessionState::Closed || self.quitting {
             return Vec::new();
         }
-        vec![Effect::Attach { session: session.to_owned(), resync: true }]
+        vec![self.attach(session.to_owned(), true)]
     }
 
     fn on_update(&mut self, update: SessionUpdate) {
@@ -546,6 +710,7 @@ impl App {
             SessionUpdate::TurnStarted { .. } => {
                 self.request = 0;
                 self.turn_seconds = 0;
+                self.pending_deliveries = 0;
             }
             SessionUpdate::RequestStarted { index } => self.request = index,
             SessionUpdate::TextDelta { delta } => self.live_text.push_str(&delta),
@@ -554,20 +719,19 @@ impl App {
                 match &item {
                     Item::Assistant { .. } => self.live_text.clear(),
                     Item::Reasoning { .. } => self.live_reasoning.clear(),
+                    // The user items that follow `SteerDelivered` are the steering that went out.
+                    Item::User { parts } if self.pending_deliveries > 0 => {
+                        self.pending_deliveries -= 1;
+                        self.mark_delivered(&user_text(parts));
+                    }
                     _ => {}
                 }
                 self.transcript.push_item(&item);
             }
             SessionUpdate::ToolStarted { .. } | SessionUpdate::ToolFinished { .. } | SessionUpdate::SteerQueued => {}
-            SessionUpdate::SteerDelivered { count } => {
-                let mut left = count;
-                for steer in &mut self.steers {
-                    if left > 0 && steer.state != SteerState::Delivered {
-                        steer.state = SteerState::Delivered;
-                        left -= 1;
-                    }
-                }
-            }
+            // Which chips went out is told by the user items that follow, not by position: the
+            // oldest chip may be a turn's first prompt whose answer is merely late.
+            SessionUpdate::SteerDelivered { count } => self.pending_deliveries = self.pending_deliveries.saturating_add(count),
             SessionUpdate::SteersReturned { steers } => self.on_steers_returned(&steers),
             SessionUpdate::Usage { usage } => {
                 let t = &mut self.tokens;
@@ -607,24 +771,42 @@ impl App {
         if let Some(session) = &mut self.session {
             session.state = state;
         }
-        match state {
-            SessionState::Idle | SessionState::Closed => {
-                self.flush_live();
-                self.transcript.settle();
-                self.steers.retain(|s| s.state != SteerState::Delivered);
-                // Steering the session accepted but neither delivered nor returned goes back to the
-                // composer (the host always does one or the other; this keeps the text if not).
-                let orphans: Vec<String> = self.steers.iter().filter(|s| s.state == SteerState::Queued).map(|s| s.text.clone()).collect();
-                if !orphans.is_empty() {
-                    self.steers.retain(|s| s.state != SteerState::Queued);
-                    self.refill(&orphans);
-                }
-                if state == SessionState::Closed {
-                    self.notice(Level::Info, "session closed");
-                }
-                self.hint = None;
+        if matches!(state, SessionState::Idle | SessionState::Closed) {
+            self.settle_turn(state);
+            if state == SessionState::Closed {
+                self.notice(Level::Info, "session closed");
             }
-            SessionState::Running | SessionState::RequiresAction => {}
+            self.hint = None;
+        }
+    }
+
+    /// No turn runs any more: commit what streamed, answer running calls, and account for every
+    /// chip. Steering the session accepted but neither delivered nor returned goes back to the
+    /// composer (the host always does one or the other; this keeps the text if not).
+    fn settle_turn(&mut self, _state: SessionState) {
+        self.flush_live();
+        self.transcript.settle();
+        self.pending_deliveries = 0;
+        self.steers.retain(|s| s.state != SteerState::Delivered);
+        let orphans: Vec<String> = self.steers.iter().filter(|s| s.state == SteerState::Queued).map(|s| s.text.clone()).collect();
+        if !orphans.is_empty() {
+            self.steers.retain(|s| s.state != SteerState::Queued);
+            self.refill(&orphans);
+        }
+    }
+
+    /// Marks the chip `text` belongs to as delivered: a queued steer first, then one sent while a
+    /// turn ran, then any unresolved prompt with that text.
+    fn mark_delivered(&mut self, text: &str) {
+        let open = |s: &Steer| s.state != SteerState::Delivered && s.text == text;
+        let pick = self
+            .steers
+            .iter()
+            .position(|s| open(s) && s.state == SteerState::Queued)
+            .or_else(|| self.steers.iter().position(|s| open(s) && s.steering))
+            .or_else(|| self.steers.iter().position(open));
+        if let Some(steer) = pick.and_then(|index| self.steers.get_mut(index)) {
+            steer.state = SteerState::Delivered;
         }
     }
 
@@ -653,14 +835,27 @@ impl App {
         self.notice(level, text);
     }
 
-    /// Puts text back into the composer, before whatever is being typed.
+    /// Puts text back into the composer, before whatever is being typed (its paste chips kept).
+    /// The draft changed under any open completion, so that is closed and fenced off.
     fn refill(&mut self, texts: &[String]) {
         let mut joined = texts.join("\n");
         if !self.composer.is_empty() {
             joined.push('\n');
-            joined.push_str(self.composer.text());
         }
-        self.composer.set(&joined);
+        self.composer.prepend(&joined);
+        self.invalidate_completion();
+    }
+
+    /// The draft changed without a keystroke: close the popup and move the generation on, so
+    /// neither its old byte range nor a late answer can touch the new text.
+    fn invalidate_completion(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+        if self.popup.context.take().is_some() {
+            self.outbox.push(Effect::CancelCompletion);
+        }
+        self.popup.items.clear();
+        self.popup.selected = 0;
+        self.popup.dismissed = None;
     }
 
     fn on_steers_returned(&mut self, returned: &[Vec<Part>]) {
@@ -730,11 +925,23 @@ impl App {
         }
     }
 
-    /// Sends text as a prompt (or steering while a turn runs).
+    /// Sends text as a prompt (or steering while a turn runs). While no session is attached, or
+    /// one is being switched to, it waits in order for that session.
     fn send(&mut self, text: String) -> Vec<Effect> {
+        if self.connecting || self.session.is_none() {
+            self.queued.push(text);
+            let n = self.queued.len();
+            self.hint =
+                Some(if n == 1 { "sends when the session is ready".into() } else { format!("{n} prompts send when the session is ready") });
+            return Vec::new();
+        }
+        self.dispatch(text)
+    }
+
+    /// Sends text to the attached session and records it in that session's history.
+    fn dispatch(&mut self, text: String) -> Vec<Effect> {
         let Some((session, state)) = self.session.as_ref().map(|s| (s.id.clone(), s.state)) else {
-            self.queued_first = Some(text);
-            self.hint = Some("sends when the session is ready".into());
+            self.queued.push(text);
             return Vec::new();
         };
         if state == SessionState::Closed {
@@ -742,10 +949,12 @@ impl App {
             self.notice(Level::Error, "this session is closed: /new starts another, /sessions resumes one");
             return Vec::new();
         }
+        self.remember(&text);
         let id = self.next_prompt;
         self.next_prompt = self.next_prompt.saturating_add(1);
         let effect = Effect::Prompt { id, session, parts: text_parts(text.clone()) };
-        self.steers.push(Steer { id, text, state: SteerState::Sending });
+        let steering = self.running();
+        self.steers.push(Steer { id, steering, text, state: SteerState::Sending });
         vec![effect]
     }
 
@@ -762,8 +971,8 @@ impl App {
             };
             let (name, arg) = (command.name, arg.to_owned());
             // Commands with an argument are worth recalling; `/quit` and friends are not.
-            if command.takes_argument() && self.composer.remember(&raw) && self.config.spec.persistence == Persistence::Persistent {
-                effects.push(Effect::SaveHistory(raw));
+            if command.takes_argument() {
+                self.remember(&raw);
             }
             self.composer.clear();
             self.close_popup(&mut effects);
@@ -771,9 +980,6 @@ impl App {
             return effects;
         }
         let text = self.composer.take();
-        if self.composer.remember(&text) && self.config.spec.persistence == Persistence::Persistent {
-            effects.push(Effect::SaveHistory(text.clone()));
-        }
         self.close_popup(&mut effects);
         effects.extend(self.send(text));
         effects
@@ -798,14 +1004,16 @@ impl App {
                 vec![Effect::SetConfig(SessionConfigParams { session, model: None, effort: Some(arg.to_owned()) })]
             }
             ("new", _) => {
+                // A new session like the attached one: same provider, place, workspace and model.
                 let mut spec = self.config.spec.clone();
                 if let Some(s) = &self.session {
+                    spec.provider.clone_from(&s.provider);
+                    spec.location = s.location.clone();
                     spec.workspace.clone_from(&s.workspace);
                     spec.model = Some(s.model.clone());
                     spec.effort.clone_from(&s.effort);
                 }
-                self.connecting = true;
-                vec![Effect::Create(spec)]
+                vec![self.create(spec)]
             }
             ("sessions", _) => {
                 self.picker = Some(Picker::default());
@@ -859,9 +1067,10 @@ impl App {
         }
         if !self.composer.is_empty() {
             self.composer.clear();
+            self.invalidate_completion();
             self.quit_armed = true;
             self.hint = Some("ctrl+c again to exit".into());
-            return vec![Effect::CancelCompletion];
+            return Vec::new();
         }
         if self.quit_armed {
             return self.quit();
@@ -1001,8 +1210,7 @@ impl App {
                     if self.session.as_ref().is_some_and(|s| s.id == id) {
                         return Vec::new();
                     }
-                    self.connecting = true;
-                    return vec![Effect::Attach { session: id, resync: false }];
+                    return vec![self.attach(id, false)];
                 }
             }
             _ => {}

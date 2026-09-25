@@ -32,7 +32,16 @@ pub struct Search {
     pub query: String,
     /// The history entry that matches, if any.
     pub hit: Option<usize>,
-    saved: (String, usize),
+    saved: Draft,
+}
+
+/// Everything a draft is: text, cursor and the pastes its chips stand for. Browsing history or
+/// searching it snapshots the draft and restores it whole, so a chip never loses its paste.
+#[derive(Clone, Debug, Default)]
+struct Draft {
+    text: String,
+    cursor: usize,
+    chips: Vec<Chip>,
 }
 
 /// The prompt editor.
@@ -43,7 +52,7 @@ pub struct Composer {
     chips: Vec<Chip>,
     kill: String,
     history: Vec<String>,
-    browse: Option<(usize, String)>,
+    browse: Option<(usize, Draft)>,
     search: Option<Search>,
 }
 
@@ -128,6 +137,14 @@ impl Composer {
         }
         self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
+        self.edited();
+    }
+
+    /// Puts `text` before the draft, keeping the draft's chips and the cursor's place in it.
+    pub fn prepend(&mut self, text: &str) {
+        let text = clean(&normalize_newlines(text));
+        self.text.insert_str(0, &text);
+        self.cursor = self.cursor.saturating_add(text.len()).min(self.text.len());
         self.edited();
     }
 
@@ -378,6 +395,16 @@ impl Composer {
         true
     }
 
+    fn snapshot(&self) -> Draft {
+        Draft { text: self.text.clone(), cursor: self.cursor, chips: self.chips.clone() }
+    }
+
+    fn restore(&mut self, draft: Draft) {
+        self.cursor = draft.cursor.min(draft.text.len());
+        self.text = draft.text;
+        self.chips = draft.chips;
+    }
+
     fn show_history(&mut self, index: usize) {
         if let Some(entry) = self.history.get(index) {
             self.text.clone_from(entry);
@@ -391,7 +418,7 @@ impl Composer {
         let index = match &self.browse {
             None => {
                 let Some(last) = self.history.len().checked_sub(1) else { return false };
-                self.browse = Some((last, self.text.clone()));
+                self.browse = Some((last, self.snapshot()));
                 last
             }
             Some((0, _)) => return false,
@@ -413,8 +440,7 @@ impl Composer {
             self.show_history(index + 1);
         } else {
             self.browse = None;
-            self.text = draft;
-            self.cursor = self.text.len();
+            self.restore(draft);
         }
         true
     }
@@ -428,7 +454,7 @@ impl Composer {
                     search.hit = Some(hit);
                 }
             }
-            None => self.search = Some(Search { query: String::new(), hit: None, saved: (self.text.clone(), self.cursor) }),
+            None => self.search = Some(Search { query: String::new(), hit: None, saved: self.snapshot() }),
         }
     }
 
@@ -460,7 +486,7 @@ impl Composer {
             if let Some(entry) = search.hit.and_then(|hit| self.history.get(hit)).cloned() {
                 self.set(&entry);
             } else {
-                (self.text, self.cursor) = search.saved;
+                self.restore(search.saved);
             }
         }
     }
@@ -468,7 +494,7 @@ impl Composer {
     /// Ends the search restoring the draft.
     pub fn search_cancel(&mut self) {
         if let Some(search) = self.search.take() {
-            (self.text, self.cursor) = search.saved;
+            self.restore(search.saved);
         }
     }
 
@@ -651,5 +677,23 @@ mod tests {
         let mut c = typed("ab\ncd");
         c.up();
         assert_eq!(c.layout(20, &theme).1, (0, 2));
+    }
+
+    /// REV10 #9: browsing history and coming back keeps a pasted chip's content.
+    #[test]
+    fn rev10_history_browsing_keeps_a_paste_chip() {
+        let mut c = Composer::default();
+        c.set_history(vec!["older".into()]);
+        let big = (1..=20).map(|n| format!("row {n}")).collect::<Vec<_>>().join("\n");
+        c.paste(&big);
+        assert!(c.history_prev());
+        assert_eq!(c.text(), "older");
+        assert!(c.history_next());
+        assert_eq!(c.take(), big, "the chip still expands to the paste");
+        c.paste(&big);
+        c.search_start();
+        c.search_type("old");
+        c.search_cancel();
+        assert_eq!(c.take(), big, "a cancelled search keeps it too");
     }
 }

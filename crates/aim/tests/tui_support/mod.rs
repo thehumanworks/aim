@@ -34,11 +34,13 @@ pub struct Start<'a> {
     pub before: &'a [&'a str],
     pub args: &'a [&'a str],
     pub env: &'a [(&'a str, &'a str)],
+    /// A terminal that answers no queries (DA1, cursor position).
+    pub silent: bool,
 }
 
 impl Default for Start<'_> {
     fn default() -> Self {
-        Self { rows: 24, cols: 80, before: &[], args: &[], env: &[] }
+        Self { rows: 24, cols: 80, before: &[], args: &[], env: &[], silent: false }
     }
 }
 
@@ -117,6 +119,10 @@ impl Tui {
         cmd.env("AIM_THEME", "dark");
         cmd.env("AIM_TUI_REFLOW", "0");
         cmd.env_remove("NO_COLOR");
+        // The pty is not the terminal running the tests: drop what identifies that terminal.
+        for key in ["TERM_PROGRAM", "KITTY_WINDOW_ID", "WEZTERM_PANE", "ALACRITTY_WINDOW_ID", "TMUX", "AIM_TUI_KEYBOARD"] {
+            cmd.env_remove(key);
+        }
         cmd.env_remove("COLORFGBG");
         for (key, value) in start.env {
             cmd.env(key, value);
@@ -135,6 +141,7 @@ impl Tui {
         let mut reader = pty.master.try_clone_reader().unwrap();
         let output_bytes = Arc::new(Mutex::new(0_usize));
         let frames = Arc::new(Mutex::new(0_usize));
+        let silent = start.silent;
         {
             let parser = Arc::clone(&parser);
             let writer = Arc::clone(&writer);
@@ -153,7 +160,7 @@ impl Tui {
                     let answer = {
                         let mut p = parser.lock().unwrap();
                         p.process(data);
-                        replies(data, &p)
+                        if silent { Vec::new() } else { replies(data, &p) }
                     };
                     if !answer.is_empty() {
                         let mut w = writer.lock().unwrap();

@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 
 use super::app::{App, Layout, SteerState};
 use super::markdown::{self, RenderOpts};
-use super::text::{Row, Run, truncate};
+use super::text::{Row, Run, clamp, truncate};
 use super::transcript::{EntryOpts, render_entry};
 
 /// Most composer rows shown.
@@ -20,8 +20,8 @@ pub const COMPOSER_ROWS: usize = 8;
 pub const POPUP_ROWS: usize = 8;
 /// Most steering chips shown.
 pub const CHIP_ROWS: usize = 3;
-/// Most rows of running tool calls shown.
-pub const TOOL_ROWS: usize = 6;
+/// Most rows of held-back entries (running calls and what finished behind them) shown.
+pub const HELD_ROWS: usize = 10;
 
 /// The pinned block, row by row, and where the cursor goes.
 #[derive(Debug, Default)]
@@ -154,18 +154,18 @@ fn live_rows(app: &App, width: usize, budget: usize) -> Vec<Row> {
     rows.split_off(skip)
 }
 
-fn tool_rows(app: &App, width: usize) -> Vec<Row> {
+fn held_rows(app: &App, width: usize) -> Vec<Row> {
     let opts = EntryOpts { render: RenderOpts { width, hyperlinks: false }, collapse_reasoning: false };
     let mut rows: Vec<Row> = Vec::new();
-    for entry in app.transcript.pending() {
+    for entry in app.transcript.held() {
         let mut entry_rows = render_entry(entry, &app.theme, opts);
         entry_rows.pop();
         rows.extend(entry_rows);
     }
-    if rows.len() > TOOL_ROWS {
-        let hidden = rows.len() - (TOOL_ROWS - 1);
-        rows.truncate(TOOL_ROWS - 1);
-        rows.push(Row::plain(format!("  … {hidden} more rows of running tools"), app.theme.muted));
+    if rows.len() > HELD_ROWS {
+        let hidden = rows.len() - (HELD_ROWS - 1);
+        rows.truncate(HELD_ROWS - 1);
+        rows.push(Row::plain(truncate(&format!("  … {hidden} more rows until the running call finishes"), width), app.theme.muted));
     }
     rows
 }
@@ -236,7 +236,7 @@ pub fn block(app: &App, width: u16, max_rows: u16) -> Block {
     // the block before the app learns of a resize then cannot shift where the next erase starts.
     let visible = composer.len().min(COMPOSER_ROWS).min(max - 1).max(1);
     let first = cursor_row.saturating_sub(visible - 1).min(composer.len().saturating_sub(visible));
-    let composer: Vec<Row> = composer.into_iter().skip(first).take(visible).collect();
+    let composer: Vec<Row> = composer.into_iter().skip(first).take(visible).map(|row| clamp(row, w)).collect();
     let mut room = max - 1 - composer.len();
     let rule = room > 0;
     room = room.saturating_sub(usize::from(rule));
@@ -246,7 +246,7 @@ pub fn block(app: &App, width: u16, max_rows: u16) -> Block {
     room = room.saturating_sub(popup.len());
     let chips: Vec<Row> = chip_rows(app, w).into_iter().take(room).collect();
     room = room.saturating_sub(chips.len());
-    let tools: Vec<Row> = tool_rows(app, w).into_iter().take(room).collect();
+    let tools: Vec<Row> = held_rows(app, w).into_iter().take(room).collect();
     room = room.saturating_sub(tools.len());
     let live_budget = room.min(usize::from(app.size.1 / 2).max(3));
     let live = live_rows(app, w, live_budget);
@@ -457,19 +457,23 @@ mod tests {
             agent: None,
             persistence: Persistence::Persistent,
         };
-        let mut app = App::new(Theme::plain(), AppConfig { spec, hyperlinks: false, home: Some("/home/me".into()) }, Vec::new(), false);
+        let config = AppConfig { spec, hyperlinks: false, home: Some("/home/me".into()), persist_history: false };
+        let mut app = App::new(Theme::plain(), config, Vec::new(), false);
         app.handle(Input::Resize(50, 30));
         app.start(None);
+        let attempt = app.attempt();
         app.handle(Input::Attached {
             summary: summary("s1", "/home/me/aim", SessionState::Idle, 0),
             transcript: Vec::new(),
             resync: false,
+            attempt,
         });
         app
     }
 
     fn up(app: &mut App, update: SessionUpdate) {
-        app.handle(Input::Update { session: "s1".into(), update });
+        let attempt = app.attempt();
+        app.handle(Input::Update { session: "s1".into(), attempt, update });
     }
 
     fn key(app: &mut App, code: KeyCode) {

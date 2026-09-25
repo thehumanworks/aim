@@ -12,7 +12,7 @@ use ratatui::style::Style;
 use serde_json::Value;
 
 use super::markdown::{self, RenderOpts};
-use super::text::{Row, Run, Wrap, sanitize, truncate, wrap_text};
+use super::text::{Row, Run, Wrap, clamp, sanitize, truncate, wrap_text};
 use super::theme::Theme;
 
 /// Most output lines shown under a tool call.
@@ -224,9 +224,11 @@ impl Transcript {
         self.ready() > self.committed
     }
 
-    /// Unfinished entries after the committed ones (running tool calls, for the pinned block).
-    pub fn pending(&self) -> impl Iterator<Item = &Entry> {
-        self.entries.iter().skip(self.committed).filter(|e| !e.finished())
+    /// Entries held back from scrollback: the first unfinished one and everything after it,
+    /// finished or not (a call that finished behind a running one included). The pinned block and
+    /// the foot of the fullscreen view show them until they can be committed in order.
+    pub fn held(&self) -> impl Iterator<Item = &Entry> {
+        self.entries.iter().skip(self.ready().max(self.committed))
     }
 }
 
@@ -351,7 +353,7 @@ pub fn render_entry(entry: &Entry, theme: &Theme, opts: EntryOpts) -> Vec<Row> {
         }
     };
     rows.push(Row::blank());
-    rows
+    rows.into_iter().map(|row| clamp(row, width)).collect()
 }
 
 #[cfg(test)]
@@ -383,7 +385,7 @@ mod tests {
         assert_eq!(t.take_committable().len(), 1);
         t.push_item(&Item::ToolResult { call_id: "b".into(), result: ToolResult::text("ok") });
         assert!(t.take_committable().is_empty(), "b is done but a still runs");
-        assert_eq!(t.pending().count(), 1);
+        assert_eq!(t.held().count(), 2, "a (running) and b (finished behind it)");
         t.push_item(&Item::ToolResult { call_id: "a".into(), result: ToolResult::error("boom") });
         assert_eq!(t.take_committable().len(), 2);
         assert_eq!(t.items_seen(), 5);
@@ -428,5 +430,35 @@ mod tests {
         let native = NativeItem { provider: "codex".into(), value: serde_json::json!({"type": "web_search_call"}) };
         t.push_item(&Item::Hosted { native });
         assert_eq!(t.entries(), [Entry::Notice { level: Level::Info, text: "web search call (codex)".into() }]);
+    }
+
+    /// REV10 #13: no rendered row is wider than the width it was rendered for.
+    #[test]
+    fn rev10_rows_never_exceed_their_width() {
+        let theme = Theme::plain();
+        let long_tool = Entry::Tool {
+            call_id: "c".into(),
+            name: "a_really_long_tool_name_that_goes_on".into(),
+            arguments: r#"{"path":"x"}"#.into(),
+            result: Some(ToolResult { truncated: true, ..ToolResult::text((1..=9).map(|n| n.to_string()).collect::<Vec<_>>().join("\n")) }),
+            settled: false,
+        };
+        let nested = (1..=12).fold(String::new(), |acc, depth| format!("{acc}{}- level {depth}\n", "  ".repeat(depth - 1)));
+        let entries = [
+            long_tool,
+            Entry::Assistant { text: "```a-very-long-language-label-indeed\ncode\n```".into(), interrupted: false },
+            Entry::Assistant { text: format!("> > > > > > > > quoted\n\n{nested}"), interrupted: false },
+            Entry::Assistant { text: "日本語のテキスト".into(), interrupted: false },
+            Entry::User { text: "日本語".into() },
+            Entry::Notice { level: Level::Error, text: "x".into() },
+        ];
+        for width in [1_usize, 2, 3, 8, 16] {
+            let opts = EntryOpts { render: RenderOpts { width, hyperlinks: false }, collapse_reasoning: false };
+            for entry in &entries {
+                for row in render_entry(entry, &theme, opts) {
+                    assert!(row.width() <= width, "width {width}: {:?} is {} wide", row.text(), row.width());
+                }
+            }
+        }
     }
 }
