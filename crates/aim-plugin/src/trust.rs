@@ -76,6 +76,15 @@ impl TrustStore {
         fs::create_dir_all(parent)?;
         let text = toml::to_string_pretty(&self.data).map_err(|e| PluginError::Invalid(e.to_string()))?;
         let tmp = self.path.with_extension("toml.tmp");
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
         fs::write(&tmp, text)?;
         fs::rename(tmp, &self.path)?;
         Ok(())

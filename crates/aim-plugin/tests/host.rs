@@ -77,6 +77,29 @@ async fn kv_guest_persists_across_session_host_recreation() {
 }
 
 #[tokio::test]
+async fn concurrent_session_calls_do_not_lose_kv_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut trust = TrustStore::load(dir.path()).unwrap();
+    let src = source("kv_counter", false);
+    trust.grant(&src.hash(), ["tools.provide".into(), "kv".into()]).unwrap();
+    let delegate = Arc::new(Delegate::default());
+    let host = PluginToolHost::load(&trust, vec![src], delegate, HashSet::new()).unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    for number in 0..16 {
+        let host = host.clone();
+        tasks.spawn(async move {
+            host.call("plugin__kv_counter__increment".into(), json!({"key":"parallel"}), IdempotencyKey::new(number.to_string())).await
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        results.push(result.unwrap().unwrap());
+    }
+    assert_eq!(results.len(), 16);
+    assert!(results.contains(&ToolResult::text("parallel: 16")));
+}
+
+#[tokio::test]
 async fn delegated_tool_needs_both_hash_grant_and_agent_allowlist() {
     let dir = tempfile::tempdir().unwrap();
     let mut trust = TrustStore::load(dir.path()).unwrap();

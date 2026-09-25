@@ -346,7 +346,7 @@ fn create_engine() -> Result<Engine, String> {
 }
 
 fn compiled(engine: &Engine, hash: &str, source: &[u8]) -> Result<Component, PluginError> {
-    let key = format!("{hash}:{WASMTIME_VERSION}:pooling:async:fuel20m:memory64m");
+    let key = cache_key(hash, CALL_FUEL, 64 * 1024 * 1024);
     let cache = COMPONENTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(component) = cache.lock().map_err(|_| PluginError::Runtime("component cache poisoned".into()))?.get(&key) {
         return Ok(component.clone());
@@ -354,6 +354,10 @@ fn compiled(engine: &Engine, hash: &str, source: &[u8]) -> Result<Component, Plu
     let component = Component::new(engine, source).map_err(|e| PluginError::Runtime(e.to_string()))?;
     cache.lock().map_err(|_| PluginError::Runtime("component cache poisoned".into()))?.insert(key, component.clone());
     Ok(component)
+}
+
+fn cache_key(hash: &str, fuel: u64, memory_limit: usize) -> String {
+    format!("{hash}:{WASMTIME_VERSION}:pooling:async:fuel{fuel}:memory{memory_limit}")
 }
 
 struct HostState {
@@ -599,5 +603,14 @@ mod tests {
         assert!(scope_matches("read*", "read"));
         assert!(scope_matches("read*", "read_file"));
         assert!(!scope_matches("read*", "write_file"));
+    }
+
+    #[test]
+    fn changing_engine_limits_invalidates_compiled_cache_key() {
+        let source = "a".repeat(64);
+        let current = cache_key(&source, CALL_FUEL, 64 * 1024 * 1024);
+        assert_ne!(current, cache_key(&source, CALL_FUEL + 1, 64 * 1024 * 1024));
+        assert_ne!(current, cache_key(&source, CALL_FUEL, 32 * 1024 * 1024));
+        assert_ne!(current, cache_key(&"b".repeat(64), CALL_FUEL, 64 * 1024 * 1024));
     }
 }
