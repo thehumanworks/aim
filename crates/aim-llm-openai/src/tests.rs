@@ -245,3 +245,15 @@ async fn catalog_images_gate_tool_result_images() -> Result<(), Box<dyn std::err
     assert!(!blind.contains("image_url") && blind.contains("cannot view"));
     Ok(())
 }
+
+/// REV4-B Major 1: an error reported inside the stream keeps its detail but never the key.
+#[tokio::test]
+async fn in_stream_errors_are_scrubbed_of_the_key() -> Result<(), Box<dyn std::error::Error>> {
+    let body = format!("data: {{\"error\":{{\"code\":400,\"message\":\"rejected {KEY}\"}}}}\n\n");
+    let (base, _server) = serve(sse_response(&body), None).await?;
+    let error = collect(&OpenAiProvider::new(local(base))?, request()).await.err().ok_or("expected an error")?;
+    assert_eq!(error.kind, LlmErrorKind::InvalidRequest);
+    assert!(error.message.contains("rejected"), "detail kept: {}", error.message);
+    assert!(!error.message.contains(KEY), "key scrubbed: {}", error.message);
+    Ok(())
+}

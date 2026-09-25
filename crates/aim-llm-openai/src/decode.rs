@@ -38,6 +38,8 @@ pub(crate) struct ChatDecoder {
     provider: String,
     cost_pointer: Option<String>,
     freeform: BTreeSet<String>,
+    /// Values scrubbed from errors reported inside the stream: the request's API key.
+    secrets: Vec<String>,
     response_id: Option<String>,
     text: String,
     reasoning: String,
@@ -136,12 +138,14 @@ fn unwrap_freeform(arguments: String) -> String {
 }
 
 impl ChatDecoder {
-    /// A decoder for one response; `freeform` names the request's freeform tools.
-    pub(crate) fn new(profile: &Profile, freeform: BTreeSet<String>) -> Self {
+    /// A decoder for one response; `freeform` names the request's freeform tools and `secrets`
+    /// the values that must never appear in an error it reports.
+    pub(crate) fn new(profile: &Profile, freeform: BTreeSet<String>, secrets: Vec<String>) -> Self {
         Self {
             provider: profile.id.clone(),
             cost_pointer: profile.quirks.cost_pointer.clone(),
             freeform,
+            secrets,
             response_id: None,
             text: String::new(),
             reasoning: String::new(),
@@ -156,7 +160,8 @@ impl ChatDecoder {
     /// Decodes one `data:` JSON chunk into display events.
     pub(crate) fn chunk(&mut self, value: &Value) -> Result<Vec<StreamEvent>, LlmError> {
         if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
-            return Err(errors::stream_error(error));
+            let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+            return Err(errors::stream_error(error, &secrets));
         }
         let mut events = Vec::new();
         if self.response_id.is_none() {
@@ -295,7 +300,7 @@ mod tests {
     use crate::sse::Sse;
 
     fn decode(profile: &Profile, chunks: &[Value], done: bool) -> Result<Vec<StreamEvent>, LlmError> {
-        let mut decoder = ChatDecoder::new(profile, BTreeSet::new());
+        let mut decoder = ChatDecoder::new(profile, BTreeSet::new(), Vec::new());
         for chunk in chunks {
             decoder.chunk(chunk)?;
         }
@@ -321,7 +326,7 @@ mod tests {
     /// Decodes a capture split into 13-byte network reads, as the provider does.
     fn replay(profile: &Profile, capture: &str) -> Result<Vec<StreamEvent>, LlmError> {
         let mut sse = Sse::default();
-        let mut decoder = ChatDecoder::new(profile, BTreeSet::new());
+        let mut decoder = ChatDecoder::new(profile, BTreeSet::new(), Vec::new());
         let mut frames = Vec::new();
         for piece in capture.as_bytes().chunks(13) {
             frames.extend(sse.push(piece)?);
@@ -504,7 +509,7 @@ mod tests {
 
     #[test]
     fn null_error_is_not_an_error_but_error_objects_and_reasons_are() {
-        let mut decoder = ChatDecoder::new(&Profile::openrouter(), BTreeSet::new());
+        let mut decoder = ChatDecoder::new(&Profile::openrouter(), BTreeSet::new(), Vec::new());
         assert!(decoder.chunk(&json!({"id": "r", "error": null, "choices": []})).is_ok());
         assert_eq!(
             decoder.chunk(&json!({"error": {"code": 400, "message": "bad"}})).err().map(|e| e.kind),
@@ -518,7 +523,7 @@ mod tests {
 
     #[test]
     fn freeform_calls_return_the_raw_input() -> Result<(), LlmError> {
-        let mut decoder = ChatDecoder::new(&Profile::openrouter(), BTreeSet::from(["apply_patch".to_owned()]));
+        let mut decoder = ChatDecoder::new(&Profile::openrouter(), BTreeSet::from(["apply_patch".to_owned()]), Vec::new());
         decoder.chunk(&tool_chunk(
             &json!({"index": 0, "id": "p", "function": {"name": "apply_patch", "arguments": "{\"input\":\"*** Begin"}}),
         ))?;
@@ -539,7 +544,7 @@ mod tests {
         assert_eq!(parse_usage(&usage, Some("/cost")).cost_micro_usd, Some(12));
         assert_eq!(parse_usage(&usage, None).cost_micro_usd, None);
         assert_eq!(parse_usage(&json!({"cost": -1.0}), Some("/cost")).cost_micro_usd, None);
-        let mut decoder = ChatDecoder::new(&Profile::openrouter(), BTreeSet::new());
+        let mut decoder = ChatDecoder::new(&Profile::openrouter(), BTreeSet::new(), Vec::new());
         let events = decoder.chunk(&json!({"id": "resp-1", "choices": [{"index": 0, "delta": {"content": "x"}}]}))?;
         assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta { item_id, .. } if item_id == "resp-1")));
         Ok(())

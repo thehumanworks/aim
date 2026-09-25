@@ -12,7 +12,8 @@
 //!   response byte — headers, data or keepalive comments — fails the call as `Transport`. There is
 //!   no whole-request timeout, so long streams are never cut.
 //! - **Errors** keep the provider's detail (message, code, type, upstream error), scrubbed of
-//!   the API key and truncated; 401 bodies are dropped because servers echo key prefixes.
+//!   the API key and truncated, whether they arrive as an HTTP status or inside the stream; 401
+//!   bodies are dropped because servers echo key prefixes.
 
 mod catalog;
 mod decode;
@@ -239,7 +240,7 @@ impl ModelProvider for OpenAiProvider {
             if !response.status().is_success() {
                 return Err(failure(response, &key).await);
             }
-            let mut decoder = ChatDecoder::new(&self.profile, request::freeform_names(&request.tools));
+            let mut decoder = ChatDecoder::new(&self.profile, request::freeform_names(&request.tools), vec![key]);
             let mut bytes = response.bytes_stream();
             let events = stream! {
                 let mut sse = Sse::default();
