@@ -164,6 +164,9 @@ impl Human {
             | AgentEvent::SteerQueued
             | AgentEvent::SteerDelivered { .. }
             | AgentEvent::RateLimits { .. } => Ok(()),
+            AgentEvent::Decision { decision } => {
+                writeln!(err, "· effort: {} → {} (Jev {} ms)", decision.current, decision.output, decision.latency_ms)
+            }
         };
     }
 }

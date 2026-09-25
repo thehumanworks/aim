@@ -34,6 +34,11 @@ adr = "0027"
 sha256 = "0645e649ab83d3f7ca3ac03bf94229a69f1de7629eb7e6e778bd3cf5454691cd"
 
 [[locked]]
+decision = "effort::next_spec"
+adr = "0013"
+sha256 = "90ea533be4c75a5d47937213d82584194f7822432f9cf8deeae655d5b5e13de8"
+
+[[locked]]
 decision = "policy::permits"
 adr = "0027"
 sha256 = "02ff049196e212714de9e4499158bdc8001682389faf312e96e743576695d5d9"

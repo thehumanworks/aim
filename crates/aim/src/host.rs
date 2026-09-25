@@ -146,13 +146,31 @@ pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory,
             let (provider, default_model) =
                 providers(&spec.provider, spec.model.as_deref()).map_err(|e| err(ErrorCode::InvalidParams, e))?;
             let model = spec.model.clone().unwrap_or(default_model);
+            // Establish a real index before the first provider request. Some catalogs omit a
+            // default, so use their lowest supported level rather than guessing what the remote
+            // endpoint would choose for `effort: None`.
+            let auto_effort = if spec.persistence == Persistence::Persistent
+                && spec.effort.is_none()
+                && std::env::var_os("TYPESAFE_API_KEY").is_some_and(|value| !value.is_empty())
+            {
+                provider.catalog().await.ok().and_then(|models| {
+                    models.into_iter().find(|entry| entry.id == model).and_then(|entry| {
+                        if !(2..=10).contains(&entry.efforts.len()) {
+                            return None;
+                        }
+                        entry.default_effort.filter(|default| entry.efforts.contains(default)).or_else(|| entry.efforts.first().cloned())
+                    })
+                })
+            } else {
+                None
+            };
             let workspace = workspaces(&spec).await?;
             let instructions = context::instructions(workspace.project.as_ref(), &workspace.location);
             let root = workspace.root.clone();
             let config = AgentConfig {
                 model: model.clone(),
                 instructions,
-                effort: spec.effort.clone(),
+                effort: spec.effort.clone().or_else(|| auto_effort.clone()),
                 tier: None,
                 session_id,
                 cache_key: Some(format!("aim:{root}")),
@@ -160,7 +178,11 @@ pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory,
                 max_requests,
             };
             let Connected { tools, location, shutdown, .. } = workspace;
-            let backend: Box<dyn Backend> = Box::new(Agent::with_transcript(provider, tools, config, transcript));
+            let mut agent = Agent::with_transcript(provider, tools, config, transcript);
+            if auto_effort.is_some() {
+                agent = agent.with_decider(Arc::new(crate::jev::JevDecider));
+            }
+            let backend: Box<dyn Backend> = Box::new(agent);
             Ok(Built { backend, model, root, location, shutdown })
         })
     })
