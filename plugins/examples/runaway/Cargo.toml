@@ -1,0 +1,11 @@
+[package]
+name = "aim-example-runaway"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aim-plugin-sdk = { path = "../../../crates/aim-plugin-sdk" }

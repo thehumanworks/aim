@@ -22,7 +22,11 @@ import sys
 examples = Path(sys.argv[1])
 target = Path(sys.argv[2])
 mode = sys.argv[3]
-names = ("aim_example_delegate_read.wasm", "aim_example_kv_counter.wasm")
+names = (
+    "aim_example_delegate_read.wasm",
+    "aim_example_kv_counter.wasm",
+    "aim_example_runaway.wasm",
+)
 build = examples / "build"
 build.mkdir(exist_ok=True)
 
@@ -48,5 +52,5 @@ for name in names:
 
 if mode == "--update":
     (build / "SHA256SUMS").write_text("".join(lines))
-print("Both example components match their checked-in hashes.")
+print("All example components match their checked-in hashes.")
 PY

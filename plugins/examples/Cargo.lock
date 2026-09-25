@@ -21,6 +21,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aim-example-runaway"
+version = "0.1.0"
+dependencies = [
+ "aim-plugin-sdk",
+]
+
+[[package]]
 name = "aim-plugin-sdk"
 version = "0.0.0"
 dependencies = [

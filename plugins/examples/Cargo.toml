@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["kv_counter", "delegate_read"]
+members = ["kv_counter", "delegate_read", "runaway"]
 
 [profile.release]
 opt-level = "s"

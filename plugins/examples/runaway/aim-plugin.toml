@@ -1,0 +1,11 @@
+name = "runaway"
+version = "0.1.0"
+api = "0.1"
+component = "../build/aim_example_runaway.wasm"
+capabilities = ["tools.provide"]
+
+[[tools]]
+name = "runaway"
+description = "Test fixture that loops until the host terminates its call."
+input_schema = '{"type":"object"}'
+sensitive = false

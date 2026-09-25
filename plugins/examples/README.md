@@ -9,11 +9,13 @@ component on its first call. The manifest's capability list is a **request**, no
 - `delegate_read` registers `delegate_read`, forwarding a `file_path` argument to the session's
   permissioned `read` tool. It requests `tools.provide` and `tools.call:read`. The host still applies
   the session tool allowlist and ceiling to the delegated call.
+- `runaway` is a **test fixture** whose `call-tool` spins forever. Host tests use it to prove that
+  fuel or epoch limits terminate a guest call. Do not install it as a normal plugin.
 
 `build/*.wasm` are checked-in WebAssembly **components**, not precompiled wasmtime images. This
 keeps routine native checks from rebuilding the guest toolchain. To reproduce them with the pinned
 Rust and `wasm32-wasip2` target, run `mise run plugins:examples` from the repository root. That
-task invokes `build.sh --verify`; it rebuilds both components and checks their bytes and SHA-256
+task invokes `build.sh --verify`; it rebuilds all components and checks their bytes and SHA-256
 against `build/SHA256SUMS`. After a guest source change, run `mise exec -- sh
 plugins/examples/build.sh --update` and commit the changed component and hash file together.
 
