@@ -117,6 +117,22 @@ struct BlockingState {
     release: tokio::sync::Notify,
 }
 
+#[derive(Default)]
+struct CancelBehindQueue {
+    request_started: tokio::sync::Notify,
+    notice_started: tokio::sync::Notify,
+    notice_release: tokio::sync::Notify,
+    cancelled: AtomicBool,
+}
+
+struct CancelOnDrop(Arc<CancelBehindQueue>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancelled.store(true, Ordering::SeqCst);
+    }
+}
+
 async fn record_order(state: Arc<OrderState>, sequence: u32) {
     if sequence == 0 {
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -444,6 +460,96 @@ async fn a_full_notification_queue_applies_backpressure_and_loses_nothing() {
     .unwrap();
     assert!(!server.is_closed(), "a busy handler slows the peer down; it does not cut it off");
     client.close();
+}
+
+#[tokio::test]
+async fn notification_handler_can_call_back_with_more_notifications_ahead_of_reply() {
+    let (raw, server_side) = tokio::io::duplex(1 << 16);
+    let (sr, sw) = tokio::io::split(server_side);
+    let router = Router::new(OrderState::default()).notification::<OrderedOutput, _, _>(|state, ctx, seq| async move {
+        if seq == 1 {
+            assert_eq!(ctx.peer.call::<Echo>("callback".to_owned()).await.unwrap(), "answered");
+        }
+        let mut seen = state.seen.lock().unwrap();
+        seen.push(seq);
+        if seen.len() == 3 {
+            state.complete.notify_one();
+        }
+    });
+    let state = Arc::clone(router.state());
+    let server = Peer::spawn(sr, sw, router, PeerConfig { notification_queue_capacity: 1, ..PeerConfig::default() });
+    let (rr, mut rw) = tokio::io::split(raw);
+    let mut lines = BufReader::new(rr).lines();
+    rw.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"test.ordered_output\",\"params\":1}\n").await.unwrap();
+    let callback: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(callback["method"], "test.echo");
+    let id = callback["id"].as_i64().unwrap();
+    rw.write_all(
+        format!("{{\"jsonrpc\":\"2.0\",\"method\":\"test.ordered_output\",\"params\":2}}\n{{\"jsonrpc\":\"2.0\",\"method\":\"test.ordered_output\",\"params\":3}}\n{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":\"answered\"}}\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), state.complete.notified()).await.unwrap();
+    assert_eq!(*state.seen.lock().unwrap(), vec![1, 2, 3]);
+    server.close();
+}
+
+#[tokio::test]
+async fn cancellation_behind_a_full_notification_queue_is_prompt() {
+    let (raw, server_side) = tokio::io::duplex(1 << 16);
+    let (sr, sw) = tokio::io::split(server_side);
+    let router = Router::new(CancelBehindQueue::default())
+        .method::<Sleep, _, _>(|state, _, _| async move {
+            state.request_started.notify_one();
+            let _guard = CancelOnDrop(Arc::clone(&state));
+            std::future::pending::<Result<(), ProtoError>>().await
+        })
+        .notification::<SlowNotice, _, _>(|state, _, ()| async move {
+            state.notice_started.notify_one();
+            state.notice_release.notified().await;
+        });
+    let state = Arc::clone(router.state());
+    let server = Peer::spawn(sr, sw, router, PeerConfig { notification_queue_capacity: 1, ..PeerConfig::default() });
+    let (_rr, mut rw) = tokio::io::split(raw);
+    rw.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"test.sleep\",\"params\":10000}\n").await.unwrap();
+    state.request_started.notified().await;
+    rw.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"test.slow_notice\",\"params\":null}\n").await.unwrap();
+    state.notice_started.notified().await;
+    rw.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"test.slow_notice\",\"params\":null}\n{\"jsonrpc\":\"2.0\",\"method\":\"test.slow_notice\",\"params\":null}\n{\"jsonrpc\":\"2.0\",\"method\":\"$/cancel\",\"params\":{\"id\":7}}\n").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !state.cancelled.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    state.notice_release.notify_one();
+    server.close();
+}
+
+#[tokio::test(start_paused = true)]
+async fn notification_flood_beyond_the_backlog_closes_after_the_bound() {
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let _subscriber = tracing::subscriber::set_default(Capture(Arc::clone(&logs)));
+    let (raw, server_side) = tokio::io::duplex(1 << 16);
+    let (sr, sw) = tokio::io::split(server_side);
+    let router = Router::new(BlockingState::default()).notification::<SlowNotice, _, _>(|state, _, ()| async move {
+        state.started.notify_one();
+        state.release.notified().await;
+    });
+    let state = Arc::clone(router.state());
+    let server = Peer::spawn(sr, sw, router, PeerConfig { notification_queue_capacity: 1, ..PeerConfig::default() });
+    let (_rr, mut rw) = tokio::io::split(raw);
+    rw.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"test.slow_notice\",\"params\":null}\n").await.unwrap();
+    state.started.notified().await;
+    for _ in 0..4 {
+        rw.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"test.slow_notice\",\"params\":null}\n").await.unwrap();
+    }
+    tokio::task::yield_now().await;
+    assert!(!server.is_closed(), "the backlog must absorb a finite burst");
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::timeout(Duration::from_secs(1), server.closed()).await.unwrap();
+    assert!(logs.lock().unwrap().join(" ").contains("limit_exceeded"));
 }
 
 #[tokio::test]

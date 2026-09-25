@@ -41,13 +41,13 @@ The native `Agent` implements it, and so does `acp::AcpBackend`. ACP has no mid-
 
 **Daemon handshake.** `aim-daemon/1` starts with `initialize { generations, client, auth? }` and returns the negotiated generation (kernel `negotiate`), the server, its pid and the message limit.
 
-**Notification backpressure.** A full ordered notification queue makes the `aim-rpc` reader wait. The sender is slowed down and nothing is dropped. Capacity 0 refuses notifications. Consequently, a notification handler must never wait for a response from the same peer.
+**Notification backpressure (amended by ADR 0037).** This ADR originally made the `aim-rpc` reader wait whenever its ordered notification queue filled. ADR 0037 replaces that rule with a bounded backlog so responses, requests and cancellation can make progress under finite notification pressure. Capacity 0 still refuses notifications.
 
 ## Consequences
 
 - One code path serves the CLI, the daemon and the TUI, and a new backend is one factory.
 - Backends must each uphold the turn contract. The ACP bridge has its own tests (`crates/aim/tests/acp_bridge.rs`).
-- A slow notification handler delays responses behind it on that connection (head-of-line). Handlers hand off quickly: the daemon client uses bounded per-stream queues that end the stream with `lagged` (ADR 0026).
+- A slow notification handler can fill the bounded notification backlog; a sustained flood then closes the connection after its timeout (ADR 0037). The daemon client also uses bounded per-stream queues that end the stream with `lagged` (ADR 0026).
 
 ## Verification
 

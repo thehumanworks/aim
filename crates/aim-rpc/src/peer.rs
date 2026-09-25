@@ -1,6 +1,6 @@
 //! The bidirectional JSON-RPC peer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -101,7 +101,9 @@ impl RequestCtx {
 /// Context of an incoming notification.
 #[derive(Clone, Debug)]
 pub struct NotificationCtx {
-    /// The connection.
+    /// The connection. A notification handler may call back through this peer. The reader keeps
+    /// processing responses and control frames while the ordered notification backlog has room;
+    /// a sustained flood beyond that bound closes the connection after 30 seconds.
     pub peer: Peer,
 }
 
@@ -114,10 +116,10 @@ pub struct PeerConfig {
     pub outgoing_capacity: usize,
     /// Maximum active request handlers on this connection.
     pub max_inflight_requests: usize,
-    /// Maximum notifications waiting behind this connection's ordered handler. Beyond it the
-    /// reader stops reading until the handler catches up (backpressure on the peer; nothing is
-    /// dropped). So a notification handler must never wait for a response from the same peer.
-    /// `0` refuses notifications: the first one closes the connection.
+    /// Maximum notifications in the ordered handler queue. A further bounded backlog holds up to
+    /// three times this capacity while the reader continues to process responses, requests and
+    /// cancellation. No notification overtakes the backlog. If both fill and fail to drain for
+    /// 30 seconds, the connection closes; `0` refuses the first notification immediately.
     pub notification_queue_capacity: usize,
 }
 
@@ -428,10 +430,64 @@ async fn write_loop<W: AsyncWrite + Unpin>(
 }
 
 async fn read_loop<R: AsyncRead + Unpin>(peer: Peer, mut reader: FrameReader<R>, handler: Arc<dyn Handler>) {
+    let mut backlog = VecDeque::new();
+    let backlog_capacity = peer.inner.notification_limit.saturating_mul(3);
     loop {
-        let frame = tokio::select! {
-            frame = reader.next() => frame,
-            () = peer.inner.closed.cancelled() => None,
+        while !backlog.is_empty() {
+            match peer.inner.notification_queue.try_reserve() {
+                Ok(permit) => {
+                    if let Some(notice) = backlog.pop_front() {
+                        permit.send(notice);
+                    }
+                }
+                Err(mpsc::error::TrySendError::Full(())) => break,
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    peer.close();
+                    return;
+                }
+            }
+        }
+        if backlog.len() >= backlog_capacity && !backlog.is_empty() {
+            let reserved = tokio::select! {
+                biased;
+                () = peer.inner.closed.cancelled() => break,
+                result = tokio::time::timeout(WRITE_TIMEOUT, peer.inner.notification_queue.reserve()) => result,
+            };
+            match reserved {
+                Ok(Ok(permit)) => {
+                    if let Some(notice) = backlog.pop_front() {
+                        permit.send(notice);
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    tracing::warn!(reason = "limit_exceeded", "ordered notification backlog timed out; closing connection");
+                    break;
+                }
+            }
+            continue;
+        }
+        let frame = if backlog.is_empty() {
+            tokio::select! {
+                frame = reader.next() => frame,
+                () = peer.inner.closed.cancelled() => None,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = peer.inner.closed.cancelled() => None,
+                reserved = peer.inner.notification_queue.reserve() => {
+                    if let Ok(permit) = reserved {
+                        if let Some(notice) = backlog.pop_front() {
+                            permit.send(notice);
+                        }
+                    } else {
+                        break;
+                    }
+                    continue;
+                }
+                frame = reader.next() => frame,
+            }
         };
         match frame {
             None => break,
@@ -445,17 +501,9 @@ async fn read_loop<R: AsyncRead + Unpin>(peer: Peer, mut reader: FrameReader<R>,
             }
             Some(Ok(frame)) => {
                 let mut waiting = None;
-                dispatch(&peer, &handler, &frame, &mut waiting);
+                dispatch(&peer, &handler, &frame, &mut waiting, !backlog.is_empty());
                 if let Some(notice) = waiting {
-                    // The ordered queue is full: stop reading until it has room.
-                    let queued = tokio::select! {
-                        biased;
-                        () = peer.inner.closed.cancelled() => false,
-                        sent = peer.inner.notification_queue.send(notice) => sent.is_ok(),
-                    };
-                    if !queued {
-                        break;
-                    }
+                    backlog.push_back(notice);
                 }
             }
         }
@@ -480,9 +528,9 @@ async fn notification_loop(peer: Peer, handler: Arc<dyn Handler>, mut queue: mps
     }
 }
 
-/// Handles one inbound frame. A notification that finds the ordered queue full is left in
-/// `waiting` for the caller to enqueue with backpressure.
-fn dispatch(peer: &Peer, handler: &Arc<dyn Handler>, frame: &str, waiting: &mut Option<QueuedNotification>) {
+/// Handles one inbound frame. A notification that cannot enter the ordered queue is returned
+/// through `waiting` for the reader's bounded backlog.
+fn dispatch(peer: &Peer, handler: &Arc<dyn Handler>, frame: &str, waiting: &mut Option<QueuedNotification>, backlog_pending: bool) {
     let raw: Value = match serde_json::from_str(frame) {
         Ok(raw) => raw,
         Err(err) => {
@@ -533,7 +581,12 @@ fn dispatch(peer: &Peer, handler: &Arc<dyn Handler>, frame: &str, waiting: &mut 
                 peer.close();
                 return;
             }
-            match peer.inner.notification_queue.try_send(QueuedNotification { method, params }) {
+            let notice = QueuedNotification { method, params };
+            if backlog_pending {
+                *waiting = Some(notice);
+                return;
+            }
+            match peer.inner.notification_queue.try_send(notice) {
                 Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
                 Err(mpsc::error::TrySendError::Full(notice)) => *waiting = Some(notice),
             }
