@@ -1,0 +1,31 @@
+[package]
+name = "aim"
+description = "aim's agent layer: sessions, the native agent loop, providers, CLI and TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "aim"
+path = "src/main.rs"
+
+[dependencies]
+aim-kernel = { path = "../aim-kernel" }
+aim-llm = { path = "../aim-llm" }
+aim-proto = { path = "../aim-proto" }
+aim-rpc = { path = "../aim-rpc" }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+uuid = { version = "1.26", features = ["v4"] }
+
+[dev-dependencies]
+async-stream = "0.3"
+
+[lints]
+workspace = true
