@@ -2,7 +2,9 @@
 //!
 //! Commands run with `bash -c` in the workspace root (falling back to the `sh` of
 //! `Command::Shell` when the host has no bash), in their own process group, killed at the timeout.
-//! Each call starts a fresh shell: `cd` and exported variables do not carry over to the next call.
+//! Each call starts a fresh shell: `cd` and exported variables do not carry over to the next call,
+//! and a foreground call releases its process when it returns, which kills its whole process group
+//! (jobs it started with `&` included); a long-lived job needs `run_in_background`.
 //! Output beyond a budget keeps its head and tail; the process is then kept (not released) and its
 //! id returned as the result's `handle`, so the full retained output stays readable with
 //! `exec.read` or `BashOutput`.

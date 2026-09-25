@@ -210,7 +210,7 @@ const TOOLS: [ToolDef; 9] = [
     },
     ToolDef {
         name: "Bash",
-        description: "Run a bash command in the workspace root and return its combined stdout/stderr and exit code. `timeout` in ms (default 120000, max 600000). Long output keeps its head and tail. With `run_in_background` it returns an id at once; read it with BashOutput, stop it with KillShell.",
+        description: "Run a bash command in the workspace root and return its combined stdout/stderr and exit code. `timeout` in ms (default 120000, max 600000). Long output keeps its head and tail. Jobs it starts with `&` end with it. With `run_in_background` it returns an id at once; read it with BashOutput, stop it with KillShell.",
         schema: shell::bash_schema,
         annotations: RUNS,
     },

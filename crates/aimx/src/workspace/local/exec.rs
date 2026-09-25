@@ -1,7 +1,13 @@
 //! Processes of the local backend.
 //!
 //! Every process runs in its own process group (pipes: `setpgid(0, 0)`; pty: `setsid`, so the
-//! group id is the child's pid), so signals, timeouts and release reach its whole tree. Output
+//! group id is the child's pid), so signals, timeouts and release reach its whole tree.
+//!
+//! The group outlives its leader: the leader's exit is observed with `waitid(WNOWAIT)`, which
+//! leaves it a zombie, and a zombie's pid cannot be reused, so the group id stays reserved. Only
+//! `release` (or the workspace closing) kills the whole group and then reaps the leader, so
+//! `exec.signal`, `exec.release`, `KillShell` and session expiry reach every descendant a leader
+//! left behind, and nothing is ever signalled once the id could be reused. Output
 //! goes into a per-process [`OutputRing`] with one strictly increasing `seq` across stdout,
 //! stderr and the pty. The exit status is recorded only after the output readers have drained (or
 //! a short grace period has passed, for a child that left a background process holding the pipe),
@@ -9,7 +15,6 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -20,9 +25,10 @@ use aim_proto::content::Content;
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{Command, ExecReadResult, ExitStatus, OutputChunk, OutputStream, PtySize, Signal};
 use aim_proto::ids::ProcId;
+use rustix::process::{WaitId, WaitIdOptions, WaitIdStatus};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::ChildStdin;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::{Base, Follow, blocking, io_error};
@@ -69,10 +75,14 @@ struct Proc {
     input: tokio::sync::Mutex<Input>,
     master: Option<Mutex<Master>>,
     timed_out: AtomicBool,
-    /// The group leader has been reaped (set before the output drains and the exit is recorded):
-    /// from here on the group id may be reused, so nothing is signalled.
+    /// The group leader has exited (it stays unreaped, reserving the group id, until release).
     leader_exited: AtomicBool,
     last_signal: AtomicI32,
+    /// Set by release: the group has been killed and the leader may be reaped, after which the
+    /// group id may be reused, so nothing is signalled any more. Signals are sent under this lock.
+    released: Mutex<bool>,
+    /// Wakes the supervisor to reap the leader once released.
+    reap: Notify,
 }
 
 struct ProcState {
@@ -97,6 +107,8 @@ impl Proc {
             timed_out: AtomicBool::new(false),
             leader_exited: AtomicBool::new(false),
             last_signal: AtomicI32::new(0),
+            released: Mutex::new(false),
+            reap: Notify::new(),
         }
     }
 
@@ -120,10 +132,6 @@ impl Proc {
         self.bump();
     }
 
-    fn finished(&self) -> bool {
-        lock(&self.state).exit.is_some()
-    }
-
     fn snapshot(&self, after_seq: u64, max_bytes: usize) -> ExecReadResult {
         let state = lock(&self.state);
         let slice = state.ring.read(after_seq, max_bytes);
@@ -139,10 +147,11 @@ impl Proc {
         }
     }
 
-    /// Signals the process group while the process runs (after it ended, the group id may be
-    /// reused, so nothing is sent).
+    /// Signals the whole process group, including what an exited leader left behind (its
+    /// unreaped zombie keeps the group id reserved). A no-op once released.
     fn signal(&self, signal: rustix::process::Signal) -> Outcome<()> {
-        if self.leader_exited.load(Ordering::SeqCst) || self.finished() {
+        let released = lock(&self.released);
+        if *released {
             return Ok(());
         }
         let Some(pgid) = self.pgid else {
@@ -151,12 +160,13 @@ impl Proc {
         let already_killed = self.last_signal.swap(signal.as_raw(), Ordering::SeqCst) == rustix::process::Signal::KILL.as_raw();
         match kill_group(pgid, signal) {
             Ok(()) => Ok(()),
-            // The group is gone.
+            // Nothing is left in the group.
             Err(err) if err.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => Ok(()),
-            // macOS answers EPERM for a group whose members are all zombies (killed, not yet
-            // reaped); otherwise a member changed its credentials (setuid) and cannot be signalled.
+            // macOS answers EPERM when the group holds a zombie (an exited leader, or members
+            // killed but not yet reaped) and still delivers the signal to the live members;
+            // otherwise a member changed its credentials (setuid) and cannot be signalled.
             Err(err) if err.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error()) => {
-                if already_killed {
+                if already_killed || self.leader_exited.load(Ordering::SeqCst) {
                     Ok(())
                 } else {
                     Err(ProtoError::new(ErrorCode::Denied, format!("not permitted to signal process group {pgid}")))
@@ -165,6 +175,24 @@ impl Proc {
             Err(err) => Err(ProtoError::new(ErrorCode::Internal, format!("signalling process group {pgid}: {err}"))),
         }
     }
+
+    /// Kills the whole group while the unreaped leader still reserves its id, then lets the
+    /// supervisor reap the leader. Idempotent.
+    fn release(&self) {
+        {
+            let mut released = lock(&self.released);
+            if !*released {
+                if let Some(pgid) = self.pgid
+                    && let Err(err) = kill_group(pgid, rustix::process::Signal::KILL)
+                    && err.raw_os_error() != Some(rustix::io::Errno::SRCH.raw_os_error())
+                {
+                    tracing::debug!(%err, pgid, "killing a released process group");
+                }
+                *released = true;
+            }
+        }
+        self.reap.notify_one();
+    }
 }
 
 fn kill_group(pgid: i32, signal: rustix::process::Signal) -> io::Result<()> {
@@ -172,36 +200,50 @@ fn kill_group(pgid: i32, signal: rustix::process::Signal) -> io::Result<()> {
     rustix::process::kill_process_group(group, signal).map_err(io::Error::from)
 }
 
-fn exit_from_std(status: std::process::ExitStatus) -> ExitStatus {
-    match (status.code(), status.signal()) {
-        (Some(code), _) => ExitStatus::Exited { code },
-        (None, Some(signal)) => ExitStatus::Signaled { signal },
-        (None, None) => ExitStatus::Exited { code: -1 },
+/// How often a waiting supervisor re-checks for its leader's exit when no `SIGCHLD` arrives.
+const EXIT_POLL: Duration = Duration::from_millis(100);
+
+fn exit_from_waitid(status: &WaitIdStatus) -> ExitStatus {
+    if status.exited() {
+        ExitStatus::Exited { code: status.exit_status().unwrap_or(-1) }
+    } else if status.killed() || status.dumped() {
+        ExitStatus::Signaled { signal: status.terminating_signal().unwrap_or(0) }
+    } else {
+        ExitStatus::Exited { code: -1 }
     }
 }
 
-/// The number of a signal from `strsignal` text (`Terminated: 15` on macOS, `Terminated` on
-/// Linux, `Signal 34` for unnamed ones).
-fn signal_number(name: &str) -> Option<i32> {
-    let digits: String = name.chars().rev().take_while(char::is_ascii_digit).collect::<Vec<_>>().into_iter().rev().collect();
-    if !digits.is_empty() {
-        return digits.parse().ok();
+/// Waits for `pid` to exit **without reaping it** (`waitid(WEXITED | WNOHANG | WNOWAIT)`), woken
+/// by `SIGCHLD` and re-checked every [`EXIT_POLL`] in case a signal is missed.
+async fn leader_exit(pid: rustix::process::Pid) -> io::Result<ExitStatus> {
+    // Subscribe before the first check, so an exit in between still wakes us.
+    let mut sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).ok();
+    loop {
+        match rustix::process::waitid(WaitId::Pid(pid), WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT) {
+            Ok(Some(status)) => return Ok(exit_from_waitid(&status)),
+            Ok(None) | Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+        match sigchld.as_mut() {
+            Some(signals) => {
+                if let Ok(None) = tokio::time::timeout(EXIT_POLL, signals.recv()).await {
+                    sigchld = None;
+                }
+            }
+            None => tokio::time::sleep(EXIT_POLL).await,
+        }
     }
-    let table = [
-        ("Hangup", 1),
-        ("Interrupt", 2),
-        ("Quit", 3),
-        ("Illegal instruction", 4),
-        ("Trace/breakpoint trap", 5),
-        ("Aborted", 6),
-        ("Abort trap", 6),
-        ("Killed", 9),
-        ("Segmentation fault", 11),
-        ("Broken pipe", 13),
-        ("Alarm clock", 14),
-        ("Terminated", 15),
-    ];
-    table.iter().find(|(text, _)| name.starts_with(text)).map(|(_, number)| *number)
+}
+
+/// Blocks until `pid` exits, without reaping it (for the pty's waiter thread).
+fn leader_exit_blocking(pid: rustix::process::Pid) -> io::Result<ExitStatus> {
+    loop {
+        match rustix::process::waitid(WaitId::Pid(pid), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT) {
+            Ok(Some(status)) => return Ok(exit_from_waitid(&status)),
+            Ok(None) | Err(rustix::io::Errno::INTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 fn spawn_error(err: &io::Error, program: &str) -> ProtoError {
@@ -238,42 +280,54 @@ async fn drain(readers: Vec<JoinHandle<()>>) {
 
 fn kill_on_timeout(proc: &Proc) {
     proc.timed_out.store(true, Ordering::SeqCst);
-    if let Some(pgid) = proc.pgid
-        && let Err(err) = kill_group(pgid, rustix::process::Signal::KILL)
-    {
-        tracing::debug!(%err, pgid, "killing a timed-out process group failed");
+    if let Err(err) = proc.signal(rustix::process::Signal::KILL) {
+        tracing::debug!(%err, "killing a timed-out process group failed");
+    }
+}
+
+fn exit_of(proc: &Proc, status: &io::Result<ExitStatus>) -> ExitStatus {
+    if proc.timed_out.load(Ordering::SeqCst) {
+        ExitStatus::TimedOut
+    } else {
+        status.as_ref().map_or(ExitStatus::Exited { code: -1 }, |status| *status)
     }
 }
 
 async fn supervise_pipes(proc: Arc<Proc>, mut child: tokio::process::Child, readers: Vec<JoinHandle<()>>, timeout: Option<Duration>) {
+    let pid = child.id().and_then(|id| i32::try_from(id).ok()).and_then(rustix::process::Pid::from_raw);
+    let exited = async {
+        match pid {
+            Some(pid) => leader_exit(pid).await,
+            None => Err(io::Error::other("the child has no pid")),
+        }
+    };
     let status = match timeout {
         Some(limit) => {
+            tokio::pin!(exited);
             tokio::select! {
-                status = child.wait() => status,
+                status = &mut exited => status,
                 () = tokio::time::sleep(limit) => {
                     kill_on_timeout(&proc);
-                    if let Err(err) = child.start_kill() {
-                        tracing::debug!(%err, "killing a timed-out child failed");
-                    }
-                    child.wait().await
+                    exited.await
                 }
             }
         }
-        None => child.wait().await,
+        None => exited.await,
     };
     proc.leader_exited.store(true, Ordering::SeqCst);
     drain(readers).await;
-    let exit = if proc.timed_out.load(Ordering::SeqCst) {
-        ExitStatus::TimedOut
-    } else {
-        status.map_or(ExitStatus::Exited { code: -1 }, exit_from_std)
-    };
-    proc.finish(exit);
+    proc.finish(exit_of(&proc, &status));
+    // The leader stays a zombie (reserving the group id) until the process is released.
+    proc.reap.notified().await;
+    if let Err(err) = child.wait().await {
+        tracing::debug!(%err, "reaping a released process");
+    }
 }
 
 async fn supervise_pty(
     proc: Arc<Proc>,
-    exited: oneshot::Receiver<io::Result<portable_pty::ExitStatus>>,
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    exited: oneshot::Receiver<io::Result<ExitStatus>>,
     drained: oneshot::Receiver<()>,
     timeout: Option<Duration>,
 ) {
@@ -290,24 +344,17 @@ async fn supervise_pty(
         }
         None => exited.await,
     };
+    let status = status.unwrap_or_else(|_| Err(io::Error::other("the pty waiter stopped")));
     proc.leader_exited.store(true, Ordering::SeqCst);
     if tokio::time::timeout(DRAIN_GRACE, drained).await.is_err() {
         tracing::debug!("pty output still open after exit; later output is dropped");
     }
-    let exit = if proc.timed_out.load(Ordering::SeqCst) {
-        ExitStatus::TimedOut
-    } else {
-        match status {
-            Ok(Ok(status)) => match status.signal() {
-                Some(name) => {
-                    ExitStatus::Signaled { signal: signal_number(name).unwrap_or_else(|| proc.last_signal.load(Ordering::SeqCst)) }
-                }
-                None => ExitStatus::Exited { code: i32::try_from(status.exit_code()).unwrap_or(-1) },
-            },
-            Ok(Err(_)) | Err(_) => ExitStatus::Exited { code: -1 },
-        }
-    };
-    proc.finish(exit);
+    proc.finish(exit_of(&proc, &status));
+    // The leader stays a zombie (reserving the group id) until the process is released.
+    proc.reap.notified().await;
+    if let Err(err) = tokio::task::spawn_blocking(move || child.wait()).await {
+        tracing::debug!(%err, "reaping a released pty process");
+    }
 }
 
 fn spawn_pipes(cwd: PathBuf, spec: &SpawnSpec<'_>, ring_bytes: usize) -> Outcome<Arc<Proc>> {
@@ -381,7 +428,7 @@ fn spawn_pty(
     for (key, value) in spec.env {
         builder.env(key, value);
     }
-    let (mut child, master, mut reader, writer) = {
+    let (child, master, mut reader, writer) = {
         let _spawning = lock(&SPAWN);
         let pair = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize { rows: size.rows, cols: size.cols, pixel_width: 0, pixel_height: 0 })
@@ -426,17 +473,22 @@ fn spawn_pty(
         .map_err(|err| ProtoError::new(ErrorCode::Internal, format!("starting a pty reader: {err}")))?;
 
     let (exited_tx, exited_rx) = oneshot::channel();
+    let leader = pgid.and_then(rustix::process::Pid::from_raw);
     std::thread::Builder::new()
         .name("aimx-pty-wait".to_owned())
         .spawn(move || {
             let _permit = permit;
-            if exited_tx.send(child.wait()).is_err() {
+            let status = match leader {
+                Some(leader) => leader_exit_blocking(leader),
+                None => Err(io::Error::other("the pty child has no pid")),
+            };
+            if exited_tx.send(status).is_err() {
                 tracing::debug!("pty supervisor gone before the child exited");
             }
         })
         .map_err(|err| ProtoError::new(ErrorCode::Internal, format!("starting a pty waiter: {err}")))?;
 
-    tokio::spawn(supervise_pty(Arc::clone(&proc), exited_rx, drained_rx, spec.timeout));
+    tokio::spawn(supervise_pty(Arc::clone(&proc), child, exited_rx, drained_rx, spec.timeout));
     Ok(proc)
 }
 
@@ -453,9 +505,7 @@ impl LocalExec {
 impl Drop for LocalExec {
     fn drop(&mut self) {
         for proc in lock(&self.procs).values() {
-            if let Err(err) = proc.signal(rustix::process::Signal::KILL) {
-                tracing::debug!(%err, "killing a process on workspace close failed");
-            }
+            proc.release();
         }
     }
 }
@@ -576,25 +626,9 @@ impl Exec for LocalExec {
             let Some(proc) = removed else {
                 return Err(ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")));
             };
-            // Best effort: the process is forgotten either way.
-            if let Err(err) = proc.signal(rustix::process::Signal::KILL) {
-                tracing::debug!(%err, "killing a released process failed");
-            }
+            // Kills the whole group (whatever the leader left behind too); forgotten either way.
+            proc.release();
             Ok(())
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::signal_number;
-
-    #[test]
-    fn signal_names() {
-        assert_eq!(signal_number("Terminated: 15"), Some(15));
-        assert_eq!(signal_number("Terminated"), Some(15));
-        assert_eq!(signal_number("Killed"), Some(9));
-        assert_eq!(signal_number("Signal 34"), Some(34));
-        assert_eq!(signal_number("mystery"), None);
     }
 }

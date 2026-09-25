@@ -11,6 +11,8 @@ mod exec;
 #[cfg(test)]
 mod fs;
 #[cfg(test)]
+mod groups;
+#[cfg(test)]
 mod handshake;
 #[cfg(test)]
 mod idempotency;
