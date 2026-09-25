@@ -80,6 +80,18 @@ impl ToolHost for RemoteHarness {
         self.client.call(name, arguments, key)
     }
 
+    fn reserve_blob(&self, path: String, key: IdempotencyKey) -> BoxFuture<Result<String, ProtoError>> {
+        self.client.reserve_blob(path, key)
+    }
+
+    fn finalize_blob(&self, reservation: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        self.client.finalize_blob(reservation, bytes, key)
+    }
+
+    fn cancel_blob(&self, reservation: String, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        self.client.cancel_blob(reservation, key)
+    }
+
     fn write_blob(&self, path: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
         self.client.write_blob(path, bytes, key)
     }

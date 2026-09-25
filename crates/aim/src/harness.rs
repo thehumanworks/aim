@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use aim_proto::content::Content;
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{
-    AuthProof, BackendSpec, ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, ExecRead, ExecReadParams, ExecReadResult, FsWrite,
-    FsWriteParams, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, Precondition, ToolsCall, ToolsCallParams,
-    ToolsList, ToolsListParams, WatchEvent, WatchEventParams, WorkspaceInfo, WorkspaceOpen, WorkspaceOpenParams,
+    AuthProof, BackendSpec, ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, ExecRead, ExecReadParams, ExecReadResult, FsCancel,
+    FsCancelParams, FsFinalize, FsFinalizeParams, FsReserve, FsReserveParams, FsWrite, FsWriteParams, GenerationRange, Initialize,
+    InitializeParams, InitializeResult, PeerInfo, Precondition, ToolsCall, ToolsCallParams, ToolsList, ToolsListParams, WatchEvent,
+    WatchEventParams, WorkspaceInfo, WorkspaceOpen, WorkspaceOpenParams,
 };
 use aim_proto::ids::{IdempotencyKey, ResumeToken};
 use aim_proto::rpc::Notification as _;
@@ -562,6 +563,38 @@ impl ToolHost for HarnessClient {
         Box::pin(async move {
             peer.call::<ToolsCall>(ToolsCallParams { workspace, name, arguments, idempotency_key: Some(key), scope: None }).await
         })
+    }
+
+    fn reserve_blob(&self, path: String, key: IdempotencyKey) -> BoxFuture<Result<String, ProtoError>> {
+        let peer = self.peer.clone();
+        let workspace = self.workspace.id.clone();
+        Box::pin(async move {
+            peer.call::<FsReserve>(FsReserveParams { workspace, path, if_absent: true, idempotency_key: key, scope: None })
+                .await
+                .map(|result| result.reservation)
+        })
+    }
+
+    fn finalize_blob(&self, reservation: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        let peer = self.peer.clone();
+        let workspace = self.workspace.id.clone();
+        Box::pin(async move {
+            peer.call::<FsFinalize>(FsFinalizeParams {
+                workspace,
+                reservation,
+                content: Content::from_bytes(bytes),
+                idempotency_key: key,
+                scope: None,
+            })
+            .await
+            .map(|_| ())
+        })
+    }
+
+    fn cancel_blob(&self, reservation: String, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        let peer = self.peer.clone();
+        let workspace = self.workspace.id.clone();
+        Box::pin(async move { peer.call::<FsCancel>(FsCancelParams { workspace, reservation, idempotency_key: key, scope: None }).await })
     }
 
     fn write_blob(&self, path: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
