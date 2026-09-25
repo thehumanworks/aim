@@ -31,7 +31,7 @@ The codex review REV8 (`scratchpad/reviews/REV8.md`) and Claude's review REV9 (`
 - An effort that is not set is `auto`: a new session whose spec and agent definition name none, and any record without a level. A set effort is `explicit` for a new session. On resume it keeps its recorded source, so older logs resume as they did.
 - Jev decisions (0028) announce `auto`. A `set_config` with an effort announces `explicit`.
 - `set_config` with `effort: "auto"` (`aim_proto::daemon::AUTO_EFFORT`, reserved) returns a native session to `auto`. The level in force is where Jev starts. ACP agents offer no automatic effort and refuse it, unless the agent itself advertises such a level.
-- A resume restores the source. For `auto`, the recorded level is the starting point, and the decider is attached again when the session is persistent and one is configured.
+- A resume restores the source. For `auto`, the recorded level is the starting point, and the decider is attached again when the session is persistent and one is configured. When what a resume puts in force differs from the log's last record, the resume records it. Two cases: a starting level for an effort that had none, and the source an older log did not record.
 - An advised `auto` session that switches models starts from the new model's ladder: its catalog default, else its lowest level (REV9-m1). Requests and decision records then agree on the index.
 
 **Every config change has an outcome the requester can see** (amends 0036's "a refusal at that point is logged").
@@ -63,7 +63,7 @@ Bytes read are charged afterwards, including a `CLAUDE.md` that loses to `AGENTS
 ## Consequences
 
 - A resumed session keeps the authority it was created with, and deleting or loosening its agent file cannot widen it. The cost is that a session whose agent file is gone cannot be resumed until the file is restored.
-- Automatic effort survives restarts. `"auto"` is reserved in `session.set_config`, so a catalog level with that name cannot be pinned through it. None of the catalogs aim reads has one (codex `gpt-6-sol`: `minimal … xhigh`; docs/research/live-probes.md).
+- Automatic effort survives restarts, except for sessions created before this ADR whose automatic start level was recorded as a plain effort: they cannot be told apart from an explicit choice, so they resume as explicit until `effort: "auto"`. `"auto"` is reserved in `session.set_config`, so a catalog level with that name cannot be pinned through it. None of the catalogs aim reads has one (codex `gpt-6-sol`: `minimal … xhigh`; docs/research/live-probes.md).
 - UIs learn the outcome of every deferred change from the update stream. Idle requesters get it as the reply.
 - `Backend::set_config` returns an `InForce { model, effort, effort_source }` value. Its error contract is now "may have changed something; ask again".
 - Discovery can read slightly less than before (a partly spent budget stops a batch early). In exchange the advertised bounds hold.

@@ -527,10 +527,8 @@ impl SessionHost {
             Persistence::Ephemeral => Arc::new(MemoryStore::default()),
         };
         let opened = if let Some(resume) = resume {
-            let recorder = Recorder::resume(Arc::clone(&store), &resume.meta, &resume.events);
-            // The log already says what is in force; nothing is recorded.
-            let announced = backend.set_config(None, None).await.ok();
-            Ok((resume.meta, recorder, announced))
+            let mut recorder = Recorder::resume(Arc::clone(&store), &resume.meta, &resume.events);
+            record_resumed_config(backend.as_mut(), &mut recorder, &resume).await.map(|announced| (resume.meta, recorder, announced))
         } else {
             let meta = SessionMeta {
                 id: session_id,
@@ -639,6 +637,23 @@ impl SessionHost {
 struct Resume {
     meta: SessionMeta,
     events: Vec<SessionEvent>,
+}
+
+/// What a resumed session's backend has in force. A resume can put another configuration in force
+/// than the log's last: an automatic effort that now has a starting level, or a source an older log
+/// did not record. It is recorded then, so the log and a later resume agree with what requests carry
+/// (ADR 0038).
+async fn record_resumed_config(backend: &mut dyn Backend, recorder: &mut Recorder, resume: &Resume) -> Result<Option<InForce>, StoreError> {
+    let announced = backend.set_config(None, None).await.ok();
+    let (model, effort, source) = last_config(&resume.meta, &resume.events);
+    if let Some(now) = &announced
+        && (now.model.as_str(), now.effort.as_deref(), now.effort_source) != (model.as_str(), effort.as_deref(), source)
+    {
+        recorder
+            .record(EventBody::ConfigChanged { model: now.model.clone(), effort: now.effort.clone(), effort_source: now.effort_source })
+            .await?;
+    }
+    Ok(announced)
 }
 
 /// The model, effort and effort source in force at the end of a stored log.

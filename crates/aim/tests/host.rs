@@ -921,6 +921,19 @@ async fn a_log_from_before_adr_0038_resumes_as_it_did() {
         let (_, mut updates) = f.host.attach("old".into()).await.unwrap();
         turn(&f, &mut updates, "old", "go").await;
         assert_eq!(counting.calls.load(Ordering::SeqCst), advice, "recorded effort {effort:?}");
+        // What the resume put in force is recorded when it differs from the log's last record.
+        let (_, events) = f.store.load("old".into()).await.unwrap();
+        let configs: Vec<(Option<String>, EffortSource)> = events
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::ConfigChanged { effort, effort_source, .. } => Some((effort.clone(), *effort_source)),
+                _ => None,
+            })
+            .collect();
+        match effort {
+            None => assert_eq!(configs.get(1), Some(&(Some("low".to_owned()), EffortSource::Auto)), "{configs:?}"),
+            Some(_) => assert_eq!(configs.len(), 1, "nothing changed: {configs:?}"),
+        }
     }
 }
 
