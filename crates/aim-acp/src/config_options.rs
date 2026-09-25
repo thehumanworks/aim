@@ -220,3 +220,52 @@ pub fn confirm(options: &[ConfigOption], id: &str, value: &str) -> Result<(), Ac
         Err(AcpError::ConfigNotApplied { id: id.to_owned(), requested: value.to_owned(), current })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn options() -> Vec<ConfigOption> {
+        parse_config_options(Some(&json!([
+            {"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": "auto",
+             "options": [{"value": "auto", "name": "Auto"}, {"value": "plan", "name": "Plan"}]},
+            {"id": "speed", "name": "Fast", "type": "boolean", "currentValue": false},
+            {"id": "effort", "name": "Effort", "type": "select", "currentValue": "low", "options": [{"value": "low", "name": "Low"}]}
+        ])))
+    }
+
+    #[test]
+    fn keys_resolve_by_category_then_conventional_id() {
+        let options = options();
+        assert_eq!(find(&options, &ConfigKey::Mode).map(|o| o.id.as_str()), Some("mode"));
+        // No `thought_level` category here: the conventional id wins.
+        assert_eq!(find(&options, &ConfigKey::Effort).map(|o| o.id.as_str()), Some("effort"));
+        assert!(find(&options, &ConfigKey::Model).is_none());
+        assert_eq!(find(&options, &ConfigKey::Id("speed".into())).map(|o| o.id.as_str()), Some("speed"));
+    }
+
+    #[test]
+    fn set_params_follow_the_option_kind() {
+        let options = options();
+        assert_eq!(set_params(&options, &ConfigKey::Mode, "plan").unwrap(), ("mode".into(), json!({"configId": "mode", "value": "plan"})));
+        assert_eq!(
+            set_params(&options, &ConfigKey::Id("speed".into()), "on").unwrap().1,
+            json!({"configId": "speed", "type": "boolean", "value": true})
+        );
+        assert!(matches!(set_params(&options, &ConfigKey::Id("speed".into()), "maybe"), Err(AcpError::ConfigValueRejected { .. })));
+        assert!(matches!(set_params(&options, &ConfigKey::Model, "x"), Err(AcpError::ConfigUnavailable { .. })));
+    }
+
+    #[test]
+    fn confirmation_reads_the_agents_answer() {
+        let options = options();
+        assert!(confirm(&options, "mode", "auto").is_ok());
+        assert!(confirm(&options, "speed", "off").is_ok());
+        assert_eq!(
+            confirm(&options, "mode", "plan"),
+            Err(AcpError::ConfigNotApplied { id: "mode".into(), requested: "plan".into(), current: Some("auto".into()) })
+        );
+    }
+}

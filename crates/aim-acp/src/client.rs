@@ -33,6 +33,8 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Updates kept for a session id the client has not registered yet (they can precede the
 /// `session/new` response).
 const EARLY_UPDATES_PER_SESSION: usize = 256;
+/// JSON-RPC internal error.
+const INTERNAL_ERROR_CODE: i32 = -32603;
 /// Unregistered session ids tracked at once.
 const EARLY_SESSIONS: usize = 16;
 
@@ -203,9 +205,11 @@ impl Router {
         lock(&self.sessions).remove(session_id);
     }
 
+    /// Marks the connection closed. Routes stay: every in-flight prompt still delivers its
+    /// (failed) stop through them, which is how a turn learns the agent is gone.
     fn close_all(&self) {
         self.closed.store(true, Ordering::Release);
-        lock(&self.sessions).clear();
+        lock(&self.sessions).retain(|_, route| matches!(route, Route::Live(_)));
     }
 
     fn on_notification(&self, method: &str, params: &Value) {
@@ -303,8 +307,9 @@ impl Shared {
                 methods: self.auth_methods.iter().map(|m| m.id.clone()).collect(),
             };
         }
-        let exited = self.process.as_ref().is_some_and(|p| p.exited.load(Ordering::Acquire));
-        if agent_client_protocol::is_incoming_transport_closed(&error) || self.router.closed.load(Ordering::Acquire) || exited {
+        // The SDK fails pending requests with an internal error when the transport goes away.
+        let never_answered = code == INTERNAL_ERROR_CODE && error.message.contains("never received");
+        if agent_client_protocol::is_incoming_transport_closed(&error) || never_answered {
             return self.closed_error().await;
         }
         AcpError::Rpc { method: method.to_owned(), code, message: redact(&error.message), data: error.data }

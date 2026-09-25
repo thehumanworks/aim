@@ -613,7 +613,7 @@ impl TurnCollector {
     fn tool_items(&self, call: &ToolCallState) -> Vec<Item> {
         let arguments = call.raw_input.as_ref().map(Value::to_string).unwrap_or_default();
         let native = serde_json::to_value(call).ok().map(|value| NativeItem { provider: self.provider.clone(), value });
-        let content = call
+        let mut content: Vec<ToolContent> = call
             .content
             .iter()
             .filter_map(|c| match c {
@@ -624,6 +624,12 @@ impl TurnCollector {
                 ToolCallContent::Diff { .. } | ToolCallContent::Terminal { .. } => None,
             })
             .collect();
+        // Built-ins such as Write report their result only as a `rawOutput` string.
+        if content.is_empty()
+            && let Some(Value::String(text)) = &call.raw_output
+        {
+            content.push(ToolContent::Text { text: text.clone() });
+        }
         vec![
             Item::ToolCall { call_id: call.id.clone(), name: call.display_name().to_owned(), arguments, native },
             Item::ToolResult {
@@ -648,4 +654,98 @@ pub(crate) enum Routed {
         /// The result, or the error.
         result: Result<Value, AcpError>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn chunk(kind: &str, text: &str, message_id: Option<&str>) -> Value {
+        json!({"sessionUpdate": kind, "content": {"type": "text", "text": text}, "messageId": message_id})
+    }
+
+    fn feed(updates: &[Value]) -> Vec<Item> {
+        let mut calls = BTreeMap::new();
+        let mut collector = TurnCollector::new("acp:test");
+        let mut items: Vec<Item> = updates.iter().flat_map(|raw| collector.push(&parse_update(raw, &mut calls))).collect();
+        items.extend(collector.finish());
+        items
+    }
+
+    #[test]
+    fn chunks_of_one_message_form_one_item_and_kinds_split_items() {
+        let items = feed(&[
+            chunk("agent_thought_chunk", "think", Some("m1")),
+            chunk("agent_thought_chunk", "ing", Some("m1")),
+            chunk("agent_message_chunk", "Hel", Some("m2")),
+            chunk("agent_message_chunk", "lo", None),
+            chunk("agent_message_chunk", "again", Some("m3")),
+        ]);
+        assert_eq!(
+            items,
+            vec![
+                Item::Reasoning { id: Some("m1".into()), summary: vec!["thinking".into()], native: None },
+                Item::Assistant { id: Some("m2".into()), parts: vec![Part::Text { text: "Hello".into() }], native: None },
+                Item::Assistant { id: Some("m3".into()), parts: vec![Part::Text { text: "again".into() }], native: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn images_map_and_unmappable_content_is_left_to_the_raw_update() {
+        let image = json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "image", "mimeType": "image/png", "data": "iVBO"}});
+        let link = json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "resource_link", "uri": "file:///a", "name": "a"}});
+        let items = feed(&[image, link]);
+        let [Item::Assistant { parts, .. }] = items.as_slice() else { panic!("{items:?}") };
+        assert!(matches!(parts.as_slice(), [Part::Image { media_type, .. }] if media_type == "image/png"));
+    }
+
+    #[test]
+    fn tool_calls_upsert_and_complete_once() {
+        let mut calls = BTreeMap::new();
+        let start = json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Read a", "kind": "read", "status": "pending",
+                           "rawInput": {"path": "a"}, "locations": [{"path": "/w/a", "line": 3}], "_meta": {"claudeCode": {"toolName": "Read"}}});
+        let Update::ToolCall(state) = parse_update(&start, &mut calls) else { panic!() };
+        assert_eq!((state.name.as_deref(), state.kind.as_str(), state.status), (Some("Read"), "read", ToolCallStatus::Pending));
+        let done = json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "failed",
+                          "content": [{"type": "content", "content": {"type": "text", "text": "no such file"}}, {"type": "terminal", "terminalId": "x"}]});
+        let Update::ToolCall(state) = parse_update(&done, &mut calls) else { panic!() };
+        assert_eq!(state.title, "Read a", "partial updates keep earlier fields");
+        assert_eq!(state.locations, vec![ToolLocation { path: "/w/a".into(), line: Some(3) }]);
+        assert_eq!(state.content.len(), 2);
+
+        let items = feed(&[start, done.clone(), done]);
+        assert_eq!(items.len(), 2, "a finished call is recorded once: {items:?}");
+        let Item::ToolResult { result, .. } = &items[1] else { panic!() };
+        assert!(result.is_error);
+        assert_eq!(result.content, vec![ToolContent::Text { text: "no such file".into() }]);
+        // A fresh `tool_call` for the same id replaces the state.
+        let restart = json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Read b"});
+        let Update::ToolCall(state) = parse_update(&restart, &mut calls) else { panic!() };
+        assert_eq!((state.status, state.locations.len(), state.raw_input.is_none()), (ToolCallStatus::Pending, 0, true));
+    }
+
+    #[test]
+    fn turn_ends_need_a_stop_reason() {
+        assert!(matches!(parse_turn_end(json!({})), Err(AcpError::Protocol { .. })));
+        let end = parse_turn_end(json!({"stopReason": "refusal"})).unwrap();
+        assert_eq!((end.stop, end.usage), (StopReason::Other { reason: "refusal".into() }, None));
+    }
+
+    #[test]
+    fn content_parts_round_trip_through_acp_json() {
+        let parts = [
+            ContentPart::Text { text: "t".into() },
+            ContentPart::Image { media_type: "image/png".into(), data: "AA==".into(), uri: Some("https://x/y.png".into()) },
+            ContentPart::ResourceLink { uri: "file:///a".into(), name: "a".into() },
+            ContentPart::Resource { uri: "file:///b".into(), text: Some("body".into()) },
+        ];
+        for part in parts {
+            assert_eq!(ContentPart::parse(&part.to_acp()), part);
+        }
+        let image = Part::Image { media_type: "image/png".into(), data: Base64Bytes(vec![0, 1, 2]) };
+        assert_eq!(ContentPart::from_part(&image).to_part(), Some(image));
+    }
 }

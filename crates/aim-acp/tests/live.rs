@@ -54,12 +54,36 @@ async fn connect(name: &str) -> AcpClient {
     client
 }
 
-/// A fresh, empty, absolute working directory unique to this run.
-fn scratch(name: &str) -> PathBuf {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let dir = std::env::temp_dir().join(format!("aim-acp-live-{name}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.canonicalize().unwrap()
+/// A fresh, empty, absolute working directory unique to this run. Dropping it removes the
+/// directory and whatever Claude Code created for it in its project store.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("aim-acp-live-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir.canonicalize().unwrap())
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn name(&self) -> String {
+        self.0.file_name().unwrap().to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        drop(std::fs::remove_dir_all(&self.0));
+        for dir in files_named(&projects_dir(), &self.name()) {
+            if dir.is_dir() {
+                drop(std::fs::remove_dir_all(&dir));
+            }
+        }
+    }
 }
 
 /// Runs one prompt to completion; returns its events and the concatenated assistant text.
@@ -100,8 +124,8 @@ async fn live_probe() {
         let login = client.login_command(&method.id).unwrap();
         println!("[live_probe] login `{}`: program={} args={:?}", login.method_id, login.program.display(), login.args);
     }
-    let cwd = scratch("probe");
-    let report = client.probe(&cwd).await.unwrap();
+    let cwd = Scratch::new("probe");
+    let report = client.probe(cwd.path()).await.unwrap();
     // Give the background `claude auth status` push a moment (the adapter's probe has a 5 s timeout).
     for _ in 0..50 {
         if client.auth_status().is_some() {
@@ -199,8 +223,8 @@ async fn live_prompt_native() {
 
     // Positive control: a persisted session does leave a transcript, so "no file" below means
     // something.
-    let persisted_cwd = scratch("persisted");
-    let mut persisted = client.new_session(SessionOptions::new(&persisted_cwd)).await.unwrap();
+    let persisted_cwd = Scratch::new("persisted");
+    let mut persisted = client.new_session(SessionOptions::new(persisted_cwd.path())).await.unwrap();
     let (events, reply, elapsed) = run_turn(&mut persisted, "Reply with exactly: OK").await;
     println!("[live_prompt_native] persisted turn: {} ms, reply {reply:?}, stop {:?}", elapsed.as_millis(), stop_of(&events).stop);
     let found = find_transcript(persisted.id(), Duration::from_secs(5)).await;
@@ -216,8 +240,8 @@ async fn live_prompt_native() {
     );
 
     // The private session: `persistSession: false`.
-    let private_cwd = scratch("private");
-    let mut options = SessionOptions::new(&private_cwd);
+    let private_cwd = Scratch::new("private");
+    let mut options = SessionOptions::new(private_cwd.path());
     options.persist = false;
     let mut session = client.new_session(options).await.unwrap();
     let id = session.id().to_owned();
@@ -245,20 +269,13 @@ async fn live_prompt_native() {
     client.shutdown(Duration::from_secs(5)).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let found = files_named(&projects, &id);
-    let slug_dirs = files_named(&projects, private_cwd.file_name().unwrap().to_str().unwrap());
+    let slug_dirs = files_named(&projects, &private_cwd.name());
     let slug_files: Vec<_> = slug_dirs.iter().flat_map(|d| files_under(d)).collect();
     println!(
         "[live_prompt_native] private session {id} after close + exit: files named after it {found:?}; project dirs for its cwd {slug_dirs:?} holding files {slug_files:?}"
     );
     assert!(found.is_empty(), "persistSession:false left a transcript: {found:?}");
     assert!(slug_files.is_empty(), "files in the private session's project dir: {slug_files:?}");
-
-    // Leave no test residue in the user's Claude store.
-    for dir in files_named(&projects, "aim-acp-live-") {
-        if dir.is_dir() {
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-    }
 }
 
 /// Every file (not directory) below `dir`.
@@ -281,7 +298,8 @@ fn entry_types(path: &Path) -> Vec<String> {
 #[ignore = "live: needs claude-agent-acp and a Claude login"]
 async fn live_set_config() {
     let client = connect("live_set_config").await;
-    let mut options = SessionOptions::new(scratch("config"));
+    let cwd = Scratch::new("config");
+    let mut options = SessionOptions::new(cwd.path());
     options.persist = false;
     let mut session = client.new_session(options).await.unwrap();
     let show = |session: &AcpSession| {
@@ -316,10 +334,10 @@ async fn live_set_config() {
 #[ignore = "live: needs claude-agent-acp and a Claude login"]
 async fn live_aim_tools_mode_start() {
     let client = connect("live_aim_tools_mode_start").await;
-    let cwd = scratch("aimtools");
-    let log = cwd.join("echo-mcp.log");
+    let cwd = Scratch::new("aimtools");
+    let log = cwd.path().join("echo-mcp.log");
     let nonce = format!("ping-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
-    let mut options = SessionOptions::new(&cwd);
+    let mut options = SessionOptions::new(cwd.path());
     options.persist = false;
     options.tool_authority = aim_acp::ToolAuthority::aim();
     options.mcp_servers = vec![aim_acp::McpServerSpec::Stdio {
@@ -363,15 +381,18 @@ async fn live_aim_tools_mode_start() {
 #[ignore = "live: needs claude-agent-acp and a Claude login"]
 async fn live_permission_yolo() {
     let client = connect("live_permission_yolo").await;
-    let mut options = SessionOptions::new(scratch("permission"));
+    let cwd = Scratch::new("permission");
+    let mut options = SessionOptions::new(cwd.path());
     options.persist = false;
     let mut session = client.new_session(options).await.unwrap();
-    // "Manual" mode asks before every Bash call.
+    // "Manual" mode asks before file writes (read-only commands such as `echo` run unasked).
     session.set_config(&ConfigKey::Mode, "default").await.unwrap();
     let nonce = format!("perm-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
-    let (events, reply, elapsed) =
-        run_turn(&mut session, &format!("Run the shell command `echo {nonce}` with the Bash tool, then reply with exactly its output."))
-            .await;
+    let file = cwd.path().join(format!("{nonce}.txt"));
+    let prompt =
+        format!("Use the Write tool to create the file {} containing exactly `{nonce}`, then reply with exactly: {nonce}", file.display());
+    let (events, reply, elapsed) = run_turn(&mut session, &prompt).await;
+    println!("[live_permission_yolo] file written: {}", std::fs::read_to_string(&file).is_ok_and(|text| text.contains(&nonce)));
     let permissions: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
