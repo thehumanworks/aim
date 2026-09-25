@@ -73,6 +73,13 @@ function search(query) {
   const q = String(query).toLowerCase();
   return __aimToolSpecs.filter(t => (t.name + ' ' + t.description).toLowerCase().includes(q));
 }
+function __aimResult(result) {
+  if (result === null || typeof result !== 'object' || !Array.isArray(result.content)) return result;
+  const joined = result.content.filter(part => part && part.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n');
+  Object.defineProperty(result, 'text', {value: joined, enumerable: false});
+  Object.defineProperty(result, 'toString', {value: () => joined, enumerable: false});
+  return result;
+}
 function __aimTool(name) {
   if (typeof name !== 'string') return undefined;
   const canonical = name.startsWith('functions.') ? name.slice('functions.'.length) : name;
@@ -80,7 +87,7 @@ function __aimTool(name) {
   return async (arguments_) => {
     const response = JSON.parse(await __aimCallTool(canonical, JSON.stringify(arguments_ ?? {})));
     if (!response.ok) throw new Error(response.error);
-    return response.result;
+    return __aimResult(response.result);
   };
 }
 const __aimFunctions = new Proxy(Object.create(null), {

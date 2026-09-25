@@ -1127,7 +1127,11 @@ async fn program_tools_obey_the_agent_allowlist() {
         media: None,
         decider: None,
         tools: Vec::new(),
-        code: Some(CodeConfig { worker: "/nonexistent/aim-coderun".into(), user_programs: programs.path().join("programs") }),
+        code: Some(CodeConfig {
+            worker: "/nonexistent/aim-coderun".into(),
+            user_programs: programs.path().join("programs"),
+            mode: aim::coderun::mode::Mode::On,
+        }),
     };
     let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(reader_project(Some("Read, run_code"))));
     let for_tools = Arc::clone(&tools);
@@ -1150,4 +1154,62 @@ async fn program_tools_obey_the_agent_allowlist() {
         "{got:?}"
     );
     assert!(!programs.path().join("programs").exists(), "nothing was committed");
+}
+
+/// `Read`, `Glob` (a tool code mode `on` hides) and `Write`.
+struct CodeModeWorkspace;
+
+impl ToolHost for CodeModeWorkspace {
+    fn specs(&self) -> Vec<ToolSpec> {
+        ["Read", "Glob", "Write"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: name.into(),
+                input_schema: json!({"type": "object"}),
+                input: aim_proto::tool::ToolInput::default(),
+                annotations: ToolAnnotations::default(),
+            })
+            .collect()
+    }
+
+    fn call(&self, name: String, _arguments: Value, _key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
+        Box::pin(async move { Ok(ToolResult::text(name)) })
+    }
+}
+
+/// ADR 0076: each code mode's tools in a native session. `off` (no `CodeConfig`) offers the
+/// workspace alone, `on` hides the compact set, `only` offers the code tools alone; an agent whose
+/// ceiling lacks `run_code` keeps its direct tools even under `only`, and one allowing `run_code`
+/// but not the program tools gets `run_code` alone.
+#[tokio::test]
+async fn code_modes_compose_their_tool_lists_and_never_widen_a_ceiling() {
+    let programs = tempfile::tempdir().unwrap();
+    let code = |mode| CodeConfig { worker: "/nonexistent/aim-coderun".into(), user_programs: programs.path().join("programs"), mode };
+    let cases: [(Option<aim::coderun::mode::Mode>, Option<&str>, &[&str]); 5] = [
+        (None, None, &["Read", "Glob", "Write"]),
+        (Some(aim::coderun::mode::Mode::On), None, &["Read", "Write", "run_code", "save_program", "run_program", "list_programs"]),
+        (Some(aim::coderun::mode::Mode::Only), None, &["run_code", "save_program", "run_program", "list_programs"]),
+        (Some(aim::coderun::mode::Mode::Only), Some("Read, Glob"), &["Read", "Glob"]),
+        (Some(aim::coderun::mode::Mode::Only), Some("Read, run_code"), &["run_code"]),
+    ];
+    for (mode, agent_tools, expected) in cases {
+        let services = NativeServices { code: mode.map(code), ..NativeServices::default() };
+        let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(reader_project(agent_tools)));
+        let f = fixture_on(Arc::new(MemoryStore::default()), Vec::new(), vec![text("done")], services, move |spec| Connected {
+            tools: Arc::new(CodeModeWorkspace) as Arc<dyn ToolHost>,
+            root: spec.workspace.clone(),
+            location: "local".into(),
+            project: Some(Arc::clone(&files)),
+            shutdown: Box::new(|| Box::pin(async {})),
+        });
+        let session =
+            if agent_tools.is_some() { persistent("reader") } else { SessionSpec { persistence: Persistence::Persistent, ..spec(None) } };
+        let id = f.host.create(session).await.unwrap().meta.id;
+        let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+        f.host.prompt(id, vec![Part::Text { text: "go".into() }]).await.unwrap();
+        until_idle(&mut updates).await;
+        let offered: Vec<String> = f.provider.seen.lock().unwrap()[0].tools.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(offered, expected, "mode {mode:?}, agent tools {agent_tools:?}");
+    }
 }

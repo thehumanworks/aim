@@ -71,6 +71,22 @@ async fn typescript_nested_calls_and_output() {
     assert!(!events[0].immediate);
 }
 
+/// ADR 0076: a nested result's `.text` (and its string form) is its text, `Promise.all` runs
+/// calls together, and the added fields stay out of the result's JSON.
+#[tokio::test]
+async fn nested_results_expose_their_text_and_run_together() {
+    let (result, _) = execute(
+        "const [a, b] = await Promise.all([tools.add({a:1,b:2}), tools.add({a:3,b:4})]); text(a.text + ',' + `${b}` + ',' + JSON.stringify(a).includes('\"text\":\"3\"') + ',' + Object.keys(a).includes('text'));",
+        None,
+        1024,
+        2_000,
+        16 << 20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.output, "3,7,true,false\n");
+}
+
 #[tokio::test]
 async fn global_this_exposes_tools_and_index() {
     let (result, _) = execute(

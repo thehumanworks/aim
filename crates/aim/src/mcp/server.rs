@@ -23,6 +23,9 @@ const PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_CALLS: usize = 32;
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// A code tool's calls may run a cell to its longest deadline; this adds a margin for admission
+/// and the worker's start (ADR 0076).
+const CELL_CALL_TIMEOUT: Duration = Duration::from_millis(crate::coderun::MAX_TIMEOUT_MS + 30_000);
 
 type Pending = Pin<Box<dyn Future<Output = (String, Option<Value>)> + Send>>;
 
@@ -47,10 +50,17 @@ impl AimMcpServer {
         self
     }
 
+    /// The deadline for one call of `name`: the call timeout, or for a code tool (`run_code`,
+    /// `exec`, `wait`, `run_program`) at least a cell's longest deadline plus a margin.
+    fn timeout_for(&self, name: &str) -> Duration {
+        if crate::coderun::mode::CELL_TOOLS.contains(&name) { self.call_timeout.max(CELL_CALL_TIMEOUT) } else { self.call_timeout }
+    }
+
     /// Serves newline-delimited MCP JSON-RPC until EOF.
     ///
     /// Requests may complete out of order. At most 32 calls run concurrently; each call has a
-    /// 60-second default deadline. `notifications/cancelled` drops the corresponding call future.
+    /// 60-second default deadline (a code tool's, 330 s). `notifications/cancelled` drops the
+    /// corresponding call future.
     ///
     /// # Errors
     /// Returns an I/O error when the transport fails or an inbound frame exceeds 16 MiB.
@@ -166,7 +176,7 @@ impl AimMcpServer {
                 let name = name.to_owned();
                 let request_id = id.clone();
                 let idempotency_key = IdempotencyKey::new(format!("mcp-{connection_id}-{key}"));
-                let timeout = self.call_timeout;
+                let timeout = self.timeout_for(&name);
                 let (handle, registration) = AbortHandle::new_pair();
                 active.insert(key.clone(), handle);
                 pending.push(Box::pin(async move {
