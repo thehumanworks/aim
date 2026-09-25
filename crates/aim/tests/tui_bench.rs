@@ -104,7 +104,11 @@ fn tui_transcript_size() {
         let full_rss = tui.rss_kib();
         let page = Instant::now();
         tui.send("\x1b[5~");
-        let scrolled = page.elapsed() + tui.time_until(Duration::from_secs(10), |s| s.contains("rows below")).unwrap();
+        let scrolled = if items == 0 {
+            Duration::ZERO
+        } else {
+            page.elapsed() + tui.time_until(Duration::from_secs(10), |s| s.contains("rows below")).unwrap()
+        };
         println!(
             "{items} items: attach+replay to idle {} ({} KiB written) · RSS inline {} MiB, fullscreen {} MiB · keystroke p50 {} p95 {} · fullscreen open {} · page up {}",
             ms(replayed),
