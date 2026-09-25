@@ -1208,6 +1208,11 @@ async fn options_are_published_replayed_on_attach_and_follow_the_model() {
     assert_eq!(options.models[1].description.as_deref(), Some("1M context"));
     assert_eq!(options.models[0].name, None, "a display name equal to the id adds nothing");
     assert_eq!(values(&options.efforts), ["low", "medium", "high"], "the ladder of the model in force");
+    assert_eq!(
+        options.auto_effort.as_deref(),
+        Some("unpinned: kept until a model change, then the provider's default"),
+        "the native loop takes `auto`; without a decider it only unpins the effort"
+    );
 
     // A client attaching later gets them in its snapshot.
     let (late, _late_updates) = f.host.attach(id.clone()).await.unwrap();
@@ -1259,4 +1264,40 @@ async fn a_session_without_a_catalog_sends_no_options_and_is_not_held_up() {
     assert_eq!(first.options, None, "no options yet, and attach did not wait for them");
     stalled.host.prompt(id, user("hi")).await.unwrap();
     until(&mut updates, is_idle).await;
+}
+
+/// A client attaching after a model change is told the model in force, by the live session and by
+/// one resumed from the store (REV: the summary kept the model the session began with).
+#[tokio::test]
+async fn attach_reports_the_model_in_force_after_a_change_and_a_resume() {
+    let m2 = ModelInfo { id: "m2".into(), display_name: "m2".into(), ..ladder_model() };
+    let store = Arc::new(MemoryStore::default());
+    let first = fixture_full(Arc::clone(&store) as Arc<dyn SessionStore>, Arc::clone(&store), Vec::new(), vec![ladder_model(), m2.clone()]);
+    let id = first.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    first.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m2".into()), effort: None }).await.unwrap();
+    let (attached, _) = first.host.attach(id.clone()).await.unwrap();
+    assert_eq!(attached.summary.meta.model, "m2");
+    let listed = first.host.list(SessionListParams::default()).await.unwrap();
+    assert_eq!(listed.iter().find(|s| s.meta.id == id).map(|s| s.meta.model.as_str()), Some("m2"));
+    first.host.shutdown().await.unwrap();
+
+    // A restarted host resumes it with the model its log ended with, and says so.
+    let second = fixture_full(Arc::clone(&store) as Arc<dyn SessionStore>, store, Vec::new(), vec![ladder_model(), m2]);
+    let (resumed, _) = second.host.attach(id).await.unwrap();
+    assert_eq!(resumed.summary.meta.model, "m2");
+}
+
+/// Jev's `auto`: a persistent session with a decider says Jev picks the effort.
+#[tokio::test]
+async fn options_say_what_auto_does_in_an_advised_session() {
+    let counting = Arc::new(Counting::default());
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_services(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, Vec::new(), vec![ladder_model()], advised(&counting));
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (first, mut updates) = f.host.attach(id).await.unwrap();
+    let options = match first.options {
+        Some(options) => options,
+        None => until(&mut updates, |u| options_of(u).is_some()).await.last().and_then(options_of).cloned().unwrap(),
+    };
+    assert_eq!(options.auto_effort.as_deref(), Some("Jev picks the effort per request"));
 }

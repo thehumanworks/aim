@@ -81,10 +81,24 @@ pub trait Backend: Send {
 /// Longest wait for a catalog fetched only to fill a session's options (in the background).
 pub const OPTIONS_LOOKUP: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// A native session's options from its provider's catalog (ADR 0074): every model the provider
-/// does not hide, and the effort ladder of `current` with its default marked.
+/// What `auto` does in a native session (ADR 0074). The native loop always takes it
+/// ([`Agent`]'s `set_config`); Jev then moves the effort per request when the session has a
+/// decider (persistent sessions with `TYPESAFE_API_KEY`) and the model a usable ladder; otherwise
+/// the level in force stays unpinned and a model change resets it to the provider's default.
 #[must_use]
-pub fn catalog_options(models: &[ModelInfo], current: &str) -> SessionOptions {
+pub fn native_auto(jev: bool, model: Option<&ModelInfo>) -> String {
+    if jev && model.and_then(super::ladder_start).is_some() {
+        "Jev picks the effort per request".to_owned()
+    } else {
+        "unpinned: kept until a model change, then the provider's default".to_owned()
+    }
+}
+
+/// A native session's options from its provider's catalog (ADR 0074): every model the provider
+/// does not hide, the effort ladder of `current` with its default marked, and `auto` (always
+/// taken; `jev`: the session has a decider).
+#[must_use]
+pub fn catalog_options(models: &[ModelInfo], current: &str, jev: bool) -> SessionOptions {
     let window = |tokens: u64| {
         if tokens >= 1_000_000 { format!("{}M context", tokens / 1_000_000) } else { format!("{}k context", tokens / 1_000) }
     };
@@ -112,7 +126,8 @@ pub fn catalog_options(models: &[ModelInfo], current: &str) -> SessionOptions {
                 .collect()
         })
         .unwrap_or_default();
-    SessionOptions { models: choices, efforts }
+    let auto_effort = Some(native_auto(jev, models.iter().find(|model| model.id == current)));
+    SessionOptions { models: choices, efforts, auto_effort }
 }
 
 impl Backend for Agent {
@@ -180,6 +195,7 @@ impl Backend for Agent {
 
     fn options(&self) -> BackendFuture<'static, Option<SessionOptions>> {
         let (provider, model, known) = (Arc::clone(&self.provider), self.config.model.clone(), self.catalog_handle());
+        let jev = self.has_decider();
         Box::pin(async move {
             // The catalog the session already holds (W26 fetched it at start for codex; a model
             // check refreshes it); else one bounded fetch, which a gateway's cache shares.
@@ -191,7 +207,7 @@ impl Backend for Agent {
                 *known.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&fetched));
                 fetched
             };
-            (!models.is_empty()).then(|| catalog_options(&models, &model))
+            (!models.is_empty()).then(|| catalog_options(&models, &model, jev))
         })
     }
 }

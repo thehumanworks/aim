@@ -473,7 +473,7 @@ pub struct ChoiceValue {
 /// What a session can switch to (ADR 0074), as its backend knows it: the models of its provider
 /// (a native provider's catalog without hidden models; an ACP agent's advertised `model` values)
 /// and the effort ladder of the model in force (empty: no effort control is known). [`AUTO_EFFORT`]
-/// is never listed here; clients offer it themselves.
+/// is never listed in `efforts`: `auto_effort` says whether the session takes it.
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SessionOptions {
     /// Models, in the source's order.
@@ -482,6 +482,11 @@ pub struct SessionOptions {
     /// The current model's effort levels, least effort first.
     #[serde(default)]
     pub efforts: Vec<ChoiceValue>,
+    /// `Some` when `session.set_config` takes [`AUTO_EFFORT`], saying what it does in this session
+    /// (native sessions always take it; an ACP agent only when it advertises it). `None`: the
+    /// session refuses it, and clients neither offer nor send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_effort: Option<String>,
 }
 
 method!(

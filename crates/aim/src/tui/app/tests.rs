@@ -914,13 +914,25 @@ fn choice(value: &str, name: Option<&str>) -> aim_proto::daemon::ChoiceValue {
     aim_proto::daemon::ChoiceValue { value: value.into(), name: name.map(Into::into), description: None }
 }
 
-fn options(models: &[&str], efforts: &[&str]) -> SessionUpdate {
+/// Options of a session; `auto_effort` says whether it takes `auto`.
+fn options_with(models: &[&str], efforts: &[&str], auto_effort: Option<&str>) -> SessionUpdate {
     SessionUpdate::Options {
         options: SessionOptions {
             models: models.iter().map(|m| choice(m, Some(&format!("Model {m}")))).collect(),
             efforts: efforts.iter().map(|e| choice(e, None)).collect(),
+            auto_effort: auto_effort.map(Into::into),
         },
     }
+}
+
+/// Options of a native session (it takes `auto`).
+fn options(models: &[&str], efforts: &[&str]) -> SessionUpdate {
+    options_with(models, efforts, Some("Jev picks the effort per request"))
+}
+
+/// Options of an agent that refuses `auto` (claude-agent-acp).
+fn agent_options(models: &[&str], efforts: &[&str]) -> SessionUpdate {
+    options_with(models, efforts, None)
 }
 
 /// The hints of the completion request `text` raises, as (value, detail).
@@ -1047,7 +1059,7 @@ fn options_replace_seen_values_and_never_leak_across_providers() {
     app.handle(Input::Sessions(Ok(vec![codex])));
     app.handle(press(KeyCode::Esc));
     assert_eq!(values_for(&mut app, "/model "), ["openai/gpt-4.1-mini"]);
-    assert_eq!(values_for(&mut app, "/effort "), ["low", "auto"]);
+    assert_eq!(values_for(&mut app, "/effort "), ["low"], "`auto` only once the session says it takes it");
     // The session's options replace them, with details.
     update_on(&mut app, "o1", options(&["openai/gpt-4.1-mini", "anthropic/claude-sonnet-5"], &["low", "medium", "high"]));
     let models = hints_for(&mut app, "/model ");
@@ -1057,7 +1069,7 @@ fn options_replace_seen_values_and_never_leak_across_providers() {
     typed(&mut app, "/provider codex");
     app.handle(press(KeyCode::Enter));
     assert_eq!(values_for(&mut app, "/model "), ["gpt-6-sol"], "while the codex session opens");
-    assert_eq!(values_for(&mut app, "/effort "), ["auto"]);
+    assert!(values_for(&mut app, "/effort ").is_empty());
     let mut summary = persistent_summary("c1");
     summary.meta.provider = "codex".into();
     summary.meta.model = "gpt-6-sol".into();
@@ -1092,6 +1104,56 @@ fn an_effort_off_the_known_ladder_is_refused_before_it_is_sent() {
     update(&mut app, SessionUpdate::ConfigChanged { model: "m2".into(), effort: None, effort_source: EffortSource::Auto });
     typed(&mut app, "/effort ultra");
     assert_eq!(config_to(&app.handle(press(KeyCode::Enter)), "s1").len(), 1);
+    update(&mut app, options(&["m1", "m2"], &["minimal"]));
+    assert_eq!(values_for(&mut app, "/effort "), ["minimal", "auto"]);
+}
+
+#[test]
+fn effort_values_match_with_case_folded_and_reach_each_backend_as_it_wants() {
+    // Native: the ladder's spelling, since the loop matches exactly.
+    let mut app = attached();
+    update(&mut app, options(&["m1"], &["low", "high"]));
+    typed(&mut app, "/effort Low");
+    let sent = config_to(&app.handle(press(KeyCode::Enter)), "s1");
+    assert_eq!(sent.iter().map(|p| p.effort.as_deref()).collect::<Vec<_>>(), [Some("low")]);
+    typed(&mut app, "/effort AUTO");
+    let sent = config_to(&app.handle(press(KeyCode::Enter)), "s1");
+    assert_eq!(sent.iter().map(|p| p.effort.as_deref()).collect::<Vec<_>>(), [Some("auto")]);
+    // ACP: as typed, for its resolver (ADR 0075); `auto` is neither offered nor sent.
+    let mut app = new_app(Persistence::Persistent);
+    app.start(Some("a1".into()));
+    let mut agent = persistent_summary("a1");
+    agent.meta.provider = "acp:claude".into();
+    agent.meta.model = "default".into();
+    app.handle(Input::Attached { summary: agent, transcript: Vec::new(), surfaces: Vec::new(), resync: false, attempt: app.attempt });
+    update_on(&mut app, "a1", agent_options(&["default", "sonnet"], &["default", "low", "high"]));
+    assert_eq!(values_for(&mut app, "/effort "), ["default", "low", "high"]);
+    typed(&mut app, "/effort Low");
+    let sent = config_to(&app.handle(press(KeyCode::Enter)), "a1");
+    assert_eq!(sent.iter().map(|p| p.effort.as_deref()).collect::<Vec<_>>(), [Some("Low")]);
+    typed(&mut app, "/effort auto");
+    assert!(config_to(&app.handle(press(KeyCode::Enter)), "a1").is_empty());
+    assert!(
+        notices(&app).iter().any(|n| n == "effort `auto` is not offered by default (offers: default, low, high)"),
+        "{:?}",
+        notices(&app)
+    );
+}
+
+/// A model that changed while the stream was down: the kept ladder is the old model's, so the
+/// session decides until it sends the new one.
+#[test]
+fn a_reattach_after_a_missed_model_change_does_not_trust_the_old_ladder() {
+    let mut app = attached();
+    update(&mut app, options(&["m1", "m2"], &["low", "high"]));
+    let attempt = app.attempt;
+    app.handle(Input::StreamEnded { session: "s1".into(), attempt });
+    let mut moved = summary("s1", SessionState::Idle);
+    moved.meta.model = "m2".into();
+    app.handle(Input::Attached { summary: moved, transcript: Vec::new(), surfaces: Vec::new(), resync: true, attempt: app.attempt });
+    assert_eq!(app.session.as_ref().map(|s| s.model.as_str()), Some("m2"));
+    typed(&mut app, "/effort ultra");
+    assert_eq!(config_to(&app.handle(press(KeyCode::Enter)), "s1").len(), 1, "not refused by m1's ladder");
     update(&mut app, options(&["m1", "m2"], &["minimal"]));
     assert_eq!(values_for(&mut app, "/effort "), ["minimal", "auto"]);
 }

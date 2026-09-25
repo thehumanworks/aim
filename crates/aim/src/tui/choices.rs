@@ -3,7 +3,7 @@
 //! `/effort` and `/provider` complete. The decisions are the kernel's (`aim_kernel::switch`); this
 //! module only maps strings to the ids it decides over and back.
 
-use aim_kernel::switch::{self, EffortRequest, Shape, Switch};
+use aim_kernel::switch::{self, AutoEffort, EffortRequest, Shape, Switch};
 use aim_proto::daemon::{AUTO_EFFORT, ChoiceValue, Location, Persistence, SessionSpec};
 
 use super::app::SessionView;
@@ -33,6 +33,39 @@ impl<T: PartialEq + Clone> Registry<T> {
     }
 }
 
+/// Ids for model and effort values: case and inner whitespace are folded, as ADR 0075's resolver
+/// folds them, so `Low` and `low` get one id; the first spelling registered is the one kept.
+struct Folded {
+    keys: Vec<String>,
+    spellings: Vec<String>,
+}
+
+/// `text` as model and effort values are compared.
+fn fold(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+impl Folded {
+    fn new() -> Self {
+        Self { keys: Vec::new(), spellings: Vec::new() }
+    }
+
+    fn id(&mut self, text: &str) -> u64 {
+        let key = fold(text);
+        let index = self.keys.iter().position(|k| *k == key).unwrap_or_else(|| {
+            self.keys.push(key);
+            self.spellings.push(text.to_owned());
+            self.keys.len() - 1
+        });
+        // A registry never holds more than a catalog's worth of values.
+        u64::try_from(index).unwrap_or(u64::MAX)
+    }
+
+    fn spelling(&self, id: u64) -> Option<String> {
+        self.spellings.get(usize::try_from(id).ok()?).cloned()
+    }
+}
+
 /// A switch the user asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SwitchTo {
@@ -50,13 +83,14 @@ pub enum SwitchTo {
 pub fn derive_spec(attached: Option<&SessionView>, configured: &SessionSpec, to: &SwitchTo) -> Option<SessionSpec> {
     let mut text = Registry::<String>::new();
     let mut places = Registry::<Location>::new();
+    let mut values = Folded::new();
     let mut shape = |provider: &str, location: &Location, workspace: &str, persistence, model: Option<&str>, effort: Option<&str>| Shape {
         provider: text.id(&provider.to_owned()),
         location: places.id(location),
         workspace: text.id(&workspace.to_owned()),
         persistent: persistence == Persistence::Persistent,
-        model: model.map(|m| text.id(&m.to_owned())),
-        effort: effort.map(|e| text.id(&e.to_owned())),
+        model: model.map(|m| values.id(m)),
+        effort: effort.map(|e| values.id(e)),
     };
     let attached = attached.map(|s| {
         // An agent that reports no model (an empty id) has none to carry.
@@ -82,11 +116,11 @@ pub fn derive_spec(attached: Option<&SessionView>, configured: &SessionSpec, to:
         location: places.value(out.location)?,
         provider: text.value(out.provider)?,
         model: match out.model {
-            Some(id) => Some(text.value(id)?),
+            Some(id) => Some(values.spelling(id)?),
             None => None,
         },
         effort: match out.effort {
-            Some(id) => Some(text.value(id)?),
+            Some(id) => Some(values.spelling(id)?),
             None => None,
         },
         agent: configured.agent.clone(),
@@ -94,13 +128,24 @@ pub fn derive_spec(attached: Option<&SessionView>, configured: &SessionSpec, to:
     })
 }
 
-/// Whether `/effort <requested>` is sent for a model whose ladder is `ladder` (empty: not known,
-/// the session decides). `auto` always is (`aim_kernel::switch::effort_sent`).
-pub fn effort_offered(ladder: &[ChoiceValue], requested: &str) -> bool {
-    let mut text = Registry::<String>::new();
-    let ids: Vec<u64> = ladder.iter().map(|c| text.id(&c.value)).collect();
-    let request = if requested == AUTO_EFFORT { EffortRequest::Auto } else { EffortRequest::Level(text.id(&requested.to_owned())) };
-    switch::effort_sent(&ids, request)
+/// What `/effort <requested>` sends, or `None` when it is refused here
+/// (`aim_kernel::switch::effort_sent`): a level off a known `ladder` (empty: not known, the
+/// session decides), or `auto` where the session refuses it. Values match with case folded. With
+/// `canonical` the ladder's spelling of the level (and `auto`) is sent, for backends that match
+/// exactly (the native loop); otherwise the value as typed, for a backend that resolves values
+/// itself (ACP, ADR 0075).
+pub fn effort_to_send(ladder: &[ChoiceValue], auto: AutoEffort, requested: &str, canonical: bool) -> Option<String> {
+    let mut values = Folded::new();
+    let ids: Vec<u64> = ladder.iter().map(|c| values.id(&c.value)).collect();
+    let request = if fold(requested) == AUTO_EFFORT { EffortRequest::Auto } else { EffortRequest::Level(values.id(requested)) };
+    if !switch::effort_sent(&ids, auto, request) {
+        return None;
+    }
+    Some(match (canonical, request) {
+        (false, _) => requested.to_owned(),
+        (true, EffortRequest::Auto) => AUTO_EFFORT.to_owned(),
+        (true, EffortRequest::Level(id)) => values.spelling(id)?,
+    })
 }
 
 /// What the popup says about a choice: its name and description, without repeating the value
@@ -115,23 +160,25 @@ fn detail(choice: &ChoiceValue) -> String {
     [name, description].into_iter().flatten().collect::<Vec<_>>().join(" · ")
 }
 
-/// `/effort` candidates: the ladder's levels (or, before the session said, values seen for its
-/// provider), each once, and `auto` (`aim_kernel::switch::effort_candidates`).
-pub fn effort_hints(ladder: Option<&[ChoiceValue]>, seen: &[String]) -> Vec<Hint> {
+/// `/effort` candidates (`aim_kernel::switch::effort_candidates`): the ladder's levels (or, before
+/// the session said, values seen for its provider), each once, and `auto` only where the session
+/// takes it, described by `auto_detail`.
+pub fn effort_hints(ladder: Option<&[ChoiceValue]>, seen: &[String], auto: AutoEffort, auto_detail: &str) -> Vec<Hint> {
     let choices: Vec<ChoiceValue> = match ladder {
         Some(ladder) => ladder.to_vec(),
         None => seen.iter().map(|value| ChoiceValue { value: value.clone(), name: None, description: None }).collect(),
     };
-    let mut text = Registry::<String>::new();
-    let ids: Vec<u64> = choices.iter().map(|c| text.id(&c.value)).collect();
-    let auto = text.id(&AUTO_EFFORT.to_owned());
-    switch::effort_candidates(&ids, auto)
+    let mut values = Folded::new();
+    let ids: Vec<u64> = choices.iter().map(|c| values.id(&c.value)).collect();
+    let auto_id = values.id(AUTO_EFFORT);
+    switch::effort_candidates(&ids, auto_id, auto)
         .into_iter()
         .filter_map(|id| {
-            let value = text.value(id)?;
-            let detail = match choices.iter().find(|c| c.value == value) {
-                Some(choice) => detail(choice),
-                None => "let aim choose the effort".to_owned(),
+            let value = values.spelling(id)?;
+            let detail = if id == auto_id {
+                auto_detail.to_owned()
+            } else {
+                choices.iter().find(|c| c.value == value).map(detail).unwrap_or_default()
             };
             Some(Hint { value, detail })
         })
@@ -214,19 +261,49 @@ mod tests {
         // An agent that reports no model carries none.
         let spec = derive_spec(Some(&view("acp:claude", "", None)), &configured(), &SwitchTo::New).unwrap();
         assert_eq!(spec.model, None);
+        // Values keep their spelling through the folded registry.
+        let spec = derive_spec(Some(&view("codex", "GPT-6-Sol", Some("High"))), &configured(), &SwitchTo::New).unwrap();
+        assert_eq!((spec.model.as_deref(), spec.effort.as_deref()), (Some("GPT-6-Sol"), Some("High")));
+    }
+
+    fn hint_values(hints: Vec<Hint>) -> Vec<String> {
+        hints.into_iter().map(|h| h.value).collect()
     }
 
     #[test]
-    fn efforts_are_the_ladder_and_auto_and_only_offered_ones_are_sent() {
-        let ladder = [choice("low"), choice("high"), choice("low")];
-        let values: Vec<String> = effort_hints(Some(&ladder), &[]).into_iter().map(|h| h.value).collect();
-        assert_eq!(values, ["low", "high", "auto"]);
-        let seen: Vec<String> = effort_hints(None, &["auto".into(), "max".into()]).into_iter().map(|h| h.value).collect();
-        assert_eq!(seen, ["auto", "max"], "auto once");
-        assert!(effort_offered(&ladder, "high"));
-        assert!(effort_offered(&ladder, AUTO_EFFORT));
-        assert!(!effort_offered(&ladder, "ultra"));
-        assert!(effort_offered(&[], "ultra"), "an unknown ladder leaves the decision to the session");
+    fn efforts_are_the_ladder_and_auto_where_taken() {
+        let ladder = [choice("low"), choice("high"), choice("Low")];
+        assert_eq!(hint_values(effort_hints(Some(&ladder), &[], AutoEffort::Taken, "Jev")), ["low", "high", "auto"]);
+        assert_eq!(hint_values(effort_hints(Some(&ladder), &[], AutoEffort::Refused, "")), ["low", "high"], "an agent that refuses auto");
+        assert_eq!(hint_values(effort_hints(Some(&ladder), &[], AutoEffort::Unknown, "")), ["low", "high"], "not known: not offered");
+        let auto = effort_hints(Some(&ladder), &[], AutoEffort::Taken, "Jev picks the effort per request").pop().unwrap();
+        assert_eq!((auto.value.as_str(), auto.detail.as_str()), ("auto", "Jev picks the effort per request"));
+        // Before the session said: values seen for its provider, `auto` counted as `auto`.
+        assert_eq!(hint_values(effort_hints(None, &["auto".into(), "max".into()], AutoEffort::Unknown, "")), ["max"]);
+        assert_eq!(hint_values(effort_hints(None, &["Auto".into(), "max".into()], AutoEffort::Taken, "")), ["max", "Auto"]);
+    }
+
+    #[test]
+    fn efforts_match_with_case_folded_and_are_sent_as_the_backend_wants() {
+        let ladder = [choice("low"), choice("high")];
+        // The native loop matches exactly: it gets the ladder's spelling.
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Taken, "Low", true).as_deref(), Some("low"));
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Taken, " HIGH ", true).as_deref(), Some("high"));
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Taken, "AUTO", true).as_deref(), Some("auto"));
+        // An ACP agent resolves values itself (ADR 0075): it gets them as typed.
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Refused, "Low", false).as_deref(), Some("Low"));
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Refused, "auto", false), None, "never to a session that refuses it");
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Taken, "ultra", true), None);
+        assert_eq!(
+            effort_to_send(&[], AutoEffort::Unknown, "ultra", true).as_deref(),
+            Some("ultra"),
+            "an unknown ladder: the session decides"
+        );
+        assert_eq!(
+            effort_to_send(&[], AutoEffort::Unknown, "auto", false).as_deref(),
+            Some("auto"),
+            "unknown support: the session decides"
+        );
     }
 
     #[test]
