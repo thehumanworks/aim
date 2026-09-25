@@ -109,8 +109,11 @@ def invocation(harness: str, paths: dict[str, Path], home: Path, url: str, model
     if harness == "aim_openrouter":
         env["AIM_OPENROUTER_BASE_URL"] = url + "/v1"
         env["OPENROUTER_API_KEY"] = "fixture" if mode == "mock" else BASE_ENV["OPENROUTER_API_KEY"]
-        return env, [str(paths["aim"]), "run", "--ephemeral", "--aimx", str(paths["aimx"]),
-                     "-p", "openrouter", "-m", model, "-C", str(workspace), "--json", "--max-requests", "24", prompt]
+        args = [str(paths["aim"]), "run", "--ephemeral", "--aimx", str(paths["aimx"]),
+                "-p", "openrouter", "-m", model, "-C", str(workspace), "--json", "--max-requests", "24"]
+        if effort:
+            args.extend(["-e", effort])
+        return env, [*args, prompt]
     if harness == "aim_codex":
         env["AIM_CODEX_BASE_URL"] = url + "/backend-api/codex"
         env["CODEX_HOME"] = str(CODEX_AUTH)
