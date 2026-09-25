@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture as ToolFuture, ToolHost};
 use aim::daemon::{client::DaemonClient, server, socket_path, spawn};
-use aim::host::{BoxFuture, Connected, HostConfig, SessionClient, SessionHost, WorkspaceFactory};
+use aim::host::{BoxFuture, Connected, HostConfig, SessionClient, SessionHost, WorkspaceFactory, aimx_workspaces};
 use aim::store::MemoryStore;
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
@@ -258,6 +258,45 @@ async fn detached_stream_stops_while_session_keeps_running() {
 }
 
 #[tokio::test]
+async fn disconnect_mid_turn_ends_stream_and_late_client_recovers() {
+    let (dir, _, _, task) = started(100, Duration::from_millis(2)).await;
+    let socket = socket_path(dir.path());
+    let first = DaemonClient::connect(&socket).await.unwrap();
+    let second = DaemonClient::connect(&socket).await.unwrap();
+    let session = first.create(spec()).await.unwrap().meta.id;
+    let (_, mut surviving) = first.attach(session.clone()).await.unwrap();
+    let (_, mut disconnected) = second.attach(session.clone()).await.unwrap();
+    first.prompt(session.clone(), input()).await.unwrap();
+    while !matches!(disconnected.next().await, Some(SessionUpdate::TextDelta { .. })) {}
+    second.disconnect();
+    assert!(tokio::time::timeout(Duration::from_secs(1), disconnected.next()).await.unwrap().is_none());
+    until_idle(&mut surviving).await;
+    let late = DaemonClient::connect(&socket).await.unwrap();
+    let (snapshot, _) = late.attach(session).await.unwrap();
+    assert_eq!(snapshot.transcript.len(), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn idle_exit_waits_for_connections_then_removes_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, _) = host(1, Duration::ZERO);
+    let socket = socket_path(dir.path());
+    let task = tokio::spawn({
+        let home = dir.path().to_path_buf();
+        let socket = socket.clone();
+        async move { server::serve(&home, &socket, Some(Duration::from_millis(100)), host).await }
+    });
+    wait_socket(&socket).await;
+    let client = DaemonClient::connect(&socket).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(socket.exists());
+    client.disconnect();
+    tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
 async fn stale_socket_is_recovered() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("run")).unwrap();
@@ -302,7 +341,50 @@ async fn binary_auto_spawn_status_stop_leaves_no_socket() {
 }
 
 #[tokio::test]
+async fn concurrent_auto_spawn_gets_one_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_aim"));
+    let (first, second) =
+        tokio::join!(spawn::connect_or_spawn_executable(dir.path(), binary), spawn::connect_or_spawn_executable(dir.path(), binary),);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.initialize_result().pid, second.initialize_result().pid);
+    let stopped = std::process::Command::new(binary).args(["daemon", "stop"]).env("AIM_HOME", dir.path()).status().unwrap();
+    assert!(stopped.success());
+    first.disconnect();
+    second.disconnect();
+}
+
+#[tokio::test]
 #[ignore = "requires a real codex provider and aimx credentials"]
 async fn live_daemon_codex_turn() {
-    // The merged provider and aimx integration supplies this scenario in the lead's branch.
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let socket = socket_path(dir.path());
+    let host: Arc<dyn SessionClient> = Arc::new(SessionHost::new(HostConfig {
+        store: Arc::new(MemoryStore::default()),
+        providers: Arc::new(aim::providers::build),
+        workspaces: aimx_workspaces(aim::cli::find_aimx(None)),
+        max_requests: 4,
+        update_capacity: 1024,
+    }));
+    let task = tokio::spawn({
+        let home = dir.path().to_path_buf();
+        let socket = socket.clone();
+        async move { server::serve(&home, &socket, None, host).await }
+    });
+    wait_socket(&socket).await;
+    let client = DaemonClient::connect(&socket).await.unwrap();
+    let mut session_spec = spec();
+    session_spec.workspace = workspace.path().to_string_lossy().into_owned();
+    session_spec.provider = "codex".into();
+    let session = client.create(session_spec).await.unwrap().meta.id;
+    let (_, mut updates) = client.attach(session.clone()).await.unwrap();
+    assert_eq!(
+        client.prompt(session, vec![Part::Text { text: "Reply with one short greeting.".into() }]).await.unwrap(),
+        PromptOutcome::Started { turn: 1 }
+    );
+    let collected = tokio::time::timeout(Duration::from_secs(240), until_idle(&mut updates)).await.unwrap();
+    assert!(collected.iter().any(|u| matches!(u, SessionUpdate::TurnEnded { .. })));
+    task.abort();
 }

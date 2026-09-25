@@ -214,6 +214,24 @@ impl SessionHost {
         Self { config, sessions: Arc::new(Mutex::new(HashMap::new())), resuming: Arc::new(tokio::sync::Mutex::new(())) }
     }
 
+    /// Closes every live session and waits for each actor and workspace shutdown to finish.
+    ///
+    /// # Errors
+    /// Returns `timeout` if an actor or workspace does not finish within ten seconds.
+    pub async fn shutdown(&self) -> Result<(), ProtoError> {
+        let live: Vec<Arc<Live>> = lock(&self.sessions).values().cloned().collect();
+        for session in live {
+            let _closed = session.control.send(Control::Close);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !lock(&self.sessions).is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| err(ErrorCode::Timeout, "session shutdown exceeded ten seconds"))
+    }
+
     fn live(&self, id: &str) -> Result<Arc<Live>, ProtoError> {
         lock(&self.sessions).get(id).cloned().ok_or_else(|| err(ErrorCode::NotFound, format!("no live session {id}")))
     }

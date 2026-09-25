@@ -232,6 +232,9 @@ fn prepare(home: &Path, socket: &Path) -> Result<(UnixListener, SocketFiles), Pr
     if metadata.permissions().mode() & 0o077 != 0 {
         fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).map_err(|e| io_error("securing daemon run directory", &e))?;
     }
+    if fs::metadata(&run).map_err(|e| io_error("verifying daemon run directory", &e))?.permissions().mode() & 0o077 != 0 {
+        return Err(error(ErrorCode::Denied, "daemon run directory is too permissive"));
+    }
     let lock_path = run.join("daemon.lock");
     let lock_file = OpenOptions::new()
         .create(true)
@@ -248,11 +251,15 @@ fn prepare(home: &Path, socket: &Path) -> Result<(UnixListener, SocketFiles), Pr
         fs::remove_file(socket).map_err(|e| io_error("removing stale socket", &e))?;
     }
     let listener = UnixListener::bind(socket).map_err(|e| io_error("binding daemon socket", &e))?;
-    fs::set_permissions(socket, fs::Permissions::from_mode(0o600)).map_err(|e| io_error("securing daemon socket", &e))?;
     let pid = run.join("daemon.pid");
+    let files = SocketFiles { socket: socket.to_path_buf(), pid: pid.clone(), _lock: lock_file };
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o600)).map_err(|e| io_error("securing daemon socket", &e))?;
+    if fs::metadata(socket).map_err(|e| io_error("verifying daemon socket", &e))?.permissions().mode() & 0o077 != 0 {
+        return Err(error(ErrorCode::Denied, "daemon socket is too permissive"));
+    }
     fs::write(&pid, std::process::id().to_string()).map_err(|e| io_error("writing daemon pid", &e))?;
     fs::set_permissions(&pid, fs::Permissions::from_mode(0o600)).map_err(|e| io_error("securing daemon pid", &e))?;
-    Ok((listener, SocketFiles { socket: socket.to_path_buf(), pid, _lock: lock_file }))
+    Ok((listener, files))
 }
 
 fn serve_connection(stream: UnixStream, host: Arc<dyn SessionClient>, dedup: Arc<Dedup>) -> Result<Peer, ProtoError> {

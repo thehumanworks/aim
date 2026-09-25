@@ -158,13 +158,24 @@ async fn main_async(args: Args) -> Result<i32, String> {
                     let (writer, _guard) = tracing_appender::non_blocking(file);
                     let _ignored = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).try_init();
                     let store = Arc::new(SqliteStore::open(&home.join("aim.db")).map_err(|e| e.to_string())?);
-                    let host = SessionHost::new(HostConfig {
+                    let host = Arc::new(SessionHost::new(HostConfig {
                         store,
                         backends: aim::providers::backends(cli::find_aimx(None), 64),
                         update_capacity: 1024,
-                    });
-                    match server::serve(&home, &socket, idle_exit.map(std::time::Duration::from_secs), Arc::new(host)).await {
-                        Ok(()) | Err(aim_proto::error::ProtoError { code: aim_proto::error::ErrorCode::Conflict, .. }) => Ok(0),
+                    }));
+                    match server::serve(
+                        &home,
+                        &socket,
+                        idle_exit.map(std::time::Duration::from_secs),
+                        Arc::clone(&host) as Arc<dyn SessionClient>,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            host.shutdown().await.map_err(|e| e.to_string())?;
+                            Ok(0)
+                        }
+                        Err(aim_proto::error::ProtoError { code: aim_proto::error::ErrorCode::Conflict, .. }) => Ok(0),
                         Err(err) => Err(err.to_string()),
                     }
                 }
