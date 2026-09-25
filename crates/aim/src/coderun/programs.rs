@@ -2,20 +2,22 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use aim_coderun::budget::{dropped_note, truncate_middle};
 use aim_coderun::protocol::Execute;
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolAnnotations, ToolInput, ToolLocation, ToolResult, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::CodeToolHost;
-use super::supervisor::Supervisor;
+use super::supervisor::{CellBridge, Observer, Supervisor};
+use super::{ADMISSION_WAIT, CodeToolHost, DEFAULT_OUTPUT_BYTES, DEFAULT_TIMEOUT_MS, PROGRAM_WORKERS, closed};
 use crate::agent::ToolHost;
-use crate::agent::tools::BoxFuture;
+use crate::agent::tools::{BoxFuture, ToolCallContext};
 use crate::programs::{ProgramError, ProgramManifest, ProgramScope, ProgramStore};
 
 /// Code mode plus the three saved-program tools for one session.
@@ -78,24 +80,59 @@ impl ProgramToolHost {
             return Err(ProtoError::new(ErrorCode::Denied, "program content hash is not trusted"));
         }
         validate_schema(&saved.manifest.params, &args.params, 0)?;
-        let narrowed: Arc<dyn ToolHost> = Arc::new(saved.narrow_host(Arc::clone(&self.code.shared.inner)));
-        let supervisor = Supervisor::new(self.code.shared.executable.clone(), Arc::clone(&narrowed));
+        let shared = &self.code.shared;
+        let deadline = Instant::now() + Duration::from_millis(DEFAULT_TIMEOUT_MS);
+        // At most PROGRAM_WORKERS program workers per session, and a clear busy answer instead of
+        // an unbounded pile of sandboxed workers (REV13a M9).
+        let _worker = tokio::time::timeout(ADMISSION_WAIT, Arc::clone(&shared.programs).acquire_owned())
+            .await
+            .map_err(|_| {
+                ProtoError::new(
+                    ErrorCode::LimitExceeded,
+                    format!(
+                        "code mode is busy: {PROGRAM_WORKERS} programs are already running in this session; try again when one finishes"
+                    ),
+                )
+            })?
+            .map_err(|_| closed())?;
+        let narrowed: Arc<dyn ToolHost> = Arc::new(saved.narrow_host(Arc::clone(&shared.inner)));
+        let tools = narrowed.specs();
+        let cell_id = Uuid::now_v7().to_string();
+        // A program gets its own worker, so its narrowed authority never shares a process.
+        let supervisor = Supervisor::new(shared.executable.clone(), 0);
+        let mut ticket = supervisor.enqueue(&cell_id)?;
         let request = Execute {
-            session_id: self.code.shared.session_id.clone(),
-            cell_id: Uuid::now_v7().to_string(),
+            session_id: shared.session_id.clone(),
+            cell_id: cell_id.clone(),
             code: saved.source,
-            timeout_ms: 120_000,
+            timeout_ms: 1,
             memory_limit_bytes: 64 * 1024 * 1024,
-            output_limit_bytes: 40_000,
-            tools: narrowed.specs(),
+            output_limit_bytes: DEFAULT_OUTPUT_BYTES,
+            tools: tools.clone(),
             store: HashMap::new(),
             program_args: Some(args.params),
         };
-        let (sender, _receiver) = mpsc::unbounded_channel();
-        let result = supervisor.execute(request, sender).await?;
+        let bridge = CellBridge {
+            session_id: shared.session_id.clone(),
+            allowed: tools.into_iter().map(|spec| spec.name).collect(),
+            host: narrowed,
+            output: None,
+            observer: Arc::new(Observer::new(ToolCallContext::current())),
+        };
+        let result = tokio::select! {
+            result = ticket.run(request, bridge, deadline) => result?,
+            () = shared.closed.cancelled() => return Err(closed()),
+        };
+        drop(ticket);
+        supervisor.close();
         let returned = serde_json::from_str(&result.output).unwrap_or_else(|_| Value::String(result.output.clone()));
         validate_schema(&saved.manifest.returns, &returned, 0)?;
-        Ok(ToolResult::text(result.output))
+        let mut output = result.output;
+        if let Some(note) = dropped_note(result.dropped_bytes, result.dropped_events) {
+            output.push('\n');
+            output.push_str(&note);
+        }
+        Ok(ToolResult::text(truncate_middle(&output, DEFAULT_OUTPUT_BYTES)))
     }
 }
 

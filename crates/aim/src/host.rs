@@ -309,7 +309,7 @@ pub fn native_backends_with(
                 Some((agent, _)) => format!("aim:{root}:agent:{}", agent.meta.name),
                 None => format!("aim:{root}"),
             };
-            let Connected { mut tools, location, shutdown, .. } = workspace;
+            let Connected { mut tools, location, mut shutdown, .. } = workspace;
             // Media services are composed before the agent's allowlist, which then applies to them
             // too. A missing credential omits the tools rather than making every call fail. Private
             // and ephemeral sessions do not send prompts to them: there is no per-session opt-in
@@ -329,7 +329,9 @@ pub fn native_backends_with(
             };
             if let Some(code) = services.code.as_ref().filter(|_| code_permitted) {
                 let agent = agent.as_ref().map(|(agent, policy)| (agent, policy));
-                tools = with_code_mode(tools, code, agent, provider.as_ref(), &model, &session_id, &spec.location, &root).await;
+                let cells;
+                (tools, cells) = with_code_mode(tools, code, agent, provider.as_ref(), &model, &session_id, &spec.location, &root).await;
+                shutdown = cells_first(cells, shutdown);
             }
             let config = AgentConfig {
                 model: model.clone(),
@@ -370,8 +372,23 @@ async fn with_extra_tools(tools: Arc<dyn ToolHost>, factories: &[ToolsFactory], 
     if extra.is_empty() { tools } else { Arc::new(crate::agent::tools::Compose::new(tools, extra)) }
 }
 
+/// Ends a session's code cells before its workspace shuts down, so no cell holds the harness,
+/// and never waits on them for more than two seconds (ADR 0066).
+fn cells_first(
+    cells: crate::coderun::CodeModeHandle,
+    workspace: Box<dyn FnOnce() -> BoxFuture<()> + Send>,
+) -> Box<dyn FnOnce() -> BoxFuture<()> + Send> {
+    Box::new(move || {
+        Box::pin(async move {
+            cells.close(Duration::from_secs(2)).await;
+            workspace().await;
+        })
+    })
+}
+
 /// Adds code mode and the saved-program tools over `tools`, the session's final (narrowed) set,
-/// so nested calls in a cell reach exactly the tools the session may use.
+/// so nested calls in a cell reach exactly the tools the session may use. Also returns the handle
+/// that ends the session's cells.
 #[expect(clippy::too_many_arguments, reason = "one session's composition inputs, kept explicit")]
 async fn with_code_mode(
     tools: Arc<dyn ToolHost>,
@@ -382,10 +399,11 @@ async fn with_code_mode(
     session_id: &str,
     location: &Location,
     root: &str,
-) -> Arc<dyn ToolHost> {
+) -> (Arc<dyn ToolHost>, crate::coderun::CodeModeHandle) {
     let catalog = provider.catalog().await.unwrap_or_default();
     let mode = catalog.iter().find(|m| m.id == model).map_or(crate::coderun::CodeMode::RunCode, crate::coderun::CodeMode::from_model);
     let host = crate::coderun::CodeToolHost::new(Arc::clone(&tools), code.worker.clone(), session_id.to_owned(), mode);
+    let cells = host.handle();
     // Project programs live in the workspace; remote workspaces get user programs only for now.
     let project = matches!(location, Location::Local).then(|| PathBuf::from(root).join(".agents/programs"));
     let store = Arc::new(crate::programs::ProgramStore::new(code.user_programs.clone(), project));
@@ -400,9 +418,9 @@ async fn with_code_mode(
             if let Some(allow) = top.allow.as_mut() {
                 allow.extend(["exec".to_owned(), "wait".to_owned()]);
             }
-            narrowed(composed, agent, &top)
+            (narrowed(composed, agent, &top), cells)
         }
-        None => composed,
+        None => (composed, cells),
     }
 }
 

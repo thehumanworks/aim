@@ -169,9 +169,7 @@ pub fn truncate_middle(text: &str, max_bytes: usize) -> String {
 #[must_use]
 pub fn dropped_note(dropped_bytes: u64, dropped_events: u64) -> Option<String> {
     (dropped_events > 0 || dropped_bytes > 0).then(|| {
-        format!(
-            "[output limit reached: {dropped_events} more output calls ({dropped_bytes} bytes) were dropped; the cell kept running]"
-        )
+        format!("[output limit reached: {dropped_events} more output calls ({dropped_bytes} bytes) were dropped; the cell kept running]")
     })
 }
 
