@@ -29,6 +29,9 @@ use crate::authz::{Principal, ProtectedPaths};
 use crate::dedup::{Begin, DedupConfig, DedupTable};
 use crate::workspace::Workspace;
 
+/// How far in the future a timestamped idempotency key may be minted (client clock skew).
+const MAX_KEY_SKEW: Duration = Duration::from_mins(5);
+
 /// Server settings.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -42,22 +45,29 @@ pub struct ServerConfig {
     pub max_read_bytes: u64,
     /// Output retained per process.
     pub output_ring_bytes: u64,
-    /// How long idempotency outcomes are replayable.
-    pub dedup_window: Duration,
-    /// How long a key is remembered after its outcome expired (answers `unknown_outcome`).
-    pub tombstone_ttl: Duration,
-    /// Maximum idempotency outcomes kept.
+    /// How long a completed outcome is replayable (at most `key_horizon`).
+    pub replay_window: Duration,
+    /// How long an idempotency key is valid, advertised as `Limits.dedup_window_secs`: a key is
+    /// remembered this long after first sight (a retry replays while its outcome is kept, then
+    /// answers `unknown_outcome`), and a key that carries its minting time (a `UUIDv7`) answers
+    /// `unknown_outcome` once it is older than this, whether or not it is still remembered.
+    pub key_horizon: Duration,
+    /// Maximum idempotency outcomes kept (older ones are dropped early; their keys stay known).
     pub max_dedup_records: usize,
-    /// Maximum tombstones kept.
-    pub max_tombstones: usize,
+    /// Maximum idempotency keys remembered; new keys answer `limit_exceeded` beyond it (a key is
+    /// never forgotten inside its horizon, so the sustained rate is at most this per horizon).
+    pub max_dedup_keys: usize,
+    /// Maximum idempotent requests executing at once; more answer `limit_exceeded`.
+    pub max_in_flight: usize,
     /// How long a disconnected session stays resumable.
     pub resume_ttl: Duration,
 }
 
 impl ServerConfig {
     /// Defaults for `principal`: 16 MiB messages, 2 MiB reads (JSON escaping can grow text up to
-    /// six-fold, so a read always fits in a message), 8 MiB output rings, a 10-minute dedup window
-    /// with 24-hour tombstones, and a 30-minute resume TTL.
+    /// six-fold, so a read always fits in a message), 8 MiB output rings, outcomes replayable for
+    /// 10 minutes, keys valid for 24 hours (up to 2^20 of them: a sustained ~12 new keys per
+    /// second), 256 idempotent requests in flight, and a 30-minute resume TTL.
     #[must_use]
     pub fn new(principal: Principal, protected: ProtectedPaths) -> Self {
         Self {
@@ -66,10 +76,11 @@ impl ServerConfig {
             max_message_bytes: aim_rpc::DEFAULT_MAX_MESSAGE_BYTES as u64,
             max_read_bytes: 2 * 1024 * 1024,
             output_ring_bytes: 8 * 1024 * 1024,
-            dedup_window: Duration::from_secs(600),
-            tombstone_ttl: Duration::from_hours(24),
+            replay_window: Duration::from_mins(10),
+            key_horizon: Duration::from_hours(24),
             max_dedup_records: 16_384,
-            max_tombstones: 1 << 20,
+            max_dedup_keys: 1 << 20,
+            max_in_flight: 256,
             resume_ttl: Duration::from_mins(30),
         }
     }
@@ -82,7 +93,7 @@ impl ServerConfig {
             max_message_bytes: self.max_message_bytes,
             max_read_bytes: self.max_read_bytes,
             output_ring_bytes: self.output_ring_bytes,
-            dedup_window_secs: secs(self.dedup_window),
+            dedup_window_secs: secs(self.key_horizon),
             resume_ttl_secs: secs(self.resume_ttl),
         }
     }
@@ -166,6 +177,11 @@ struct Recorded {
     session: Option<String>,
 }
 
+/// Wall-clock milliseconds since the Unix epoch (0 if the clock is before it).
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -183,9 +199,15 @@ impl State {
     /// `session` is the caller's resume token when the outcome names session state (a process):
     /// it is then replayed only to that session (or its resumption), and any other session gets
     /// `unknown_outcome`, since the id would be useless to it.
+    ///
+    /// `minted` is the key's own minting time (Unix milliseconds) when it carries one
+    /// ([`crate::dedup::minted_ms`]): such a key older than the key horizon answers
+    /// `unknown_outcome` even when the table no longer remembers it, and one minted beyond the
+    /// allowed clock skew in the future is refused.
     async fn idempotent<F>(
         self: &Arc<Self>,
         scoped_key: String,
+        minted: Option<u64>,
         fingerprint: u64,
         session: Option<String>,
         work: F,
@@ -193,10 +215,19 @@ impl State {
     where
         F: Future<Output = Result<Value, ProtoError>> + Send + 'static,
     {
+        let now = unix_ms();
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        if minted.is_some_and(|minted| minted > now.saturating_add(ms(MAX_KEY_SKEW))) {
+            return Err(ProtoError::new(
+                ErrorCode::InvalidParams,
+                "the idempotency key's UUIDv7 time is in the future; check the client's clock",
+            ));
+        }
+        let too_old = minted.is_some_and(|minted| minted.saturating_add(ms(self.config.key_horizon)) <= now);
         let mut work = Some(work);
         loop {
             let mut done = self.dedup_done.subscribe();
-            let begin = lock(&self.dedup).begin(&scoped_key, fingerprint, self.now_ms());
+            let begin = lock(&self.dedup).begin(&scoped_key, fingerprint, too_old, self.now_ms());
             match begin {
                 Begin::Execute => {
                     let Some(work) = work.take() else {
@@ -238,6 +269,15 @@ impl State {
                 Begin::Mismatch => {
                     return Err(ProtoError::new(ErrorCode::Conflict, "idempotency key reused for a different request"));
                 }
+                Begin::Full => {
+                    return Err(ProtoError::new(
+                        ErrorCode::LimitExceeded,
+                        "the server remembers as many idempotency keys as it may; retry later (keys expire after `dedup_window_secs`)",
+                    ));
+                }
+                Begin::Busy => {
+                    return Err(ProtoError::new(ErrorCode::LimitExceeded, "too many mutations in flight; retry when some finish"));
+                }
             }
         }
     }
@@ -273,11 +313,14 @@ impl Server {
     }
 
     fn with_workspace(config: ServerConfig, fixed_workspace: Option<Arc<dyn Workspace>>) -> Self {
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         let dedup = DedupConfig {
-            window_ms: u64::try_from(config.dedup_window.as_millis()).unwrap_or(u64::MAX),
-            tombstone_ms: u64::try_from(config.tombstone_ttl.as_millis()).unwrap_or(u64::MAX),
+            replay_ms: ms(config.replay_window.min(config.key_horizon)),
+            // A key minted up to the allowed clock skew in the future stays valid that much longer.
+            horizon_ms: ms(config.key_horizon.saturating_add(MAX_KEY_SKEW)),
             max_records: config.max_dedup_records,
-            max_tombstones: config.max_tombstones,
+            max_keys: config.max_dedup_keys,
+            max_in_flight: config.max_in_flight,
         };
         let state = Arc::new(State {
             principal: Arc::new(config.principal.clone()),

@@ -138,9 +138,13 @@ async fn mutating_tools_run_once_and_need_a_key() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_records_answer_unknown_outcome() {
-    let env = env_with(|config, _| config.dedup_window = Duration::from_millis(300)).await;
+    let env = env_with(|config, _| {
+        config.replay_window = Duration::from_millis(300);
+        config.key_horizon = Duration::from_secs(3600);
+    })
+    .await;
     let (client, init, ws) = session(&env).await;
-    assert_eq!(init.limits.dedup_window_secs, 1, "sub-second windows round up");
+    assert_eq!(init.limits.dedup_window_secs, 3600, "the advertised window is the key horizon");
     let k = key();
     client.peer.call::<FsWrite>(write_params(&ws, "one", &k)).await.unwrap();
     std::fs::write(env.path("f"), "moved on").unwrap();
@@ -244,4 +248,84 @@ async fn a_process_is_replayed_only_to_its_own_session() {
     assert_eq!(again, first);
     assert_eq!(resumed.peer.call::<ToolsCall>(background(&ws)).await.unwrap(), first_tool);
     resumed.peer.call::<ExecRelease>(ExecReleaseParams { proc: again }).await.unwrap();
+}
+
+/// Milliseconds since the Unix epoch.
+fn unix_ms() -> u64 {
+    u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()).unwrap()
+}
+
+/// A `UUIDv7` idempotency key minted at `ms` (RFC 9562: 48-bit big-endian Unix milliseconds).
+fn v7_key(ms: u64) -> IdempotencyKey {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let rand = NEXT.fetch_add(1, Ordering::Relaxed) ^ u64::from(std::process::id()) << 20;
+    IdempotencyKey::new(format!(
+        "{:08x}-{:04x}-7{:03x}-{:x}{:03x}-{:012x}",
+        ms >> 16,
+        ms & 0xffff,
+        rand & 0xfff,
+        8 + (rand >> 12 & 0x3),
+        rand >> 14 & 0xfff,
+        rand & 0xffff_ffff_ffff
+    ))
+}
+
+/// A key's memory has a horizon: a timestamped (`UUIDv7`) key older than it answers
+/// `unknown_outcome`, even after its record and tombstone are gone, and never runs again
+/// (REV4-A finding 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn timestamped_keys_past_the_horizon_never_run_again() {
+    let env = env_with(|config, _| {
+        config.replay_window = Duration::from_millis(100);
+        config.key_horizon = Duration::from_millis(300);
+    })
+    .await;
+    let (client, _, ws) = session(&env).await;
+    let k = v7_key(unix_ms());
+    client.peer.call::<FsWrite>(write_params(&ws, "one", &k)).await.unwrap();
+    std::fs::write(env.path("f"), "moved on").unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let err = client.peer.call::<FsWrite>(write_params(&ws, "one", &k)).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::UnknownOutcome);
+    assert_eq!(std::fs::read_to_string(env.path("f")).unwrap(), "moved on", "never re-executed");
+
+    // A key minted long ago is refused on first sight; one from the future is malformed.
+    let old = v7_key(unix_ms() - 3_600_000);
+    assert_eq!(client.peer.call::<FsWrite>(write_params(&ws, "old", &old)).await.unwrap_err().code, ErrorCode::UnknownOutcome);
+    let future = v7_key(unix_ms() + 86_400_000);
+    assert_eq!(client.peer.call::<FsWrite>(write_params(&ws, "future", &future)).await.unwrap_err().code, ErrorCode::InvalidParams);
+    assert_eq!(std::fs::read_to_string(env.path("f")).unwrap(), "moved on");
+}
+
+/// The key table is bounded by refusing new keys while it is full, never by forgetting a key
+/// inside its horizon (REV4-A finding 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_key_table_refuses_new_keys_instead_of_forgetting_old_ones() {
+    let env = env_with(|config, _| {
+        config.replay_window = Duration::from_millis(50);
+        config.key_horizon = Duration::from_secs(3600);
+        config.max_dedup_keys = 2;
+    })
+    .await;
+    let (client, _, ws) = session(&env).await;
+    let keys = [key(), key(), key()];
+    let mut refused = 0;
+    for (i, k) in keys.iter().enumerate() {
+        match client.peer.call::<FsWrite>(write_params(&ws, &format!("v{i}"), k)).await {
+            Ok(_) => {}
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::LimitExceeded, "{err:?}");
+                refused += 1;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    std::fs::write(env.path("f"), "moved on").unwrap();
+    for k in &keys[..2] {
+        let err = client.peer.call::<FsWrite>(write_params(&ws, "again", k)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnknownOutcome, "an old key is still remembered");
+    }
+    assert_eq!(refused, 1, "the third key did not fit");
+    assert_eq!(std::fs::read_to_string(env.path("f")).unwrap(), "moved on", "nothing re-executed");
 }

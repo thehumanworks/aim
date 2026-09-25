@@ -147,8 +147,9 @@ impl Conn {
         let scoped = format!("{}\u{0}{key}", ws.grant.principal().id);
         let fingerprint = fingerprint(method, &ws.info.root, params);
         let owner = session.map(|session| session.token.clone());
-        let value =
-            self.state.idempotent(scoped, fingerprint, owner, async move { serde_json::to_value(work.await?).map_err(internal) }).await?;
+        let minted = crate::dedup::minted_ms(key.as_str());
+        let work = async move { serde_json::to_value(work.await?).map_err(internal) };
+        let value = self.state.idempotent(scoped, minted, fingerprint, owner, work).await?;
         serde_json::from_value(value).map_err(internal)
     }
 
