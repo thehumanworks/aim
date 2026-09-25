@@ -95,8 +95,8 @@ pub const fn reason(fallback: Fallback) -> &'static str {
     }
 }
 
-/// Asks the kernel what a session is offered ([`aim_kernel::code_mode::decide`], with the
-/// provisional [`DEFAULT_MODE`]) and logs a fallback: as a warning when the mode was asked for
+/// Asks the kernel what a session is offered ([`aim_kernel::code_mode::decide`], with
+/// [`DEFAULT_MODE`]) and logs a fallback: as a warning when the mode was asked for
 /// explicitly, else at debug level (an unset request on a machine without the worker is normal,
 /// and so is an agent whose ceiling leaves out `run_code`).
 #[must_use]
@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(requested(None), CodeModeRequest::Unset);
         assert_eq!(requested(Some("sometimes")), CodeModeRequest::Invalid);
         assert_eq!(requested(Some("only")), CodeModeRequest::Set(Mode::Only));
-        assert_eq!(DEFAULT_MODE, Mode::On, "the provisional default is today's behavior (ADR 0076)");
+        assert_eq!(DEFAULT_MODE, Mode::Off, "T4b's benchmark decided the default (ADR 0076, bench/results/t4b-code-mode-*.json)");
         let invalid = decide(requested(Some("onn")), true, true, true);
         assert_eq!((invalid.mode, invalid.code, invalid.fallback), (Mode::Off, false, None), "an invalid value turns code mode off");
         assert_eq!(

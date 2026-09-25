@@ -147,11 +147,10 @@ pub fn services() -> crate::host::NativeServices {
     }
 }
 
-/// Code mode as `AIM_CODE_MODE` asks (ADR 0076; unset means the provisional default, an invalid
-/// value means off), when the
-/// `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this executable. It runs
-/// sandboxed on macOS and refuses to run on Linux until its bubblewrap profile exists (ADR 0018),
-/// so it is offered on macOS only. `None` when the mode is off or cannot run.
+/// Code mode as `AIM_CODE_MODE` asks (ADR 0076; unset means the default, `off`; an invalid value
+/// also means off), when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this
+/// executable. It runs sandboxed on macOS and refuses to run on Linux until its bubblewrap profile
+/// exists (ADR 0018), so it is offered on macOS only. `None` when the mode is off or cannot run.
 pub(crate) fn code_mode() -> Option<crate::host::CodeConfig> {
     code_mode_as(crate::coderun::mode::requested_from_env())
 }

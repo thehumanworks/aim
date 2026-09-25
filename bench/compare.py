@@ -63,7 +63,7 @@ def compare_wire(candidate: dict, baseline: dict, manifest: dict) -> list[str]:
         if row["first_request_bytes"] > base["first_request_bytes"]:
             errors.append(f"{key}: first request grew beyond current-main baseline")
         if case == "W1" and harness == "aim_openrouter" and row["first_request_bytes"] > wire["aim_w1_max_bytes"]:
-            errors.append(f"{key}: first request exceeds W26 budget")
+            errors.append(f"{key}: first request exceeds the manifest's W1 budget")
         if len(row["request_json_bytes"]) != len(base["request_json_bytes"]) or any(
             current_size > old_size for current_size, old_size in zip(row["request_json_bytes"], base["request_json_bytes"])
         ):

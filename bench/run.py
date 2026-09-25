@@ -30,7 +30,7 @@ import tomllib
 from contextlib import contextmanager
 from pathlib import Path
 
-from live_tasks import grade, prepare
+from live_tasks import grade, graded_files, prepare
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
@@ -38,12 +38,17 @@ MANIFEST = BENCH / "manifest.toml"
 PROXY = BENCH / "proxy.py"
 CODEX_AUTH = Path.home() / ".codex"
 BASE_ENV = os.environ.copy()
+# Every trial root lives under this fixed directory, which is also each harness's TMPDIR. Codex CLI,
+# pi and aim put the workspace path in model-visible text (pi also names its temp output file), so
+# the caller's TMPDIR (`/var/folders/…/T/` on macOS, `/tmp` in some sandboxes) used to change the
+# deterministic byte counts by its length (T4b: +44 bytes on every codex and pi row).
+TRIAL_ROOT = Path("/tmp")
 
 
 @contextmanager
 def temporary_workspace():
     """Wait briefly for a peer's just-exited helper to stop touching its isolated HOME."""
-    path = Path(tempfile.mkdtemp(prefix="aim-bench-"))
+    path = Path(tempfile.mkdtemp(prefix="aim-bench-", dir=TRIAL_ROOT))
     try:
         yield path
     finally:
@@ -116,6 +121,7 @@ def peak_rss(stderr: str) -> float | None:
 def update_diagnostics(stdout: bytes) -> dict:
     """Keep only tool names and failure classes, never model text or tool arguments."""
     calls: Counter[str] = Counter()
+    nested: Counter[str] = Counter()
     failed_tools: Counter[str] = Counter()
     patterns: Counter[str] = Counter()
     read_failures: Counter[str] = Counter()
@@ -130,6 +136,8 @@ def update_diagnostics(stdout: bytes) -> dict:
         name = update.get("name")
         if kind == "tool_started" and isinstance(name, str):
             calls[name] += 1
+            if update.get("parent"):
+                nested[name] += 1
             if name == "Read":
                 try:
                     arguments = json.loads(update.get("arguments") or "{}")
@@ -159,7 +167,11 @@ def update_diagnostics(stdout: bytes) -> dict:
         elif kind == "turn_failed":
             message = str(update.get("message", ""))
             terminal = "max_requests" if "too many" in message or "exceeded" in message else "provider" if "provider" in message else "other"
-    return {"tool_calls_by_name": dict(calls), "failed_tools_by_name": dict(failed_tools),
+    # `tool_calls_by_name` counts every call, as before; a nested call is one a code cell made
+    # (its update names a `parent`, ADR 0066), so the model's own calls are the difference.
+    return {"tool_calls_by_name": dict(calls), "nested_tool_calls_by_name": dict(nested),
+            "direct_tool_calls": sum(calls.values()) - sum(nested.values()), "nested_tool_calls": sum(nested.values()),
+            "failed_tools_by_name": dict(failed_tools),
             "tool_result_pattern_counts": dict(patterns), "read_failure_classes": dict(read_failures),
             "read_argument_keys": dict(read_argument_keys), "turn_failure_class": terminal}
 
@@ -206,8 +218,8 @@ class ProcessTreeRss:
 
 
 def isolated_env(home: Path) -> dict[str, str]:
-    env = {name: BASE_ENV[name] for name in ("PATH", "LANG", "LC_ALL", "TMPDIR", "USER") if name in BASE_ENV}
-    env.update(HOME=str(home), AIM_HOME=str(home / ".aim"), XDG_CONFIG_HOME=str(home / ".config"),
+    env = {name: BASE_ENV[name] for name in ("PATH", "LANG", "LC_ALL", "USER") if name in BASE_ENV}
+    env.update(HOME=str(home), TMPDIR=str(TRIAL_ROOT), AIM_HOME=str(home / ".aim"), XDG_CONFIG_HOME=str(home / ".config"),
                XDG_CACHE_HOME=str(home / ".cache"), XDG_DATA_HOME=str(home / ".local/share"),
                XDG_STATE_HOME=str(home / ".local/state"), TERM="xterm", PYTHONDONTWRITEBYTECODE="1")
     return env
@@ -324,7 +336,7 @@ def path_map(args: argparse.Namespace) -> dict[str, Path]:
 
 def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], mode: str, model: str,
              effort: str | None, timeout: int, spend_cap_usd: float | None = None,
-             request_reserve_usd: float = 0.0) -> dict:
+             request_reserve_usd: float = 0.0, keep_outputs: Path | None = None) -> dict:
     base, _ = split_arm(harness)
     borrowed_auth = CODEX_AUTH / "auth.json"
     auth_before = executable_hash(borrowed_auth) if base == "aim_codex" and borrowed_auth.exists() else None
@@ -439,9 +451,20 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
             result["borrowed_codex_auth_unchanged"] = auth_before is not None and executable_hash(borrowed_auth) == auth_before
         if mode == "live":
             result["passed"] = process.returncode == 0 and not timed_out and grade(case["id"], workspace)
+            if keep_outputs is not None:
+                keep(keep_outputs / harness / f"{case['id']}-r{repetition}", case["id"], workspace)
         else:
             result["passed"] = process.returncode == 0 and len(rows) >= case.get("steps", 0) + 1
         return result
+
+
+def keep(target: Path, task_id: str, workspace: Path) -> None:
+    """Copy the files the grader reads, when present, for a human to check a grade."""
+    for name in graded_files(task_id):
+        source = workspace / name
+        if source.is_file() and not source.is_symlink() and source.stat().st_size <= 1_000_000:
+            (target / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target / name)
 
 
 def summary(runs: list[dict], harnesses: list[str]) -> list[dict]:
@@ -465,6 +488,9 @@ def summary(runs: list[dict], harnesses: list[str]) -> list[dict]:
                        "pass_rate_ci95": [round(center - radius, 3), round(center + radius, 3)],
                        "ite_per_passed": round(total_ite / passes, 2) if passes and complete_ite else None,
                        "usd_per_passed": round(total_usd / passes, 6) if passes and measured_cost else None,
+                       "mean_requests": round(statistics.mean(row.get("requests", 0) for row in group), 2),
+                       "mean_direct_tool_calls": round(statistics.mean(row.get("direct_tool_calls", 0) for row in group), 2),
+                       "mean_nested_tool_calls": round(statistics.mean(row.get("nested_tool_calls", 0) for row in group), 2),
                        "p50_wall_ms": round(statistics.median(row["wall_ms"] for row in group), 2)})
     return result
 
@@ -483,10 +509,15 @@ def main() -> None:
     parser.add_argument("--aim-coderun-bin", type=Path, help="measured code worker executable")
     parser.add_argument("--source-sha", help="source commit of an explicitly supplied baseline binary")
     parser.add_argument("--no-gate", action="store_true", help="record a diagnostic or immutable baseline without comparison")
+    parser.add_argument("--keep-outputs", type=Path, help="live: copy each trial's graded files here to diagnose a grade "
+                        "(model-written text: keep it out of committed results)")
     args = parser.parse_args()
     if args.source_sha and (not re.fullmatch(r"[0-9a-f]{40}", args.source_sha)
                             or any(getattr(args, f"{name}_bin") is None for name in ("aim", "aimx", "aim_coderun"))):
         parser.error("--source-sha needs a 40-character hash and all three aim executable overrides")
+    if args.tier == "wire" and not args.no_gate and code_mode(None) is not None:
+        parser.error("the wire gate measures aim's default code mode: unset AIM_CODE_MODE and AIM_BENCH_CODE_MODE, "
+                     "or pass --no-gate")
     with MANIFEST.open("rb") as stream:
         manifest = tomllib.load(stream)
     tier = manifest[args.tier]
@@ -541,7 +572,7 @@ def main() -> None:
                 effort = tier["effort"] if args.tier == "wire" else tier["codex_effort"] if base == "aim_codex" else None
                 remaining = tier["max_spend_usd"] - budget_used if args.tier == "live" and base != "aim_codex" else None
                 row = run_once(harness, case, repetition, paths, args.tier, model, effort, tier.get("timeout_seconds", 90),
-                               spend_cap_usd=remaining, request_reserve_usd=reserve)
+                               spend_cap_usd=remaining, request_reserve_usd=reserve, keep_outputs=args.keep_outputs)
                 runs.append(row)
                 if args.tier == "live" and base != "aim_codex":
                     if row["missing_success_cost"]:
@@ -568,7 +599,7 @@ def main() -> None:
     print(f"wrote {args.out}", flush=True)
     if args.tier == "wire" and not args.no_gate:
         from compare import compare_wire
-        baseline = json.loads((BENCH / "results/w26-main-baseline.json").read_text())
+        baseline = json.loads((BENCH / manifest["wire"]["baseline"]).read_text())
         errors = compare_wire(result, baseline, manifest)
         if errors:
             for error in errors:

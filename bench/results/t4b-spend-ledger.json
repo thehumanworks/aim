@@ -1,0 +1,82 @@
+{
+  "task": "T4b",
+  "openrouter_cap_usd": 3.0,
+  "openrouter_invocations": [
+    {
+      "file": "t4b-code-mode-smoke1-openrouter.json",
+      "note": "smoke, 3 scripting tasks x 3 arms; before the report-location grader fix (6b1878f)",
+      "runs": 9,
+      "provider_reported_usd": 0.049602,
+      "budget_used_including_transport_reserve_usd": 0.049602,
+      "transport_errors": 0
+    },
+    {
+      "file": "t4b-code-mode-smoke2-openrouter.json",
+      "note": "smoke repeated with --keep-outputs to read the failures",
+      "runs": 9,
+      "provider_reported_usd": 0.075318,
+      "budget_used_including_transport_reserve_usd": 0.075318,
+      "transport_errors": 0
+    },
+    {
+      "file": "t4b-code-mode-smoke3-openrouter.json",
+      "note": "doc_index smoke after the grader fix",
+      "runs": 3,
+      "provider_reported_usd": 0.007126,
+      "budget_used_including_transport_reserve_usd": 0.007126,
+      "transport_errors": 0
+    },
+    {
+      "file": "t4b-code-mode-openrouter-r1.json",
+      "note": "primary, repetition 1 (arm order off,on,only)",
+      "runs": 27,
+      "provider_reported_usd": 0.135467,
+      "budget_used_including_transport_reserve_usd": 0.135467,
+      "transport_errors": 0
+    },
+    {
+      "file": "t4b-code-mode-openrouter-r2.json",
+      "note": "primary, repetition 2 (arm order on,only,off)",
+      "runs": 27,
+      "provider_reported_usd": 0.135901,
+      "budget_used_including_transport_reserve_usd": 0.135901,
+      "transport_errors": 0
+    },
+    {
+      "file": "t4b-code-mode-openrouter-r3.json",
+      "note": "primary, repetition 3 (arm order only,off,on)",
+      "runs": 27,
+      "provider_reported_usd": 0.124112,
+      "budget_used_including_transport_reserve_usd": 0.124112,
+      "transport_errors": 0
+    }
+  ],
+  "openrouter_total_usd": 0.527526,
+  "subscription_runs": [
+    {
+      "file": "t4b-code-mode-codex.json",
+      "subscription": "chatgpt_codex",
+      "note": "aim_codex@off|on, 3 scripting tasks x 2 repetitions",
+      "runs": 12
+    },
+    {
+      "file": "t4b-code-mode-smoke-acp.json",
+      "subscription": "claude",
+      "note": "acp_claude@off todo_table smoke",
+      "runs": 1
+    },
+    {
+      "file": "t4b-code-mode-acp.json",
+      "subscription": "claude",
+      "note": "acp_claude@off|on, 3 scripting tasks x 2 repetitions",
+      "runs": 12
+    }
+  ],
+  "codex_runs_total": 12,
+  "codex_cap": 12,
+  "claude_runs_total": 13,
+  "claude_cap": 16,
+  "codex_auth_sha256_before": "7315f3c9b3897654d275eeb95f0469665b9dd695112837cf0ff768e1813191b0",
+  "codex_auth_sha256_after": "7315f3c9b3897654d275eeb95f0469665b9dd695112837cf0ff768e1813191b0",
+  "mock_runs_not_billed": "wire-tier runs and one request dump per mode used the scripted proxy only"
+}
