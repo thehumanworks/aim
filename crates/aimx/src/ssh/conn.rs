@@ -537,30 +537,53 @@ mod tests {
                 );
             }
             std::fs::copy(client.with_extension("pub"), dir.path().join("authorized_keys")).expect("authorized keys");
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port");
-            let port = listener.local_addr().expect("address").port();
-            drop(listener);
             let server_config = dir.path().join("sshd_config");
-            std::fs::write(&server_config, format!(
-                "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nPidFile {}\n",
-                host.display(), dir.path().join("authorized_keys").display(), dir.path().join("sshd.pid").display()
-            )).expect("sshd config");
             let pubkey = std::fs::read_to_string(host.with_extension("pub")).expect("host public key");
-            std::fs::write(dir.path().join("known_hosts"), format!("[127.0.0.1]:{port} {pubkey}")).expect("known hosts");
             let config = dir.path().join("ssh_config");
             std::fs::create_dir(dir.path().join("shared")).expect("shared path");
-            std::fs::write(&config, format!(
-                "Host aim-conn-test\n HostName 127.0.0.1\n Port {port}\n User {}\n IdentityFile {}\n IdentitiesOnly yes\n UserKnownHostsFile {}\n StrictHostKeyChecking yes\n LogLevel ERROR\n ForwardAgent yes\n ForwardX11 yes\n RemoteCommand printf bad\n RequestTTY force\n ControlPath {}/%C\n",
-                std::env::var("USER").expect("user"), client.display(), dir.path().join("known_hosts").display(), dir.path().join("shared").display()
-            )).expect("ssh config");
-            assert!(Command::new("/usr/sbin/sshd").args(["-t", "-f"]).arg(&server_config).status().expect("sshd check").success());
-            let child = Command::new("/usr/sbin/sshd")
-                .args(["-D", "-e", "-f"])
-                .arg(&server_config)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("sshd");
+            let mut ready = None;
+            for _ in 0..8 {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port");
+                let port = listener.local_addr().expect("address").port();
+                drop(listener);
+                std::fs::write(&server_config, format!(
+                    "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nPidFile {}\n",
+                    host.display(), dir.path().join("authorized_keys").display(), dir.path().join("sshd.pid").display()
+                )).expect("sshd config");
+                std::fs::write(dir.path().join("known_hosts"), format!("[127.0.0.1]:{port} {pubkey}")).expect("known hosts");
+                std::fs::write(&config, format!(
+                    "Host aim-conn-test\n HostName 127.0.0.1\n Port {port}\n User {}\n IdentityFile {}\n IdentitiesOnly yes\n UserKnownHostsFile {}\n StrictHostKeyChecking yes\n LogLevel ERROR\n ForwardAgent yes\n ForwardX11 yes\n RemoteCommand printf bad\n RequestTTY force\n ControlPath {}/%C\n",
+                    std::env::var("USER").expect("user"), client.display(), dir.path().join("known_hosts").display(), dir.path().join("shared").display()
+                )).expect("ssh config");
+                assert!(Command::new("/usr/sbin/sshd").args(["-t", "-f"]).arg(&server_config).status().expect("sshd check").success());
+                let mut child = Command::new("/usr/sbin/sshd")
+                    .args(["-D", "-e", "-f"])
+                    .arg(&server_config)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("sshd");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    if child.try_wait().expect("sshd state").is_some() {
+                        break;
+                    }
+                    if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                        ready = Some(child);
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        drop(child.kill());
+                        drop(child.wait());
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if ready.is_some() {
+                    break;
+                }
+            }
+            let child = ready.expect("private sshd did not bind after eight fresh ports");
             Self { dir, child, config }
         }
 
