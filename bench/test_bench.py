@@ -17,7 +17,7 @@ from acp_trials import events as acp_events, ite as acp_ite
 from code_mode import decide
 from compare import compare_wire
 from proxy import BenchServer, Handler, Recorder, SseUsage, append_only, has_generated_delta, mock_response, render_order, request_shape, usage_fields
-from run import TRIAL_ROOT, invocation, isolated_env, path_map, split_arm, summary, temporary_workspace, update_diagnostics
+from run import TRIAL_ROOT, invocation, main as run_main, isolated_env, path_map, split_arm, summary, temporary_workspace, update_diagnostics
 
 
 class RecorderTests(unittest.TestCase):
@@ -114,11 +114,17 @@ class RecorderTests(unittest.TestCase):
 
     def test_wire_gate_rejects_failed_trajectory_and_byte_growth(self):
         bench = Path(__file__).resolve().parent
-        baseline = json.loads((bench / "results/w26-main-baseline.json").read_text())
-        candidate = json.loads((bench / "results/w26-after-wire.json").read_text())
         with (bench / "manifest.toml").open("rb") as stream:
             manifest = tomllib.load(stream)
-        self.assertEqual(compare_wire(candidate, baseline, manifest), [])
+        baseline = json.loads((bench / manifest["wire"]["baseline"]).read_text())
+        candidate = copy.deepcopy(baseline)
+        self.assertEqual(compare_wire(candidate, baseline, manifest), [], "the committed baseline meets its manifest")
+        grown = copy.deepcopy(candidate)
+        for row in grown["runs"]:
+            if row["harness"] == "aim_openrouter" and row["case"] == "W1":
+                row["first_request_bytes"] += 100
+                row["request_json_bytes"][0] += 100
+        self.assertTrue(any("W1 budget" in error for error in compare_wire(grown, baseline, manifest)))
         broken = copy.deepcopy(candidate)
         broken["runs"][0]["passed"] = False
         broken["runs"][0]["first_request_bytes"] += 10_000
@@ -273,6 +279,16 @@ class LiveTaskTests(unittest.TestCase):
         self.assertEqual(seen["terminal"], "turn_ended")
         self.assertEqual(acp_ite(seen["usage"]), 200 + 60 + 250 + 50)
         self.assertNotIn("secret", str(seen))
+
+    def test_the_gated_wire_run_refuses_a_callers_code_mode(self):
+        for variable in ("AIM_CODE_MODE", "AIM_BENCH_CODE_MODE"):
+            with mock.patch.dict("run.BASE_ENV", {variable: "off"}, clear=True), \
+                 mock.patch("sys.argv", ["run.py", "wire", "--out", "/dev/null"]), \
+                 mock.patch("run.path_map", side_effect=AssertionError("refused before any build")), \
+                 self.assertRaises(SystemExit) as stop, \
+                 mock.patch("sys.stderr"):
+                run_main()
+            self.assertEqual(stop.exception.code, 2, variable)
 
     def test_trial_paths_do_not_depend_on_the_callers_tmpdir(self):
         with mock.patch.dict("run.BASE_ENV", {"PATH": "/bin", "TMPDIR": "/var/folders/xx/long-caller-temp/T/"}, clear=True):

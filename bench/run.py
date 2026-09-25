@@ -515,6 +515,9 @@ def main() -> None:
     if args.source_sha and (not re.fullmatch(r"[0-9a-f]{40}", args.source_sha)
                             or any(getattr(args, f"{name}_bin") is None for name in ("aim", "aimx", "aim_coderun"))):
         parser.error("--source-sha needs a 40-character hash and all three aim executable overrides")
+    if args.tier == "wire" and not args.no_gate and code_mode(None) is not None:
+        parser.error("the wire gate measures aim's default code mode: unset AIM_CODE_MODE and AIM_BENCH_CODE_MODE, "
+                     "or pass --no-gate")
     with MANIFEST.open("rb") as stream:
         manifest = tomllib.load(stream)
     tier = manifest[args.tier]
@@ -596,7 +599,7 @@ def main() -> None:
     print(f"wrote {args.out}", flush=True)
     if args.tier == "wire" and not args.no_gate:
         from compare import compare_wire
-        baseline = json.loads((BENCH / "results/w26-main-baseline.json").read_text())
+        baseline = json.loads((BENCH / manifest["wire"]["baseline"]).read_text())
         errors = compare_wire(result, baseline, manifest)
         if errors:
             for error in errors:

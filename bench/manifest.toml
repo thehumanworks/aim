@@ -3,7 +3,7 @@ version = 1
 hardware = "macOS arm64, report host details in each result"
 topology = "local, loopback HTTP recording proxy, fresh git worktree per run"
 permissions = "workspace read/write/exec; no hosted search; no network tool"
-aim_code_mode = "enabled, with a built and explicitly selected aim-coderun worker"
+aim_code_mode = "aim's default (off since T4b, ADR 0076) unless an arm sets AIM_CODE_MODE; the aim-coderun worker is built and explicitly selected"
 cache_state = "fresh isolated HOME per trial; one recorded mock prewarm per harness before timed trials"
 token_estimate = "ceil(uncompressed request JSON bytes / 4); provider usage is separate"
 
@@ -15,9 +15,14 @@ harnesses = ["aim_openrouter", "codex", "pi"]
 optional_harnesses = ["omp", "unreal"] # require pinned local artifacts supplied to run.py
 max_concurrency = 1
 prewarm_mock_runs = 1
-aim_w1_max_bytes = 6000
+# The gate's current-main baseline (T4b, recorded at d211f6a with the default code mode, off).
+baseline = "results/t4b-main-baseline.json"
+# W1 is 8,353 bytes: W26's 5,844 plus ADR 0064's UI tools, T3's and ADR 0076's prompt lines, and
+# the default's move to off (bench/README.md, "Wire gate repair"). 47 bytes of room: any new tool
+# or prompt line needs this number changed in review.
+aim_w1_max_bytes = 8400
 aim_w2_max_tool_output_chars = 12088
-aim_expected_tools = 10
+aim_expected_tools = 15 # 11 direct tools with code mode off, and ADR 0064's four ui_* tools
 aim_max_auxiliary_requests = 1
 
 [[wire.case]]
