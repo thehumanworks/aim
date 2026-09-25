@@ -68,9 +68,25 @@ by folding its `ui` events.
 `ui_update` (component upserts and data ops), `ui_close` and `ui_catalog` (a component's props, on
 demand). Descriptions stay compact — argument shape plus a short component list — and parameter
 schemas are `{"type": "object"}`; the host validates and its errors name the offending component's
-props. The tools reach their session through a task-local outlet the session actor installs around
-each turn, so a call can only touch the surfaces of the session whose turn runs it; outside a turn
-(e.g. on a spawned task) they answer `unavailable`.
+props. Together they add 773 bytes to an OpenRouter (Chat Completions) request that already offers
+tools and 781 bytes in the codex (Responses) form, under the 800-byte budget (measured with the
+providers' request builders, `ui::tools::tests::the_tools_add_under_800_bytes_to_a_request`). The
+model boundary is forgiving where intent is unambiguous: components nested inline are flattened into
+the id-keyed list, a lone top-level component becomes `root` and several are stacked under a new root
+`Column`, and a `ui_show` without an id gets `ui1`, `ui2`, … named in its result; the protocol behind
+it stays strict. The tools reach their session through a task-local outlet the session actor
+installs around each turn, so a call can only touch the surfaces of the session whose turn runs it;
+outside a turn (e.g. on a spawned task, such as a nested call from code mode) they answer
+`unavailable`.
+
+**Clients.** Both clients fold with `Surfaces::apply`. The TUI never rewrites scrollback: a
+transcript surface is printed like any finished entry, and one updated after it was printed shows
+live in the pinned block and is committed once, in its final state, when the turn ends; widgets,
+dialogs (modal, boxed, focused), toasts (five seconds), status segments and fullscreen's side panel
+render from the current state; `overlay`, `title` and an unknown `tool(<call_id>)` degrade to the
+transcript. The web renders surfaces into a tree of fixed tags whose model text is only ever text
+nodes (Markdown through `pulldown-cmark`; raw HTML stays text; links keep `http(s)`/`mailto` targets
+only), under the existing CSP.
 
 **Actions.** A pressed Button becomes a user input item whose text is
 `<ui_action>{"surface":…,"component":…,"name":…,"context":{…}}</ui_action>`
@@ -96,5 +112,8 @@ must move when A2UI v1.0 is final.
 - TUI and web renderers: every component, placement degradation, fallback, parity on the shared
   fixture, and the web's inert rendering of `<script>`.
 - Host and PTY tests: replay after detach/re-attach and after resume; a Button press reaching the
-  agent; the live OpenRouter smoke test (`live_ui_surfaces_openrouter`) with the measured bytes the
-  tools add to the first request.
+  agent; the live OpenRouter smoke test (`crates/aim/tests/ui_live.rs`,
+  `live_ui_surfaces_openrouter`). Its first run (2026-09-25, `openai/gpt-4.1-mini`) rendered a table
+  with a data-bound progress bar in 3.5 s — the model's first `ui_show` used an unknown prop, the
+  refusal listed the component's props, and its second call succeeded — and moved the bar to 60%
+  with `ui_update` in 2.2 s.
