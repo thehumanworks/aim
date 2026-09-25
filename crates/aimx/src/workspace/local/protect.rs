@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rustix::fs::{FileType, Stat};
 use rustix::io::Errno;
 
-use super::walk::{Loc, kind, stat_entry};
+use super::walk::{Loc, MAX_LINKS, kind, stat_entry};
 use crate::authz::ProtectedPaths;
 use crate::authz::identity::{Chain, FileId, Step, guards};
 
@@ -48,6 +48,24 @@ fn file_id(stat: &Stat) -> FileId {
 
 fn lstat_id(path: &Path) -> Option<FileId> {
     rustix::fs::lstat(path).ok().map(|stat| file_id(&stat))
+}
+
+/// Collapses lexical dot components in a symlink target even when its suffix does not exist.
+fn clean_target(path: &Path) -> PathBuf {
+    let mut cleaned = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir => cleaned = PathBuf::from("/"),
+            Component::Normal(name) => cleaned.push(name),
+            Component::ParentDir => {
+                if cleaned != Path::new("/") {
+                    cleaned.pop();
+                }
+            }
+            Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    cleaned
 }
 
 /// `name` with every cased letter's case swapped, when it has one.
@@ -193,19 +211,33 @@ impl Protector {
         Chain { steps, fold_case }
     }
 
+    /// Includes a protected link entry and each target, even when a target has not been created.
+    fn protected_chains(&self, path: &Path) -> io::Result<Vec<Chain>> {
+        let mut current = path.to_path_buf();
+        let mut chains = Vec::new();
+        for _ in 0..MAX_LINKS {
+            chains.push(self.protected(&current));
+            match rustix::fs::lstat(&current) {
+                Ok(stat) if kind(&stat) == FileType::Symlink => {
+                    let target = std::fs::read_link(&current)?;
+                    current = if target.is_absolute() {
+                        clean_target(&target)
+                    } else {
+                        clean_target(&current.parent().unwrap_or(Path::new("/")).join(target))
+                    };
+                }
+                _ => return Ok(chains),
+            }
+        }
+        Err(io::Error::other("protected symlink chain is too deep"))
+    }
+
     /// The protected path that modifying the target of `loc` would modify (`tree`: including by
     /// removing or moving something that contains it), if any.
     pub(super) fn hit(&self, loc: &Loc, tree: bool) -> io::Result<Option<&str>> {
         let target = self.target(loc)?;
         for path in self.protected.paths() {
-            let path_ref = Path::new(path);
-            let mut chains = vec![self.protected(path_ref)];
-            // A protected symlink protects what it points to as well.
-            if rustix::fs::lstat(path_ref).is_ok_and(|stat| kind(&stat) == FileType::Symlink)
-                && let Ok(real) = std::fs::canonicalize(path_ref)
-            {
-                chains.push(self.protected(&real));
-            }
+            let chains = self.protected_chains(Path::new(path))?;
             if chains.iter().any(|chain| guards(&target, chain, tree)) {
                 return Ok(Some(path));
             }

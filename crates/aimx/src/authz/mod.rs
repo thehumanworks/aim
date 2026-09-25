@@ -10,6 +10,7 @@
 pub mod confine;
 pub mod identity;
 
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use aim_proto::error::{ErrorCode, ProtoError};
@@ -129,6 +130,8 @@ pub struct Grant {
     protected: Arc<ProtectedPaths>,
     root: String,
     alias: Option<String>,
+    /// The same local root descriptor the backend uses; absent for remote backends.
+    local_root: Option<Arc<OwnedFd>>,
 }
 
 impl Grant {
@@ -138,7 +141,13 @@ impl Grant {
     #[must_use]
     pub fn new(principal: Arc<Principal>, protected: Arc<ProtectedPaths>, root: String, alias: Option<String>) -> Self {
         let alias = alias.and_then(|a| normalize(&a)).filter(|a| *a != root);
-        Self { principal, protected, root, alias }
+        Self { principal, protected, root, alias, local_root: None }
+    }
+
+    /// Anchors this local grant to the descriptor selected before authorization.
+    pub(crate) fn bind_local_root(mut self, descriptor: Arc<OwnedFd>) -> Self {
+        self.local_root = Some(descriptor);
+        self
     }
 
     /// The canonical workspace root.

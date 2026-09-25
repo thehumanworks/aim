@@ -34,7 +34,7 @@ use super::{State, lock};
 use crate::authz::confine::normalize;
 use crate::authz::{Access, Grant};
 use crate::tools::{self, ToolCtx};
-use crate::workspace::local::{LocalConfig, LocalWorkspace, canonical_root};
+use crate::workspace::local::{LocalConfig, LocalWorkspace, OpenRoot};
 use crate::workspace::{CopyRequest, EditRequest, GlobQuery, GrepQuery, ListRequest, Outcome, SpawnSpec, WriteRequest};
 
 /// Default and maximum `fs.list` page.
@@ -153,6 +153,32 @@ impl Conn {
         serde_json::from_value(value).map_err(internal)
     }
 
+    /// Runs a tool mutation only after admission. Admission refusals abandon the key; an
+    /// attempted operation's outcome, including a backend error, remains replayable.
+    async fn idempotent_admitted<T, F>(
+        &self,
+        ws: &OpenWorkspace,
+        key: &IdempotencyKey,
+        method: &str,
+        params: &impl Serialize,
+        session: Option<&Session>,
+        work: F,
+    ) -> Result<Outcome<T>, ProtoError>
+    where
+        T: Serialize + DeserializeOwned + Send + 'static,
+        F: Future<Output = Result<Outcome<T>, ProtoError>> + Send + 'static,
+    {
+        let scoped = format!("{}\u{0}{key}", ws.grant.principal().id);
+        let fingerprint = fingerprint(method, &ws.info.root, params);
+        let owner = session.map(|session| session.token.clone());
+        let minted = crate::dedup::minted_ms(key.as_str());
+        let work = async move { work.await.map(|outcome| outcome.and_then(|value| serde_json::to_value(value).map_err(internal))) };
+        self.state
+            .idempotent_admitted(scoped, minted, fingerprint, owner, work)
+            .await
+            .map(|outcome| outcome.and_then(|value| serde_json::from_value(value).map_err(internal)))
+    }
+
     fn initialize(&self, ctx: &RequestCtx, params: &InitializeParams) -> Outcome<InitializeResult> {
         let mut slot = lock(&self.session);
         if slot.is_some() {
@@ -173,13 +199,17 @@ impl Conn {
             .with_detail(serde_json::json!({ "server": { "min": min, "max": max } }))
         })?;
         let principal = Arc::clone(&self.state.principal);
-        let resumed_session = params.resume.as_ref().and_then(|token| self.state.resumable(token.as_str(), &principal));
+        let resumed_session =
+            params.resume.as_ref().and_then(|token| self.state.resume_and_attach(token.as_str(), &principal, self.id, ctx.peer.clone()));
         let resumed = resumed_session.is_some();
-        let session = match resumed_session {
-            Some(session) => session,
-            None => self.state.new_session(Arc::clone(&principal))?,
+        let (session, previous) = if let Some(attached) = resumed_session {
+            attached
+        } else {
+            let session = self.state.new_session(Arc::clone(&principal))?;
+            let previous = session.attach(self.id, ctx.peer.clone());
+            (session, previous)
         };
-        if let Some(previous) = session.attach(self.id, ctx.peer.clone()) {
+        if let Some(previous) = previous {
             previous.close();
         }
         *slot = Some(Arc::clone(&session));
@@ -199,8 +229,12 @@ impl Conn {
         if let BackendSpec::Ssh { .. } = params.backend {
             return Err(ProtoError::new(ErrorCode::Unavailable, "SSH workspaces are not available yet (milestone M1b)"));
         }
-        let root =
-            if let Some(backend) = &self.state.fixed_workspace { backend.root().to_owned() } else { canonical_root(&params.root).await? };
+        let opened = if self.state.fixed_workspace.is_some() { None } else { Some(LocalWorkspace::acquire_root(&params.root).await?) };
+        let root = if let Some(backend) = &self.state.fixed_workspace {
+            backend.root().to_owned()
+        } else {
+            opened.as_ref().ok_or_else(|| ProtoError::new(ErrorCode::Internal, "local workspace root was not acquired"))?.path().to_owned()
+        };
         if !session.principal.may_open(&root) {
             return Err(ProtoError::new(
                 ErrorCode::Denied,
@@ -211,20 +245,25 @@ impl Conn {
             return Ok(open.info.clone());
         }
         session.may_add_workspace()?;
+        let root_descriptor = opened.as_ref().map(OpenRoot::descriptor);
         let backend: Arc<dyn crate::workspace::Workspace> = if let Some(fixed) = &self.state.fixed_workspace {
             Arc::clone(fixed)
         } else {
+            let opened = opened.ok_or_else(|| ProtoError::new(ErrorCode::Internal, "local workspace root was not acquired"))?;
             let config = LocalConfig {
                 output_ring_bytes: usize::try_from(self.state.config.output_ring_bytes).unwrap_or(usize::MAX),
                 protected: Arc::clone(&self.state.protected),
                 ptys: Some(Arc::clone(&self.state.ptys)),
                 max_concurrency: Some(self.state.config.max_procs_per_session),
             };
-            Arc::new(LocalWorkspace::open(&root, config).await?)
+            Arc::new(LocalWorkspace::from_open_root(opened, config).await?)
         };
         let id = WorkspaceId::new(format!("w{}", crate::id::random_hex()));
         let info = WorkspaceInfo { id: id.clone(), root: root.clone(), caps: backend.caps().clone() };
-        let grant = Grant::new(Arc::clone(&session.principal), Arc::clone(&self.state.protected), root, normalize(&params.root));
+        let mut grant = Grant::new(Arc::clone(&session.principal), Arc::clone(&self.state.protected), root, normalize(&params.root));
+        if let Some(descriptor) = root_descriptor {
+            grant = grant.bind_local_root(descriptor);
+        }
         session.add_workspace(Arc::new(OpenWorkspace { id, info: info.clone(), grant, backend }))?;
         Ok(info)
     }
@@ -370,9 +409,11 @@ impl Conn {
         }
         let work_params = params.clone();
         let owner = Arc::clone(&session);
-        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, ExecSpawn::NAME, &params, Some(&session), async move {
+        let target = Arc::clone(&ws);
+        self.idempotent_admitted(&ws, &params.idempotency_key, ExecSpawn::NAME, &params, Some(&session), async move {
             let p = work_params;
-            let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
+            let exec =
+                target.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
             let spec = SpawnSpec {
                 command: &p.command,
                 cwd: &cwd,
@@ -383,12 +424,16 @@ impl Conn {
                 key: &p.idempotency_key,
             };
             let slot = owner.procs.reserve()?;
-            let proc = exec.spawn(spec).await?;
-            owner.procs.insert(proc.clone(), ws.id.clone(), slot);
-            owner.forward(Arc::clone(&ws.backend), proc.clone());
-            Ok(ExecSpawnResult { proc })
+            let proc = match exec.spawn(spec).await {
+                Ok(proc) => proc,
+                Err(err) if crate::workspace::local::spawn_admission_refused(&err) => return Err(err),
+                Err(err) => return Ok(Err(err)),
+            };
+            owner.procs.insert(proc.clone(), target.id.clone(), slot);
+            owner.forward(Arc::clone(&target.backend), proc.clone());
+            Ok(Ok(ExecSpawnResult { proc }))
         })
-        .await
+        .await?
     }
 
     async fn exec_read(self: Arc<Self>, params: ExecReadParams) -> Outcome<ExecReadResult> {
@@ -510,7 +555,19 @@ impl Conn {
         };
         let (name, arguments) = (params.name.clone(), params.arguments.clone());
         let scope = tools::spawns_processes(&params.name).then_some(&*session);
-        self.idempotent(&Arc::clone(&ws), &key, ToolsCall::NAME, &params, scope, async move { tools::call(&ctx, &name, arguments).await })
+        match self
+            .idempotent_admitted(
+                &ws,
+                &key,
+                ToolsCall::NAME,
+                &params,
+                scope,
+                async move { tools::call_admitted(&ctx, &name, arguments).await },
+            )
             .await
+        {
+            Err(err) => Ok(ToolResult::error(err.message)),
+            Ok(outcome) => outcome,
+        }
     }
 }

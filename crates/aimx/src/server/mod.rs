@@ -237,13 +237,30 @@ impl State {
     where
         F: Future<Output = Result<Value, ProtoError>> + Send + 'static,
     {
+        self.idempotent_admitted(scoped_key, minted, fingerprint, session, async move { Ok(work.await) }).await.unwrap_or_else(Err)
+    }
+
+    /// Only the outer error from `work` is an admission refusal that may abandon the key.
+    /// The inner result is an attempted operation and is always retained, including limit errors.
+    async fn idempotent_admitted<F>(
+        self: &Arc<Self>,
+        scoped_key: String,
+        minted: Option<u64>,
+        fingerprint: u64,
+        session: Option<String>,
+        work: F,
+    ) -> Result<Result<Value, ProtoError>, ProtoError>
+    where
+        // The outer error is a pre-execution admission refusal; the inner outcome is recorded.
+        F: Future<Output = Result<Result<Value, ProtoError>, ProtoError>> + Send + 'static,
+    {
         let now = unix_ms();
         let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         if minted.is_some_and(|minted| minted > now.saturating_add(ms(MAX_KEY_SKEW))) {
-            return Err(ProtoError::new(
+            return Ok(Err(ProtoError::new(
                 ErrorCode::InvalidParams,
                 "the idempotency key's UUIDv7 time is in the future; check the client's clock",
-            ));
+            )));
         }
         let too_old = minted.is_some_and(|minted| minted.saturating_add(ms(self.config.key_horizon)) <= now);
         let mut work = Some(work);
@@ -254,58 +271,57 @@ impl State {
                 Begin::Execute => {
                     let Some(work) = work.take() else {
                         lock(&self.dedup).abandon(&scoped_key);
-                        return Err(ProtoError::new(ErrorCode::Internal, "idempotent work already consumed"));
+                        return Ok(Err(ProtoError::new(ErrorCode::Internal, "idempotent work already consumed")));
                     };
                     let state = Arc::clone(self);
                     let key = scoped_key.clone();
                     let task = tokio::spawn(async move {
-                        let result = tokio::spawn(work)
+                        // A panic may follow a partial effect, so keep its uncertain outcome too.
+                        let outcome = tokio::spawn(work)
                             .await
-                            .unwrap_or_else(|err| Err(ProtoError::new(ErrorCode::Internal, format!("request failed: {err}"))));
-                        // A request refused for a limit ran nothing (every mutation's effect is
-                        // atomic, or admitted before it starts), so it is not recorded: the same
-                        // key may be retried once there is room.
-                        if result.as_ref().is_err_and(|err| err.code == ErrorCode::LimitExceeded) {
-                            lock(&state.dedup).abandon(&key);
-                        } else {
-                            lock(&state.dedup).complete(&key, Recorded { result: result.clone(), session }, state.now_ms());
+                            .unwrap_or_else(|err| Ok(Err(ProtoError::new(ErrorCode::Internal, format!("request failed: {err}")))));
+                        match &outcome {
+                            Ok(result) => lock(&state.dedup).complete(&key, Recorded { result: result.clone(), session }, state.now_ms()),
+                            Err(_) => lock(&state.dedup).abandon(&key),
                         }
                         state.dedup_done.send_modify(|v| *v = v.wrapping_add(1));
-                        result
+                        outcome
                     });
-                    return task.await.unwrap_or_else(|err| Err(ProtoError::new(ErrorCode::Internal, format!("request failed: {err}"))));
+                    return task
+                        .await
+                        .unwrap_or_else(|err| Ok(Err(ProtoError::new(ErrorCode::Internal, format!("request failed: {err}")))));
                 }
                 Begin::Replay(recorded) => {
                     if recorded.session.is_some() && recorded.session != session {
-                        return Err(ProtoError::new(
+                        return Ok(Err(ProtoError::new(
                             ErrorCode::UnknownOutcome,
                             "this idempotency key started a process in another session, which was not resumed; its outcome cannot be handed to this session",
-                        ));
+                        )));
                     }
-                    return recorded.result;
+                    return Ok(recorded.result);
                 }
                 Begin::InFlight => {
                     if done.changed().await.is_err() {
-                        return Err(ProtoError::new(ErrorCode::Unavailable, "server shutting down"));
+                        return Ok(Err(ProtoError::new(ErrorCode::Unavailable, "server shutting down")));
                     }
                 }
                 Begin::Expired => {
-                    return Err(ProtoError::new(
+                    return Ok(Err(ProtoError::new(
                         ErrorCode::UnknownOutcome,
                         "this idempotency key was used before and its outcome has expired; the effect may or may not have happened",
-                    ));
+                    )));
                 }
                 Begin::Mismatch => {
-                    return Err(ProtoError::new(ErrorCode::Conflict, "idempotency key reused for a different request"));
+                    return Ok(Err(ProtoError::new(ErrorCode::Conflict, "idempotency key reused for a different request")));
                 }
                 Begin::Full => {
-                    return Err(ProtoError::new(
+                    return Ok(Err(ProtoError::new(
                         ErrorCode::LimitExceeded,
                         "the server remembers as many idempotency keys as it may; retry later (keys expire after `dedup_window_secs`)",
-                    ));
+                    )));
                 }
                 Begin::Busy => {
-                    return Err(ProtoError::new(ErrorCode::LimitExceeded, "too many mutations in flight; retry when some finish"));
+                    return Ok(Err(ProtoError::new(ErrorCode::LimitExceeded, "too many mutations in flight; retry when some finish")));
                 }
             }
         }
@@ -526,4 +542,55 @@ fn transient(err: &io::Error) -> bool {
             err.kind(),
             io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset | io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
         )
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use aim_proto::error::{ErrorCode, ProtoError};
+
+    use super::{Server, ServerConfig, local_principal};
+    use crate::authz::ProtectedPaths;
+
+    #[tokio::test]
+    async fn limit_error_after_partial_mutation_keeps_the_key() {
+        let root = tempfile::tempdir().unwrap();
+        let principal = local_principal(&[root.path()], false).unwrap();
+        let server = Server::new(ServerConfig::new(principal, ProtectedPaths::default()));
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let capacity = std::sync::Arc::new(AtomicBool::new(false));
+        let parent = root.path().join("created-parent");
+        let work = |runs: std::sync::Arc<AtomicUsize>, capacity: std::sync::Arc<AtomicBool>, parent: std::path::PathBuf| async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            std::fs::create_dir_all(&parent).unwrap();
+            if !capacity.load(Ordering::SeqCst) {
+                return Err(ProtoError::new(ErrorCode::LimitExceeded, "staging write ran out of space"));
+            }
+            std::fs::write(parent.join("target"), "unexpected retry").unwrap();
+            Ok(serde_json::Value::Null)
+        };
+        let first = server
+            .state
+            .idempotent(
+                "partial-write".into(),
+                None,
+                1,
+                None,
+                work(std::sync::Arc::clone(&runs), std::sync::Arc::clone(&capacity), parent.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(first.code, ErrorCode::LimitExceeded);
+        assert!(parent.is_dir(), "the failure happened after a parent directory was created");
+        capacity.store(true, Ordering::SeqCst);
+        let second = server
+            .state
+            .idempotent("partial-write".into(), None, 1, None, work(std::sync::Arc::clone(&runs), capacity, parent.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(second, first);
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "a partial mutation must never run twice");
+        assert!(!parent.join("target").exists());
+    }
 }

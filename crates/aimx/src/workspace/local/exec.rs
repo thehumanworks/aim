@@ -93,6 +93,9 @@ impl std::fmt::Debug for LocalExec {
 }
 
 type Master = Box<dyn portable_pty::MasterPty + Send>;
+
+/// The PTY permit refusal happens before a process is started and may be retried with the same key.
+pub(super) const PTY_CAPACITY_MESSAGE: &str = "as many pty processes run as may; end one first";
 type PtyWriter = Box<dyn io::Write + Send>;
 
 struct Proc {
@@ -558,13 +561,14 @@ impl Exec for LocalExec {
             let proc = match spec.pty {
                 Some(size) => {
                     // The permit lives as long as the pty's threads (it is released when both end).
-                    let permit =
-                        match &self.ptys {
-                            Some(ptys) => Some(Arc::new(Arc::clone(ptys).try_acquire_owned().map_err(|_| {
-                                ProtoError::new(ErrorCode::LimitExceeded, "as many pty processes run as may; end one first")
-                            })?)),
-                            None => None,
-                        };
+                    let permit = match &self.ptys {
+                        Some(ptys) => Some(Arc::new(
+                            Arc::clone(ptys)
+                                .try_acquire_owned()
+                                .map_err(|_| ProtoError::new(ErrorCode::LimitExceeded, PTY_CAPACITY_MESSAGE))?,
+                        )),
+                        None => None,
+                    };
                     spawn_pty(&cwd, &spec, size, self.ring_bytes, permit)?
                 }
                 None => spawn_pipes(&cwd, &spec, self.ring_bytes)?,
