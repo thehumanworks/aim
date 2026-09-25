@@ -31,7 +31,8 @@ use rustix::io::Errno;
 use sha2::{Digest as _, Sha256};
 
 use super::walk::{Follow, Loc, kind, open_dir, open_entry, stat_entry};
-use super::{Base, blocking, io_error};
+use super::{Authority, Base, blocking, io_error};
+use crate::authz::Access;
 use crate::edit::apply_edits;
 use crate::id::{hex, random_hex};
 use crate::page::Page;
@@ -49,13 +50,17 @@ const NEW_DIR: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
 /// The local filesystem, confined to a root.
 #[derive(Debug)]
 pub(super) struct LocalFs {
-    base: Arc<Base>,
+    pub(super) base: Arc<Base>,
     mutations: Arc<Mutex<()>>,
 }
 
 impl LocalFs {
     pub(super) fn new(base: Arc<Base>) -> Self {
         Self { base, mutations: Arc::new(Mutex::new(())) }
+    }
+
+    pub(super) fn scoped(&self, base: Arc<Base>) -> Self {
+        Self { base, mutations: Arc::clone(&self.mutations) }
     }
 }
 
@@ -184,7 +189,7 @@ fn make_dirs(loc: &Loc) -> io::Result<OwnedFd> {
 }
 
 fn stat(base: &Base, path: &str, hash: bool) -> Outcome<Meta> {
-    let loc = base.resolve(path, Follow::NoFinal)?;
+    let loc = base.resolve(path, Follow::NoFinal, Authority::Path(Access::Read))?;
     let (stat, file) = if loc.name.is_some() {
         let (dir, name) = entry(&loc, path)?;
         let stat = existing(dir, name, path)?.ok_or_else(|| not_found(path))?;
@@ -203,7 +208,7 @@ fn stat(base: &Base, path: &str, hash: bool) -> Outcome<Meta> {
 }
 
 fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64, hash: bool) -> Outcome<FsReadResult> {
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Read))?;
     if loc.target_dir().is_some() {
         return Err(is_a_directory(path));
     }
@@ -316,7 +321,7 @@ fn write(
     precondition: &Precondition,
     create_dirs: bool,
 ) -> Outcome<WriteOutcome> {
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Write))?;
     base.check_protected(&loc, false)?;
     let Some(name) = loc.name.as_deref().filter(|_| loc.opened.is_none()) else {
         return Err(is_a_directory(path));
@@ -344,7 +349,7 @@ fn write(
 }
 
 fn edit(base: &Base, mutations: &Mutex<()>, path: &str, edits: &[ExactEdit], precondition: &Precondition) -> Outcome<EditOutcome> {
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Write))?;
     base.check_protected(&loc, false)?;
     if loc.target_dir().is_some() {
         return Err(is_a_directory(path));
@@ -378,7 +383,7 @@ fn edit(base: &Base, mutations: &Mutex<()>, path: &str, edits: &[ExactEdit], pre
 }
 
 fn list(base: &Base, path: &str, limit: u32, page_token: Option<&str>, include_hidden: bool) -> Outcome<FsListResult> {
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Read))?;
     let Some(dir) = loc.target_dir() else {
         let (parent, name) = entry(&loc, path)?;
         return match existing(parent, name, path)? {
@@ -417,7 +422,7 @@ fn list(base: &Base, path: &str, limit: u32, page_token: Option<&str>, include_h
 }
 
 fn mkdir(base: &Base, mutations: &Mutex<()>, path: &str) -> Outcome<()> {
-    let loc = base.resolve(path, Follow::Final)?;
+    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Write))?;
     if loc.target_dir().is_some() {
         return Ok(());
     }
@@ -476,7 +481,7 @@ fn remove_tree(parent: &OwnedFd, name: &OsStr, depth: usize) -> io::Result<()> {
 }
 
 fn remove(base: &Base, mutations: &Mutex<()>, path: &str, recursive: bool) -> Outcome<()> {
-    let loc = base.resolve(path, Follow::NoFinal)?;
+    let loc = base.resolve(path, Follow::NoFinal, Authority::Path(Access::Tree))?;
     if loc.name.is_none() {
         return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be removed"));
     }
@@ -502,8 +507,8 @@ fn remove(base: &Base, mutations: &Mutex<()>, path: &str, recursive: bool) -> Ou
 }
 
 fn rename(base: &Base, mutations: &Mutex<()>, from: &str, to: &str, overwrite: bool) -> Outcome<()> {
-    let source = base.resolve(from, Follow::NoFinal)?;
-    let target = base.resolve(to, Follow::NoFinal)?;
+    let source = base.resolve(from, Follow::NoFinal, Authority::Path(Access::Tree))?;
+    let target = base.resolve(to, Follow::NoFinal, Authority::Path(Access::Tree))?;
     if source.name.is_none() || target.name.is_none() {
         return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be moved or replaced"));
     }
@@ -576,8 +581,8 @@ fn identity(fd: &OwnedFd) -> io::Result<(i128, i128)> {
 }
 
 fn copy(base: &Base, mutations: &Mutex<()>, from: &str, to: &str, overwrite: bool, recursive: bool) -> Outcome<()> {
-    let source = base.resolve(from, Follow::Final)?;
-    let target = base.resolve(to, Follow::NoFinal)?;
+    let source = base.resolve(from, Follow::Final, Authority::Path(Access::Read))?;
+    let target = base.resolve(to, Follow::NoFinal, Authority::Path(Access::Tree))?;
     if target.name.is_none() {
         return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be replaced"));
     }

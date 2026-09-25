@@ -1,5 +1,6 @@
 //! Per-call and session authority at the real harness RPC boundary (ADRs 0021, 0027).
 
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -111,6 +112,20 @@ async fn deny_overrides_allow() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn deny_write_catches_case_alias() {
+    let env = env().await;
+    std::fs::write(env.path("Guarded"), "safe").unwrap();
+    if !env.path("guarded").exists() {
+        return; // The alias exists only on case-insensitive filesystems.
+    }
+    let (client, _, ws) = session(&env).await;
+    let mut scope = write_scope(&root(&env.root));
+    scope["deny_write"] = json!([root(&env.path("Guarded"))]);
+    denied(&client, "fs.write", write_params(&ws, "guarded", Some(scope))).await;
+    assert_eq!(std::fs::read_to_string(env.path("Guarded")).unwrap(), "safe");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn session_ceiling_survives_omitted_scope() {
     let env = env().await;
     std::fs::write(env.path("f"), "original").unwrap();
@@ -150,6 +165,35 @@ async fn workspace_ceiling_can_name_a_descendant_prefix() {
     let ws: WorkspaceId = serde_json::from_value(opened["id"].clone()).unwrap();
     assert!(client.peer.call_raw("fs.read", json!({"workspace": ws, "path": "sub/allowed"})).await.is_ok());
     denied(&client, "fs.read", json!({"workspace": ws, "path": "outside"})).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_prefix_cannot_cross_an_in_workspace_symlink() {
+    let env = env().await;
+    std::fs::create_dir(env.path("allowed")).unwrap();
+    std::fs::create_dir(env.path("private")).unwrap();
+    std::fs::write(env.path("private/secret"), "PRIVATE-SENTINEL").unwrap();
+    symlink("../private", env.path("allowed/link")).unwrap();
+    let (client, _, ws) = session(&env).await;
+    let scope = json!({"roots": ["allowed"], "ops": ["read", "write"]});
+    denied(&client, "fs.read", json!({"workspace": ws, "path": "allowed/link/secret", "scope": scope})).await;
+    denied(&client, "fs.write", write_params(&ws, "allowed/link/new", Some(scope.clone()))).await;
+    denied(&client, "search.grep", json!({"workspace": ws, "pattern": "PRIVATE-SENTINEL", "path": "allowed/link/secret", "scope": scope}))
+        .await;
+    denied(
+        &client,
+        "tools.call",
+        json!({"workspace": ws, "name": "Read", "arguments": {"file_path": "allowed/link/secret"}, "scope": scope}),
+    )
+    .await;
+    let exec_scope = json!({"roots": ["allowed"], "ops": ["exec"]});
+    denied(
+        &client,
+        "exec.spawn",
+        json!({"workspace": ws, "command": {"kind": "argv", "argv": ["true"]}, "cwd": "allowed/link", "idempotency_key": key(), "scope": exec_scope}),
+    )
+    .await;
+    assert!(!env.path("private/new").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

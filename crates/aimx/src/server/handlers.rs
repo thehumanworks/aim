@@ -151,9 +151,24 @@ impl Conn {
         }
     }
 
-    fn scoped_grant(&self, session: &Session, workspace: &OpenWorkspace, call: Option<&CallScope>) -> Outcome<Grant> {
+    fn apply_scope(&self, session: &Session, workspace: &OpenWorkspace, call: Option<&CallScope>) -> Outcome<Arc<OpenWorkspace>> {
         let ceiling = session.ceiling();
-        workspace.grant.scoped(ceiling.as_ref(), call, self.policy_limits())
+        let grant = workspace.grant.scoped(ceiling.as_ref(), call, self.policy_limits())?;
+        let backend = if ceiling.is_some() || call.is_some() {
+            workspace
+                .backend
+                .scoped(grant.clone())
+                .ok_or_else(|| ProtoError::new(ErrorCode::Denied, "this backend cannot enforce a scoped path after symlink resolution"))?
+        } else {
+            Arc::clone(&workspace.backend)
+        };
+        Ok(Arc::new(OpenWorkspace { id: workspace.id.clone(), info: workspace.info.clone(), grant, backend }))
+    }
+
+    fn scoped_workspace(&self, id: &WorkspaceId, call: Option<&CallScope>) -> Outcome<(Arc<Session>, Arc<OpenWorkspace>)> {
+        let (session, workspace) = self.workspace(id)?;
+        let workspace = self.apply_scope(&session, &workspace, call)?;
+        Ok((session, workspace))
     }
 
     /// Runs a mutation in workspace `ws` at most once per (principal, key). `session` scopes the
@@ -300,23 +315,23 @@ impl Conn {
     }
 
     async fn fs_stat(self: Arc<Self>, params: FsStatParams) -> Outcome<Meta> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let path = grant.path(&params.path, Access::Read)?;
         ws.backend.fs().stat(&path, params.hash).await
     }
 
     async fn fs_read(self: Arc<Self>, params: FsReadParams) -> Outcome<FsReadResult> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let path = grant.path(&params.path, Access::Read)?;
         let cap = output_cap(&grant)?.min(self.state.config.max_read_bytes.max(1));
         ws.backend.fs().read(&path, params.range, cap, params.hash).await
     }
 
     async fn fs_write(self: Arc<Self>, params: FsWriteParams) -> Outcome<WriteOutcome> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let path = grant.path(&params.path, Access::Write)?;
         let work_params = params.clone();
         self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsWrite::NAME, &params, None, async move {
@@ -334,8 +349,8 @@ impl Conn {
     }
 
     async fn fs_edit(self: Arc<Self>, params: FsEditParams) -> Outcome<EditOutcome> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let path = grant.path(&params.path, Access::Write)?;
         let work_params = params.clone();
         self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsEdit::NAME, &params, None, async move {
@@ -346,8 +361,8 @@ impl Conn {
     }
 
     async fn fs_list(self: Arc<Self>, params: FsListParams) -> Outcome<FsListResult> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let path = grant.path(&params.path, Access::Read)?;
         let limit = params.limit.unwrap_or(LIST_DEFAULT).clamp(1, LIST_MAX);
         let request = ListRequest { path: &path, limit, page_token: params.page_token.as_deref(), include_hidden: params.include_hidden };
@@ -355,8 +370,8 @@ impl Conn {
     }
 
     async fn fs_mkdir(self: Arc<Self>, params: FsMkdirParams) -> Outcome<()> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let path = grant.path(&params.path, Access::Write)?;
         let key = params.idempotency_key.clone();
         self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsMkdir::NAME, &params, None, async move {
@@ -366,8 +381,8 @@ impl Conn {
     }
 
     async fn fs_remove(self: Arc<Self>, params: FsRemoveParams) -> Outcome<()> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let path = grant.path(&params.path, Access::Tree)?;
         let (key, recursive) = (params.idempotency_key.clone(), params.recursive);
         self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsRemove::NAME, &params, None, async move {
@@ -377,8 +392,8 @@ impl Conn {
     }
 
     async fn fs_rename(self: Arc<Self>, params: FsRenameParams) -> Outcome<()> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let from = grant.path(&params.from, Access::Tree)?;
         let to = grant.path(&params.to, Access::Tree)?;
         let (key, overwrite) = (params.idempotency_key.clone(), params.overwrite);
@@ -391,8 +406,8 @@ impl Conn {
     /// Reads several files; per-file failures are entries, and once the total reaches
     /// `max_read_bytes` the remaining files answer `limit_exceeded` (so the reply fits a message).
     async fn fs_read_many(self: Arc<Self>, params: FsReadManyParams) -> Outcome<FsReadManyResult> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         if params.paths.len() > READ_MANY_MAX {
             return Err(ProtoError::new(ErrorCode::LimitExceeded, format!("at most {READ_MANY_MAX} paths per fs.read_many")));
         }
@@ -420,8 +435,8 @@ impl Conn {
     }
 
     async fn fs_copy(self: Arc<Self>, params: FsCopyParams) -> Outcome<()> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let from = grant.path(&params.from, Access::Read)?;
         let to = grant.path(&params.to, Access::Tree)?;
         let (key, overwrite, recursive) = (params.idempotency_key.clone(), params.overwrite, params.recursive);
@@ -434,8 +449,8 @@ impl Conn {
 
     fn watch_start(&self, params: &WatchStartParams) -> Outcome<WatchStartResult> {
         let session = self.session()?;
-        let ws = session.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let ws = self.apply_scope(&session, session.workspace(&params.workspace)?.as_ref(), params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         grant.path(&params.path, Access::Read)?;
         Err(ProtoError::new(ErrorCode::Unavailable, "file watching is not available on this backend (caps.watch is false)"))
     }
@@ -446,8 +461,8 @@ impl Conn {
     }
 
     async fn exec_spawn(self: Arc<Self>, params: ExecSpawnParams) -> Outcome<ExecSpawnResult> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (session, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let cwd = grant.exec_path(params.cwd.as_deref().unwrap_or(""))?;
         let max_processes = usize::try_from(grant.limits().map_or(u32::MAX, |limits| limits.max_processes)).unwrap_or(usize::MAX);
         if ws.backend.exec().is_none() {
@@ -484,8 +499,8 @@ impl Conn {
 
     async fn exec_read(self: Arc<Self>, params: ExecReadParams) -> Outcome<ExecReadResult> {
         let session = self.session()?;
-        let ws = session.proc_workspace(&params.proc)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
         grant.exec_path(&cwd)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
@@ -497,8 +512,8 @@ impl Conn {
 
     async fn exec_write_stdin(self: Arc<Self>, params: ExecWriteStdinParams) -> Outcome<()> {
         let session = self.session()?;
-        let ws = session.proc_workspace(&params.proc)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
         grant.exec_path(&cwd)?;
         let work_params = params.clone();
@@ -514,8 +529,8 @@ impl Conn {
 
     async fn exec_resize(self: Arc<Self>, params: ExecResizeParams) -> Outcome<()> {
         let session = self.session()?;
-        let ws = session.proc_workspace(&params.proc)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
         grant.exec_path(&cwd)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
@@ -524,8 +539,8 @@ impl Conn {
 
     async fn exec_signal(self: Arc<Self>, params: ExecSignalParams) -> Outcome<()> {
         let session = self.session()?;
-        let ws = session.proc_workspace(&params.proc)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
         grant.exec_path(&cwd)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
@@ -536,8 +551,8 @@ impl Conn {
     /// has exited, whatever output remains unread.
     async fn exec_wait(self: Arc<Self>, params: ExecWaitParams) -> Outcome<ExecWaitResult> {
         let session = self.session()?;
-        let ws = session.proc_workspace(&params.proc)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
         grant.exec_path(&cwd)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
@@ -556,8 +571,8 @@ impl Conn {
 
     async fn exec_release(self: Arc<Self>, params: ExecReleaseParams) -> Outcome<()> {
         let session = self.session()?;
-        let ws = session.proc_workspace(&params.proc)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
         grant.exec_path(&cwd)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
@@ -566,8 +581,8 @@ impl Conn {
     }
 
     async fn search_grep(self: Arc<Self>, params: GrepParams) -> Outcome<GrepResult> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let path = grant.path(params.path.as_deref().unwrap_or(""), Access::Read)?;
         let query = GrepQuery {
             pattern: &params.pattern,
@@ -582,8 +597,8 @@ impl Conn {
     }
 
     async fn search_glob(self: Arc<Self>, params: GlobParams) -> Outcome<GlobResult> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let path = grant.path(params.path.as_deref().unwrap_or(""), Access::Read)?;
         if params.patterns.is_empty() {
             return Err(ProtoError::new(ErrorCode::InvalidParams, "at least one pattern is required"));
@@ -602,8 +617,8 @@ impl Conn {
     }
 
     async fn tools_call(self: Arc<Self>, request: RequestCtx, params: ToolsCallParams) -> Outcome<ToolResult> {
-        let (session, ws) = self.workspace(&params.workspace)?;
-        let grant = self.scoped_grant(&session, &ws, params.scope.as_ref())?;
+        let (session, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let grant = ws.grant.clone();
         let annotations = tools::annotations_of(&params.name)
             .ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("unknown tool `{}`", params.name)))?;
         let ctx = ToolCtx {

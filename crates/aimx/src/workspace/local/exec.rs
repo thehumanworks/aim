@@ -33,7 +33,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::walk::{self, Follow};
-use super::{Base, blocking, io_error};
+use super::{Authority, Base, blocking, io_error};
 use crate::id::random_hex;
 use crate::ring::OutputRing;
 use crate::workspace::{BoxFuture, Exec, Outcome, SpawnSpec};
@@ -83,12 +83,24 @@ pub(super) struct LocalExec {
     base: Arc<Base>,
     ring_bytes: usize,
     ptys: Option<Arc<Semaphore>>,
-    procs: Mutex<HashMap<ProcId, Arc<Proc>>>,
+    procs: Arc<ProcRegistry>,
+}
+
+/// All scoped views of a workspace own one registry; processes are released when its final
+/// owner goes away, not when an individual request ends.
+struct ProcRegistry(Mutex<HashMap<ProcId, Arc<Proc>>>);
+
+impl Drop for ProcRegistry {
+    fn drop(&mut self) {
+        for proc in lock(&self.0).values() {
+            proc.release();
+        }
+    }
 }
 
 impl std::fmt::Debug for LocalExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LocalExec").field("procs", &lock(&self.procs).len()).finish_non_exhaustive()
+        f.debug_struct("LocalExec").field("procs", &lock(&self.procs.0).len()).finish_non_exhaustive()
     }
 }
 
@@ -521,19 +533,15 @@ fn spawn_pty(
 
 impl LocalExec {
     pub(super) fn new(base: Arc<Base>, ring_bytes: usize, ptys: Option<Arc<Semaphore>>) -> Self {
-        Self { base, ring_bytes, ptys, procs: Mutex::new(HashMap::new()) }
+        Self { base, ring_bytes, ptys, procs: Arc::new(ProcRegistry(Mutex::new(HashMap::new()))) }
+    }
+
+    pub(super) fn scoped(&self, base: Arc<Base>) -> Self {
+        Self { base, ring_bytes: self.ring_bytes, ptys: self.ptys.clone(), procs: Arc::clone(&self.procs) }
     }
 
     fn get(&self, proc: &ProcId) -> Outcome<Arc<Proc>> {
-        lock(&self.procs).get(proc).cloned().ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")))
-    }
-}
-
-impl Drop for LocalExec {
-    fn drop(&mut self) {
-        for proc in lock(&self.procs).values() {
-            proc.release();
-        }
+        lock(&self.procs.0).get(proc).cloned().ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")))
     }
 }
 
@@ -543,7 +551,7 @@ impl Exec for LocalExec {
             let base = Arc::clone(&self.base);
             let cwd_path = spec.cwd.to_owned();
             let cwd = blocking(move || {
-                let loc = base.resolve(&cwd_path, Follow::Final)?;
+                let loc = base.resolve(&cwd_path, Follow::Final, Authority::Exec)?;
                 if let Some(dir) = loc.target_dir() {
                     return dir.try_clone().map_err(|err| io_error(&err, &cwd_path));
                 }
@@ -574,7 +582,7 @@ impl Exec for LocalExec {
                 None => spawn_pipes(&cwd, &spec, self.ring_bytes)?,
             };
             let id = ProcId::new(format!("p{}", random_hex()));
-            lock(&self.procs).insert(id.clone(), proc);
+            lock(&self.procs.0).insert(id.clone(), proc);
             Ok(id)
         })
     }
@@ -660,7 +668,7 @@ impl Exec for LocalExec {
 
     fn release<'a>(&'a self, proc: &'a ProcId) -> BoxFuture<'a, Outcome<()>> {
         Box::pin(async move {
-            let removed = lock(&self.procs).remove(proc);
+            let removed = lock(&self.procs.0).remove(proc);
             let Some(proc) = removed else {
                 return Err(ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")));
             };

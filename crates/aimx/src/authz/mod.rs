@@ -324,6 +324,12 @@ impl Grant {
         self.effective.as_ref().map(|scope| scope.limits())
     }
 
+    /// Canonical write-denied prefixes added by the bound session and this call.
+    #[must_use]
+    pub(crate) fn write_denies(&self) -> &[String] {
+        &self.tree_denies
+    }
+
     /// `path` relative to the workspace root, for display (`.` for the root itself).
     #[must_use]
     pub fn display<'a>(&self, path: &'a str) -> &'a str {

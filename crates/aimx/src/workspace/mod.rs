@@ -19,6 +19,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aim_proto::content::Content;
@@ -28,6 +29,8 @@ use aim_proto::harness::{
     PtySize, Signal, WriteOutcome,
 };
 use aim_proto::ids::{IdempotencyKey, ProcId};
+
+use crate::authz::Grant;
 
 pub mod local;
 
@@ -39,6 +42,12 @@ pub type Outcome<T> = Result<T, ProtoError>;
 
 /// A workspace: a root directory on some host, with files, processes and search.
 pub trait Workspace: Send + Sync {
+    /// Bind this backend to one request's effective grant. A backend without descriptor-bound
+    /// scope enforcement returns `None`, so callers can refuse scoped access.
+    fn scoped(&self, _grant: Grant) -> Option<Arc<dyn Workspace>> {
+        None
+    }
+
     /// What this backend can do.
     fn caps(&self) -> &Caps;
 
