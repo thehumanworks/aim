@@ -179,13 +179,27 @@ def sse(event: dict) -> bytes:
     return b"data: " + encoded(event) + b"\n\n"
 
 
-def mock_response(route: str, model: str, index: int, recorder: Recorder, request_size: int) -> bytes:
+def offered_tools(body: dict) -> set[str]:
+    return {str((tool.get("function") or tool).get("name", "")) for tool in body.get("tools") or [] if isinstance(tool, dict)}
+
+
+def chat_tool_call(command: str, offered: set[str] | None) -> tuple[str, dict]:
+    """The scripted shell step: a direct `Bash` call, or, when the request offers `run_code` but no
+    direct `Bash` (aim's `AIM_CODE_MODE=only`, ADR 0076), one cell that runs the same command."""
+    if offered is not None and "Bash" not in offered and "run_code" in offered:
+        return "run_code", {"code": f"const r = await tools.Bash({json.dumps({'command': command})}); text(r.text)"}
+    return "Bash", {"command": command}
+
+
+def mock_response(route: str, model: str, index: int, recorder: Recorder, request_size: int,
+                  offered: set[str] | None = None) -> bytes:
     tool = recorder.scenario in {"big_output", "big_file", "steps"} and index <= recorder.steps
     command = recorder.command
     if route.endswith("/chat/completions"):
         base = {"id": f"mock-{index}", "object": "chat.completion.chunk", "created": 1, "model": model}
         if tool:
-            first = {**base, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": f"call-{index}", "type": "function", "function": {"name": "Bash", "arguments": encoded({"command": command}).decode()}}]}, "finish_reason": None}]}
+            name, arguments = chat_tool_call(command, offered)
+            first = {**base, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": f"call-{index}", "type": "function", "function": {"name": name, "arguments": encoded(arguments).decode()}}]}, "finish_reason": None}]}
             finish = "tool_calls"
         else:
             first = {**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": "OK"}, "finish_reason": None}]}
@@ -344,7 +358,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(429, "benchmark spend cap reached")
                 return
             if self.server.mode == "mock":
-                payload = mock_response(route, parsed.get("model", self.server.model), index, self.server.recorder, len(body))
+                payload = mock_response(route, parsed.get("model", self.server.model), index, self.server.recorder, len(body),
+                                            offered_tools(parsed))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Content-Length", str(len(payload)))

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from live_tasks import TASKS, grade, prepare
 from compare import compare_wire
-from proxy import BenchServer, Handler, Recorder, SseUsage, append_only, has_generated_delta, render_order, request_shape, usage_fields
+from proxy import BenchServer, Handler, Recorder, SseUsage, append_only, has_generated_delta, mock_response, render_order, request_shape, usage_fields
 from run import TRIAL_ROOT, invocation, isolated_env, path_map, split_arm, summary, temporary_workspace, update_diagnostics
 
 
@@ -47,6 +47,18 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(shape["tool_output_chars"], len("secret full output handle h (BashOutput/exec.read)"))
         self.assertTrue(shape["tool_output_has_recovery_hint"])
         self.assertNotIn("secret", str(shape))
+
+    def test_mock_scripts_a_cell_when_only_the_code_tool_is_offered(self):
+        recorder = SimpleNamespace(scenario="big_output", steps=1, command="seq 1 3")
+        def call(offered):
+            payload = mock_response("/v1/chat/completions", "m", 1, recorder, 10, offered)
+            first = json.loads(payload.split(b"\n\n")[0][len(b"data: "):])
+            return first["choices"][0]["delta"]["tool_calls"][0]["function"]
+        self.assertEqual(call({"Bash", "run_code"})["name"], "Bash", "a direct Bash is used when offered")
+        self.assertEqual(call(None)["name"], "Bash")
+        cell = call({"run_code", "list_programs"})
+        self.assertEqual(cell["name"], "run_code")
+        self.assertIn('tools.Bash({"command": "seq 1 3"})', json.loads(cell["arguments"])["code"])
 
     def test_render_order_recognizes_append_only_despite_json_key_order(self):
         first = {"messages": [{"role": "system", "content": "stable"}, {"role": "user", "content": "one"}],
@@ -191,9 +203,22 @@ class LiveTaskTests(unittest.TestCase):
         ))
         diagnostic = update_diagnostics(lines)
         self.assertEqual(diagnostic["tool_calls_by_name"], {"Bash": 1})
+        self.assertEqual((diagnostic["direct_tool_calls"], diagnostic["nested_tool_calls"]), (1, 0))
         self.assertEqual(diagnostic["failed_tools_by_name"], {"Bash": 1})
         self.assertEqual(diagnostic["turn_failure_class"], "max_requests")
         self.assertNotIn("secret-value", str(diagnostic))
+
+    def test_diagnostics_separate_the_models_calls_from_a_cells_nested_calls(self):
+        lines = b'\n'.join((
+            b'{"type":"tool_started","call_id":"c1","name":"run_code","arguments":"{}"}',
+            b'{"type":"tool_started","call_id":"n1","name":"Read","arguments":"{}","parent":"c1"}',
+            b'{"type":"tool_started","call_id":"n2","name":"Grep","arguments":"{}","parent":"c1"}',
+            b'{"type":"tool_started","call_id":"c2","name":"Bash","arguments":"{}"}',
+        ))
+        diagnostic = update_diagnostics(lines)
+        self.assertEqual(diagnostic["tool_calls_by_name"], {"run_code": 1, "Read": 1, "Grep": 1, "Bash": 1})
+        self.assertEqual(diagnostic["nested_tool_calls_by_name"], {"Read": 1, "Grep": 1})
+        self.assertEqual((diagnostic["direct_tool_calls"], diagnostic["nested_tool_calls"]), (2, 2))
 
     def test_trial_paths_do_not_depend_on_the_callers_tmpdir(self):
         with mock.patch.dict("run.BASE_ENV", {"PATH": "/bin", "TMPDIR": "/var/folders/xx/long-caller-temp/T/"}, clear=True):

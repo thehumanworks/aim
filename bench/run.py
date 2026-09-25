@@ -121,6 +121,7 @@ def peak_rss(stderr: str) -> float | None:
 def update_diagnostics(stdout: bytes) -> dict:
     """Keep only tool names and failure classes, never model text or tool arguments."""
     calls: Counter[str] = Counter()
+    nested: Counter[str] = Counter()
     failed_tools: Counter[str] = Counter()
     patterns: Counter[str] = Counter()
     read_failures: Counter[str] = Counter()
@@ -135,6 +136,8 @@ def update_diagnostics(stdout: bytes) -> dict:
         name = update.get("name")
         if kind == "tool_started" and isinstance(name, str):
             calls[name] += 1
+            if update.get("parent"):
+                nested[name] += 1
             if name == "Read":
                 try:
                     arguments = json.loads(update.get("arguments") or "{}")
@@ -164,7 +167,11 @@ def update_diagnostics(stdout: bytes) -> dict:
         elif kind == "turn_failed":
             message = str(update.get("message", ""))
             terminal = "max_requests" if "too many" in message or "exceeded" in message else "provider" if "provider" in message else "other"
-    return {"tool_calls_by_name": dict(calls), "failed_tools_by_name": dict(failed_tools),
+    # `tool_calls_by_name` counts every call, as before; a nested call is one a code cell made
+    # (its update names a `parent`, ADR 0066), so the model's own calls are the difference.
+    return {"tool_calls_by_name": dict(calls), "nested_tool_calls_by_name": dict(nested),
+            "direct_tool_calls": sum(calls.values()) - sum(nested.values()), "nested_tool_calls": sum(nested.values()),
+            "failed_tools_by_name": dict(failed_tools),
             "tool_result_pattern_counts": dict(patterns), "read_failure_classes": dict(read_failures),
             "read_argument_keys": dict(read_argument_keys), "turn_failure_class": terminal}
 
@@ -470,6 +477,9 @@ def summary(runs: list[dict], harnesses: list[str]) -> list[dict]:
                        "pass_rate_ci95": [round(center - radius, 3), round(center + radius, 3)],
                        "ite_per_passed": round(total_ite / passes, 2) if passes and complete_ite else None,
                        "usd_per_passed": round(total_usd / passes, 6) if passes and measured_cost else None,
+                       "mean_requests": round(statistics.mean(row.get("requests", 0) for row in group), 2),
+                       "mean_direct_tool_calls": round(statistics.mean(row.get("direct_tool_calls", 0) for row in group), 2),
+                       "mean_nested_tool_calls": round(statistics.mean(row.get("nested_tool_calls", 0) for row in group), 2),
                        "p50_wall_ms": round(statistics.median(row["wall_ms"] for row in group), 2)})
     return result
 
