@@ -311,3 +311,19 @@ async fn release_kills_a_running_process() {
     let err = client.peer.call::<ExecRelease>(ExecReleaseParams { proc }).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_for_exit() {
+    use aim_proto::harness::{ExecWait, ExecWaitParams};
+
+    let env = env().await;
+    let (client, _, ws) = session(&env).await;
+    let proc = spawn(&client, spec(&ws, sh("sleep 0.4; echo unread; exit 7"))).await;
+    let early = client.peer.call::<ExecWait>(ExecWaitParams { proc: proc.clone(), timeout_ms: Some(50) }).await.unwrap();
+    assert_eq!(early.exit, None, "the timeout elapsed first; the process keeps running");
+    let done = client.peer.call::<ExecWait>(ExecWaitParams { proc: proc.clone(), timeout_ms: None }).await.unwrap();
+    assert_eq!(done.exit, Some(ExitStatus::Exited { code: 7 }));
+    // Its output is still there to read.
+    let (chunks, _) = run_to_exit(&client, &proc).await;
+    assert_eq!(joined(&chunks, OutputStream::Stdout), "unread\n");
+}

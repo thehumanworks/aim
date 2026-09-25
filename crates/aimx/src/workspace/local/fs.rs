@@ -25,9 +25,11 @@ use sha2::{Digest as _, Sha256};
 use super::{Base, Follow, blocking, io_error};
 use crate::edit::apply_edits;
 use crate::id::{hex, random_hex};
-use crate::workspace::{BoxFuture, EditRequest, Fs, ListRequest, Outcome, WriteRequest};
+use crate::workspace::{BoxFuture, CopyRequest, EditRequest, Fs, ListRequest, Outcome, WriteRequest};
 
 const BLOCK: usize = 64 * 1024;
+/// Deepest directory tree `copy` descends into.
+const MAX_COPY_DEPTH: usize = 256;
 
 /// The local filesystem, confined to a root.
 #[derive(Debug)]
@@ -341,6 +343,84 @@ fn rename(base: &Base, mutations: &Mutex<()>, from: &str, to: &str, overwrite: b
     }
 }
 
+/// Copies directory `from` into the new directory `to`; symlinks are copied as links (never
+/// followed), special files are skipped, and each directory keeps its mode.
+fn copy_tree(from: &Path, to: &Path, depth: usize) -> io::Result<()> {
+    if depth > MAX_COPY_DEPTH {
+        return Err(io::Error::other("directory tree too deep to copy"));
+    }
+    fs::create_dir(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dest = to.join(entry.file_name());
+        if file_type.is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(entry.path())?, &dest)?;
+        } else if file_type.is_dir() {
+            copy_tree(&entry.path(), &dest, depth + 1)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &dest)?;
+        }
+    }
+    fs::set_permissions(to, fs::metadata(from)?.permissions())
+}
+
+fn copy(base: &Base, mutations: &Mutex<()>, from: &str, to: &str, overwrite: bool, recursive: bool) -> Outcome<()> {
+    let source = base.resolve(from, Follow::Final)?;
+    let target = base.resolve(to, Follow::NoFinal)?;
+    if target == base.root {
+        return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be replaced"));
+    }
+    base.check_protected(&target, true)?;
+    let _serial = lock(mutations);
+    let meta = fs::metadata(&source).map_err(|err| io_error(&err, from))?;
+    if meta.is_dir() && !recursive {
+        return Err(ProtoError::new(ErrorCode::Conflict, format!("`{from}` is a directory; pass recursive")));
+    }
+    if meta.is_dir() && target.starts_with(&source) {
+        return Err(ProtoError::new(ErrorCode::Conflict, format!("cannot copy `{from}` into itself")));
+    }
+    let existing = match fs::symlink_metadata(&target) {
+        Ok(existing) => Some(existing),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => return Err(io_error(&err, to)),
+    };
+    if let Some(existing) = &existing {
+        if !overwrite {
+            return Err(ProtoError::new(ErrorCode::Conflict, format!("`{to}` already exists; pass overwrite")));
+        }
+        if existing.is_dir() {
+            return Err(ProtoError::new(ErrorCode::Conflict, format!("`{to}` is a directory; remove it first")));
+        }
+    }
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, format!("`{to}` is not a valid destination")));
+    };
+    // Build the copy beside the destination, then rename it into place.
+    let staging = dir.join(format!(".{}.aimx-{}.tmp", name.to_string_lossy(), random_hex()));
+    let placed = if meta.is_dir() {
+        copy_tree(&source, &staging, 0).and_then(|()| {
+            if existing.is_some() {
+                fs::remove_file(&target)?;
+            }
+            fs::rename(&staging, &target)
+        })
+    } else {
+        fs::copy(&source, &staging).and_then(|_| File::open(&staging)?.sync_all()).and_then(|()| fs::rename(&staging, &target))
+    };
+    if let Err(err) = placed {
+        let cleanup = if meta.is_dir() { fs::remove_dir_all(&staging) } else { fs::remove_file(&staging) };
+        if let Err(cleanup) = cleanup
+            && cleanup.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(%cleanup, staging = %staging.display(), "could not remove a partial copy");
+        }
+        return Err(io_error(&err, to));
+    }
+    sync_dir(dir);
+    Ok(())
+}
+
 impl Fs for LocalFs {
     fn stat<'a>(&'a self, path: &'a str, hash: bool) -> BoxFuture<'a, Outcome<Meta>> {
         let base = Arc::clone(&self.base);
@@ -393,6 +473,14 @@ impl Fs for LocalFs {
         let mutations = Arc::clone(&self.mutations);
         let path = path.to_owned();
         Box::pin(blocking(move || remove(&base, &mutations, &path, recursive)))
+    }
+
+    fn copy<'a>(&'a self, req: CopyRequest<'a>) -> BoxFuture<'a, Outcome<()>> {
+        let base = Arc::clone(&self.base);
+        let mutations = Arc::clone(&self.mutations);
+        let (from, to) = (req.from.to_owned(), req.to.to_owned());
+        let (overwrite, recursive) = (req.overwrite, req.recursive);
+        Box::pin(blocking(move || copy(&base, &mutations, &from, &to, overwrite, recursive)))
     }
 
     fn rename<'a>(&'a self, from: &'a str, to: &'a str, overwrite: bool, _key: &'a IdempotencyKey) -> BoxFuture<'a, Outcome<()>> {

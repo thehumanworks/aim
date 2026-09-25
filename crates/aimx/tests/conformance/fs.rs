@@ -281,3 +281,71 @@ async fn mkdir_remove_rename() {
     assert_eq!(std::fs::read_to_string(env.path("other")).unwrap(), "f");
     assert_eq!(rename("missing", "m2", false).await.unwrap_err().code, ErrorCode::NotFound);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_files_and_trees() {
+    use aim_proto::harness::{FsCopy, FsCopyParams};
+    use std::os::unix::fs::symlink;
+
+    let env = env().await;
+    let (client, _, ws) = session(&env).await;
+    std::fs::create_dir_all(env.path("tree/sub")).unwrap();
+    std::fs::write(env.path("tree/a.sh"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(env.path("tree/a.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(env.path("tree/sub/b"), "b").unwrap();
+    symlink(env.dir.path(), env.path("tree/out-link")).unwrap();
+    let copy = |from: &str, to: &str, overwrite: bool, recursive: bool| {
+        let params = FsCopyParams { workspace: ws.clone(), from: from.into(), to: to.into(), overwrite, recursive, idempotency_key: key() };
+        let peer = client.peer.clone();
+        async move { peer.call::<FsCopy>(params).await }
+    };
+
+    copy("tree/a.sh", "a-copy.sh", false, false).await.unwrap();
+    assert_eq!(std::fs::read_to_string(env.path("a-copy.sh")).unwrap(), "#!/bin/sh\n");
+    assert_eq!(std::fs::metadata(env.path("a-copy.sh")).unwrap().permissions().mode() & 0o777, 0o755);
+    assert_eq!(copy("tree/sub/b", "a-copy.sh", false, false).await.unwrap_err().code, ErrorCode::Conflict);
+    copy("tree/sub/b", "a-copy.sh", true, false).await.unwrap();
+    assert_eq!(std::fs::read_to_string(env.path("a-copy.sh")).unwrap(), "b");
+
+    assert_eq!(copy("tree", "tree2", false, false).await.unwrap_err().code, ErrorCode::Conflict, "directories need recursive");
+    copy("tree", "tree2", false, true).await.unwrap();
+    assert_eq!(std::fs::read_to_string(env.path("tree2/sub/b")).unwrap(), "b");
+    // A link inside the tree is copied as a link, not followed out of the root.
+    assert!(std::fs::symlink_metadata(env.path("tree2/out-link")).unwrap().file_type().is_symlink());
+    assert_eq!(copy("tree", "tree/sub/inner", false, true).await.unwrap_err().code, ErrorCode::Conflict, "not into itself");
+    assert_eq!(copy("tree", "tree2", true, true).await.unwrap_err().code, ErrorCode::Conflict, "never merges into a directory");
+    assert_eq!(copy("tree/out-link", "stolen", false, true).await.unwrap_err().code, ErrorCode::Denied);
+    assert_eq!(copy("missing", "x", false, false).await.unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(copy("tree/sub/b", "../escaped", false, false).await.unwrap_err().code, ErrorCode::Denied);
+    let leftovers: Vec<String> = std::fs::read_dir(&env.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.contains(".aimx-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_many_reports_per_file() {
+    use aim_proto::harness::{FsReadMany, FsReadManyParams, ReadManyEntry};
+
+    let env = env().await;
+    let (client, _, ws) = session(&env).await;
+    std::fs::write(env.path("a"), "alpha").unwrap();
+    std::fs::write(env.path("b"), "beta").unwrap();
+    let params = FsReadManyParams {
+        workspace: ws,
+        paths: vec!["a".into(), "missing".into(), "../outside".into(), "b".into()],
+        max_bytes_per_file: Some(3),
+    };
+    let result = client.peer.call::<FsReadMany>(params).await.unwrap();
+    let summary: Vec<String> = result
+        .entries
+        .into_iter()
+        .map(|entry| match entry {
+            ReadManyEntry::Ok { path, read } => format!("{path}={}{}", content_string(read.content), if read.truncated { "…" } else { "" }),
+            ReadManyEntry::Error { path, code, .. } => format!("{path}!{code}"),
+        })
+        .collect();
+    assert_eq!(summary, ["a=alp…", "missing!not_found", "../outside!denied", "b=bet…"]);
+}

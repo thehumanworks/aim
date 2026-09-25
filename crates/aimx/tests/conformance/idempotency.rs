@@ -156,3 +156,37 @@ async fn expired_records_answer_unknown_outcome() {
     assert_eq!(err.code, ErrorCode::UnknownOutcome);
     assert_eq!(wait_for_lines(&env.path("log"), 1).await, "once\n");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retried_stdin_writes_send_their_bytes_once() {
+    use aim_proto::harness::{ExecRead, ExecReadParams, ExecWriteStdin, ExecWriteStdinParams};
+
+    let env = env().await;
+    let (client, _, ws) = session(&env).await;
+    let mut params = spawn_params(&ws, "cat", &key());
+    params.stdin = true;
+    let proc = client.peer.call::<ExecSpawn>(params).await.unwrap().proc;
+    let k = key();
+    let write = ExecWriteStdinParams { proc: proc.clone(), data: text("once\n"), eof: false, idempotency_key: k };
+    client.peer.call::<ExecWriteStdin>(write.clone()).await.unwrap();
+    client.peer.call::<ExecWriteStdin>(write).await.unwrap();
+    let close = ExecWriteStdinParams { proc: proc.clone(), data: text(""), eof: true, idempotency_key: key() };
+    client.peer.call::<ExecWriteStdin>(close).await.unwrap();
+    let mut out = String::new();
+    let mut cursor = 0;
+    loop {
+        let read = client
+            .peer
+            .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: cursor, max_bytes: None, wait_ms: 5000 })
+            .await
+            .unwrap();
+        for chunk in read.chunks {
+            cursor = chunk.seq;
+            out.push_str(&String::from_utf8(chunk.data.into_bytes()).unwrap());
+        }
+        if read.exit.is_some() {
+            break;
+        }
+    }
+    assert_eq!(out, "once\n");
+}

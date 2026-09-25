@@ -18,6 +18,10 @@ use aim_proto::harness::{
     ExecRead, ExecRelease, ExecResize, ExecSignal, ExecSpawn, ExecWriteStdin, FsEdit, FsList, FsMkdir, FsRead, FsRemove, FsRename, FsStat,
     FsWrite, Glob, Grep, Initialize, ToolsCall, ToolsList, WorkspaceOpen,
 };
+use aim_proto::harness::{
+    ExecWait, ExecWaitParams, ExecWaitResult, FsCopy, FsCopyParams, FsReadMany, FsReadManyParams, FsReadManyResult, ReadManyEntry,
+    WatchStart, WatchStartParams, WatchStartResult, WatchStop, WatchStopParams,
+};
 use aim_proto::ids::{IdempotencyKey, ResumeToken, WorkspaceId};
 use aim_proto::rpc::Method as _;
 use aim_proto::tool::ToolResult;
@@ -31,7 +35,7 @@ use crate::authz::confine::normalize;
 use crate::authz::{Access, Grant};
 use crate::tools::{self, ToolCtx};
 use crate::workspace::local::{LocalConfig, LocalWorkspace, canonical_root};
-use crate::workspace::{EditRequest, GlobQuery, GrepQuery, ListRequest, Outcome, SpawnSpec, WriteRequest};
+use crate::workspace::{CopyRequest, EditRequest, GlobQuery, GrepQuery, ListRequest, Outcome, SpawnSpec, WriteRequest};
 
 /// Default and maximum `fs.list` page.
 const LIST_DEFAULT: u32 = 1000;
@@ -39,6 +43,8 @@ const LIST_MAX: u32 = 10_000;
 /// Default and maximum search results.
 const SEARCH_DEFAULT: u32 = 1000;
 const SEARCH_MAX: u32 = 100_000;
+/// Most files one `fs.read_many` may name.
+const READ_MANY_MAX: usize = 1000;
 /// Default `exec.read` payload and longest wait.
 const EXEC_READ_DEFAULT: u64 = 1024 * 1024;
 const EXEC_WAIT_MAX: Duration = Duration::from_secs(300);
@@ -88,6 +94,12 @@ pub(super) fn router(state: Arc<State>, id: u64) -> Router<Conn> {
     let router = route!(router, FsMkdir, fs_mkdir);
     let router = route!(router, FsRemove, fs_remove);
     let router = route!(router, FsRename, fs_rename);
+    let router = route!(router, FsReadMany, fs_read_many);
+    let router = route!(router, FsCopy, fs_copy);
+    let router = route!(router, ExecWait, exec_wait);
+    let router = router
+        .method::<WatchStart, _, _>(|conn: Arc<Conn>, _ctx: RequestCtx, params| async move { conn.watch_start(&params) })
+        .method::<WatchStop, _, _>(|conn: Arc<Conn>, _ctx: RequestCtx, params| async move { conn.watch_stop(&params) });
     let router = route!(router, ExecSpawn, exec_spawn);
     let router = route!(router, ExecRead, exec_read);
     let router = route!(router, ExecWriteStdin, exec_write_stdin);
@@ -277,6 +289,58 @@ impl Conn {
         .await
     }
 
+    /// Reads several files; per-file failures are entries, and once the total reaches
+    /// `max_read_bytes` the remaining files answer `limit_exceeded` (so the reply fits a message).
+    async fn fs_read_many(self: Arc<Self>, params: FsReadManyParams) -> Outcome<FsReadManyResult> {
+        let (_, ws) = self.workspace(&params.workspace)?;
+        if params.paths.len() > READ_MANY_MAX {
+            return Err(ProtoError::new(ErrorCode::LimitExceeded, format!("at most {READ_MANY_MAX} paths per fs.read_many")));
+        }
+        let cap = self.state.config.max_read_bytes.max(1);
+        let per_file = params.max_bytes_per_file.unwrap_or(cap).clamp(1, cap);
+        let mut budget = cap;
+        let mut entries = Vec::with_capacity(params.paths.len());
+        for path in params.paths {
+            let read = match ws.grant.path(&path, Access::Read) {
+                Err(err) => Err(err),
+                Ok(_) if budget == 0 => {
+                    Err(ProtoError::new(ErrorCode::LimitExceeded, "fs.read_many byte budget spent; read the rest separately"))
+                }
+                Ok(confined) => ws.backend.fs().read(&confined, None, per_file.min(budget)).await,
+            };
+            entries.push(match read {
+                Ok(read) => {
+                    budget = budget.saturating_sub(read.content.len() as u64);
+                    ReadManyEntry::Ok { path, read }
+                }
+                Err(err) => ReadManyEntry::Error { path, code: err.code.name().to_owned(), message: err.message },
+            });
+        }
+        Ok(FsReadManyResult { entries })
+    }
+
+    async fn fs_copy(self: Arc<Self>, params: FsCopyParams) -> Outcome<()> {
+        let (_, ws) = self.workspace(&params.workspace)?;
+        let from = ws.grant.path(&params.from, Access::Read)?;
+        let to = ws.grant.path(&params.to, Access::Tree)?;
+        let (key, overwrite, recursive) = (params.idempotency_key.clone(), params.overwrite, params.recursive);
+        let target = Arc::clone(&ws);
+        self.idempotent(&ws, &params.idempotency_key, FsCopy::NAME, &params, async move {
+            target.backend.fs().copy(CopyRequest { from: &from, to: &to, overwrite, recursive, key: &key }).await
+        })
+        .await
+    }
+
+    #[expect(clippy::unused_self, reason = "every handler is a method of the connection, whether it needs it or not")]
+    fn watch_start(&self, _params: &WatchStartParams) -> Outcome<WatchStartResult> {
+        Err(ProtoError::new(ErrorCode::Unavailable, "file watching is not available on this backend (caps.watch is false)"))
+    }
+
+    #[expect(clippy::unused_self, reason = "every handler is a method of the connection, whether it needs it or not")]
+    fn watch_stop(&self, params: &WatchStopParams) -> Outcome<()> {
+        Err(ProtoError::new(ErrorCode::NotFound, format!("unknown watch `{}`", params.watch)))
+    }
+
     async fn exec_spawn(self: Arc<Self>, params: ExecSpawnParams) -> Outcome<ExecSpawnResult> {
         let (session, ws) = self.workspace(&params.workspace)?;
         ws.grant.exec()?;
@@ -339,6 +403,24 @@ impl Conn {
         ws.grant.exec()?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
         exec.signal(&params.proc, params.signal).await
+    }
+
+    /// Waits for a process to end: a read after every possible `seq` returns as soon as the process
+    /// has exited, whatever output remains unread.
+    async fn exec_wait(self: Arc<Self>, params: ExecWaitParams) -> Outcome<ExecWaitResult> {
+        let ws = self.session()?.proc_workspace(&params.proc)?;
+        let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
+        let deadline = params.timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+        loop {
+            let wait = deadline.map_or(EXEC_WAIT_MAX, |d| d.saturating_duration_since(tokio::time::Instant::now()).min(EXEC_WAIT_MAX));
+            let read = exec.read(&params.proc, u64::MAX, 1, wait).await?;
+            if read.exit.is_some() {
+                return Ok(ExecWaitResult { exit: read.exit });
+            }
+            if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                return Ok(ExecWaitResult { exit: None });
+            }
+        }
     }
 
     async fn exec_release(self: Arc<Self>, params: ExecReleaseParams) -> Outcome<()> {

@@ -102,3 +102,17 @@ async fn workspaces_are_scoped_to_their_session() {
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watch_is_reported_unavailable() {
+    use aim_proto::harness::{WatchStart, WatchStartParams, WatchStop, WatchStopParams};
+
+    let env = env().await;
+    let client = connect(&env.socket).await;
+    initialize(&client, None).await;
+    let ws = open(&client, &env.root).await;
+    let err = client.peer.call::<WatchStart>(WatchStartParams { workspace: ws, path: ".".into() }).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable);
+    let err = client.peer.call::<WatchStop>(WatchStopParams { watch: "w".into() }).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+}
