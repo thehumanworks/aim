@@ -1,0 +1,35 @@
+[package]
+name = "aim-coderun"
+description = "Crash-isolated JavaScript and TypeScript code-mode worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "aim-coderun"
+path = "src/main.rs"
+
+[dependencies]
+aim-proto = { path = "../aim-proto" }
+aim-rpc = { path = "../aim-rpc" }
+oxc_allocator = "=0.151.0"
+oxc_ast = "=0.151.0"
+oxc_ast_visit = "=0.151.0"
+oxc_codegen = "=0.151.0"
+oxc_parser = "=0.151.0"
+oxc_semantic = "=0.151.0"
+oxc_span = "=0.151.0"
+oxc_transformer = "=0.151.0"
+rquickjs = { version = "=0.14.0", features = ["futures", "parallel"] }
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["process", "io-util"] }
+
+[lints]
+workspace = true
