@@ -200,7 +200,9 @@ pub trait SessionClient: Send + Sync {
     fn prompt(&self, session: String, parts: Vec<Part>) -> BoxFuture<Result<PromptOutcome, ProtoError>>;
     /// Cancels the running turn.
     fn cancel(&self, session: String) -> BoxFuture<Result<(), ProtoError>>;
-    /// Changes model or effort (applies from the next turn when one is running).
+    /// Changes model or effort. When idle it applies at once and a refusal (e.g. an effort the
+    /// model does not offer) is the error; while a turn runs it is accepted and applies as the turn
+    /// ends (a refusal then is logged, and `ConfigChanged` always announces the state in force).
     fn set_config(&self, params: SessionConfigParams) -> BoxFuture<Result<(), ProtoError>>;
     /// Stops the session's agent; the log remains.
     fn close(&self, session: String) -> BoxFuture<Result<(), ProtoError>>;
@@ -221,7 +223,13 @@ pub struct HostConfig {
 enum Control {
     Prompt(Vec<Part>, oneshot::Sender<PromptOutcome>),
     Cancel,
-    SetConfig { model: Option<String>, effort: Option<String> },
+    /// A config change; the reply says whether it applied (at once when idle), or that it was
+    /// accepted for after the running turn.
+    SetConfig {
+        model: Option<String>,
+        effort: Option<String>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Close,
 }
 
@@ -247,13 +255,21 @@ pub struct SessionHost {
     sessions: Arc<Mutex<HashMap<String, Arc<Live>>>>,
     /// Serializes resuming stored sessions so one is never started twice.
     resuming: Arc<tokio::sync::Mutex<()>>,
+    /// `true` once shutdown began. Starting a session holds a read guard until the session is
+    /// live, so shutdown (a write guard) waits for starts in flight and later starts are refused.
+    closing: Arc<tokio::sync::RwLock<bool>>,
 }
 
 impl SessionHost {
     /// A host with no sessions.
     #[must_use]
     pub fn new(config: HostConfig) -> Self {
-        Self { config, sessions: Arc::new(Mutex::new(HashMap::new())), resuming: Arc::new(tokio::sync::Mutex::new(())) }
+        Self {
+            config,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            resuming: Arc::new(tokio::sync::Mutex::new(())),
+            closing: Arc::new(tokio::sync::RwLock::new(false)),
+        }
     }
 
     /// Closes every live session and waits for each actor and workspace shutdown to finish.
@@ -261,6 +277,8 @@ impl SessionHost {
     /// # Errors
     /// Returns `timeout` if an actor or workspace does not finish within ten seconds.
     pub async fn shutdown(&self) -> Result<(), ProtoError> {
+        // Waits for sessions that are still starting; none can start afterwards.
+        *self.closing.write().await = true;
         let live: Vec<Arc<Live>> = lock(&self.sessions).values().cloned().collect();
         for session in live {
             let _closed = session.control.send(Control::Close);
@@ -279,6 +297,10 @@ impl SessionHost {
     }
 
     async fn start(&self, spec: SessionSpec, resume: Option<Resume>) -> Result<SessionSummary, ProtoError> {
+        let open = self.closing.read().await;
+        if *open {
+            return Err(err(ErrorCode::Unavailable, "the host is shutting down"));
+        }
         let session_id = resume.as_ref().map_or_else(session::new_session_id, |r| r.meta.id.clone());
         // The user sees the whole history; the model continues from its compacted context.
         let transcript = resume.as_ref().map(|r| items_of(&r.events)).unwrap_or_default();
@@ -340,7 +362,7 @@ impl SessionHost {
         let (control, control_rx) = mpsc::unbounded_channel();
         let live = Arc::new(Live { summary: Mutex::new(summary.clone()), transcript: Mutex::new(transcript), updates, control });
         lock(&self.sessions).insert(meta.id.clone(), Arc::clone(&live));
-        let actor = Actor { live: Arc::clone(&live), backend, recorder, root, location };
+        let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location };
         let sessions = Arc::clone(&self.sessions);
         let id = meta.id.clone();
         tokio::spawn(async move {
@@ -351,6 +373,7 @@ impl SessionHost {
                 sessions.remove(&id);
             }
         });
+        drop(open);
         Ok(summary)
     }
 
@@ -403,6 +426,10 @@ struct Actor {
     live: Arc<Live>,
     backend: Box<dyn Backend>,
     recorder: Recorder,
+    /// Why the session log can no longer be written. After the first failed append nothing more
+    /// is recorded, the running turn is stopped and reported failed, and the session closes, so the
+    /// log ends cleanly where it failed (ADR 0036).
+    broken: Option<String>,
     root: String,
     location: String,
 }
@@ -419,10 +446,22 @@ fn set_state(live: &Live, state: SessionState) {
 
 /// Records, mirrors and fans out one update, in order. Finished items are mirrored and broadcast
 /// under the transcript lock so `attach` sees each item exactly once.
-async fn publish(live: &Live, recorder: &mut Recorder, update: SessionUpdate) {
-    if recorder.observe(&update).await.is_err() {
-        tracing::warn!(session = recorder.session(), "could not record an update");
+///
+/// Once the log is `broken`, nothing more is recorded, and the turn's terminal event is reported as
+/// the store failure: a client never sees a successful turn whose log is incomplete.
+async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<String>, update: SessionUpdate) {
+    if broken.is_none()
+        && let Err(e) = recorder.observe(&update).await
+    {
+        tracing::warn!(session = recorder.session(), error = %e, "the session log could not be written; closing the session");
+        *broken = Some(format!("store: the session log could not be written ({e}); the session is closed"));
     }
+    let update = match (broken.as_ref(), update) {
+        (Some(why), SessionUpdate::TurnEnded { .. } | SessionUpdate::TurnFailed { .. }) => {
+            SessionUpdate::TurnFailed { message: why.clone() }
+        }
+        (_, update) => update,
+    };
     if let SessionUpdate::ItemAdded { item } = &update {
         let mut transcript = lock(&live.transcript);
         transcript.push(item.clone());
@@ -442,28 +481,38 @@ impl Actor {
                     // The requester learns the turn number before it runs.
                     let _gone = reply.send(PromptOutcome::Started { turn });
                     let closing = self.run_turn(parts, &mut control, &mut pending_config).await;
-                    // Changes asked for during the turn apply now, before any later control.
-                    if let Some((model, effort)) = pending_config.take() {
-                        self.apply_config(model, effort).await;
+                    // Changes asked for during the turn apply now, before any later control. Their
+                    // requesters were already answered; a refusal is logged, and the state in force
+                    // is what `ConfigChanged` announces.
+                    if let Some((model, effort)) = pending_config.take()
+                        && let Err(message) = self.apply_config(model, effort).await
+                    {
+                        tracing::warn!(session = self.recorder.session(), %message, "a deferred config change was refused");
                     }
                     if closing {
                         break;
                     }
                 }
                 Control::Cancel => {}
-                Control::SetConfig { model, effort } => self.apply_config(model, effort).await,
+                Control::SetConfig { model, effort, reply } => {
+                    let applied = self.apply_config(model, effort).await;
+                    let _gone = reply.send(applied);
+                }
                 Control::Close => break,
+            }
+            if self.broken.is_some() {
+                break;
             }
         }
         set_state(&self.live, SessionState::Closed);
         self.backend.shutdown().await;
     }
 
-    async fn apply_config(&mut self, model: Option<String>, effort: Option<String>) {
-        match self.backend.set_config(model, effort).await {
-            Ok((model, effort)) => publish(&self.live, &mut self.recorder, SessionUpdate::ConfigChanged { model, effort }).await,
-            Err(message) => tracing::warn!(session = self.recorder.session(), %message, "the backend refused a config change"),
-        }
+    /// Applies a config change and announces what is now in force.
+    async fn apply_config(&mut self, model: Option<String>, effort: Option<String>) -> Result<(), String> {
+        let (model, effort) = self.backend.set_config(model, effort).await?;
+        publish(&self.live, &mut self.recorder, &mut self.broken, SessionUpdate::ConfigChanged { model, effort }).await;
+        Ok(())
     }
 
     /// Runs one turn while serving control messages; returns whether a close arrived.
@@ -473,9 +522,14 @@ impl Actor {
         control: &mut mpsc::UnboundedReceiver<Control>,
         pending_config: &mut Option<(Option<String>, Option<String>)>,
     ) -> bool {
-        let Self { live, backend, recorder, root, location } = self;
-        if recorder.begin_turn().await.is_err() {
-            tracing::warn!(session = recorder.session(), "could not record the turn start");
+        let Self { live, backend, recorder, broken, root, location } = self;
+        if let Err(e) = recorder.begin_turn().await {
+            // Nothing ran: report the failure as this turn's only terminal event and close.
+            let why = format!("store: the session log could not be written ({e}); the session is closed");
+            tracing::warn!(session = recorder.session(), %why);
+            let _unwatched = live.updates.send(SessionUpdate::TurnFailed { message: why.clone() });
+            *broken = Some(why);
+            return true;
         }
         set_state(live, SessionState::Running);
         let turn_no = recorder.turns();
@@ -506,17 +560,24 @@ impl Actor {
                         }
                         break;
                     }
-                    Some(update) = events_rx.recv() => publish(live, recorder, update).await,
+                    Some(update) = events_rx.recv() => {
+                        publish(live, recorder, broken, update).await;
+                        if broken.is_some() {
+                            // The log failed: stop the turn; it winds down and reports the failure.
+                            cancel.cancel();
+                        }
+                    }
                     Some(message) = control.recv() => match message {
                         Control::Prompt(steer, reply) => {
                             let _gone = reply.send(PromptOutcome::Steered);
                             let _ended = steer_tx.send(steer);
                         }
                         Control::Cancel => cancel.cancel(),
-                        Control::SetConfig { model, effort } => {
+                        Control::SetConfig { model, effort, reply } => {
                             // Later requests win field by field; unspecified fields keep earlier ones.
                             let (pending_model, pending_effort) = pending_config.take().unwrap_or_default();
                             *pending_config = Some((model.or(pending_model), effort.or(pending_effort)));
+                            let _gone = reply.send(Ok(()));
                         }
                         Control::Close => {
                             closing = true;
@@ -528,7 +589,7 @@ impl Actor {
         }
         drop(events_tx);
         while let Some(update) = events_rx.recv().await {
-            publish(live, recorder, update).await;
+            publish(live, recorder, broken, update).await;
         }
         // Steering that arrived as the turn finished was never read: hand it back.
         let mut unsent = Vec::new();
@@ -536,10 +597,10 @@ impl Actor {
             unsent.push(steer);
         }
         if !unsent.is_empty() {
-            publish(live, recorder, SessionUpdate::SteersReturned { steers: unsent }).await;
+            publish(live, recorder, broken, SessionUpdate::SteersReturned { steers: unsent }).await;
         }
         set_state(live, SessionState::Idle);
-        closing
+        closing || broken.is_some()
     }
 }
 
@@ -647,10 +708,16 @@ impl SessionClient for SessionHost {
     fn set_config(&self, params: SessionConfigParams) -> BoxFuture<Result<(), ProtoError>> {
         let live = self.live(&params.session);
         Box::pin(async move {
+            let (reply, answer) = oneshot::channel();
             live?
                 .control
-                .send(Control::SetConfig { model: params.model, effort: params.effort })
-                .map_err(|_| err(ErrorCode::Unavailable, "session closed"))
+                .send(Control::SetConfig { model: params.model, effort: params.effort, reply })
+                .map_err(|_| err(ErrorCode::Unavailable, "session closed"))?;
+            match answer.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(message)) => Err(err(ErrorCode::InvalidParams, message)),
+                Err(_) => Err(err(ErrorCode::Unavailable, "session closed")),
+            }
         })
     }
 

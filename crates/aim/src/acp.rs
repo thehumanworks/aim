@@ -144,6 +144,27 @@ impl Bridge {
     }
 }
 
+/// Whether `value` is one the agent advertises for `key` (by category, else by conventional id).
+fn check_option(options: &[ConfigOption], key: &ConfigKey, value: &str) -> Result<(), String> {
+    let (category, id) = match key {
+        ConfigKey::Model => ("model", "model"),
+        ConfigKey::Effort => ("thought_level", "effort"),
+        ConfigKey::Mode => ("mode", "mode"),
+        ConfigKey::Id(id) => ("", id.as_str()),
+    };
+    let option = options
+        .iter()
+        .find(|o| (!category.is_empty() && o.category.as_deref() == Some(category)) || o.id == id)
+        .ok_or_else(|| format!("the agent offers no {} option", key.label()))?;
+    match &option.kind {
+        aim_acp::ConfigKind::Select { values, .. } if !values.iter().any(|v| v.value == value) => {
+            let offered: Vec<&str> = values.iter().map(|v| v.value.as_str()).collect();
+            Err(format!("{} `{value}` is not offered (offers: {})", key.label(), offered.join(", ")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The model and effort an agent reports in its configuration options.
 #[must_use]
 pub fn current_config(options: &[ConfigOption]) -> (String, Option<String>) {
@@ -392,6 +413,13 @@ impl Backend for AcpBackend {
 
     fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<(String, Option<String>), String>> {
         Box::pin(async move {
+            // Check both values against what the agent advertises before changing anything, so a
+            // refused effort cannot leave a changed model behind.
+            for (key, value) in [(ConfigKey::Model, &model), (ConfigKey::Effort, &effort)] {
+                if let Some(value) = value {
+                    check_option(self.session.config_options(), &key, value)?;
+                }
+            }
             if let Some(model) = model {
                 self.session.set_config(&ConfigKey::Model, &model).await.map_err(|e| e.to_string())?;
             }

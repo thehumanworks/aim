@@ -4,19 +4,20 @@
 #![expect(clippy::unnecessary_wraps, reason = "scripted streams are sequences of Results")]
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture, ToolHost};
 use aim::host::{Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends};
-use aim::store::{MemoryStore, SessionStore};
+use aim::store::{MemoryStore, SessionStore, StoreError, StoredSessionSummary};
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
 use aim_proto::daemon::{
     Location, Persistence, PromptOutcome, SessionConfigParams, SessionListParams, SessionSpec, SessionState, SessionUpdate,
 };
-use aim_proto::error::ProtoError;
+use aim_proto::error::{ErrorCode, ProtoError};
+use aim_proto::event::{SessionEvent, SessionMeta};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolAnnotations, ToolResult, ToolSpec};
 use futures_util::StreamExt as _;
@@ -25,6 +26,7 @@ use serde_json::{Value, json};
 struct Scripted {
     responses: Mutex<VecDeque<Vec<Result<StreamEvent, LlmError>>>>,
     seen: Mutex<Vec<Request>>,
+    models: Vec<ModelInfo>,
 }
 
 impl ModelProvider for Scripted {
@@ -33,7 +35,8 @@ impl ModelProvider for Scripted {
     }
 
     fn catalog(&self) -> LlmFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
-        Box::pin(async { Ok(Vec::new()) })
+        let models = self.models.clone();
+        Box::pin(async move { Ok(models) })
     }
 
     fn stream(&self, request: Request) -> LlmFuture<'_, Result<EventStream, LlmError>> {
@@ -103,7 +106,16 @@ fn fixture(script: Vec<Vec<Result<StreamEvent, LlmError>>>) -> Fixture {
 }
 
 fn fixture_with(store: Arc<MemoryStore>, script: Vec<Vec<Result<StreamEvent, LlmError>>>) -> Fixture {
-    let provider = Arc::new(Scripted { responses: Mutex::new(script.into()), seen: Mutex::default() });
+    fixture_full(Arc::clone(&store) as Arc<dyn SessionStore>, store, script, Vec::new())
+}
+
+fn fixture_full(
+    backing: Arc<dyn SessionStore>,
+    store: Arc<MemoryStore>,
+    script: Vec<Vec<Result<StreamEvent, LlmError>>>,
+    models: Vec<ModelInfo>,
+) -> Fixture {
+    let provider = Arc::new(Scripted { responses: Mutex::new(script.into()), seen: Mutex::default(), models });
     let connects = Arc::new(AtomicUsize::new(0));
     let shutdowns = Arc::new(AtomicUsize::new(0));
     let (c, s) = (Arc::clone(&connects), Arc::clone(&shutdowns));
@@ -130,7 +142,7 @@ fn fixture_with(store: Arc<MemoryStore>, script: Vec<Vec<Result<StreamEvent, Llm
     });
     let for_factory = Arc::clone(&provider);
     let host = SessionHost::new(HostConfig {
-        store: Arc::clone(&store) as Arc<dyn SessionStore>,
+        store: backing,
         backends: native_backends(
             Arc::new(move |_name, _model| Ok((Arc::clone(&for_factory) as Arc<dyn ModelProvider>, "m1".to_owned()))),
             workspaces,
@@ -378,4 +390,92 @@ async fn a_resumed_session_keeps_its_initial_effort() {
     until(&mut updates, is_idle).await;
     let seen = second.provider.seen.lock().unwrap().clone();
     assert_eq!(seen[0].effort.as_deref(), Some("high"), "the effort chosen at creation survives a restart");
+}
+
+/// A store whose appends start failing when told to.
+struct Failing {
+    inner: Arc<MemoryStore>,
+    fail: AtomicBool,
+}
+
+impl SessionStore for Failing {
+    fn create(&self, meta: SessionMeta) -> BoxFuture<Result<(), StoreError>> {
+        self.inner.create(meta)
+    }
+
+    fn append(&self, session: String, events: Vec<SessionEvent>) -> BoxFuture<Result<(), StoreError>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(StoreError::Backend("disk full".into())) });
+        }
+        self.inner.append(session, events)
+    }
+
+    fn load(&self, session: String) -> BoxFuture<Result<(SessionMeta, Vec<SessionEvent>), StoreError>> {
+        self.inner.load(session)
+    }
+
+    fn list(&self, limit: u32) -> BoxFuture<Result<Vec<SessionMeta>, StoreError>> {
+        self.inner.list(limit)
+    }
+
+    fn summarize(&self, limit: u32) -> BoxFuture<Result<Vec<StoredSessionSummary>, StoreError>> {
+        self.inner.summarize(limit)
+    }
+}
+
+#[tokio::test]
+async fn a_log_that_cannot_be_written_fails_the_turn_and_closes_the_session() {
+    let memory = Arc::new(MemoryStore::default());
+    let failing = Arc::new(Failing { inner: Arc::clone(&memory), fail: AtomicBool::new(false) });
+    let f = fixture_full(Arc::clone(&failing) as Arc<dyn SessionStore>, memory, vec![slow_call("a", 50), text("done")], Vec::new());
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    f.host.prompt(id.clone(), user("go")).await.unwrap();
+    until(&mut updates, |u| matches!(u, SessionUpdate::ToolStarted { .. })).await;
+    failing.fail.store(true, Ordering::SeqCst);
+    let rest: Vec<SessionUpdate> = tokio::time::timeout(Duration::from_secs(5), updates.collect()).await.unwrap();
+    let terminal: Vec<&SessionUpdate> =
+        rest.iter().filter(|u| matches!(u, SessionUpdate::TurnEnded { .. } | SessionUpdate::TurnFailed { .. })).collect();
+    assert!(matches!(terminal.as_slice(), [SessionUpdate::TurnFailed { message }] if message.starts_with("store:")), "{terminal:?}");
+    assert_eq!(rest.last(), Some(&SessionUpdate::StateChanged { state: SessionState::Closed }));
+    assert!(f.host.prompt(id, user("again")).await.is_err(), "the session closed");
+}
+
+#[tokio::test]
+async fn an_effort_the_model_does_not_offer_is_refused_when_idle() {
+    let model = ModelInfo {
+        id: "m1".into(),
+        display_name: "m1".into(),
+        context_window: Some(100_000),
+        efforts: vec!["low".into(), "high".into()],
+        default_effort: None,
+        tiers: Vec::new(),
+        tools: true,
+        images: false,
+        hidden: false,
+        native: None,
+    };
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, Vec::new(), vec![model]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let refused = f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("ultra".into()) }).await;
+    assert_eq!(refused.map_err(|e| e.code), Err(ErrorCode::InvalidParams));
+    let unknown = f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("nope".into()), effort: None }).await;
+    assert_eq!(unknown.map_err(|e| e.code), Err(ErrorCode::InvalidParams));
+    assert!(f.host.set_config(SessionConfigParams { session: id, model: None, effort: Some("high".into()) }).await.is_ok());
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_a_starting_session_and_refuses_new_ones() {
+    let f = fixture(Vec::new());
+    let host = f.host.clone();
+    // The workspace takes 20 ms to connect: shutdown begins while the session is starting.
+    let starting = tokio::spawn(async move { host.create(spec(Persistence::Ephemeral)).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    f.host.shutdown().await.unwrap();
+    let started = starting.await.unwrap().unwrap();
+    assert!(f.host.prompt(started.meta.id, user("hi")).await.is_err(), "no session outlives shutdown");
+    let late = f.host.create(spec(Persistence::Ephemeral)).await.map_err(|e| e.code);
+    assert_eq!(late.err(), Some(ErrorCode::Unavailable));
+    assert_eq!(f.shutdowns.load(Ordering::SeqCst), 1, "its workspace was shut down");
 }

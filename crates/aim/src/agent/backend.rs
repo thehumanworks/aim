@@ -65,20 +65,40 @@ impl Backend for Agent {
     }
 
     fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<(String, Option<String>), String>> {
-        if effort.is_some() {
-            self.set_explicit_effort();
-        }
-        if model.is_some() {
-            self.forget_window();
-        }
-        let config = self.config_mut();
-        if let Some(model) = model {
-            config.model = model;
-        }
-        if effort.is_some() {
-            config.effort = effort;
-        }
-        let now = (config.model.clone(), config.effort.clone());
-        Box::pin(async move { Ok(now) })
+        Box::pin(async move {
+            if model.is_some() || effort.is_some() {
+                // Capabilities are data: check the change against the provider's catalog before
+                // anything changes. Without a catalog (it failed, or lists nothing) the change is
+                // taken on trust and the provider has the last word.
+                let target = model.clone().unwrap_or_else(|| self.config.model.clone());
+                if let Ok(models) = self.provider.catalog().await
+                    && !models.is_empty()
+                {
+                    let Some(info) = models.iter().find(|m| m.id == target) else {
+                        return Err(format!("model `{target}` is not in the {} catalog", self.provider.id()));
+                    };
+                    if let Some(effort) = &effort
+                        && !info.efforts.is_empty()
+                        && !info.efforts.contains(effort)
+                    {
+                        return Err(format!("effort `{effort}` is not offered by `{target}` (offers: {})", info.efforts.join(", ")));
+                    }
+                }
+            }
+            if effort.is_some() {
+                self.set_explicit_effort();
+            }
+            if model.is_some() {
+                self.forget_window();
+            }
+            let config = self.config_mut();
+            if let Some(model) = model {
+                config.model = model;
+            }
+            if effort.is_some() {
+                config.effort = effort;
+            }
+            Ok((config.model.clone(), config.effort.clone()))
+        })
     }
 }
