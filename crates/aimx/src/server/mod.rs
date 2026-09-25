@@ -6,6 +6,7 @@
 //! principal and the grant of the workspace it names.
 
 mod handlers;
+mod journal;
 pub mod network;
 mod session;
 pub mod token;
@@ -76,6 +77,9 @@ pub struct ServerConfig {
     pub max_procs: usize,
     /// Maximum processes with a pseudo-terminal running at once (each holds two threads).
     pub max_ptys: usize,
+    /// The durable reservation journal's directory ([`reservation_journal_dir`]); `None` keeps
+    /// no journal, so only a session's end (or its resume TTL) removes its unused markers.
+    pub reservation_journal: Option<std::path::PathBuf>,
 }
 
 impl ServerConfig {
@@ -104,6 +108,7 @@ impl ServerConfig {
             max_procs_per_session: 64,
             max_procs: 256,
             max_ptys: 64,
+            reservation_journal: None,
         }
     }
 
@@ -136,7 +141,8 @@ pub fn local_principal(roots: &[impl AsRef<Path>], read_only: bool) -> io::Resul
 }
 
 /// Reads the default protected set and write-protects the whole aim state directory, including
-/// worker receipts and the daemon socket. An explicit `AIM_HOME` is protected too.
+/// worker receipts, the daemon socket and the reservation journal ([`reservation_journal_dir`]).
+/// An explicit `AIM_HOME` is protected too.
 #[must_use]
 pub fn default_protected(home: &str) -> ProtectedPaths {
     let explicit = std::env::var_os("AIM_HOME");
@@ -154,6 +160,12 @@ fn protected_aim_home(home: &str, explicit: Option<&Path>) -> ProtectedPaths {
         }
     }
     protected
+}
+
+/// Where the servers of the user whose home is `home` journal live file reservations (ADR 0067).
+#[must_use]
+pub fn reservation_journal_dir(home: &str) -> std::path::PathBuf {
+    Path::new(home).join(".aim/aimx/reservations")
 }
 
 /// Adds the canonical spelling of every protected path (its deepest existing ancestor resolved,
@@ -200,6 +212,8 @@ pub(crate) struct State {
     procs: Arc<Semaphore>,
     /// Running pty processes.
     ptys: Arc<Semaphore>,
+    /// The durable reservation journal, when configured.
+    journal: Option<journal::Journal>,
 }
 
 impl std::fmt::Debug for State {
@@ -397,6 +411,7 @@ impl Server {
             fixed_workspace,
             procs: Arc::new(Semaphore::new(config.max_procs.min(Semaphore::MAX_PERMITS))),
             ptys: Arc::new(Semaphore::new(config.max_ptys.min(Semaphore::MAX_PERMITS))),
+            journal: config.reservation_journal.clone().map(journal::Journal::new),
             config,
         });
         let every = (state.config.resume_ttl / 4).clamp(Duration::from_millis(50), Duration::from_secs(10));

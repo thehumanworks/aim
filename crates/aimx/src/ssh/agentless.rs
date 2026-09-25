@@ -476,6 +476,31 @@ impl Fs for AgentlessWorkspace {
     fn write<'a>(&'a self, req: WriteRequest<'a>) -> BoxFuture<'a, Outcome<WriteOutcome>> {
         Box::pin(async move { self.write_file(req).await })
     }
+    fn supports_reservations(&self) -> bool {
+        true
+    }
+    /// Removes a reservation marker only while it has `hash`: the compare and the `rm` run in one
+    /// remote script under this backend's mutation lock, so no aimx write interleaves (`REV13a` M6).
+    /// A marker replaced by a symlink is never followed. As ADR 0054 states, a same-user process
+    /// outside aimx could still swap the file between the compare and the `rm`.
+    fn cancel_if_hash<'a>(&'a self, path: &'a str, hash: &'a ContentHash) -> BoxFuture<'a, Outcome<()>> {
+        Box::pin(async move {
+            let _mutation = self.mutations.lock().await;
+            let target = self.safe(path, false).await?;
+            let script = format!(
+                "p={}; t={}; [ -L \"$p\" ] && exit 42; [ -f \"$t\" ] || exit 44; if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < \"$t\"); elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < \"$t\"); else exit 127; fi; [ \"sha256:${{h%% *}}\" = {} ] || exit 42; rm -f -- \"$t\"",
+                quote(path),
+                quote(&target),
+                quote(&hash.0)
+            );
+            match self.run_status(&script, &[]).await?.0 {
+                0 => Ok(()),
+                42 => Err(error(ErrorCode::PreconditionFailed, "reservation marker changed")),
+                44 => Err(error(ErrorCode::NotFound, "reservation marker is gone")),
+                _ => Err(error(ErrorCode::Unavailable, "remote reservation cancel failed")),
+            }
+        })
+    }
     fn edit<'a>(&'a self, req: EditRequest<'a>) -> BoxFuture<'a, Outcome<EditOutcome>> {
         Box::pin(async move {
             let _mutation = self.mutations.lock().await;

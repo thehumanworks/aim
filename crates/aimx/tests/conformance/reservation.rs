@@ -160,3 +160,116 @@ async fn abandoned_reservation_is_cleaned_after_resume_window() {
     .await
     .unwrap();
 }
+
+/// A spawned `aimx serve --stdio` whose home (and so reservation journal) is `home`.
+struct Served {
+    child: tokio::process::Child,
+    client: crate::common::Client,
+    ws: aim_proto::ids::WorkspaceId,
+}
+
+async fn serve(home: &std::path::Path, root: &std::path::Path) -> Served {
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_aimx"))
+        .args(["serve", "--stdio", "--root"])
+        .arg(root)
+        .env("HOME", home)
+        .env("AIMX_LOG", "off")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let client = crate::common::client_over(child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    crate::common::initialize(&client, None).await;
+    let ws = crate::common::open(&client, root).await;
+    Served { child, client, ws }
+}
+
+async fn reserve_at(served: &Served, path: &str) -> String {
+    served
+        .client
+        .peer
+        .call::<FsReserve>(FsReserveParams {
+            workspace: served.ws.clone(),
+            path: path.into(),
+            if_absent: true,
+            idempotency_key: key(),
+            scope: None,
+        })
+        .await
+        .unwrap()
+        .reservation
+}
+
+fn journal_entries(home: &std::path::Path) -> usize {
+    std::fs::read_dir(home.join(".aim/aimx/reservations")).map_or(0, |dir| dir.flatten().count())
+}
+
+fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let root = dir.path().join("ws");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    (dir, home, root)
+}
+
+/// `REV13a` M5: the marker of an aimx killed before its session ended is removed at the next open
+/// of its root, through the durable journal (ADR 0067).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_servers_marker_is_swept_at_the_next_open() {
+    let (_dir, home, root) = fixture();
+    let mut first = serve(&home, &root).await;
+    reserve_at(&first, "art/killed.png").await;
+    assert!(root.join("art/killed.png").exists());
+    assert_eq!(journal_entries(&home), 1);
+    let journal = home.join(".aim/aimx/reservations");
+    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&journal).unwrap().permissions()) & 0o777, 0o700);
+    first.child.kill().await.unwrap();
+    assert!(root.join("art/killed.png").exists(), "a killed server cannot clean up");
+    let second = serve(&home, &root).await;
+    assert!(!root.join("art/killed.png").exists(), "the next open sweeps the abandoned marker");
+    assert_eq!(journal_entries(&home), 0);
+    second.client.peer.close();
+}
+
+/// A live reservation of a concurrent aimx is never swept; it finalizes normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concurrent_servers_live_reservation_is_not_swept() {
+    let (_dir, home, root) = fixture();
+    let first = serve(&home, &root).await;
+    let reservation = reserve_at(&first, "art/live.png").await;
+    let second = serve(&home, &root).await;
+    assert!(root.join("art/live.png").exists(), "a live reservation keeps its marker");
+    first
+        .client
+        .peer
+        .call::<FsFinalize>(FsFinalizeParams {
+            workspace: first.ws.clone(),
+            reservation,
+            content: Content::from_bytes(b"image".to_vec()),
+            idempotency_key: key(),
+            scope: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.join("art/live.png")).unwrap(), b"image");
+    assert_eq!(journal_entries(&home), 0);
+    second.client.peer.close();
+    first.client.peer.close();
+}
+
+/// `REV13a` M5: closing the connection lets `aimx serve --stdio` end its session, which cancels
+/// its unused markers before the process exits.
+#[tokio::test(flavor = "multi_thread")]
+async fn stdio_eof_cancels_unused_markers_before_exit() {
+    let (_dir, home, root) = fixture();
+    let mut served = serve(&home, &root).await;
+    reserve_at(&served, "art/unused.png").await;
+    served.client.peer.close();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), served.child.wait()).await.unwrap().unwrap();
+    assert!(status.success());
+    assert!(!root.join("art/unused.png").exists());
+    assert_eq!(journal_entries(&home), 0);
+}

@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::authz::Grant;
+use crate::authz::{Bound, Grant};
 use crate::workspace::{Outcome, Workspace};
 
 /// Everything a tool call may use.
@@ -89,6 +89,8 @@ impl Default for ProcTable {
 struct ProcEntry {
     workspace: WorkspaceId,
     cwd: Option<String>,
+    /// The effective authority of the spawning call (ADR 0067).
+    bound: Bound,
     cursor: u64,
     _slot: ProcSlot,
 }
@@ -147,24 +149,37 @@ impl ProcTable {
 
     /// Records a process spawned in `workspace` with the slot reserved for it.
     pub fn insert(&self, proc: ProcId, workspace: WorkspaceId, slot: ProcSlot) {
-        self.lock().insert(proc, ProcEntry { workspace, cwd: None, cursor: 0, _slot: slot });
+        self.lock().insert(proc, ProcEntry { workspace, cwd: None, bound: Bound::default(), cursor: 0, _slot: slot });
     }
 
-    /// Records a process and the cwd where its execution authority was admitted.
-    pub fn insert_at(&self, proc: ProcId, workspace: WorkspaceId, cwd: String, slot: ProcSlot) {
-        self.lock().insert(proc, ProcEntry { workspace, cwd: Some(cwd), cursor: 0, _slot: slot });
+    /// Records a process, the cwd where its execution authority was admitted, and the authority
+    /// of the call that spawned it (`grant`), which bounds every later control call (ADR 0067).
+    pub fn insert_at(&self, proc: ProcId, workspace: WorkspaceId, cwd: String, grant: &Grant, slot: ProcSlot) {
+        self.lock().insert(proc, ProcEntry { workspace, cwd: Some(cwd), bound: grant.bound(), cursor: 0, _slot: slot });
+    }
+
+    /// Checks that a call under `grant` may control (read, write to, resize, signal, wait for or
+    /// release) `proc`: its effective authority must narrow the one the process was spawned under,
+    /// and permit execution at the process's cwd. Backends that bind a scope check the cwd the
+    /// spawn resolved as well (ADR 0067).
+    ///
+    /// # Errors
+    /// `not_found` for a process the session does not own; `denied` otherwise.
+    pub fn authorize(&self, proc: &ProcId, grant: &Grant) -> Outcome<()> {
+        let (cwd, bound) = self
+            .lock()
+            .get(proc)
+            .map(|entry| (entry.cwd.clone(), entry.bound.clone()))
+            .ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")))?;
+        grant.within(&bound)?;
+        grant.exec_path(cwd.as_deref().unwrap_or_else(|| grant.root()))?;
+        Ok(())
     }
 
     /// The workspace a process runs in, when the session owns it.
     #[must_use]
     pub fn workspace(&self, proc: &ProcId) -> Option<WorkspaceId> {
         self.lock().get(proc).map(|entry| entry.workspace.clone())
-    }
-
-    /// The cwd used to authorize a process, when recorded at spawn.
-    #[must_use]
-    pub fn cwd(&self, proc: &ProcId) -> Option<String> {
-        self.lock().get(proc).and_then(|entry| entry.cwd.clone())
     }
 
     /// Forgets a process (freeing its slot); whether it was known.

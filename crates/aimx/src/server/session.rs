@@ -11,14 +11,24 @@ use aim_proto::ids::{ProcId, WorkspaceId};
 use aim_rpc::Peer;
 use tokio::sync::watch;
 
+use super::journal::Entry;
 use super::{State, lock};
-use crate::authz::{Grant, Principal};
+use crate::authz::{Bound, Grant, Principal};
 use crate::tools::ProcTable;
 use crate::workspace::{Outcome, Workspace};
 use aim_kernel::policy::Limits as PolicyLimits;
 
 /// Output bytes pushed per `exec.output` batch read.
 const PUSH_BYTES: u64 = 256 * 1024;
+/// Most live file reservations per session (ADR 0054).
+pub(crate) const MAX_RESERVATIONS: usize = 64;
+
+/// Whether a failed finalize or cancel means the marker is no longer this reservation's: it is
+/// gone, changed, or replaced by a directory. Such a reservation ends, freeing its slot
+/// (`REV13a` L1); any other failure (a refusal, an unavailable backend) keeps it for a retry.
+pub(crate) fn marker_lost(err: &ProtoError) -> bool {
+    matches!(err.code, ErrorCode::PreconditionFailed | ErrorCode::NotFound | ErrorCode::Conflict)
+}
 /// How long one forwarder read waits for new output.
 const PUSH_WAIT: Duration = Duration::from_secs(30);
 
@@ -35,8 +45,33 @@ pub(crate) struct Reservation {
     pub(crate) workspace: WorkspaceId,
     pub(crate) path: String,
     pub(crate) hash: ContentHash,
+    /// The reserve-time view, used only by the session-end cleanup; finalize and cancel act
+    /// through the current call's view (ADR 0067).
     pub(crate) backend: Arc<dyn Workspace>,
+    /// The reserving call's authority, which every later finalize or cancel must stay within.
+    pub(crate) bound: Bound,
     pub(crate) active: bool,
+    /// The durable journal entry, held (locked) while the reservation lives.
+    pub(crate) journal: Option<Entry>,
+}
+
+impl Reservation {
+    /// The reservation ended (finalized, cancelled, or its marker is no longer ours): it can never
+    /// be used again, and its journal entry goes.
+    pub(crate) fn end(&mut self) {
+        self.active = false;
+        if let Some(entry) = self.journal.take() {
+            entry.remove();
+        }
+    }
+}
+
+/// A session's reservations; `closed` is set, under the same lock, when the session ends, so a
+/// reserve racing the end cannot add a claim nobody will clean up (`REV13a` L2).
+#[derive(Default)]
+struct Reservations {
+    live: HashMap<String, Arc<tokio::sync::Mutex<Reservation>>>,
+    closed: bool,
 }
 
 /// The connection a session is attached to.
@@ -56,7 +91,7 @@ pub(crate) struct Session {
     attached: watch::Sender<Option<Attachment>>,
     detached_at: Mutex<Option<Instant>>,
     ceiling: Mutex<Option<CallScope>>,
-    reservations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Reservation>>>>,
+    reservations: Mutex<Reservations>,
 }
 
 impl Session {
@@ -71,7 +106,7 @@ impl Session {
             attached: watch::channel(None).0,
             detached_at: Mutex::new(Some(Instant::now())),
             ceiling: Mutex::new(ceiling),
-            reservations: Mutex::new(HashMap::new()),
+            reservations: Mutex::new(Reservations::default()),
         }
     }
 
@@ -161,21 +196,29 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) fn add_reservation(&self, id: String, reservation: Reservation) -> Outcome<()> {
+    /// Adds a live reservation. On refusal the claim comes back, so the caller removes its marker.
+    ///
+    /// # Errors
+    /// `limit_exceeded` beyond [`MAX_RESERVATIONS`]; `unavailable` once the session has ended.
+    pub(crate) fn add_reservation(&self, id: String, reservation: Reservation) -> Result<(), Box<(ProtoError, Reservation)>> {
         let mut reservations = lock(&self.reservations);
-        if reservations.len() >= 64 {
-            return Err(ProtoError::new(ErrorCode::LimitExceeded, "too many live file reservations"));
+        if reservations.closed {
+            let err = ProtoError::new(ErrorCode::Unavailable, "the session ended; the reservation was released");
+            return Err(Box::new((err, reservation)));
         }
-        reservations.insert(id, Arc::new(tokio::sync::Mutex::new(reservation)));
+        if reservations.live.len() >= MAX_RESERVATIONS {
+            return Err(Box::new((ProtoError::new(ErrorCode::LimitExceeded, "too many live file reservations"), reservation)));
+        }
+        reservations.live.insert(id, Arc::new(tokio::sync::Mutex::new(reservation)));
         Ok(())
     }
 
     pub(crate) fn reservation(&self, id: &str) -> Outcome<Arc<tokio::sync::Mutex<Reservation>>> {
-        lock(&self.reservations).get(id).cloned().ok_or_else(|| ProtoError::new(ErrorCode::NotFound, "unknown file reservation"))
+        lock(&self.reservations).live.get(id).cloned().ok_or_else(|| ProtoError::new(ErrorCode::NotFound, "unknown file reservation"))
     }
 
     pub(crate) fn remove_reservation(&self, id: &str) {
-        lock(&self.reservations).remove(id);
+        lock(&self.reservations).live.remove(id);
     }
 
     /// The workspace a process of this session runs in.
@@ -195,14 +238,25 @@ impl Session {
             }
             self.procs.remove(&proc);
         }
-        let reservations: Vec<_> = lock(&self.reservations).drain().map(|(_, reservation)| reservation).collect();
+        let reservations: Vec<_> = {
+            let mut reservations = lock(&self.reservations);
+            reservations.closed = true;
+            reservations.live.drain().map(|(_, reservation)| reservation).collect()
+        };
         for reservation in reservations {
             let mut claim = reservation.lock().await;
             if claim.active {
-                if let Err(err) = claim.backend.fs().cancel_if_hash(&claim.path, &claim.hash).await {
-                    tracing::warn!(%err, "could not clean up abandoned file reservation");
+                match claim.backend.fs().cancel_if_hash(&claim.path, &claim.hash).await {
+                    Ok(()) => claim.end(),
+                    // The marker is gone or changed: it is no longer ours to remove.
+                    Err(err) if marker_lost(&err) => claim.end(),
+                    Err(err) => {
+                        // The journal entry stays (unlocked once this process ends), so a later
+                        // `workspace.open` retries the cleanup.
+                        tracing::warn!(%err, "could not clean up abandoned file reservation");
+                        claim.active = false;
+                    }
                 }
-                claim.active = false;
             }
         }
         lock(&self.workspaces).clear();
@@ -213,12 +267,15 @@ impl Session {
     /// connection, in `seq` order. While no connection is attached nothing is consumed; after a
     /// reconnect the push resumes from the last delivered chunk (clients deduplicate by `seq`,
     /// and `exec.read {after_seq}` remains the reconciliation read).
-    pub(crate) fn forward(self: &Arc<Self>, backend: Arc<dyn Workspace>, proc: ProcId) {
-        tokio::spawn(forward(Arc::downgrade(self), backend, proc));
+    ///
+    /// One batch read carries at most `max_bytes` (the spawning call's effective
+    /// `max_output_bytes`, at most [`PUSH_BYTES`]); a single chunk is never split (ADR 0067).
+    pub(crate) fn forward(self: &Arc<Self>, backend: Arc<dyn Workspace>, proc: ProcId, max_bytes: u64) {
+        tokio::spawn(forward(Arc::downgrade(self), backend, proc, max_bytes.clamp(1, PUSH_BYTES)));
     }
 }
 
-async fn forward(session: Weak<Session>, backend: Arc<dyn Workspace>, proc: ProcId) {
+async fn forward(session: Weak<Session>, backend: Arc<dyn Workspace>, proc: ProcId, max_bytes: u64) {
     let Some(mut attached) = session.upgrade().map(|s| s.attached.subscribe()) else { return };
     drop(session);
     let Some(exec) = backend.exec() else { return };
@@ -232,7 +289,7 @@ async fn forward(session: Weak<Session>, backend: Arc<dyn Workspace>, proc: Proc
             continue;
         };
         let read = tokio::select! {
-            read = exec.read(&proc, cursor, PUSH_BYTES, PUSH_WAIT) => read,
+            read = exec.read(&proc, cursor, max_bytes, PUSH_WAIT) => read,
             changed = attached.changed() => {
                 if changed.is_err() {
                     return;
@@ -314,6 +371,33 @@ mod tests {
 
     fn peer() -> Peer {
         Peer::spawn(tokio::io::empty(), tokio::io::sink(), NoHandler, PeerConfig::default())
+    }
+
+    /// `REV13a` L2: a reserve that finishes after the session ended gets its claim back (so it
+    /// removes its marker) instead of adding it to a session nobody will clean up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reservation_added_after_close_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let local =
+            crate::workspace::local::LocalWorkspace::open(dir.path().to_str().unwrap(), crate::workspace::local::LocalConfig::default());
+        let backend: Arc<dyn Workspace> = Arc::new(local.await.unwrap());
+        let principal = Arc::new(Principal { id: "test".into(), roots: Vec::new(), read_only: false, ceiling: None });
+        let session = Session::new("token".into(), principal, ProcTable::new(1, Arc::new(Semaphore::new(1))), 1);
+        let claim = || Reservation {
+            workspace: WorkspaceId::new("w"),
+            path: "/nowhere".into(),
+            hash: ContentHash("sha256:00".into()),
+            backend: Arc::clone(&backend),
+            bound: Bound::default(),
+            active: true,
+            journal: None,
+        };
+        assert!(session.add_reservation("a".into(), claim()).is_ok());
+        session.close().await;
+        let refused = session.add_reservation("b".into(), claim()).unwrap_err();
+        assert_eq!(refused.0.code, ErrorCode::Unavailable);
+        assert!(refused.1.active, "the claim comes back to the caller, who removes its marker");
+        assert!(session.reservation("a").is_err() && session.reservation("b").is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

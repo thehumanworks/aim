@@ -33,12 +33,24 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::walk::{self, Follow};
-use super::{Authority, Base, blocking, io_error};
+use super::{Authority, Base, blocking, io_error, path_string};
 use crate::id::random_hex;
 use crate::ring::OutputRing;
 use crate::workspace::{BoxFuture, Exec, Outcome, SpawnSpec};
 
 const READ_BLOCK: usize = 32 * 1024;
+/// The smallest output chunk a scoped spawn splits its output into (ADR 0067): a smaller
+/// `max_output_bytes` would multiply per-chunk bookkeeping in the output ring.
+const MIN_CHUNK: usize = 1024;
+
+/// How a process's output is kept: the ring's byte budget, and the largest chunk (the spawning
+/// call's `max_output_bytes`, at least [`MIN_CHUNK`]), so every `exec.read` answer and pushed
+/// `exec.output` stays within that limit without ever splitting a sequence number.
+#[derive(Clone, Copy, Debug)]
+struct OutputBounds {
+    ring_bytes: usize,
+    max_chunk: usize,
+}
 
 /// Serialises everything that creates inheritable descriptors and forks. On macOS the standard
 /// library creates pipes with `pipe` + `fcntl(FD_CLOEXEC)`, so a child forked by another thread in
@@ -88,12 +100,19 @@ pub(super) struct LocalExec {
 
 /// All scoped views of a workspace own one registry; processes are released when its final
 /// owner goes away, not when an individual request ends.
-struct ProcRegistry(Mutex<HashMap<ProcId, Arc<Proc>>>);
+struct ProcRegistry(Mutex<HashMap<ProcId, Registered>>);
+
+/// A registered process and the real cwd its spawn resolved (the process keeps that directory
+/// whatever later happens to its path), which a scoped view checks on every control call.
+struct Registered {
+    proc: Arc<Proc>,
+    cwd: String,
+}
 
 impl Drop for ProcRegistry {
     fn drop(&mut self) {
-        for proc in lock(&self.0).values() {
-            proc.release();
+        for registered in lock(&self.0).values() {
+            registered.proc.release();
         }
     }
 }
@@ -112,6 +131,7 @@ type PtyWriter = Box<dyn io::Write + Send>;
 
 struct Proc {
     pgid: Option<i32>,
+    max_chunk: usize,
     state: Mutex<ProcState>,
     version: watch::Sender<u64>,
     input: tokio::sync::Mutex<Input>,
@@ -139,10 +159,11 @@ enum Input {
 }
 
 impl Proc {
-    fn new(pgid: Option<i32>, ring_bytes: usize, input: Input, master: Option<Master>) -> Self {
+    fn new(pgid: Option<i32>, output: OutputBounds, input: Input, master: Option<Master>) -> Self {
         Self {
             pgid,
-            state: Mutex::new(ProcState { ring: OutputRing::new(ring_bytes), exit: None }),
+            max_chunk: output.max_chunk.max(1),
+            state: Mutex::new(ProcState { ring: OutputRing::new(output.ring_bytes), exit: None }),
             version: watch::channel(0).0,
             input: tokio::sync::Mutex::new(input),
             master: master.map(Mutex::new),
@@ -158,13 +179,21 @@ impl Proc {
         self.version.send_modify(|v| *v = v.wrapping_add(1));
     }
 
-    /// Appends output; ignored once the exit is recorded (a straggler holding the pipe).
-    fn push(&self, stream: OutputStream, data: Vec<u8>) {
+    /// Appends output, in chunks of at most `max_chunk` bytes; ignored once the exit is recorded
+    /// (a straggler holding the pipe).
+    fn push(&self, stream: OutputStream, data: &[u8]) {
         let pushed = {
             let mut state = lock(&self.state);
-            if state.exit.is_some() { None } else { state.ring.push(stream, data) }
+            if state.exit.is_some() || data.is_empty() {
+                false
+            } else {
+                for piece in data.chunks(self.max_chunk) {
+                    state.ring.push(stream, piece.to_vec());
+                }
+                true
+            }
         };
-        if pushed.is_some() {
+        if pushed {
             self.bump();
         }
     }
@@ -306,7 +335,7 @@ async fn pump<R: AsyncRead + Unpin>(proc: Arc<Proc>, mut reader: R, stream: Outp
     loop {
         match reader.read(&mut block).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => proc.push(stream, block.get(..n).unwrap_or_default().to_vec()),
+            Ok(n) => proc.push(stream, block.get(..n).unwrap_or_default()),
         }
     }
 }
@@ -399,7 +428,7 @@ async fn supervise_pty(
     }
 }
 
-fn spawn_pipes(cwd: &OwnedFd, spec: &SpawnSpec<'_>, ring_bytes: usize) -> Outcome<Arc<Proc>> {
+fn spawn_pipes(cwd: &OwnedFd, spec: &SpawnSpec<'_>, output: OutputBounds) -> Outcome<Arc<Proc>> {
     let (mut command, program) = match spec.command {
         Command::Argv { argv } => {
             let Some((program, args)) = argv.split_first() else {
@@ -426,7 +455,7 @@ fn spawn_pipes(cwd: &OwnedFd, spec: &SpawnSpec<'_>, ring_bytes: usize) -> Outcom
     let mut child = spawned.map_err(|err| spawn_error(&err, &program))?;
     let pgid = child.id().and_then(|id| i32::try_from(id).ok());
     let input = child.stdin.take().map_or(Input::Closed, Input::Pipe);
-    let proc = Arc::new(Proc::new(pgid, ring_bytes, input, None));
+    let proc = Arc::new(Proc::new(pgid, output, input, None));
     let mut readers = Vec::with_capacity(2);
     if let Some(stdout) = child.stdout.take() {
         readers.push(tokio::spawn(pump(Arc::clone(&proc), stdout, OutputStream::Stdout)));
@@ -442,7 +471,7 @@ fn spawn_pty(
     cwd: &OwnedFd,
     spec: &SpawnSpec<'_>,
     size: PtySize,
-    ring_bytes: usize,
+    output: OutputBounds,
     permit: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Outcome<Arc<Proc>> {
     let mut builder = match spec.command {
@@ -486,7 +515,7 @@ fn spawn_pty(
     });
     let (child, master, mut reader, writer) = spawned.map_err(|err| io_error(&err, spec.cwd))??;
     let pgid = child.process_id().and_then(|id| i32::try_from(id).ok());
-    let proc = Arc::new(Proc::new(pgid, ring_bytes, Input::Pty(Arc::new(Mutex::new(writer))), Some(master)));
+    let proc = Arc::new(Proc::new(pgid, output, Input::Pty(Arc::new(Mutex::new(writer))), Some(master)));
 
     let (drained_tx, drained_rx) = oneshot::channel();
     let reading = Arc::clone(&proc);
@@ -499,7 +528,7 @@ fn spawn_pty(
             loop {
                 match reader.read(&mut block) {
                     Ok(0) => break,
-                    Ok(n) => reading.push(OutputStream::Pty, block.get(..n).unwrap_or_default().to_vec()),
+                    Ok(n) => reading.push(OutputStream::Pty, block.get(..n).unwrap_or_default()),
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                     // EIO once the slave side is closed (Linux) is the pty's end of file.
                     Err(_) => break,
@@ -540,8 +569,18 @@ impl LocalExec {
         Self { base, ring_bytes: self.ring_bytes, ptys: self.ptys.clone(), procs: Arc::clone(&self.procs) }
     }
 
+    /// The process, once this view's grant (if any) permits execution at the cwd its spawn
+    /// resolved: a control call is judged against the resolved target, never a lexical path
+    /// (ADR 0046, 0067).
     fn get(&self, proc: &ProcId) -> Outcome<Arc<Proc>> {
-        lock(&self.procs.0).get(proc).cloned().ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")))
+        let (found, cwd) = lock(&self.procs.0)
+            .get(proc)
+            .map(|registered| (Arc::clone(&registered.proc), registered.cwd.clone()))
+            .ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")))?;
+        if let Some(grant) = &self.base.grant {
+            grant.exec_path(&cwd)?;
+        }
+        Ok(found)
     }
 }
 
@@ -550,10 +589,11 @@ impl Exec for LocalExec {
         Box::pin(async move {
             let base = Arc::clone(&self.base);
             let cwd_path = spec.cwd.to_owned();
-            let cwd = blocking(move || {
+            let (cwd, real_cwd) = blocking(move || {
                 let loc = base.resolve(&cwd_path, Follow::Final, Authority::Exec)?;
                 if let Some(dir) = loc.target_dir() {
-                    return dir.try_clone().map_err(|err| io_error(&err, &cwd_path));
+                    let real = path_string(&base.real(&loc))?;
+                    return Ok((dir.try_clone().map_err(|err| io_error(&err, &cwd_path))?, real));
                 }
                 let exists = match (loc.dir(), &loc.name) {
                     (Ok(dir), Some(name)) if loc.missing.is_empty() => walk::stat_entry(dir, name).is_ok(),
@@ -566,6 +606,11 @@ impl Exec for LocalExec {
                 }
             })
             .await?;
+            let max_chunk =
+                self.base.grant.as_ref().and_then(crate::authz::Grant::limits).map_or(READ_BLOCK, |limits| {
+                    usize::try_from(limits.max_output_bytes).unwrap_or(usize::MAX).clamp(MIN_CHUNK, READ_BLOCK)
+                });
+            let output = OutputBounds { ring_bytes: self.ring_bytes, max_chunk };
             let proc = match spec.pty {
                 Some(size) => {
                     // The permit lives as long as the pty's threads (it is released when both end).
@@ -577,12 +622,12 @@ impl Exec for LocalExec {
                         )),
                         None => None,
                     };
-                    spawn_pty(&cwd, &spec, size, self.ring_bytes, permit)?
+                    spawn_pty(&cwd, &spec, size, output, permit)?
                 }
-                None => spawn_pipes(&cwd, &spec, self.ring_bytes)?,
+                None => spawn_pipes(&cwd, &spec, output)?,
             };
             let id = ProcId::new(format!("p{}", random_hex()));
-            lock(&self.procs.0).insert(id.clone(), proc);
+            lock(&self.procs.0).insert(id.clone(), Registered { proc, cwd: real_cwd });
             Ok(id)
         })
     }
@@ -668,12 +713,13 @@ impl Exec for LocalExec {
 
     fn release<'a>(&'a self, proc: &'a ProcId) -> BoxFuture<'a, Outcome<()>> {
         Box::pin(async move {
+            self.get(proc)?;
             let removed = lock(&self.procs.0).remove(proc);
-            let Some(proc) = removed else {
+            let Some(registered) = removed else {
                 return Err(ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")));
             };
             // Kills the whole group (whatever the leader left behind too); forgotten either way.
-            proc.release();
+            registered.proc.release();
             Ok(())
         })
     }

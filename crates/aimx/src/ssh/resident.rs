@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncWriteExt as _, copy};
 use tokio::net::UnixStream;
 
-use crate::server::{Server, ServerConfig, default_protected, local_principal};
+use crate::server::{Server, ServerConfig, default_protected, local_principal, reservation_journal_dir};
 
 /// Paths of one resident server, keyed by its canonical workspace root.
 #[derive(Clone, Debug)]
@@ -132,7 +132,9 @@ pub async fn serve_child(root: &Path, idle: Duration) -> io::Result<()> {
     writeln!(pid, "{}", std::process::id())?;
     let home = std::env::var("HOME").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME is unset"))?;
     let principal = local_principal(&[&paths.root], false)?;
-    let server = Server::new(ServerConfig::new(principal, default_protected(&home)));
+    let mut config = ServerConfig::new(principal, default_protected(&home));
+    config.reservation_journal = Some(reservation_journal_dir(&home));
+    let server = Server::new(config);
     let listener = Server::bind_unix(&paths.socket)?;
     let idle_watch = async {
         let mut since = Instant::now();

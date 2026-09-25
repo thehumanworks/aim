@@ -11,11 +11,11 @@ use aim_kernel::policy::Limits as PolicyLimits;
 use aim_proto::content::Content;
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{
-    BackendSpec, CallScope, EditOutcome, ExecReadParams, ExecReadResult, ExecReleaseParams, ExecResizeParams, ExecSignalParams,
-    ExecSpawnParams, ExecSpawnResult, ExecWriteStdinParams, FsCancelParams, FsEditParams, FsFinalizeParams, FsListParams, FsListResult,
-    FsMkdirParams, FsReadParams, FsReadResult, FsRemoveParams, FsRenameParams, FsReserveParams, FsReserveResult, FsStatParams,
-    FsWriteParams, GlobParams, GlobResult, GrepParams, GrepResult, InitializeParams, InitializeResult, Meta, PeerInfo, ToolsCallParams,
-    ToolsListResult, WorkspaceInfo, WorkspaceOpenParams, WriteOutcome,
+    BackendSpec, CallScope, ContentHash, EditOutcome, ExecReadParams, ExecReadResult, ExecReleaseParams, ExecResizeParams,
+    ExecSignalParams, ExecSpawnParams, ExecSpawnResult, ExecWriteStdinParams, FsCancelParams, FsEditParams, FsFinalizeParams, FsListParams,
+    FsListResult, FsMkdirParams, FsReadParams, FsReadResult, FsRemoveParams, FsRenameParams, FsReserveParams, FsReserveResult,
+    FsStatParams, FsWriteParams, GlobParams, GlobResult, GrepParams, GrepResult, InitializeParams, InitializeResult, Meta, PeerInfo,
+    ToolsCallParams, ToolsListResult, WorkspaceInfo, WorkspaceOpenParams, WriteOutcome,
 };
 use aim_proto::harness::{
     ExecRead, ExecRelease, ExecResize, ExecSignal, ExecSpawn, ExecWriteStdin, FsCancel, FsEdit, FsFinalize, FsList, FsMkdir, FsRead,
@@ -32,7 +32,7 @@ use aim_rpc::{RequestCtx, Router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::session::{OpenWorkspace, Reservation, Session};
+use super::session::{self, OpenWorkspace, Reservation, Session};
 use super::token::TokenStore;
 use super::{State, lock};
 use crate::authz::confine::{is_within, normalize};
@@ -69,6 +69,21 @@ fn internal(err: impl std::fmt::Display) -> ProtoError {
 fn output_cap(grant: &Grant) -> Outcome<u64> {
     let limit = grant.limits().map_or(u64::MAX, |limits| limits.max_output_bytes);
     if limit == 0 { Err(ProtoError::new(ErrorCode::Denied, "effective authority permits no output bytes")) } else { Ok(limit) }
+}
+
+/// `sha256:<hex>` of a reservation marker.
+fn marker_hash(bytes: &[u8]) -> ContentHash {
+    use sha2::Digest as _;
+    ContentHash(format!("sha256:{}", crate::id::hex(&sha2::Sha256::digest(bytes))))
+}
+
+/// Ends a finalized or cancelled reservation, or one whose marker is no longer ours (`REV13a` L1:
+/// a failed finalize or cancel must not keep a slot); keeps it after any other failure.
+fn settle_claim(session: &Session, id: &str, claim: &mut Reservation, failure: Option<&ProtoError>) {
+    if failure.is_none_or(session::marker_lost) {
+        claim.end();
+        session.remove_reservation(id);
+    }
 }
 
 fn bounded_result<T: Serialize>(value: T, grant: &Grant) -> Outcome<T> {
@@ -343,10 +358,45 @@ impl Conn {
             };
             Arc::new(LocalWorkspace::from_open_root(opened, config).await?)
         };
+        self.sweep_reservations(&root, &grant, backend.as_ref()).await;
         let id = WorkspaceId::new(format!("w{}", crate::id::random_hex()));
         let info = WorkspaceInfo { id: id.clone(), root: root.clone(), caps: backend.caps().clone() };
         session.add_workspace(Arc::new(OpenWorkspace { id, info: info.clone(), grant, backend }))?;
         Ok(info)
+    }
+
+    /// Removes the markers of `root`'s abandoned reservations, those whose journal entry no live
+    /// process holds (an aimx killed before its session ended, `REV13a` M5; ADR 0067). A marker goes
+    /// only while it has its recorded hash; a read-only server leaves them.
+    async fn sweep_reservations(&self, root: &str, grant: &Grant, backend: &dyn crate::workspace::Workspace) {
+        let Some(journal) = &self.state.journal else { return };
+        if grant.principal().read_only || !backend.fs().supports_reservations() {
+            return;
+        }
+        let journal = journal.clone();
+        let owned_root = root.to_owned();
+        let Ok(abandoned) = tokio::task::spawn_blocking(move || journal.abandoned(&owned_root)).await else { return };
+        for (record, entry) in abandoned {
+            let removed = match grant.path(&record.path, Access::Write) {
+                Ok(path) => backend.fs().cancel_if_hash(&path, &ContentHash(record.hash.clone())).await,
+                Err(err) => Err(err),
+            };
+            match removed {
+                Ok(()) => {
+                    tracing::info!(path = %record.path, "removed an abandoned reservation marker");
+                    entry.remove();
+                }
+                Err(err) if session::marker_lost(&err) => entry.remove(),
+                // aimx may never remove it (it is protected now, say): forget it rather than let
+                // it fill the journal.
+                Err(err) if err.code == ErrorCode::Denied => {
+                    tracing::warn!(%err, path = %record.path, "leaving an abandoned reservation marker aimx may not remove");
+                    entry.remove();
+                }
+                // Kept (and unlocked again) for a later open.
+                Err(err) => tracing::warn!(%err, path = %record.path, "could not remove an abandoned reservation marker"),
+            }
+        }
     }
 
     async fn fs_stat(self: Arc<Self>, params: FsStatParams) -> Outcome<Meta> {
@@ -368,6 +418,11 @@ impl Conn {
         let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
         let grant = ws.grant.clone();
         let path = grant.path(&params.path, Access::Write)?;
+        // Comparing the content with a caller's hash reads it (REV14 F5): an `IfHash` write needs
+        // read authority too; a write-only scope may still create or blindly replace.
+        if matches!(params.precondition, aim_proto::harness::Precondition::IfHash { .. }) {
+            grant.path(&params.path, Access::Read)?;
+        }
         let work_params = params.clone();
         self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsWrite::NAME, &params, None, async move {
             let p = work_params;
@@ -395,11 +450,22 @@ impl Conn {
         let work_ws = Arc::clone(&ws);
         let work_session = Arc::clone(&session);
         let params_work = params.clone();
+        let journal = self.state.journal.clone();
         self.idempotent(&ws, &params.idempotency_key, FsReserve::NAME, &params, Some(&session), async move {
             let id = crate::id::secret_hex().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "cannot create a reservation id"))?;
-            let marker = format!("aim-reservation:{id}");
-            let content = Content::from_bytes(marker.into_bytes());
-            let outcome = work_ws
+            let marker = format!("aim-reservation:{id}").into_bytes();
+            let hash = marker_hash(&marker);
+            // Journaled before the marker exists, so no crash can leave an unrecorded marker.
+            let entry = match &journal {
+                Some(journal) => Some(journal.record(&work_ws.info.root, &path, &hash).map_err(|err| {
+                    let code =
+                        if err.kind() == std::io::ErrorKind::QuotaExceeded { ErrorCode::LimitExceeded } else { ErrorCode::Unavailable };
+                    ProtoError::new(code, format!("cannot journal the reservation: {err}"))
+                })?),
+                None => None,
+            };
+            let content = Content::from_bytes(marker);
+            let written = work_ws
                 .backend
                 .fs()
                 .write(WriteRequest {
@@ -409,17 +475,32 @@ impl Conn {
                     create_dirs: true,
                     key: &params_work.idempotency_key,
                 })
-                .await?;
+                .await;
+            let outcome = match written {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    if let Some(entry) = entry {
+                        entry.remove();
+                    }
+                    return Err(err);
+                }
+            };
             let claim = Reservation {
                 workspace: params_work.workspace.clone(),
                 path: path.clone(),
                 hash: outcome.hash.clone(),
                 backend: Arc::clone(&work_ws.backend),
+                bound: work_ws.grant.bound(),
                 active: true,
+                journal: entry,
             };
-            if let Err(err) = work_session.add_reservation(id.clone(), claim) {
-                if let Err(cleanup) = work_ws.backend.fs().cancel_if_hash(&path, &outcome.hash).await {
-                    tracing::warn!(%cleanup, "could not release excess file reservation");
+            if let Err(refused) = work_session.add_reservation(id.clone(), claim) {
+                let (err, mut claim) = *refused;
+                match work_ws.backend.fs().cancel_if_hash(&path, &outcome.hash).await {
+                    Ok(()) => claim.end(),
+                    Err(cleanup) if session::marker_lost(&cleanup) => claim.end(),
+                    // The journal entry stays for a later sweep.
+                    Err(cleanup) => tracing::warn!(%cleanup, "could not release a refused file reservation"),
                 }
                 return Err(err);
             }
@@ -428,6 +509,9 @@ impl Conn {
         .await
     }
 
+    /// Finalizes a reservation through the **current** call's view: its authority must stay within
+    /// the reserving call's, and the backend checks it against the resolved marker, so a symlink
+    /// planted after the reservation cannot redirect the write (REV14 F2, ADR 0067).
     async fn fs_finalize(self: Arc<Self>, params: FsFinalizeParams) -> Outcome<WriteOutcome> {
         let (session, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
         let work_session = Arc::clone(&session);
@@ -439,8 +523,9 @@ impl Conn {
             if !claim.active || claim.workspace != params_work.workspace {
                 return Err(ProtoError::new(ErrorCode::NotFound, "unknown file reservation"));
             }
+            work_ws.grant.within(&claim.bound)?;
             work_ws.grant.path(&claim.path, Access::Write)?;
-            let outcome = claim
+            let written = work_ws
                 .backend
                 .fs()
                 .write(WriteRequest {
@@ -450,15 +535,14 @@ impl Conn {
                     create_dirs: false,
                     key: &params_work.idempotency_key,
                 })
-                .await?;
-            claim.active = false;
-            drop(claim);
-            work_session.remove_reservation(&params_work.reservation);
-            Ok(outcome)
+                .await;
+            settle_claim(&work_session, &params_work.reservation, &mut claim, written.as_ref().err());
+            written
         })
         .await
     }
 
+    /// Cancels a reservation through the current call's view, like [`Self::fs_finalize`].
     async fn fs_cancel(self: Arc<Self>, params: FsCancelParams) -> Outcome<()> {
         let (session, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
         let work_session = Arc::clone(&session);
@@ -470,20 +554,22 @@ impl Conn {
             if !claim.active || claim.workspace != params_work.workspace {
                 return Err(ProtoError::new(ErrorCode::NotFound, "unknown file reservation"));
             }
+            work_ws.grant.within(&claim.bound)?;
             work_ws.grant.path(&claim.path, Access::Write)?;
-            claim.backend.fs().cancel_if_hash(&claim.path, &claim.hash).await?;
-            claim.active = false;
-            drop(claim);
-            work_session.remove_reservation(&params_work.reservation);
-            Ok(())
+            let cancelled = work_ws.backend.fs().cancel_if_hash(&claim.path, &claim.hash).await;
+            settle_claim(&work_session, &params_work.reservation, &mut claim, cancelled.as_ref().err());
+            cancelled
         })
         .await
     }
 
+    /// An exact edit reveals the content it matches, so it needs read as well as write authority
+    /// (REV14 F5); the backend checks both on the resolved target.
     async fn fs_edit(self: Arc<Self>, params: FsEditParams) -> Outcome<EditOutcome> {
         let (_, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
         let grant = ws.grant.clone();
         let path = grant.path(&params.path, Access::Write)?;
+        grant.path(&params.path, Access::Read)?;
         let work_params = params.clone();
         self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsEdit::NAME, &params, None, async move {
             let p = work_params;
@@ -597,6 +683,7 @@ impl Conn {
         let grant = ws.grant.clone();
         let cwd = grant.exec_path(params.cwd.as_deref().unwrap_or(""))?;
         let max_processes = usize::try_from(grant.limits().map_or(u32::MAX, |limits| limits.max_processes)).unwrap_or(usize::MAX);
+        let push_bytes = output_cap(&grant)?;
         if ws.backend.exec().is_none() {
             return Err(ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"));
         }
@@ -622,8 +709,9 @@ impl Conn {
                 Err(err) if crate::workspace::local::spawn_admission_refused(&err) => return Err(err),
                 Err(err) => return Ok(Err(err)),
             };
-            owner.procs.insert_at(proc.clone(), target.id.clone(), cwd, slot);
-            owner.forward(Arc::clone(&target.backend), proc.clone());
+            owner.procs.insert_at(proc.clone(), target.id.clone(), cwd, &target.grant, slot);
+            // Pushed output honours the spawning call's output limit, per batch (ADR 0067).
+            owner.forward(Arc::clone(&target.backend), proc.clone(), push_bytes);
             Ok(Ok(ExecSpawnResult { proc }))
         })
         .await?
@@ -633,8 +721,7 @@ impl Conn {
         let session = self.session()?;
         let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
         let grant = ws.grant.clone();
-        let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
-        grant.exec_path(&cwd)?;
+        session.procs.authorize(&params.proc, &grant)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
         let max_bytes =
             params.max_bytes.unwrap_or(EXEC_READ_DEFAULT).clamp(1, output_cap(&grant)?.min(self.state.config.max_read_bytes.max(1)));
@@ -646,8 +733,7 @@ impl Conn {
         let session = self.session()?;
         let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
         let grant = ws.grant.clone();
-        let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
-        grant.exec_path(&cwd)?;
+        session.procs.authorize(&params.proc, &grant)?;
         let work_params = params.clone();
         let target = Arc::clone(&ws);
         self.idempotent(&ws, &params.idempotency_key, ExecWriteStdin::NAME, &params, None, async move {
@@ -663,8 +749,7 @@ impl Conn {
         let session = self.session()?;
         let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
         let grant = ws.grant.clone();
-        let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
-        grant.exec_path(&cwd)?;
+        session.procs.authorize(&params.proc, &grant)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
         exec.resize(&params.proc, params.size).await
     }
@@ -673,8 +758,7 @@ impl Conn {
         let session = self.session()?;
         let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
         let grant = ws.grant.clone();
-        let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
-        grant.exec_path(&cwd)?;
+        session.procs.authorize(&params.proc, &grant)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
         exec.signal(&params.proc, params.signal).await
     }
@@ -685,8 +769,7 @@ impl Conn {
         let session = self.session()?;
         let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
         let grant = ws.grant.clone();
-        let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
-        grant.exec_path(&cwd)?;
+        session.procs.authorize(&params.proc, &grant)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
         let deadline = params.timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
         loop {
@@ -705,11 +788,14 @@ impl Conn {
         let session = self.session()?;
         let ws = self.apply_scope(&session, session.proc_workspace(&params.proc)?.as_ref(), params.scope.as_ref())?;
         let grant = ws.grant.clone();
-        let cwd = session.procs.cwd(&params.proc).unwrap_or_else(|| ws.info.root.clone());
-        grant.exec_path(&cwd)?;
+        session.procs.authorize(&params.proc, &grant)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
-        session.procs.remove(&params.proc);
-        exec.release(&params.proc).await
+        let released = exec.release(&params.proc).await;
+        // A refusal (the resolved cwd is outside this call's authority) keeps the process owned.
+        if released.as_ref().is_ok() || released.as_ref().is_err_and(|err| err.code == ErrorCode::NotFound) {
+            session.procs.remove(&params.proc);
+        }
+        released
     }
 
     async fn search_grep(self: Arc<Self>, params: GrepParams) -> Outcome<GrepResult> {
