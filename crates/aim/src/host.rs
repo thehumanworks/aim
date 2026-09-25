@@ -560,9 +560,16 @@ struct Offered {
 }
 
 /// Starts a new configuration generation; returns it. Lookups tagged with an older one are stale.
-fn next_options_generation(live: &Live) -> u64 {
+/// With `model_changed` the latest options are dropped too (they are another model's), under the
+/// transcript lock, so an attach never pairs them with the new model: it gets no options, and the
+/// new ones follow on its stream.
+fn next_options_generation(live: &Live, model_changed: bool) -> u64 {
+    let _ordered = lock(&live.transcript);
     let mut offered = lock(&live.options);
     offered.generation = offered.generation.wrapping_add(1);
+    if model_changed {
+        offered.latest = None;
+    }
     offered.generation
 }
 
@@ -960,7 +967,7 @@ impl Actor {
             lookup.abort();
         }
         // Nothing looked up before the close publishes after it.
-        next_options_generation(&self.live);
+        next_options_generation(&self.live, false);
         set_state(&self.live, SessionState::Closed);
         self.backend.shutdown().await;
     }
@@ -1028,7 +1035,8 @@ impl Actor {
     async fn announce(&mut self, in_force: InForce) -> Result<(), String> {
         // Options looked up for the configuration before this one are stale from here on, before
         // any client learns of the change (ADR 0074).
-        next_options_generation(&self.live);
+        let model_changed = self.announced.as_ref().is_none_or(|before| before.model != in_force.model);
+        next_options_generation(&self.live, model_changed);
         let update = SessionUpdate::ConfigChanged {
             model: in_force.model.clone(),
             effort: in_force.effort.clone(),
@@ -1038,7 +1046,6 @@ impl Actor {
         if let Some(why) = &self.broken {
             return Err(why.clone());
         }
-        let model_changed = self.announced.as_ref().is_none_or(|before| before.model != in_force.model);
         // A client attaching later is told the model in force, not the one the session began with.
         lock(&self.live.summary).meta.model.clone_from(&in_force.model);
         self.announced = Some(in_force);
@@ -1362,7 +1369,7 @@ mod tests {
         let before = lock(&live.options).generation;
         let stale = tokio::spawn(publish_options(Arc::clone(&live), Box::pin(async move { gate.await.ok() }), false, before));
         // The model changes while m1's lookup is in flight; m2's lookup publishes first.
-        let current = next_options_generation(&live);
+        let current = next_options_generation(&live, true);
         publish_options(Arc::clone(&live), Box::pin(async { Some(options("m2")) }), true, current).await;
         // Then m1's answer arrives.
         release.send(options("m1")).unwrap();
@@ -1372,9 +1379,15 @@ mod tests {
         assert!(updates.try_recv().is_err(), "the stale answer was dropped");
         // A close starts a generation of its own: nothing looked up before it publishes.
         let open = lock(&live.options).generation;
-        next_options_generation(&live);
+        next_options_generation(&live, false);
         publish_options(Arc::clone(&live), Box::pin(async { Some(options("m3")) }), true, open).await;
         assert!(updates.try_recv().is_err());
         assert_eq!(lock(&live.options).latest, Some(options("m2")));
+        // A model change drops the old model's options from the snapshot at once; an effort change
+        // keeps them.
+        next_options_generation(&live, false);
+        assert_eq!(lock(&live.options).latest, Some(options("m2")));
+        next_options_generation(&live, true);
+        assert_eq!(lock(&live.options).latest, None);
     }
 }

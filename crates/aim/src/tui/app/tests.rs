@@ -1140,6 +1140,24 @@ fn effort_values_match_with_case_folded_and_reach_each_backend_as_it_wants() {
     );
 }
 
+/// A model that changed while the stream was down: the kept ladder is the old model's, so the
+/// session decides until it sends the new one.
+#[test]
+fn a_reattach_after_a_missed_model_change_does_not_trust_the_old_ladder() {
+    let mut app = attached();
+    update(&mut app, options(&["m1", "m2"], &["low", "high"]));
+    let attempt = app.attempt;
+    app.handle(Input::StreamEnded { session: "s1".into(), attempt });
+    let mut moved = summary("s1", SessionState::Idle);
+    moved.meta.model = "m2".into();
+    app.handle(Input::Attached { summary: moved, transcript: Vec::new(), surfaces: Vec::new(), resync: true, attempt: app.attempt });
+    assert_eq!(app.session.as_ref().map(|s| s.model.as_str()), Some("m2"));
+    typed(&mut app, "/effort ultra");
+    assert_eq!(config_to(&app.handle(press(KeyCode::Enter)), "s1").len(), 1, "not refused by m1's ladder");
+    update(&mut app, options(&["m1", "m2"], &["minimal"]));
+    assert_eq!(values_for(&mut app, "/effort "), ["minimal", "auto"]);
+}
+
 #[test]
 fn clear_empties_the_chat_and_starts_a_session_like_new() {
     let mut app = attached();

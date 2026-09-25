@@ -789,8 +789,9 @@ impl App {
             Some(Opening { spec: Some(spec), .. }) => spec.effort.clone(),
             _ => self.config.spec.effort.clone().filter(|_| meta.provider == self.config.spec.provider),
         });
-        // Options belong to their session: another one's never linger (ADR 0074).
-        let (options, stale_efforts) = same.map_or((None, false), |s| (s.options.clone(), s.stale_efforts));
+        // Options belong to their session: another one's never linger (ADR 0074). A model that
+        // changed while the stream was down makes the kept ladder another model's.
+        let (options, stale_efforts) = same.map_or((None, false), |s| (s.options.clone(), s.stale_efforts || s.model != meta.model));
         self.session = Some(SessionView {
             id: meta.id.clone(),
             workspace: meta.workspace.clone(),
