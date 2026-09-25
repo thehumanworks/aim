@@ -85,13 +85,9 @@ async fn retries_are_deduplicated_across_connections() {
     let client = connect(&env.socket).await;
     initialize(&client, None).await;
     let ws = open(&client, &env.root).await;
-    let retry = client.peer.call::<FsWrite>(write_params(&ws, "one", &k)).await;
-    // The workspace id differs between sessions, so the request fingerprint differs: the key is
-    // recognised as used, but for a different request.
-    match retry {
-        Ok(outcome) => assert_eq!(outcome, first),
-        Err(err) => assert_eq!(err.code, ErrorCode::Conflict),
-    }
+    // Its workspace id differs, but the fingerprint uses the canonical root, so this is a replay.
+    let retry = client.peer.call::<FsWrite>(write_params(&ws, "one", &k)).await.unwrap();
+    assert_eq!(retry, first);
     assert_eq!(std::fs::read_to_string(env.path("f")).unwrap(), "later");
 }
 
