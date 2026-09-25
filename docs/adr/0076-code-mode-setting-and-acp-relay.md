@@ -327,8 +327,9 @@ native sessions, `aim mcp` and the `acp:claude` relay.
   and `bench/run.py wire --harnesses aim_openrouter@off,aim_openrouter@on,aim_openrouter@only
   --cases W1 --repetitions 1 --no-gate`. The "before" column is the same wire run on `36f1bd8`.
 
-These sizes were measured under macOS's `/var/folders/…/T/` TMPDIR; under the benchmark's fixed
-`/tmp` trial root they are 44 bytes smaller (7,745 for `on`).
+These sizes were measured under macOS's `/var/folders/…/T/` TMPDIR and before task T3's batching
+line (+139 bytes) merged: the integration branch's `on` was 7,789 bytes there, and 7,745 under the
+benchmark's fixed `/tmp` trial root, which is 44 bytes shorter.
 
 **The wire gate** (`mise run bench:wire`) failed on the integration branch, before and after this
 change. T4b repaired it and re-recorded the baseline on the decided default

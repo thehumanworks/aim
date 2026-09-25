@@ -119,6 +119,12 @@ class RecorderTests(unittest.TestCase):
         baseline = json.loads((bench / manifest["wire"]["baseline"]).read_text())
         candidate = copy.deepcopy(baseline)
         self.assertEqual(compare_wire(candidate, baseline, manifest), [], "the committed baseline meets its manifest")
+        broken = copy.deepcopy(candidate)
+        broken["runs"][0]["passed"] = False
+        broken["runs"][0]["first_request_bytes"] += 10_000
+        errors = compare_wire(broken, baseline, manifest)
+        self.assertTrue(any("trajectory failed" in error for error in errors))
+        self.assertTrue(any("first request grew" in error for error in errors))
         grown = copy.deepcopy(candidate)
         for row in grown["runs"]:
             if row["harness"] == "aim_openrouter" and row["case"] == "W1":
