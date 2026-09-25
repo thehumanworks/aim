@@ -30,7 +30,7 @@ use futures_core::Stream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AgentConfig, ToolHost};
+use crate::agent::{Agent, AgentConfig, Backend, ToolHost};
 use crate::context;
 use crate::harness::HarnessClient;
 use crate::session::{self, Recorder};
@@ -87,6 +87,65 @@ pub fn aimx_workspaces(aimx: PathBuf) -> WorkspaceFactory {
     })
 }
 
+/// What a session's backend is built from.
+pub struct BackendRequest {
+    /// The session (a resumed one carries its stored provider, model and effort).
+    pub spec: SessionSpec,
+    /// Its id: fresh, or the resumed session's.
+    pub session_id: String,
+    /// The transcript so far (empty for a new session).
+    pub transcript: Vec<Item>,
+}
+
+/// A session's backend, ready to run turns, and what the session records about it.
+pub struct Built {
+    /// Runs the turns.
+    pub backend: Box<dyn Backend>,
+    /// The model in force.
+    pub model: String,
+    /// Canonical workspace root.
+    pub root: String,
+    /// Where the workspace is (`local`, `ssh:<destination>`).
+    pub location: String,
+    /// Ends what the backend's session needs besides the backend itself (e.g. the workspace
+    /// connection); run after the backend has shut down.
+    pub shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send>,
+}
+
+/// Builds sessions' backends: the native loop, Claude Code over ACP, or a fake in tests.
+pub type BackendFactory = Arc<dyn Fn(BackendRequest) -> BoxFuture<Result<Built, ProtoError>> + Send + Sync>;
+
+/// The native loop: a provider from `providers` and tools from a workspace `workspaces`
+/// connects, with aim's instructions (system prompt plus the workspace's project instructions).
+#[must_use]
+pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory, max_requests: u32) -> BackendFactory {
+    Arc::new(move |request: BackendRequest| {
+        let (providers, workspaces) = (Arc::clone(&providers), Arc::clone(&workspaces));
+        Box::pin(async move {
+            let BackendRequest { spec, session_id, transcript } = request;
+            let (provider, default_model) =
+                providers(&spec.provider, spec.model.as_deref()).map_err(|e| err(ErrorCode::InvalidParams, e))?;
+            let model = spec.model.clone().unwrap_or(default_model);
+            let workspace = workspaces(&spec).await?;
+            let instructions = context::instructions(workspace.project.as_ref(), &workspace.location);
+            let root = workspace.root.clone();
+            let config = AgentConfig {
+                model: model.clone(),
+                instructions,
+                effort: spec.effort.clone(),
+                tier: None,
+                session_id,
+                cache_key: Some(format!("aim:{root}")),
+                parallel_tool_calls: true,
+                max_requests,
+            };
+            let Connected { tools, location, shutdown, .. } = workspace;
+            let backend: Box<dyn Backend> = Box::new(Agent::with_transcript(provider, tools, config, transcript));
+            Ok(Built { backend, model, root, location, shutdown })
+        })
+    })
+}
+
 /// What UIs program against: in process ([`SessionHost`]) or over `aim-daemon/1`.
 pub trait SessionClient: Send + Sync {
     /// Creates a session.
@@ -110,12 +169,8 @@ pub trait SessionClient: Send + Sync {
 pub struct HostConfig {
     /// Store for persistent sessions.
     pub store: Arc<dyn SessionStore>,
-    /// Builds providers.
-    pub providers: ProviderFactory,
-    /// Connects workspaces.
-    pub workspaces: WorkspaceFactory,
-    /// Most model requests per turn.
-    pub max_requests: u32,
+    /// Builds sessions' backends ([`native_backends`], ACP, …).
+    pub backends: BackendFactory,
     /// Capacity of each session's update broadcast (slow clients past it lose updates and are
     /// told to re-attach).
     pub update_capacity: usize,
@@ -164,47 +219,40 @@ impl SessionHost {
     }
 
     async fn start(&self, spec: SessionSpec, resume: Option<Resume>) -> Result<SessionSummary, ProtoError> {
-        let (provider, default_model) =
-            (self.config.providers)(&spec.provider, spec.model.as_deref()).map_err(|e| err(ErrorCode::InvalidParams, e))?;
-        let model = spec.model.clone().unwrap_or(default_model);
-        let workspace = (self.config.workspaces)(&spec).await?;
-        let instructions = context::instructions(workspace.project.as_ref(), &workspace.location);
-        let root = workspace.root.clone();
+        let session_id = resume.as_ref().map_or_else(session::new_session_id, |r| r.meta.id.clone());
+        let transcript = resume.as_ref().map(|r| items_of(&r.events)).unwrap_or_default();
+        let request = BackendRequest { spec: spec.clone(), session_id: session_id.clone(), transcript: transcript.clone() };
+        let Built { backend, model, root, location, shutdown } = (self.config.backends)(request).await?;
 
         let store: Arc<dyn SessionStore> = match spec.persistence {
             Persistence::Persistent => Arc::clone(&self.config.store),
             Persistence::Ephemeral => Arc::new(MemoryStore::default()),
         };
-        let (meta, transcript, recorder) = if let Some(resume) = resume {
-            let items = items_of(&resume.events);
+        let opened = if let Some(resume) = resume {
             let recorder = Recorder::resume(Arc::clone(&store), &resume.meta, &resume.events);
-            (resume.meta, items, recorder)
+            Ok((resume.meta, recorder))
         } else {
             let meta = SessionMeta {
-                id: session::new_session_id(),
+                id: session_id,
                 created_ms: session::now_ms(),
                 workspace: root.clone(),
-                location: workspace.location.clone(),
+                location: location.clone(),
                 provider: spec.provider.clone(),
-                model: model.clone(),
+                model,
                 title: None,
                 parent: None,
             };
-            let recorder = Recorder::create(Arc::clone(&store), meta.clone()).await.map_err(|e| err(ErrorCode::Internal, e.to_string()))?;
-            (meta, Vec::new(), recorder)
+            Recorder::create(Arc::clone(&store), meta.clone()).await.map(|recorder| (meta, recorder))
+        };
+        let (meta, recorder) = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                backend.shutdown().await;
+                shutdown().await;
+                return Err(err(ErrorCode::Internal, e.to_string()));
+            }
         };
 
-        let config = AgentConfig {
-            model,
-            instructions,
-            effort: spec.effort.clone(),
-            tier: None,
-            session_id: meta.id.clone(),
-            cache_key: Some(format!("aim:{root}")),
-            parallel_tool_calls: true,
-            max_requests: self.config.max_requests,
-        };
-        let agent = Agent::with_transcript(provider, Arc::clone(&workspace.tools), config, transcript.clone());
         let summary = SessionSummary {
             meta: meta.clone(),
             state: SessionState::Idle,
@@ -216,9 +264,7 @@ impl SessionHost {
         let (control, control_rx) = mpsc::unbounded_channel();
         let live = Arc::new(Live { summary: Mutex::new(summary.clone()), transcript: Mutex::new(transcript), updates, control });
         lock(&self.sessions).insert(meta.id.clone(), Arc::clone(&live));
-        let Connected { tools, location, shutdown, .. } = workspace;
-        drop(tools);
-        let actor = Actor { live: Arc::clone(&live), agent, recorder, root, location };
+        let actor = Actor { live: Arc::clone(&live), backend, recorder, root, location };
         let sessions = Arc::clone(&self.sessions);
         let id = meta.id.clone();
         tokio::spawn(async move {
@@ -279,7 +325,7 @@ fn last_config(meta: &SessionMeta, events: &[SessionEvent]) -> (String, Option<S
 /// A session's actor: the only owner of its agent, harness and recorder.
 struct Actor {
     live: Arc<Live>,
-    agent: Agent,
+    backend: Box<dyn Backend>,
     recorder: Recorder,
     root: String,
     location: String,
@@ -332,18 +378,14 @@ impl Actor {
             }
         }
         set_state(&self.live, SessionState::Closed);
+        self.backend.shutdown().await;
     }
 
     async fn apply_config(&mut self, model: Option<String>, effort: Option<String>) {
-        let config = self.agent.config_mut();
-        if let Some(model) = model {
-            config.model = model;
+        match self.backend.set_config(model, effort).await {
+            Ok((model, effort)) => publish(&self.live, &mut self.recorder, SessionUpdate::ConfigChanged { model, effort }).await,
+            Err(message) => tracing::warn!(session = self.recorder.session(), %message, "the backend refused a config change"),
         }
-        if effort.is_some() {
-            config.effort = effort;
-        }
-        let update = SessionUpdate::ConfigChanged { model: config.model.clone(), effort: config.effort.clone() };
-        publish(&self.live, &mut self.recorder, update).await;
     }
 
     /// Runs one turn while serving control messages; returns whether a close arrived.
@@ -353,7 +395,7 @@ impl Actor {
         control: &mut mpsc::UnboundedReceiver<Control>,
         pending_config: &mut Option<(Option<String>, Option<String>)>,
     ) -> bool {
-        let Self { live, agent, recorder, root, location } = self;
+        let Self { live, backend, recorder, root, location } = self;
         if recorder.begin_turn().await.is_err() {
             tracing::warn!(session = recorder.session(), "could not record the turn start");
         }
@@ -361,7 +403,7 @@ impl Actor {
         let turn_no = recorder.turns();
         lock(&live.summary).turns = turn_no;
         let _unwatched = live.updates.send(SessionUpdate::TurnStarted { turn: turn_no });
-        let input = if turn_no == 1 {
+        let input = if turn_no == 1 && backend.wants_environment() {
             let env = context::environment(root, location, std::env::consts::OS, &crate::cli::today());
             let mut first = vec![Part::Text { text: env }];
             first.extend(parts);
@@ -374,8 +416,8 @@ impl Actor {
         let cancel = CancellationToken::new();
         let mut closing = false;
         {
-            // The turn borrows only `agent`; recording and fan-out use `recorder` and `live`.
-            let turn = agent.run_turn_steered(input, &events_tx, &cancel, &mut steer_rx);
+            // The turn borrows only `backend`; recording and fan-out use `recorder` and `live`.
+            let turn = backend.run_turn(input, &events_tx, &cancel, &mut steer_rx);
             tokio::pin!(turn);
             loop {
                 tokio::select! {

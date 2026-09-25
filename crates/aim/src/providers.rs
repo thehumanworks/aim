@@ -6,8 +6,10 @@
 //! - `codex` — the `ChatGPT` subscription (ADR 0010). Credentials: aim's own login
 //!   (`~/.aim/auth/codex.json`), else the Codex CLI's file, read-only and never refreshed. One
 //!   provider (one auth manager) serves the whole process, so a refresh never races itself.
-//! - `acp:claude` (Claude Code over ACP, ADR 0012) is wired as its integration lands on main.
+//! - `acp:claude` is an agent backend, not a model provider: sessions run it through
+//!   [`crate::acp::with_acp`].
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use aim_llm::ModelProvider;
@@ -52,7 +54,15 @@ pub fn build(id: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, S
         "openrouter" => gateway(Profile::openrouter()),
         "ai-gateway" => gateway(Profile::ai_gateway()),
         "codex" => Ok((codex()? as Arc<dyn ModelProvider>, model.unwrap_or(CODEX_DEFAULT_MODEL).to_owned())),
-        "acp:claude" => Err(format!("provider `{id}` is not wired into this build yet")),
+        "acp:claude" => Err(format!("`{id}` is an agent (Claude Code), not a model provider: run it as a session")),
         other => Err(format!("unknown provider `{other}` (known: {})", KNOWN.join(", "))),
     }
+}
+
+/// Every backend this build can host: `acp:*` agents, else the native loop with [`build`]'s
+/// providers and local workspaces served by the `aimx` binary at `aimx`.
+#[must_use]
+pub fn backends(aimx: PathBuf, max_requests: u32) -> crate::host::BackendFactory {
+    let providers: crate::host::ProviderFactory = Arc::new(build);
+    crate::acp::with_acp(crate::host::native_backends(providers, crate::host::aimx_workspaces(aimx), max_requests))
 }

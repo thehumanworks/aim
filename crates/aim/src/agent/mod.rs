@@ -31,8 +31,10 @@ use futures_util::stream::FuturesUnordered;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
+pub mod backend;
 pub mod tools;
 
+pub use backend::{Backend, BackendFuture};
 pub use tools::ToolHost;
 
 /// How the agent talks to its model.
@@ -69,6 +71,8 @@ pub enum AgentError {
     Protocol(String),
     /// The turn exceeded [`AgentConfig::max_requests`].
     TooManyRequests(u32),
+    /// An external agent backend (e.g. Claude Code over ACP) failed.
+    External(String),
 }
 
 impl core::fmt::Display for AgentError {
@@ -77,6 +81,7 @@ impl core::fmt::Display for AgentError {
             Self::Provider(err) => write!(f, "provider: {err}"),
             Self::Protocol(msg) => write!(f, "protocol: {msg}"),
             Self::TooManyRequests(n) => write!(f, "turn exceeded {n} model requests"),
+            Self::External(msg) => write!(f, "agent: {msg}"),
         }
     }
 }

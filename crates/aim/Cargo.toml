@@ -12,6 +12,7 @@ name = "aim"
 path = "src/main.rs"
 
 [dependencies]
+aim-acp = { path = "../aim-acp" }
 aim-kernel = { path = "../aim-kernel" }
 aim-llm = { path = "../aim-llm" }
 aim-llm-codex = { path = "../aim-llm-codex" }

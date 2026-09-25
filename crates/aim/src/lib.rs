@@ -8,6 +8,8 @@
 //! - [`cli`] — the headless `aim run`.
 //! - [`host`] — hosting live sessions (the daemon's core; also used in process).
 //! - [`providers`] — model providers by id.
+//! - [`acp`] — Claude Code (and other ACP agents) as a session backend.
+pub mod acp;
 pub mod agent;
 pub mod cli;
 pub mod context;

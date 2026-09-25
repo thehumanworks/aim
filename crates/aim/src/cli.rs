@@ -1,9 +1,9 @@
 //! The headless CLI: `aim run` drives one turn end to end (docs/architecture.md §11).
 //!
-//! It spawns the execution layer (`aimx serve --stdio --root <dir>`), reads the project's
-//! instructions through it, records the session (SQLite, or memory with `--ephemeral`), runs the
-//! native loop and renders the turn: assistant text on stdout, a compact tool log on stderr — or
-//! every event as a JSON line with `--json`.
+//! It hosts one session in process, exactly as the daemon would: the native loop over aimx
+//! (`aimx serve --stdio --root <dir>`) or an ACP agent (`-p acp:claude`), recorded in SQLite (or
+//! memory with `--ephemeral`). It renders the turn: assistant text on stdout, a compact tool log
+//! on stderr — or every update as a JSON line with `--json`.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -11,14 +11,13 @@ use std::sync::Arc;
 
 use aim_llm::ModelProvider;
 use aim_proto::conversation::{Part, StopReason, Usage};
-use aim_proto::event::SessionMeta;
+use aim_proto::daemon::{Location, Persistence, SessionSpec, SessionState};
 use aim_proto::tool::{ToolContent, ToolResult};
-use tokio_util::sync::CancellationToken;
+use futures_util::StreamExt as _;
 
-use crate::agent::{Agent, AgentConfig, AgentEvent, ToolHost};
-use crate::context;
-use crate::harness::HarnessClient;
-use crate::session::{self, Recorder};
+use crate::agent::AgentEvent;
+use crate::host::{self, HostConfig, SessionClient as _, SessionHost};
+use crate::session;
 use crate::store::{MemoryStore, SessionStore, SqliteStore};
 
 /// Options of `aim run`.
@@ -164,102 +163,76 @@ impl Human {
     }
 }
 
-/// Runs one turn headlessly. Returns the process exit code.
+/// Runs one turn headlessly through an in-process session host (the same path the daemon uses).
+/// Returns the process exit code.
 ///
 /// # Errors
-/// A message for the user when setup fails (harness, provider, store).
+/// A message for the user when setup fails (workspace, provider, store, session).
 pub async fn run(options: RunOptions, factory: ProviderFactory) -> Result<i32, String> {
     let root = options.cwd.canonicalize().map_err(|e| format!("{}: {e}", options.cwd.display()))?;
-    let root_str = root.to_string_lossy().into_owned();
-    let (provider, default_model) = factory(&options.provider, options.model.as_deref())?;
-    let model = options.model.clone().unwrap_or(default_model);
-
-    let aimx = find_aimx(options.aimx.as_deref());
-    let harness =
-        HarnessClient::spawn_stdio(&aimx.to_string_lossy(), &root_str).await.map_err(|e| format!("harness ({}): {e}", aimx.display()))?;
-    let project = context::project_instructions(harness.peer(), &harness.workspace().id).await;
-    let instructions = context::instructions(project.as_ref(), "local");
-
-    let store: Arc<dyn SessionStore> = if options.ephemeral {
-        Arc::new(MemoryStore::default())
+    let (store, persistence): (Arc<dyn SessionStore>, Persistence) = if options.ephemeral {
+        (Arc::new(MemoryStore::default()), Persistence::Ephemeral)
     } else {
-        Arc::new(SqliteStore::open(&aim_home().join("aim.db")).map_err(|e| e.to_string())?)
+        (Arc::new(SqliteStore::open(&aim_home().join("aim.db")).map_err(|e| e.to_string())?), Persistence::Persistent)
     };
-    let session_id = session::new_session_id();
-    let meta = SessionMeta {
-        id: session_id.clone(),
-        created_ms: session::now_ms(),
-        workspace: root_str.clone(),
-        location: "local".to_owned(),
+    let providers: host::ProviderFactory = Arc::new(move |name: &str, model: Option<&str>| factory(name, model));
+    let workspaces = host::aimx_workspaces(find_aimx(options.aimx.as_deref()));
+    let backends = crate::acp::with_acp(host::native_backends(providers, workspaces, options.max_requests));
+    let host = SessionHost::new(HostConfig { store, backends, update_capacity: 4096 });
+
+    let spec = SessionSpec {
+        workspace: root.to_string_lossy().into_owned(),
+        location: Location::Local,
         provider: options.provider.clone(),
-        model: model.clone(),
-        title: None,
-        parent: None,
-    };
-    let mut recorder = Recorder::create(Arc::clone(&store), meta).await.map_err(|e| e.to_string())?;
-    recorder.begin_turn().await.map_err(|e| e.to_string())?;
-
-    let harness = Arc::new(harness);
-    let tools: Arc<dyn ToolHost> = Arc::clone(&harness) as Arc<dyn ToolHost>;
-    let config = AgentConfig {
-        model,
-        instructions,
+        model: options.model.clone(),
         effort: options.effort.clone(),
-        tier: None,
-        session_id: session_id.clone(),
-        cache_key: Some(format!("aim:{root_str}")),
-        parallel_tool_calls: true,
-        max_requests: options.max_requests,
+        agent: None,
+        persistence,
     };
-    let mut agent = Agent::new(provider, tools, config);
+    let summary = host.create(spec).await.map_err(|e| e.message)?;
+    let session_id = summary.meta.id.clone();
+    let (_, mut updates) = host.attach(session_id.clone()).await.map_err(|e| e.message)?;
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let json = options.json;
-    let printer = tokio::spawn(async move {
-        let mut human = Human::default();
-        let mut failures = 0_u32;
-        while let Some(event) = rx.recv().await {
-            if json {
-                if let Ok(line) = serde_json::to_string(&event) {
-                    let mut out = std::io::stdout().lock();
-                    let _ignored = writeln!(out, "{line}");
-                }
-            } else {
-                human.show(&event);
-            }
-            if recorder.observe(&event).await.is_err() {
-                failures = failures.saturating_add(1);
-            }
-        }
-        failures
-    });
-
-    let cancel = CancellationToken::new();
-    let on_signal = cancel.clone();
+    let on_signal = host.clone();
+    let signalled = session_id.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            on_signal.cancel();
+            let _gone = on_signal.cancel(signalled).await;
         }
     });
 
-    let env = context::environment(&root_str, "local", std::env::consts::OS, &today());
-    let input = vec![Part::Text { text: format!("{env}\n\n{}", options.prompt) }];
-    let outcome = agent.run_turn(input, &tx, &cancel).await;
-    drop(tx);
-    let store_failures = printer.await.unwrap_or(1);
-    if store_failures > 0 && !options.ephemeral {
-        let mut err = std::io::stderr().lock();
-        let _ignored = writeln!(err, "warning: {store_failures} event(s) could not be recorded");
+    host.prompt(session_id.clone(), vec![Part::Text { text: options.prompt.clone() }]).await.map_err(|e| e.message)?;
+    let mut human = Human::default();
+    let mut code = 1;
+    let mut ended = false;
+    while let Some(update) = updates.next().await {
+        if options.json {
+            if let Ok(line) = serde_json::to_string(&update) {
+                let mut out = std::io::stdout().lock();
+                let _ignored = writeln!(out, "{line}");
+            }
+        } else {
+            human.show(&update);
+        }
+        match &update {
+            AgentEvent::TurnEnded { stop } => {
+                code = if matches!(stop, StopReason::Cancelled) { 130 } else { 0 };
+                ended = true;
+            }
+            AgentEvent::TurnFailed { .. } => ended = true,
+            AgentEvent::StateChanged { state: SessionState::Idle } if ended => break,
+            _ => {}
+        }
+    }
+    // Closing ends the session's agent and its workspace; wait for it so nothing outlives `run`.
+    if host.close(session_id.clone()).await.is_ok() {
+        while updates.next().await.is_some() {}
     }
     if !options.json && !options.ephemeral {
         let mut err = std::io::stderr().lock();
         let _ignored = writeln!(err, "· session {session_id}");
     }
-    Ok(match outcome {
-        Ok(StopReason::Cancelled) => 130,
-        Ok(_) => 0,
-        Err(_) => 1,
-    })
+    Ok(code)
 }
 
 #[cfg(test)]

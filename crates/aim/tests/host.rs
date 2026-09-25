@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture, ToolHost};
-use aim::host::{Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory};
+use aim::host::{Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends};
 use aim::store::{MemoryStore, SessionStore};
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
@@ -131,9 +131,11 @@ fn fixture_with(store: Arc<MemoryStore>, script: Vec<Vec<Result<StreamEvent, Llm
     let for_factory = Arc::clone(&provider);
     let host = SessionHost::new(HostConfig {
         store: Arc::clone(&store) as Arc<dyn SessionStore>,
-        providers: Arc::new(move |_name, _model| Ok((Arc::clone(&for_factory) as Arc<dyn ModelProvider>, "m1".to_owned()))),
-        workspaces,
-        max_requests: 8,
+        backends: native_backends(
+            Arc::new(move |_name, _model| Ok((Arc::clone(&for_factory) as Arc<dyn ModelProvider>, "m1".to_owned()))),
+            workspaces,
+            8,
+        ),
         update_capacity: 256,
     });
     Fixture { host, provider, store, connects, shutdowns }

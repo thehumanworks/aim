@@ -65,6 +65,7 @@ dependencies = [
 name = "aim"
 version = "0.0.0"
 dependencies = [
+ "aim-acp",
  "aim-kernel",
  "aim-llm",
  "aim-llm-codex",
