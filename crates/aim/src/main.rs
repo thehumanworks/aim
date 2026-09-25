@@ -318,7 +318,7 @@ async fn main_async(args: Args) -> Result<i32, String> {
         Command::SearchSessions { reindex, limit, workspace, json, query } => {
             search_sessions_command(reindex, limit, workspace, json, query).await
         }
-        Command::Board { action } => board_cli::run(&cli::aim_home(), action).await,
+        Command::Board { action } => Box::pin(board_cli::run(&cli::aim_home(), action)).await,
         Command::Daemon { socket, idle_exit, action } => {
             let home = cli::aim_home();
             let socket = socket.unwrap_or_else(|| socket_path(&home));
