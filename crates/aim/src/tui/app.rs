@@ -6,16 +6,21 @@
 //! `SteerDelivered`), and `SteersReturned` hands unsent text back to the composer, so typed text
 //! is never lost (the tny ADR 0013 lesson).
 
+use std::collections::BTreeMap;
+
 use aim_proto::conversation::{Item, Part, RateLimits, StopReason};
 use aim_proto::daemon::{
     Location, Persistence, PromptOutcome, SessionConfigParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
+use aim_proto::ui::model::{Change, Surface, Surfaces};
+use aim_proto::ui::{Placement, UiAction, UiMessage};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::commands::{self, COMMANDS};
 use super::complete::{self, Candidate, Completed, Context, Kind, Request, Trigger};
 use super::composer::Composer;
 use super::markdown::RenderOpts;
+use super::surfaces::{self, Slot};
 use super::text::Row;
 use super::theme::Theme;
 use super::transcript::{Entry, EntryOpts, Level, Transcript, render_entry, user_text};
@@ -51,6 +56,8 @@ pub enum Input {
         summary: SessionSummary,
         /// Its finished items.
         transcript: Vec<Item>,
+        /// Its UI surfaces as of the same instant (ADR 0064).
+        surfaces: Vec<Surface>,
         /// A re-attach after the update stream dropped (only new items are applied).
         resync: bool,
         /// The attempt that asked for it.
@@ -342,6 +349,17 @@ pub struct App {
     pub scroll: Scroll,
     /// A transient hint for the status line.
     pub hint: Option<String>,
+    /// The attached session's UI surfaces (ADR 0064): the same fold the host runs.
+    pub surfaces: Surfaces,
+    /// Transcript surfaces updated after their snapshot reached scrollback: shown live in the
+    /// pinned block until the turn ends, then committed once.
+    pub live_surfaces: Vec<String>,
+    /// The focused button: (surface id, component id).
+    pub focus: Option<(String, String)>,
+    /// Toasts still showing, with the ticks they have left.
+    pub toasts: BTreeMap<String, u64>,
+    /// Animation frame (advanced by ticks).
+    pub frame: u64,
     /// Terminal size (columns, rows).
     pub size: (u16, u16),
     generation: u64,
@@ -410,6 +428,9 @@ fn text_parts(text: String) -> Vec<Part> {
     vec![Part::Text { text }]
 }
 
+/// Ticks (seconds) a toast stays.
+const TOAST_TICKS: u64 = 5;
+
 impl App {
     /// A new app. The history file is not read here: it is asked for ([`Effect::LoadHistory`])
     /// only when a persistent session is first attached, and never offered in an ephemeral one.
@@ -440,6 +461,11 @@ impl App {
             layout: if fullscreen { Layout::Fullscreen } else { Layout::Inline },
             scroll: Scroll::default(),
             hint: None,
+            surfaces: Surfaces::default(),
+            live_surfaces: Vec::new(),
+            focus: None,
+            toasts: BTreeMap::new(),
+            frame: 0,
             size: (80, 24),
             generation: 0,
             quit_armed: false,
@@ -566,8 +592,8 @@ impl App {
                 Vec::new()
             }
             Input::Created { attempt, result } if attempt == self.attempt => self.on_created(result),
-            Input::Attached { summary, transcript, resync, attempt } if attempt == self.attempt => {
-                self.on_attached(&summary, &transcript, resync)
+            Input::Attached { summary, transcript, surfaces, resync, attempt } if attempt == self.attempt => {
+                self.on_attached(&summary, &transcript, surfaces, resync)
             }
             Input::AttachFailed { attempt, error } if attempt == self.attempt => {
                 self.connection_failed(&format!("could not attach: {error}"));
@@ -604,6 +630,11 @@ impl App {
                 if self.running() {
                     self.turn_seconds = self.turn_seconds.saturating_add(1);
                 }
+                self.frame = self.frame.wrapping_add(1);
+                for left in self.toasts.values_mut() {
+                    *left = left.saturating_sub(1);
+                }
+                self.toasts.retain(|_, left| *left > 0);
                 Vec::new()
             }
             // Answers of superseded attempts, and acknowledgements with nothing to show.
@@ -676,12 +707,12 @@ impl App {
         }
     }
 
-    fn on_attached(&mut self, summary: &SessionSummary, items: &[Item], resync: bool) -> Vec<Effect> {
+    fn on_attached(&mut self, summary: &SessionSummary, items: &[Item], surfaces: Vec<Surface>, resync: bool) -> Vec<Effect> {
         self.connecting = false;
         let meta = &summary.meta;
         let same = self.session.as_ref().is_some_and(|s| s.id == meta.id);
         if resync && same {
-            self.resync(items);
+            self.resync(items, surfaces);
         } else {
             let switching = self.session.is_some();
             self.transcript.settle();
@@ -698,8 +729,23 @@ impl App {
                 self.notice(Level::Info, format!("session {label} · {} · {}/{}", meta.workspace, meta.provider, meta.model));
             }
             self.transcript.reset_items();
-            for item in items {
+            self.surfaces = Surfaces::from_snapshot(surfaces);
+            self.live_surfaces.clear();
+            self.toasts.clear();
+            self.focus = None;
+            // Transcript surfaces replay where they were created: after the items that preceded them.
+            let mut anchored: Vec<Surface> =
+                self.surfaces.list.iter().filter(|s| surfaces::slot(&s.placement) == Slot::Transcript).cloned().collect();
+            anchored.sort_by_key(|s| s.anchor);
+            let mut anchored = anchored.into_iter().peekable();
+            for (index, item) in items.iter().enumerate() {
+                while let Some(surface) = anchored.next_if(|s| s.anchor <= u64::try_from(index).unwrap_or(u64::MAX)) {
+                    self.show_in_transcript(surface);
+                }
                 self.transcript.push_item(item);
+            }
+            for surface in anchored {
+                self.show_in_transcript(surface);
             }
             self.expose_history(summary.persistence);
         }
@@ -737,13 +783,26 @@ impl App {
     /// A re-attach after the stream dropped: the snapshot is the truth. New items are applied,
     /// steering they contain counts as delivered, and streamed text is dropped (the finished item
     /// is in the snapshot, or will arrive whole).
-    fn resync(&mut self, items: &[Item]) {
+    fn resync(&mut self, items: &[Item], surfaces: Vec<Surface>) {
         for item in items.iter().skip(self.transcript.items_seen()) {
             self.transcript.push_item(item);
             if let Item::User { parts } = item {
                 self.mark_delivered(&user_text(parts));
             }
         }
+        // The snapshot is the truth for surfaces too; transcript ones not shown yet are added.
+        self.surfaces = Surfaces::from_snapshot(surfaces);
+        let unseen: Vec<Surface> = self
+            .surfaces
+            .list
+            .iter()
+            .filter(|s| surfaces::slot(&s.placement) == Slot::Transcript && self.transcript.latest_surface(&s.id).is_none())
+            .cloned()
+            .collect();
+        for surface in unseen {
+            self.show_in_transcript(surface);
+        }
+        self.fix_focus();
         self.live_text.clear();
         self.live_reasoning.clear();
         self.pending_deliveries = 0;
@@ -782,10 +841,8 @@ impl App {
                 }
                 self.transcript.push_item(&item);
             }
-            SessionUpdate::ToolStarted { .. }
-            | SessionUpdate::ToolFinished { .. }
-            | SessionUpdate::SteerQueued
-            | SessionUpdate::Ui { .. } => {}
+            SessionUpdate::ToolStarted { .. } | SessionUpdate::ToolFinished { .. } | SessionUpdate::SteerQueued => {}
+            SessionUpdate::Ui { message } => self.on_ui(&message.message),
             // Which chips went out is told by the user items that follow, not by position: the
             // oldest chip may be a turn's first prompt whose answer is merely late.
             SessionUpdate::SteerDelivered { count } => self.pending_deliveries = self.pending_deliveries.saturating_add(count),
@@ -827,6 +884,153 @@ impl App {
         }
     }
 
+    /// Folds a surface message and places what changed (ADR 0064). The host validated it; one
+    /// that does not apply here (a stale replay) is ignored.
+    fn on_ui(&mut self, message: &UiMessage) {
+        let anchor = u64::try_from(self.transcript.items_seen()).unwrap_or(u64::MAX);
+        let Ok(change) = self.surfaces.apply(message, anchor) else { return };
+        match change {
+            Change::Created(id) | Change::Updated(id) => {
+                let created = matches!(message, UiMessage::CreateSurface { .. });
+                let Some(surface) = self.surfaces.get(&id).cloned() else { return };
+                match surfaces::slot(&surface.placement) {
+                    Slot::Transcript if created => self.show_in_transcript(surface),
+                    Slot::Transcript => self.update_in_transcript(surface),
+                    Slot::Toast => {
+                        self.toasts.insert(id, TOAST_TICKS);
+                    }
+                    Slot::Dialog if created && self.composer.is_empty() => {
+                        self.focus = surfaces::buttons(&surface).first().map(|button| (id, button.clone()));
+                    }
+                    Slot::Dialog | Slot::Above | Slot::Below | Slot::Status { .. } | Slot::Panel => {}
+                }
+            }
+            Change::Deleted(surface) => {
+                self.live_surfaces.retain(|s| *s != surface.id);
+                self.toasts.remove(&surface.id);
+            }
+        }
+        self.fix_focus();
+    }
+
+    /// Shows a transcript surface: under its tool call's row for `tool(<call_id>)` when that row
+    /// is not in scrollback yet, else at the end.
+    fn show_in_transcript(&mut self, surface: Surface) {
+        if let Placement::Tool { call_id } = &surface.placement
+            && self.transcript.insert_after_tool(&call_id.clone(), surface.clone())
+        {
+            return;
+        }
+        self.transcript.push(Entry::Surface { surface: Box::new(surface) });
+    }
+
+    /// A transcript surface changed: its snapshot is replaced while not in scrollback; otherwise
+    /// it shows live until the turn ends (and is committed once then), or at once when idle.
+    fn update_in_transcript(&mut self, surface: Surface) {
+        match self.transcript.latest_surface(&surface.id) {
+            Some(index) if index >= self.transcript.committed() => self.transcript.replace_surface(index, surface),
+            _ if self.running() => {
+                if !self.live_surfaces.contains(&surface.id) {
+                    self.live_surfaces.push(surface.id);
+                }
+            }
+            _ => self.transcript.push(Entry::Surface { surface: Box::new(surface) }),
+        }
+    }
+
+    /// Buttons that can take focus, in focus order: dialogs, pinned widgets, then transcript
+    /// surfaces newest first. Status-line surfaces and expired toasts are not focusable.
+    pub fn focusable(&self) -> Vec<(String, String)> {
+        let rank = |surface: &Surface| match surfaces::slot(&surface.placement) {
+            Slot::Dialog => Some(0),
+            Slot::Above | Slot::Panel => Some(1),
+            Slot::Below => Some(2),
+            Slot::Toast if self.toasts.contains_key(&surface.id) => Some(3),
+            Slot::Transcript => Some(4),
+            Slot::Toast | Slot::Status { .. } => None,
+        };
+        let mut ranked: Vec<(usize, usize, &Surface)> = self
+            .surfaces
+            .list
+            .iter()
+            .enumerate()
+            .filter_map(|(index, surface)| rank(surface).map(|rank| (rank, usize::MAX - index, surface)))
+            .collect();
+        ranked.sort_by_key(|(rank, newest, _)| (*rank, *newest));
+        ranked.into_iter().flat_map(|(_, _, surface)| surfaces::buttons(surface).into_iter().map(|b| (surface.id.clone(), b))).collect()
+    }
+
+    /// Drops the focus when its button is gone.
+    fn fix_focus(&mut self) {
+        if let Some(focus) = &self.focus
+            && !self.focusable().contains(focus)
+        {
+            self.focus = None;
+        }
+    }
+
+    /// Moves the focus to the next (or previous) button; returns whether one took it.
+    fn cycle_focus(&mut self, back: bool) -> bool {
+        let all = self.focusable();
+        if all.is_empty() {
+            return false;
+        }
+        let at = self.focus.as_ref().and_then(|f| all.iter().position(|b| b == f));
+        let next = match (at, back) {
+            (None, false) => 0,
+            (None, true) => all.len() - 1,
+            (Some(i), false) => (i + 1) % all.len(),
+            (Some(i), true) => i.checked_sub(1).unwrap_or(all.len() - 1),
+        };
+        self.focus = all.get(next).cloned();
+        self.focus.is_some()
+    }
+
+    /// Keys while a button has the focus: enter presses it, tab moves on, esc leaves; anything
+    /// else leaves the focus and goes to the editor.
+    fn focus_key(&mut self, key: KeyEvent) -> Option<Vec<Effect>> {
+        let (surface, button) = self.focus.clone()?;
+        match key.code {
+            KeyCode::Enter => {
+                let action = self.surfaces.get(&surface).and_then(|s| surfaces::press(s, &button));
+                self.focus = None;
+                Some(action.map(|action| self.send_action(&action)).unwrap_or_default())
+            }
+            KeyCode::Tab => {
+                self.cycle_focus(false);
+                Some(Vec::new())
+            }
+            KeyCode::BackTab => {
+                self.cycle_focus(true);
+                Some(Vec::new())
+            }
+            KeyCode::Esc => {
+                self.focus = None;
+                Some(Vec::new())
+            }
+            _ => {
+                self.focus = None;
+                None
+            }
+        }
+    }
+
+    /// Sends a pressed button's action as user input (ADR 0064): it starts a turn when idle and
+    /// steers the running one. It is not prompt history.
+    fn send_action(&mut self, action: &UiAction) -> Vec<Effect> {
+        let Some((session, state)) = self.session.as_ref().map(|s| (s.id.clone(), s.state)) else { return Vec::new() };
+        if state == SessionState::Closed || self.connecting {
+            self.notice(Level::Error, "this session cannot take the action now");
+            return Vec::new();
+        }
+        let text = action.to_input_text();
+        let id = self.next_prompt;
+        self.next_prompt = self.next_prompt.saturating_add(1);
+        let steering = self.running();
+        self.steers.push(Steer { id, steering, text: text.clone(), state: SteerState::Sending });
+        vec![Effect::Prompt { id, session, parts: text_parts(text) }]
+    }
+
     fn on_state(&mut self, state: SessionState) {
         if let Some(session) = &mut self.session {
             session.state = state;
@@ -846,6 +1050,12 @@ impl App {
     fn settle_turn(&mut self, _state: SessionState) {
         self.flush_live();
         self.transcript.settle();
+        // Live transcript surfaces are committed once, in their final state.
+        for id in std::mem::take(&mut self.live_surfaces) {
+            if let Some(surface) = self.surfaces.get(&id).cloned() {
+                self.transcript.push(Entry::Surface { surface: Box::new(surface) });
+            }
+        }
         self.pending_deliveries = 0;
         self.steers.retain(|s| s.state != SteerState::Delivered);
         let orphans: Vec<String> = self.steers.iter().filter(|s| s.state == SteerState::Queued).map(|s| s.text.clone()).collect();
@@ -898,7 +1108,15 @@ impl App {
     /// Puts text back into the composer, before whatever is being typed (its paste chips kept).
     /// The draft changed under any open completion, so that is closed and fenced off.
     fn refill(&mut self, texts: &[String]) {
-        let mut joined = texts.join("\n");
+        // A button's action is not typed text: it is not put back into the editor.
+        let (actions, texts): (Vec<&String>, Vec<&String>) = texts.iter().partition(|t| UiAction::from_input_text(t).is_some());
+        if !actions.is_empty() {
+            self.notice(Level::Warn, "a UI action was not delivered; press the button again");
+        }
+        if texts.is_empty() {
+            return;
+        }
+        let mut joined = texts.iter().map(|t| t.as_str()).collect::<Vec<_>>().join("\n");
         if !self.composer.is_empty() {
             joined.push('\n');
         }
@@ -1334,10 +1552,21 @@ impl App {
         if self.scroll_key(key) {
             return Vec::new();
         }
+        if let Some(effects) = self.focus_key(key) {
+            return effects;
+        }
         if self.popup.open()
             && let Some(effects) = self.popup_key(key)
         {
             return effects;
+        }
+        // Tab reaches the surfaces' buttons when there is nothing to indent (or a dialog asks).
+        let dialog = self.surfaces.list.iter().any(|s| surfaces::slot(&s.placement) == Slot::Dialog);
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            && (self.composer.is_empty() || dialog)
+            && self.cycle_focus(key.code == KeyCode::BackTab)
+        {
+            return Vec::new();
         }
         self.edit_key(key)
     }
@@ -1420,7 +1649,8 @@ fn help_text() -> String {
     }
     out.push_str(
         "\nkeys: enter sends (steers while a turn runs) · shift/alt+enter or ctrl+j newline · ctrl+c cancels, clears, exits · \
-         ctrl+r searches history · @ files · $ skills · esc closes popups · fullscreen: pgup/pgdn, ctrl+t reasoning",
+         ctrl+r searches history · @ files · $ skills · esc closes popups · tab focuses UI buttons (enter presses) · \
+         fullscreen: pgup/pgdn, ctrl+t reasoning",
     );
     out
 }

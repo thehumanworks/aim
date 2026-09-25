@@ -9,8 +9,12 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use aim_proto::ui::UiAction;
+use aim_proto::ui::model::Surface;
+
 use super::app::{App, Layout, SteerState};
 use super::markdown::{self, RenderOpts};
+use super::surfaces::{self, Look, PINNED_ROWS, Slot};
 use super::text::{Row, Run, clamp, truncate};
 use super::transcript::{EntryOpts, render_entry};
 
@@ -22,6 +26,8 @@ pub const POPUP_ROWS: usize = 8;
 pub const CHIP_ROWS: usize = 3;
 /// Most rows of held-back entries (running calls and what finished behind them) shown.
 pub const HELD_ROWS: usize = 10;
+/// Narrowest terminal that gets a fullscreen side panel (narrower, `panel.side` is a widget).
+pub const PANEL_MIN_WIDTH: u16 = 72;
 
 /// The pinned block, row by row, and where the cursor goes.
 #[derive(Debug, Default)]
@@ -89,6 +95,10 @@ pub fn status(app: &App, width: usize) -> Line<'static> {
     if let Some(hint) = &app.hint {
         spans.push(Span::styled(format!("{hint} · "), theme.warning));
     }
+    for surface in app.surfaces.list.iter().filter(|s| surfaces::slot(&s.placement) == Slot::Status { right: false }) {
+        spans.extend(surfaces::one_line(surface, theme, width / 3).into_iter().map(|run| Span::styled(run.text, run.style)));
+        spans.push(Span::styled(" · ", theme.status));
+    }
     spans.push(Span::styled(state, style));
     let mut rest: Vec<String> = Vec::new();
     if let Some(s) = &app.session {
@@ -120,19 +130,30 @@ pub fn status(app: &App, width: usize) -> Line<'static> {
     for segment in rest {
         spans.push(Span::styled(format!(" · {segment}"), theme.status));
     }
+    // `status.right` surfaces keep the right end: the rest is cut to make room for them.
+    let mut right: Vec<Span<'static>> = Vec::new();
+    for surface in app.surfaces.list.iter().filter(|s| surfaces::slot(&s.placement) == Slot::Status { right: true }) {
+        right.push(Span::styled(" · ", theme.status));
+        right.extend(surfaces::one_line(surface, theme, width / 3).into_iter().map(|run| Span::styled(run.text, run.style)));
+    }
+    let right_width: usize = right.iter().map(Span::width).sum();
+    let room = if right_width < width { width - right_width } else { width };
     let mut line = Line::from(spans);
     let mut used = 0;
     line.spans.retain_mut(|span| {
         let w = span.width();
-        if used >= width {
+        if used >= room {
             return false;
         }
-        if used + w > width {
-            span.content = truncate(&span.content, width - used).into();
+        if used + w > room {
+            span.content = truncate(&span.content, room - used).into();
         }
         used += w;
         true
     });
+    if right_width < width {
+        line.spans.extend(right);
+    }
     line
 }
 
@@ -199,7 +220,8 @@ fn chip_rows(app: &App, width: usize) -> Vec<Row> {
             SteerState::Queued => ("⧗ queued ", theme.chip_queued),
             SteerState::Delivered => ("✓ delivered ", theme.chip_delivered),
         };
-        let text = markdown::one_line(&steer.text, width.saturating_sub(mark.len() + 2).max(4));
+        let shown = UiAction::from_input_text(&steer.text).map_or_else(|| steer.text.clone(), |action| surfaces::action_line(&action));
+        let text = markdown::one_line(&shown, width.saturating_sub(mark.len() + 2).max(4));
         rows.push(Row::new(vec![Run::new(mark, style), Run::new(text, theme.muted)]));
     }
     if chips.len() > CHIP_ROWS {
@@ -229,6 +251,88 @@ fn popup_rows(app: &App, width: usize) -> Vec<Row> {
             row.push(Run::new(format!(" {}", truncate(&candidate.detail, room.max(4))), detail_style));
         }
         rows.push(row);
+    }
+    rows
+}
+
+/// Whether `panel.side` surfaces get fullscreen's side panel (otherwise they are widgets).
+pub fn side_panel(app: &App) -> bool {
+    app.layout == Layout::Fullscreen && app.size.0 >= PANEL_MIN_WIDTH
+}
+
+/// A pinned surface's rows: at most [`PINNED_ROWS`], the rest counted.
+fn pinned(app: &App, surface: &Surface, width: usize, boxed: bool) -> Vec<Row> {
+    let focus = app.focus.as_ref().filter(|(s, _)| *s == surface.id).map(|(_, b)| b.as_str());
+    let look = Look { focus, frame: app.frame, hyperlinks: false };
+    let theme = &app.theme;
+    let inner = if boxed { width.saturating_sub(4).max(1) } else { width };
+    let mut rows = surfaces::render(surface, theme, inner, look);
+    if rows.len() > PINNED_ROWS {
+        let hidden = rows.len() - (PINNED_ROWS - 1);
+        rows.truncate(PINNED_ROWS - 1);
+        rows.push(Row::plain(format!("… +{hidden} rows"), theme.muted));
+    }
+    if !boxed {
+        return rows.into_iter().map(|row| clamp(row, width)).collect();
+    }
+    let mut out = vec![Row::plain(format!("╭{}╮", "─".repeat(width.saturating_sub(2))), theme.accent)];
+    for row in rows {
+        let pad = inner.saturating_sub(row.width());
+        let mut line = Row::new(vec![Run::new("│ ", theme.accent)]);
+        for run in row.runs {
+            line.push(run);
+        }
+        line.push(Run::new(format!("{} │", " ".repeat(pad)), theme.accent));
+        out.push(line);
+    }
+    out.push(Row::plain(format!("╰{}╯", "─".repeat(width.saturating_sub(2))), theme.accent));
+    out.into_iter().map(|row| clamp(row, width)).collect()
+}
+
+/// Rows of the surfaces pinned above the editor: dialogs, live transcript surfaces, widgets (and
+/// `panel.side` when there is no side panel), and a hint when the focused button is out of sight.
+fn above_rows(app: &App, width: usize) -> Vec<Row> {
+    let panel = side_panel(app);
+    let mut rows = Vec::new();
+    for surface in app.surfaces.list.iter().filter(|s| surfaces::slot(&s.placement) == Slot::Dialog) {
+        rows.extend(pinned(app, surface, width, true));
+    }
+    for id in &app.live_surfaces {
+        if let Some(surface) = app.surfaces.get(id) {
+            rows.extend(pinned(app, surface, width, false));
+        }
+    }
+    for surface in &app.surfaces.list {
+        let slot = surfaces::slot(&surface.placement);
+        if slot == Slot::Above || (slot == Slot::Panel && !panel) {
+            rows.extend(pinned(app, surface, width, false));
+        }
+    }
+    if let Some((surface_id, button)) = &app.focus
+        && let Some(surface) = app.surfaces.get(surface_id)
+        && surfaces::slot(&surface.placement) == Slot::Transcript
+        && !app.live_surfaces.contains(surface_id)
+    {
+        let label = surfaces::button_label(surface, button);
+        let hint = format!("▸ [ {label} ] on {surface_id} · enter presses · tab next · esc back");
+        rows.push(Row::plain(truncate(&hint, width), app.theme.popup_selected));
+    }
+    rows
+}
+
+/// Rows of the surfaces pinned below the editor, and toasts still showing.
+fn below_rows(app: &App, width: usize) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for surface in app.surfaces.list.iter().filter(|s| surfaces::slot(&s.placement) == Slot::Below) {
+        rows.extend(pinned(app, surface, width, false));
+    }
+    for surface in app.surfaces.list.iter().filter(|s| surfaces::slot(&s.placement) == Slot::Toast && app.toasts.contains_key(&s.id)) {
+        let runs = surfaces::one_line(surface, &app.theme, width.saturating_sub(2));
+        let mut row = Row::new(vec![Run::new("◆ ", app.theme.accent)]);
+        for run in runs {
+            row.push(run);
+        }
+        rows.push(clamp(row, width));
     }
     rows
 }
@@ -263,6 +367,10 @@ pub fn block(app: &App, width: u16, max_rows: u16) -> Block {
     room = room.saturating_sub(popup.len());
     let chips: Vec<Row> = chip_rows(app, w).into_iter().take(room).map(|row| clamp(row, w)).collect();
     room = room.saturating_sub(chips.len());
+    let above: Vec<Row> = above_rows(app, w).into_iter().take(room).collect();
+    room = room.saturating_sub(above.len());
+    let below: Vec<Row> = below_rows(app, w).into_iter().take(room).collect();
+    room = room.saturating_sub(below.len());
     let tools: Vec<Row> = held_rows(app, w).into_iter().take(room).collect();
     room = room.saturating_sub(tools.len());
     let live_budget = room.min(usize::from(app.size.1 / 2).max(3));
@@ -272,12 +380,14 @@ pub fn block(app: &App, width: u16, max_rows: u16) -> Block {
     rows.extend(lines(&live));
     rows.extend(lines(&tools));
     rows.extend(lines(&chips));
+    rows.extend(lines(&above));
     if gap {
         rows.push(Line::default());
     }
     let composer_top = rows.len();
     rows.extend(lines(&composer));
     rows.extend(lines(&popup));
+    rows.extend(lines(&below));
     if rule {
         rows.push(Line::styled("─".repeat(w), theme.muted));
     }
@@ -309,6 +419,8 @@ pub struct RowCache {
     width: usize,
     collapse: bool,
     rows: Vec<Vec<Row>>,
+    /// The transcript's edit serial the rows reflect (surface snapshots change in place).
+    edits: u64,
 }
 
 impl RowCache {
@@ -324,6 +436,10 @@ impl RowCache {
             self.width = width;
             self.collapse = opts.collapse_reasoning;
         }
+        if let Some(first) = app.transcript.edited_since(self.edits) {
+            self.rows.truncate(first);
+        }
+        self.edits = app.transcript.edit_serial();
         let ready = app.transcript.ready();
         let entries = app.transcript.entries();
         self.rows.truncate(ready);
@@ -342,8 +458,28 @@ impl RowCache {
 pub fn fullscreen(app: &App, cache: &mut RowCache, area: Rect, buf: &mut Buffer) -> (Option<(u16, u16)>, usize) {
     let block = block(app, area.width.saturating_sub(1), area.height / 2);
     let block_height = u16::try_from(block.rows.len()).unwrap_or(area.height).min(area.height);
-    let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(block_height));
-    cache.sync(app, usize::from(area.width));
+    let mut body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(block_height));
+    let panels: Vec<&Surface> = app.surfaces.list.iter().filter(|s| surfaces::slot(&s.placement) == Slot::Panel).collect();
+    if side_panel(app) && !panels.is_empty() {
+        let panel_width = (area.width / 3).max(24);
+        body.width = area.width.saturating_sub(panel_width);
+        let panel = Rect::new(area.x + body.width, area.y, panel_width, body.height);
+        let inner = usize::from(panel_width.saturating_sub(2)).max(1);
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        for surface in panels {
+            let focus = app.focus.as_ref().filter(|(s, _)| *s == surface.id).map(|(_, b)| b.as_str());
+            for row in surfaces::render(surface, &app.theme, inner, Look { focus, frame: app.frame, hyperlinks: false }) {
+                let mut line = Row::new(vec![Run::new("│ ", app.theme.muted)]);
+                for run in row.runs {
+                    line.push(run);
+                }
+                rows.push(line.to_line());
+            }
+            rows.push(Line::styled("│", app.theme.muted));
+        }
+        draw_rows(&rows, panel, buf);
+    }
+    cache.sync(app, usize::from(body.width));
     let total = cache.total();
     let height = usize::from(body.height);
     let limit = total.saturating_sub(height);
@@ -483,6 +619,7 @@ mod tests {
         app.handle(Input::Attached {
             summary: summary("s1", "/home/me/aim", SessionState::Idle, 0),
             transcript: Vec::new(),
+            surfaces: Vec::new(),
             resync: false,
             attempt,
         });

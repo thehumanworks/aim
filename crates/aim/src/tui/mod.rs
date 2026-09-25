@@ -26,6 +26,7 @@ mod schedule;
 #[cfg(feature = "test-support")]
 pub mod script;
 mod shell;
+mod surfaces;
 mod text;
 mod theme;
 mod transcript;

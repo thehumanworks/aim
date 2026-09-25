@@ -179,8 +179,13 @@ async fn surfaces_are_logged_and_replay_the_same_on_reattach_and_resume() {
     assert!(refused.is_some_and(|r| r.is_error), "the model is told what was wrong");
 
     let (again, _) = host.attach(session.clone()).await.unwrap();
-    let ids: Vec<(&str, &Placement, u64)> = again.surfaces.iter().map(|s| (s.id.as_str(), &s.placement, s.anchor)).collect();
-    assert_eq!(ids, [("files", &Placement::Transcript, 3), ("build", &Placement::WidgetAboveEditor, 3)], "anchored after the calls");
+    let ids: Vec<(&str, &Placement)> = again.surfaces.iter().map(|s| (s.id.as_str(), &s.placement)).collect();
+    assert_eq!(ids, [("files", &Placement::Transcript), ("build", &Placement::WidgetAboveEditor)]);
+    // A call runs as soon as it is complete, so `files` may land before or after the second call's
+    // item: either way after its own call (the user item and `c1`), never after a result.
+    for surface in &again.surfaces {
+        assert!((2..=3).contains(&surface.anchor), "{} anchored at {}", surface.id, surface.anchor);
+    }
     let build = again.surfaces.iter().find(|s| s.id == "build").unwrap();
     assert_eq!(build.data, json!({"done": 60}));
 
