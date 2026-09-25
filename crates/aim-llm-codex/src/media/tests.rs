@@ -29,7 +29,12 @@ fn redacted_fixtures_parse() {
 
 #[tokio::test]
 async fn web_search_uses_isolated_hosted_turn() {
-    let server = FakeServer::start(|_, _| Reply::sse(include_bytes!("../../fixtures/media_search.sse"))).await;
+    let server = FakeServer::start(|_, _| {
+        let mut events = include_bytes!("../../fixtures/media_search.sse").to_vec();
+        events.push(b'\n');
+        Reply::sse(&events)
+    })
+    .await;
     let answer = client(&server).web_search("capital of France").await.unwrap();
     assert_eq!(answer.text, "Paris");
     assert_eq!(answer.queries, ["capital of France"]);
