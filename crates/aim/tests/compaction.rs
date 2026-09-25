@@ -1,6 +1,7 @@
 //! The context engine's compaction in the native loop, against scripted providers.
 #![expect(clippy::unwrap_used, reason = "test fakes lock uncontended mutexes")]
 #![expect(clippy::unnecessary_wraps, reason = "scripted streams are sequences of Results")]
+#![expect(clippy::print_stderr, clippy::expect_used, reason = "live tests report their measurements and fail loudly")]
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -255,4 +256,107 @@ fn the_model_context_is_rebuilt_from_the_log_with_compactions_applied() {
         event(6, EventBody::Compacted { replaced: 1, items: vec![user("S2")] }),
     ];
     assert_eq!(model_items_of(&log), vec![user("S2"), user("u2"), assistant("a2")]);
+}
+
+/// A real provider whose catalog reports a small window, so compaction triggers early.
+struct SmallWindow {
+    inner: Arc<dyn ModelProvider>,
+    model: String,
+    window: u64,
+}
+
+impl ModelProvider for SmallWindow {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn catalog(&self) -> LlmFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
+        let info = ModelInfo {
+            id: self.model.clone(),
+            display_name: self.model.clone(),
+            context_window: Some(self.window),
+            efforts: Vec::new(),
+            default_effort: None,
+            tiers: Vec::new(),
+            tools: true,
+            images: false,
+            hidden: false,
+            native: None,
+        };
+        Box::pin(async move { Ok(vec![info]) })
+    }
+
+    fn stream(&self, request: Request) -> LlmFuture<'_, Result<EventStream, LlmError>> {
+        self.inner.stream(request)
+    }
+
+    fn compact(&self, request: Request) -> LlmFuture<'_, Result<Option<Item>, LlmError>> {
+        self.inner.compact(request)
+    }
+}
+
+/// A long history whose only important fact is stated at the start.
+fn history_with_fact(pairs: usize) -> Vec<Item> {
+    let mut items = vec![
+        user("Remember this for later: the project codename is BLUE-HERON-42."),
+        assistant("Noted: the project codename is BLUE-HERON-42."),
+    ];
+    for i in 0..pairs {
+        items.push(user(&format!("Filler question {i}: {}", "lorem ipsum dolor sit amet ".repeat(12))));
+        items.push(assistant(&format!("Filler answer {i}: {}", "consectetur adipiscing elit ".repeat(12))));
+    }
+    items
+}
+
+async fn live_compaction(provider: &str, model: &str, effort: Option<&str>) -> (String, String) {
+    let (inner, _) = aim::providers::build(provider, Some(model)).unwrap();
+    let wrapped: Arc<dyn ModelProvider> = Arc::new(SmallWindow { inner, model: model.into(), window: 8_000 });
+    let config = AgentConfig {
+        model: model.into(),
+        instructions: "You are a concise assistant.".into(),
+        effort: effort.map(Into::into),
+        tier: None,
+        session_id: format!("live-compaction-{provider}"),
+        cache_key: None,
+        parallel_tool_calls: true,
+        max_requests: 4,
+    };
+    let mut agent = Agent::with_transcript(wrapped, Arc::new(NoTools), config, history_with_fact(80));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let started = std::time::Instant::now();
+    let question = vec![Part::Text { text: "What is the project codename? Reply with the codename only.".into() }];
+    let stop = agent.run_turn(question, &tx, &CancellationToken::new()).await.unwrap();
+    assert_eq!(stop, StopReason::EndTurn);
+    let events = drain(&mut rx);
+    let method = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Compacted { method, tokens_before, tokens_after, .. } => {
+                eprintln!("live {provider}: compacted ({method}) ~{tokens_before} → ~{tokens_after} tokens");
+                Some(method.clone())
+            }
+            _ => None,
+        })
+        .expect("compaction happened");
+    let reply: String =
+        events.iter().filter_map(|e| if let AgentEvent::TextDelta { delta } = e { Some(delta.as_str()) } else { None }).collect();
+    eprintln!("live {provider}: reply {reply:?} after {:?}", started.elapsed());
+    (method, reply)
+}
+
+/// Run with `mise exec -- cargo test -p aim --test compaction -- --ignored live_ --nocapture`.
+#[tokio::test]
+#[ignore = "live: OpenRouter"]
+async fn live_compaction_local_summary_keeps_the_facts() {
+    let (method, reply) = live_compaction("openrouter", "anthropic/claude-sonnet-5", None).await;
+    assert_eq!(method, "summary");
+    assert!(reply.contains("BLUE-HERON-42"), "{reply}");
+}
+
+#[tokio::test]
+#[ignore = "live: codex (ChatGPT subscription)"]
+async fn live_compaction_codex_remote_keeps_the_facts() {
+    let (method, reply) = live_compaction("codex", "gpt-6-sol", Some("low")).await;
+    assert_eq!(method, "remote");
+    assert!(reply.contains("BLUE-HERON-42"), "{reply}");
 }
