@@ -202,8 +202,10 @@ async fn reserve_at(served: &Served, path: &str) -> String {
         .reservation
 }
 
+/// Journal entries, not counting the admission `.lock` file.
 fn journal_entries(home: &std::path::Path) -> usize {
-    std::fs::read_dir(home.join(".aim/aimx/reservations")).map_or(0, |dir| dir.flatten().count())
+    std::fs::read_dir(home.join(".aim/aimx/reservations"))
+        .map_or(0, |dir| dir.flatten().filter(|entry| entry.file_name() != ".lock").count())
 }
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -272,4 +274,53 @@ async fn stdio_eof_cancels_unused_markers_before_exit() {
     assert!(status.success());
     assert!(!root.join("art/unused.png").exists());
     assert_eq!(journal_entries(&home), 0);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes).iter().fold(String::new(), |mut out, byte| {
+        use std::fmt::Write as _;
+        write!(out, "{byte:02x}").unwrap();
+        out
+    })
+}
+
+/// Opens a workspace whose server journals in `journal`, after planting a well-formed, unlocked
+/// entry there that names an ordinary file of the workspace with its correct hash; whether the
+/// sweep deleted that file.
+async fn forged_entry_deletes_ordinary_file(journal: std::path::PathBuf, storage: std::path::PathBuf) -> bool {
+    let env = env_with(|config, root| {
+        let root = root.canonicalize().unwrap();
+        let victim = root.join("ordinary.txt");
+        let bytes = b"ordinary known file, never reserved";
+        std::fs::write(&victim, bytes).unwrap();
+        let root_text = root.to_str().unwrap();
+        let tag = sha256_hex(root_text.as_bytes()).get(..16).unwrap().to_owned();
+        let record = serde_json::json!({"version": 1, "root": root_text, "path": victim.to_str().unwrap(), "hash": format!("sha256:{}", sha256_hex(bytes))});
+        std::fs::write(storage.join(format!("{tag}-forged.json")), serde_json::to_vec(&record).unwrap()).unwrap();
+        config.reservation_journal = Some(journal);
+    })
+    .await;
+    let (client, _, _) = session(&env).await;
+    client.peer.close();
+    !env.path("ordinary.txt").exists()
+}
+
+/// REV19 B1 (the review's RPC probe as a regression test): the sweep never trusts a journal
+/// reached through a symlink, so a forged entry there cannot delete an ordinary file. The control
+/// run shows the same entry in the journal's own (trusted) storage is honored.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlinked_journal_is_never_swept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    let untrusted = tmp.join("untrusted");
+    std::fs::create_dir(&untrusted).unwrap();
+    std::os::unix::fs::symlink(&untrusted, tmp.join("journal")).unwrap();
+    assert!(!forged_entry_deletes_ordinary_file(tmp.join("journal"), untrusted.clone()).await, "a symlinked journal was swept");
+    assert_eq!(std::fs::read_dir(&untrusted).unwrap().count(), 1, "nothing was deleted from rejected storage");
+
+    let trusted = tmp.join("trusted");
+    std::fs::create_dir(&trusted).unwrap();
+    std::fs::set_permissions(&trusted, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    assert!(forged_entry_deletes_ordinary_file(trusted.clone(), trusted).await, "control: trusted storage is swept");
 }

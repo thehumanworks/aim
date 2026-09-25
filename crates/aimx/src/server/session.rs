@@ -15,7 +15,7 @@ use super::journal::Entry;
 use super::{State, lock};
 use crate::authz::{Bound, Grant, Principal};
 use crate::tools::ProcTable;
-use crate::workspace::{Outcome, Workspace};
+use crate::workspace::{Outcome, Workspace, chunk_fits};
 use aim_kernel::policy::Limits as PolicyLimits;
 
 /// Output bytes pushed per `exec.output` batch read.
@@ -277,7 +277,6 @@ impl Session {
 
 async fn forward(session: Weak<Session>, backend: Arc<dyn Workspace>, proc: ProcId, max_bytes: u64) {
     let Some(mut attached) = session.upgrade().map(|s| s.attached.subscribe()) else { return };
-    drop(session);
     let Some(exec) = backend.exec() else { return };
     let mut cursor = 0u64;
     loop {
@@ -299,9 +298,17 @@ async fn forward(session: Weak<Session>, backend: Arc<dyn Workspace>, proc: Proc
         };
         // Released, or the session ended.
         let Ok(read) = read else { return };
+        // A session ceiling narrowed since the spawn also bounds what is pushed now (REV19 B4): a
+        // larger chunk is skipped, leaving a `seq` gap that `exec.read` refuses to fill.
+        let Some(ceiling) = session.upgrade().map(|session| session.ceiling()) else { return };
+        let limit = ceiling.and_then(|ceiling| ceiling.max_output_bytes).map_or(max_bytes, |ceiling| ceiling.min(max_bytes));
         let mut delivered = true;
         for chunk in read.chunks {
             let seq = chunk.seq;
+            if !chunk_fits(chunk.data.len(), limit) {
+                cursor = seq;
+                continue;
+            }
             if peer.notify::<ExecOutput>(ExecOutputParams { proc: proc.clone(), chunk }).await.is_err() {
                 delivered = false;
                 break;

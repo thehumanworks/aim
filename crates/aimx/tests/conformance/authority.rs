@@ -307,3 +307,60 @@ async fn scoped_process_output_is_bounded_by_the_output_limit() {
     let returned: usize = read["chunks"].as_array().unwrap().iter().map(|chunk| chunk["data"]["text"].as_str().map_or(0, str::len)).sum();
     assert!((1..=1024).contains(&returned), "exec.read returned {returned} bytes");
 }
+
+/// REV19 B4 (the review's probe as a regression test): output kept under a wider limit is never
+/// handed out in a larger piece than a later, narrower call's `max_output_bytes` permits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_narrower_output_limit_refuses_larger_existing_chunks() {
+    let env = env().await;
+    let (client, _, ws) = session(&env).await;
+    let script =
+        json!({"workspace": ws, "command": {"kind": "shell", "script": "head -c 20000 /dev/zero | tr '\\0' x"}, "idempotency_key": key()});
+    let proc: ProcId = serde_json::from_value(client.peer.call_raw("exec.spawn", script).await.unwrap()["proc"].clone()).unwrap();
+    client.peer.call_raw("exec.wait", json!({"proc": proc, "timeout_ms": 10_000})).await.unwrap();
+    let wide = client.peer.call_raw("exec.read", json!({"proc": proc, "after_seq": 0})).await.unwrap();
+    let large = wide["chunks"].as_array().unwrap().iter().find(|chunk| chunk["data"]["text"].as_str().map_or(0, str::len) > 1024);
+    let seq = large.expect("the unscoped process produced a chunk above 1 KiB")["seq"].as_u64().unwrap();
+    let narrow = json!({"roots": [root(&env.root)], "ops": ["read", "write", "exec"], "max_output_bytes": 1024});
+    denied(&client, "exec.read", json!({"proc": proc, "after_seq": seq - 1, "scope": narrow})).await;
+    let mut after = 0;
+    loop {
+        match client.peer.call_raw("exec.read", json!({"proc": proc, "after_seq": after, "scope": narrow})).await {
+            Ok(read) => {
+                let chunks = read["chunks"].as_array().unwrap().clone();
+                assert!(chunks.iter().all(|chunk| chunk["data"]["text"].as_str().map_or(0, str::len) <= 1024));
+                let Some(last) = chunks.last() else { break };
+                after = last["seq"].as_u64().unwrap();
+            }
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+                break;
+            }
+        }
+    }
+    client.peer.call_raw("exec.release", json!({"proc": proc})).await.unwrap();
+}
+
+/// REV19 B4: a session ceiling narrowed after the spawn bounds what is still pushed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_narrowed_ceiling_bounds_output_pushed_later() {
+    let env = env().await;
+    let (mut client, _, ws) = session(&env).await;
+    let script = json!({"workspace": ws, "command": {"kind": "shell", "script": "sleep 1; head -c 20000 /dev/zero | tr '\\0' x"}, "idempotency_key": key()});
+    client.peer.call_raw("exec.spawn", script).await.unwrap();
+    let ceiling = json!({"roots": [root(&env.root)], "ops": ["read", "write", "exec"], "max_output_bytes": 1024});
+    client.peer.call_raw("workspace.open", json!({"root": root(&env.root), "ceiling": ceiling})).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (method, params) = tokio::time::timeout_at(deadline.into(), client.notes.recv()).await.unwrap().unwrap();
+        match method.as_str() {
+            "exec.output" => {
+                let output: ExecOutputParams = serde_json::from_value(params).unwrap();
+                let len = output.chunk.data.into_bytes().len();
+                assert!(len <= 1024, "a chunk of {len} bytes was pushed after the ceiling narrowed to 1024");
+            }
+            "exec.exited" => break,
+            _ => {}
+        }
+    }
+}

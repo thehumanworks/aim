@@ -39,7 +39,7 @@ use crate::authz::confine::{is_within, normalize};
 use crate::authz::{Access, Grant};
 use crate::tools::{self, ToolCtx};
 use crate::workspace::local::{LocalConfig, LocalWorkspace, OpenRoot};
-use crate::workspace::{CopyRequest, EditRequest, GlobQuery, GrepQuery, ListRequest, Outcome, SpawnSpec, WriteRequest};
+use crate::workspace::{CopyRequest, EditRequest, GlobQuery, GrepQuery, ListRequest, Outcome, SpawnSpec, WriteRequest, chunk_fits};
 
 /// Default and maximum `fs.list` page.
 const LIST_DEFAULT: u32 = 1000;
@@ -456,12 +456,18 @@ impl Conn {
             let marker = format!("aim-reservation:{id}").into_bytes();
             let hash = marker_hash(&marker);
             // Journaled before the marker exists, so no crash can leave an unrecorded marker.
-            let entry = match &journal {
-                Some(journal) => Some(journal.record(&work_ws.info.root, &path, &hash).map_err(|err| {
-                    let code =
-                        if err.kind() == std::io::ErrorKind::QuotaExceeded { ErrorCode::LimitExceeded } else { ErrorCode::Unavailable };
-                    ProtoError::new(code, format!("cannot journal the reservation: {err}"))
-                })?),
+            let entry = match journal {
+                Some(journal) => {
+                    let (root, marker_path, marker_hash) = (work_ws.info.root.clone(), path.clone(), hash.clone());
+                    let recorded = tokio::task::spawn_blocking(move || journal.record(&root, &marker_path, &marker_hash))
+                        .await
+                        .map_err(|err| internal(format!("journaling the reservation failed: {err}")))?;
+                    Some(recorded.map_err(|err| {
+                        let code =
+                            if err.kind() == std::io::ErrorKind::QuotaExceeded { ErrorCode::LimitExceeded } else { ErrorCode::Unavailable };
+                        ProtoError::new(code, format!("cannot journal the reservation: {err}"))
+                    })?)
+                }
                 None => None,
             };
             let content = Content::from_bytes(marker);
@@ -726,10 +732,23 @@ impl Conn {
         let grant = ws.grant.clone();
         session.procs.authorize(&params.proc, &grant)?;
         let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
-        let max_bytes =
-            params.max_bytes.unwrap_or(EXEC_READ_DEFAULT).clamp(1, output_cap(&grant)?.min(self.state.config.max_read_bytes.max(1)));
+        let cap = output_cap(&grant)?;
+        let max_bytes = params.max_bytes.unwrap_or(EXEC_READ_DEFAULT).clamp(1, cap.min(self.state.config.max_read_bytes.max(1)));
         let wait = Duration::from_millis(params.wait_ms).min(EXEC_WAIT_MAX);
-        exec.read(&params.proc, params.after_seq, max_bytes, wait).await
+        let read = exec.read(&params.proc, params.after_seq, max_bytes, wait).await?;
+        // Output kept under a wider, earlier limit is never handed out in a larger piece than this
+        // call's limit permits (REV19 B4). Only a read's first chunk can exceed `max_bytes`.
+        match read.chunks.first() {
+            Some(chunk) if !chunk_fits(chunk.data.len(), cap) => Err(ProtoError::new(
+                ErrorCode::Denied,
+                format!(
+                    "output chunk {} holds {} bytes, more than this call's max_output_bytes ({cap}) permits; read it with the authority that spawned the process",
+                    chunk.seq,
+                    chunk.data.len()
+                ),
+            )),
+            _ => Ok(read),
+        }
     }
 
     async fn exec_write_stdin(self: Arc<Self>, params: ExecWriteStdinParams) -> Outcome<()> {

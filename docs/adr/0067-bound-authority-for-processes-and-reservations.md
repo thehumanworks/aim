@@ -68,6 +68,11 @@ Two cross-model reviews found gaps in ADR 0046's per-call authority and ADR 0054
      bytes. The chunk size never goes below 1 KiB and never above the 32 KiB read block, and a
      sequence number is never split.
    - The pushed batch is clamped to the limit bound at spawn.
+   - A later, narrower limit is honored for chunks already kept (REV19 B4). An `exec.read`
+     whose first chunk is larger than the call's limit (or the 1 KiB floor) is refused
+     (`denied`), rather than returned or split, because a sequence number is never split. The
+     forwarder skips such a chunk once the session ceiling has narrowed, which leaves a `seq` gap.
+     The pure check is `workspace::chunk_fits`.
    - The `aim-proto` doc comment says this now.
 5. **Reservation lifecycle.**
    - A finalize or cancel that fails because the marker is gone, changed or replaced
@@ -76,19 +81,31 @@ Two cross-model reviews found gaps in ADR 0046's per-call authority and ADR 0054
    - A session marks itself closed under its reservation lock. A reserve that completes after
      that gets its claim back and removes its own marker.
 6. **Durable reservation journal.** A new persisted format:
-   - **Location.** `~/.aim/aimx/reservations/`. The directory has mode 0700, is owned by the
-     user, and is added to the default protected paths.
-   - **Contents.** One entry per live reservation, `<random>.json`, mode 0600:
+   - **Location.** `<canonical home>/.aim/aimx/reservations/`. The directory has mode 0700, is
+     owned by the user, and is added to the default protected paths.
+   - **Trusted storage (REV19 B1).** Writing and sweeping both open the directory component by
+     component from `/` with `O_NOFOLLOW`, so no component may be a symlink. The directory must be
+     owned by the user; a looser mode is tightened to 0700. Every entry is then reached relative to
+     that held descriptor. Storage that fails these checks is neither written nor swept, and
+     nothing is deleted from it. The home is canonicalized once when the path is built.
+   - **Contents.** One entry per live reservation, `<tag>-<random>.json`, mode 0600, where `<tag>`
+     is 16 hex digits of the SHA-256 of its root:
      `{"version":1,"root":<canonical workspace root>,"path":<absolute marker path>,"hash":"sha256:…"}`.
-   - **Write order.** An entry is written, `fsync`ed and renamed into place **before** its
-     marker is created. The owning server keeps it open and `flock`ed while the reservation
-     lives, and deletes it when the reservation ends.
+     There is also `.lock`, mode 0600, the admission lock.
+   - **Write order.** Under an exclusive `flock` on `.lock` (REV19 B3), the recorder counts the
+     entries and then creates its own entry, so threads and aimx processes cannot overshoot the
+     bound together. The entry is created as `.tmp-<tag>-<random>`, `flock`ed, written,
+     `fsync`ed and renamed into place **before** its marker is created. The owning server keeps it
+     open and locked while the reservation lives, and deletes it when the reservation ends.
    - **Sweep.** Each `workspace.open` of a root sweeps that root's entries whose lock is free,
      meaning their server exited or was killed. The sweep removes the marker only while it still
      has the recorded hash, then deletes the entry.
    - **Concurrent servers.** A live reservation of another aimx is never swept, because its lock
      is held.
-   - **Bounds.** The journal holds at most 4096 files, and one sweep looks at no more than 256.
+   - **Bounds.** The journal holds at most 4096 entry files besides `.lock`. A sweep reads every
+     name (at most 4160), opens only its own root's entries, and cleans up at most 256 of them. It
+     starts at a random point of its root's sorted entries, so repeated sweeps reach every
+     abandoned entry even when some cleanups keep failing (REV19 B2).
    - **Failure handling.** A reservation that cannot be journaled is refused (fail closed), since
      its marker could otherwise outlive a crash. A read-only server does not sweep. Temporary
      entries left by a writer that died are removed once unlocked and older than 60 s.
@@ -97,7 +114,9 @@ Two cross-model reviews found gaps in ADR 0046's per-call authority and ADR 0054
 7. **Graceful harness shutdown.** `HarnessClient::shutdown` closes the connection. It then gives a
    spawned aimx up to 2 s to finish its EOF shutdown (session close cancels its unused markers)
    before it kills the process. A dropped or cancelled `generate_image` future cancels its
-   reservation on a spawned task (a drop guard).
+   reservation on a spawned task (a drop guard). The guard stays armed until the harness answers
+   an explicit cancel, so a future dropped while that cancel is pending still cancels (REV19 B5).
+   The retry reuses the idempotency key, so aimx runs the cancel at most once.
 8. **Agentless SSH** supports reservations. `cancel_if_hash` compares the hash and removes the
    file in one remote script under the backend's mutation lock, and never follows a marker that
    became a symlink.
@@ -150,6 +169,14 @@ Two cross-model reviews found gaps in ADR 0046's per-call authority and ADR 0054
   `a_concurrent_servers_live_reservation_is_not_swept` and
   `stdio_eof_cancels_unused_markers_before_exit`), plus the unit tests in `server/journal.rs`.
 - **Session race.** `server::session::tests::a_reservation_added_after_close_is_refused`.
+- **REV19 fixes.** Each has a regression test that fails on the code before the fix:
+  - B1: `reservation.rs::a_symlinked_journal_is_never_swept` (the review's RPC probe, with a
+    trusted-storage control) and `journal::tests::untrusted_storage_is_neither_written_nor_swept`;
+  - B2: `journal::tests::sweeps_reach_every_abandoned_entry`;
+  - B3: `journal::tests::concurrent_admission_keeps_the_bound` (the review's 32-thread probe);
+  - B4: `authority.rs::a_later_narrower_output_limit_refuses_larger_existing_chunks` (the
+    review's probe) and `a_narrowed_ceiling_bounds_output_pushed_later`;
+  - B5: `media::dispatcher::tests::dropping_during_a_pending_cancel_still_cancels`.
 - **Live.** The live evidence (ADR 0022) is recorded in the FIX17 report:
   - aim's real `generate_image` on a local workspace, and one cancelled mid-generation;
   - agentless SSH reservations over the user-space sshd fixture.

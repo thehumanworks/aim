@@ -34,6 +34,19 @@ use crate::authz::Grant;
 
 pub mod local;
 
+/// The smallest output chunk a limit is honored at (ADR 0067): process output under a smaller
+/// `max_output_bytes` is still kept, returned and pushed in chunks of up to this many bytes, since
+/// smaller chunks would multiply per-chunk bookkeeping in the output ring.
+pub(crate) const MIN_OUTPUT_CHUNK: usize = 1024;
+
+/// Whether an existing output chunk of `len` bytes may be returned or pushed under an output limit
+/// of `cap` bytes: it fits the limit, or the [`MIN_OUTPUT_CHUNK`] floor (REV19 B4). Pure; a kernel
+/// candidate with the chunk-size clamp.
+#[must_use]
+pub(crate) fn chunk_fits(len: usize, cap: u64) -> bool {
+    u64::try_from(len).unwrap_or(u64::MAX) <= cap.max(u64::try_from(MIN_OUTPUT_CHUNK).unwrap_or(u64::MAX))
+}
+
 /// A boxed, sendable future borrowing the backend.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 

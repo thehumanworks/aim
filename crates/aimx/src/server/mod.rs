@@ -163,9 +163,10 @@ fn protected_aim_home(home: &str, explicit: Option<&Path>) -> ProtectedPaths {
 }
 
 /// Where the servers of the user whose home is `home` journal live file reservations (ADR 0067).
+/// The home is resolved once here; the journal refuses to pass through any symlink below it.
 #[must_use]
 pub fn reservation_journal_dir(home: &str) -> std::path::PathBuf {
-    Path::new(home).join(".aim/aimx/reservations")
+    std::fs::canonicalize(home).unwrap_or_else(|_| Path::new(home).to_path_buf()).join(".aim/aimx/reservations")
 }
 
 /// Adds the canonical spelling of every protected path (its deepest existing ancestor resolved,

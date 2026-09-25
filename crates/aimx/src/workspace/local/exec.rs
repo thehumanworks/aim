@@ -36,15 +36,11 @@ use super::walk::{self, Follow};
 use super::{Authority, Base, blocking, io_error, path_string};
 use crate::id::random_hex;
 use crate::ring::OutputRing;
-use crate::workspace::{BoxFuture, Exec, Outcome, SpawnSpec};
+use crate::workspace::{BoxFuture, Exec, MIN_OUTPUT_CHUNK, Outcome, SpawnSpec};
 
 const READ_BLOCK: usize = 32 * 1024;
-/// The smallest output chunk a scoped spawn splits its output into (ADR 0067): a smaller
-/// `max_output_bytes` would multiply per-chunk bookkeeping in the output ring.
-const MIN_CHUNK: usize = 1024;
-
 /// How a process's output is kept: the ring's byte budget, and the largest chunk (the spawning
-/// call's `max_output_bytes`, at least [`MIN_CHUNK`]), so every `exec.read` answer and pushed
+/// call's `max_output_bytes`, at least [`MIN_OUTPUT_CHUNK`]), so every `exec.read` answer and pushed
 /// `exec.output` stays within that limit without ever splitting a sequence number.
 #[derive(Clone, Copy, Debug)]
 struct OutputBounds {
@@ -606,10 +602,9 @@ impl Exec for LocalExec {
                 }
             })
             .await?;
-            let max_chunk =
-                self.base.grant.as_ref().and_then(crate::authz::Grant::limits).map_or(READ_BLOCK, |limits| {
-                    usize::try_from(limits.max_output_bytes).unwrap_or(usize::MAX).clamp(MIN_CHUNK, READ_BLOCK)
-                });
+            let max_chunk = self.base.grant.as_ref().and_then(crate::authz::Grant::limits).map_or(READ_BLOCK, |limits| {
+                usize::try_from(limits.max_output_bytes).unwrap_or(usize::MAX).clamp(MIN_OUTPUT_CHUNK, READ_BLOCK)
+            });
             let output = OutputBounds { ring_bytes: self.ring_bytes, max_chunk };
             let proc = match spec.pty {
                 Some(size) => {
