@@ -167,6 +167,8 @@ impl Human {
             | AgentEvent::SteerQueued
             | AgentEvent::SteerDelivered { .. }
             | AgentEvent::RateLimits { .. }
+            // Choices are for interactive clients (ADR 0074).
+            | AgentEvent::Options { .. }
             // Surfaces are for interactive clients; headless output shows the tool call.
             | AgentEvent::Ui { .. } => Ok(()),
             AgentEvent::Decision { decision } => {

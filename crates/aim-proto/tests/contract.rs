@@ -303,3 +303,47 @@ fn adr_0066_nested_tool_records_round_trip_and_old_readers_keep_them_as_unknown(
     let old: before_adr_0066::SessionUpdate = serde_json::from_value(wire).unwrap();
     assert!(matches!(old, before_adr_0066::SessionUpdate::ToolFinished { call_id, .. } if call_id == "n"));
 }
+
+/// ADR 0074: a session's options are one additive update and one additive attach field. An old
+/// client drops the update (its parser refuses the unknown `type`) and ignores the field.
+#[test]
+fn adr_0074_session_options_are_additive() {
+    use aim_proto::daemon::{ChoiceValue, SessionAttachPagedResult, SessionAttachResult, SessionOptions, SessionUpdate};
+    let options = SessionOptions {
+        models: vec![
+            ChoiceValue { value: "gpt-6-sol".into(), name: Some("GPT-6 Sol".into()), description: Some("400k context".into()) },
+            ChoiceValue { value: "opus[1m]".into(), name: None, description: None },
+        ],
+        efforts: vec![ChoiceValue { value: "low".into(), name: None, description: Some("default".into()) }],
+    };
+    let update = SessionUpdate::Options { options: options.clone() };
+    let wire = serde_json::to_value(&update).unwrap();
+    assert_eq!(
+        wire,
+        json!({"type": "options", "options": {
+            "models": [{"value": "gpt-6-sol", "name": "GPT-6 Sol", "description": "400k context"}, {"value": "opus[1m]"}],
+            "efforts": [{"value": "low", "description": "default"}]
+        }})
+    );
+    assert_eq!(serde_json::from_value::<SessionUpdate>(wire.clone()).unwrap(), update);
+    assert!(
+        serde_json::from_value::<before_adr_0066::SessionUpdate>(wire).is_err(),
+        "an older client's parser refuses the unknown update, so it drops it and reads on"
+    );
+    // Missing lists read as empty.
+    assert_eq!(serde_json::from_value::<SessionOptions>(json!({})).unwrap(), SessionOptions::default());
+
+    let summary = json!({"meta": {"id": "s", "created_ms": 1, "workspace": "/w", "location": "local", "provider": "p", "model": "m"},
+                         "state": "idle", "persistence": "persistent", "last_activity_ms": 1, "turns": 0});
+    let old = json!({"summary": summary, "transcript": []});
+    let parsed: SessionAttachResult = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(parsed.options, None, "a reply without options reads as none");
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), old, "and serializes as before");
+    let with = SessionAttachResult { options: Some(options.clone()), ..parsed };
+    let wire = serde_json::to_value(&with).unwrap();
+    assert_eq!(wire["options"]["efforts"][0]["value"], "low");
+    assert_eq!(serde_json::from_value::<SessionAttachResult>(wire).unwrap(), with);
+    let paged: SessionAttachPagedResult =
+        serde_json::from_value(json!({"summary": summary, "snapshot_id": "x", "total_bytes": 2, "first_chunk": "W10="})).unwrap();
+    assert_eq!(paged.options, None);
+}

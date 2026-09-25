@@ -141,7 +141,9 @@ impl Recorder {
             | AgentEvent::SteerDelivered { .. }
             | AgentEvent::SteersReturned { .. }
             // A rejection changes nothing: the log keeps state, not requests (ADR 0038).
-            | AgentEvent::ConfigRejected { .. } => return Ok(()),
+            | AgentEvent::ConfigRejected { .. }
+            // What a session can switch to is the backend's data of the moment (ADR 0074).
+            | AgentEvent::Options { .. } => return Ok(()),
         };
         self.record(body).await
     }

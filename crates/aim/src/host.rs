@@ -1188,8 +1188,12 @@ impl SessionClient for SessionHost {
             let live = host.live_or_resume(&session).await?;
             let transcript = lock(&live.transcript);
             let rx = live.updates.subscribe();
-            let result =
-                SessionAttachResult { summary: lock(&live.summary).clone(), transcript: transcript.clone(), surfaces: live.ui.snapshot() };
+            let result = SessionAttachResult {
+                summary: lock(&live.summary).clone(),
+                transcript: transcript.clone(),
+                surfaces: live.ui.snapshot(),
+                options: None,
+            };
             drop(transcript);
             Ok((result, updates_of(rx)))
         })

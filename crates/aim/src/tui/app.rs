@@ -879,6 +879,7 @@ impl App {
             SessionUpdate::ConfigRejected { message, .. } => {
                 self.notice(Level::Error, format!("configuration not changed: {message}"));
             }
+            SessionUpdate::Options { .. } => {}
             SessionUpdate::Compacted { method, tokens_before, tokens_after, .. } => {
                 // The model's context was folded; the transcript shown keeps every item.
                 let (before, after) = (super::view::short_count(tokens_before), super::view::short_count(tokens_after));
