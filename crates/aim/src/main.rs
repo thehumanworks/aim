@@ -134,6 +134,29 @@ enum Command {
         #[command(subcommand)]
         action: board_cli::BoardAction,
     },
+    /// Serve a workspace's tools in code mode over MCP stdio: the relay a strict `acp:claude`
+    /// session gets when code mode is on (ADR 0076). Started by aim, not by hand.
+    #[command(name = "code-mcp", hide = true)]
+    CodeMcp {
+        /// Workspace root (on the workspace's host).
+        #[arg(long)]
+        root: String,
+        /// SSH destination of a remote workspace.
+        #[arg(long)]
+        ssh: Option<String>,
+        /// The aimx binary that connects the workspace.
+        #[arg(long)]
+        aimx: PathBuf,
+        /// The `aim-coderun` worker.
+        #[arg(long)]
+        coderun: PathBuf,
+        /// The user's program repository.
+        #[arg(long)]
+        programs: PathBuf,
+        /// `on` or `only`.
+        #[arg(long = "code-mode")]
+        code_mode: String,
+    },
     /// Inspect and trust user MCP servers, or serve aim's tools to an MCP client.
     Mcp {
         /// Serve aim's local services over MCP stdio.
@@ -477,6 +500,14 @@ async fn main_async(args: Args) -> Result<i32, String> {
         }
         Command::Board { action } => Box::pin(board_cli::run(&cli::aim_home(), action)).await,
         Command::Mcp { stdio, cwd, ssh, aimx, action } => mcp_command(stdio, cwd, ssh, aimx, action).await,
+        Command::CodeMcp { root, ssh, aimx, coderun, programs, code_mode } => {
+            let mode = aim::mcp::proxy::relay_mode(&code_mode)?;
+            let location = ssh.map_or(aim_proto::daemon::Location::Local, |destination| aim_proto::daemon::Location::Ssh { destination });
+            let code = aim::host::CodeConfig { worker: coderun, user_programs: programs, mode };
+            let relay = aim::mcp::proxy::CodeRelay { root, location, aimx, code };
+            aim::mcp::proxy::serve(&relay, tokio::io::stdin(), tokio::io::stdout()).await?;
+            Ok(0)
+        }
         Command::Daemon {
             socket,
             web,
