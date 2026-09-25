@@ -13,7 +13,7 @@
 //!
 //! The cut keeps the longest tail that fits [`KEEP_PERCENT`] of the window and never separates
 //! a tool call from its result, matched by call id so parallel calls are handled. That decision
-//! is the kernel's `compaction::plan_cut` (ADR 0025).
+//! is the verified kernel's `compaction::plan_cut` (ADR 0025, LOCKED).
 //!
 //! **Nothing is lost.** The session log keeps every item. The model's context is rebuilt by
 //! applying the recorded `Compacted` events.
@@ -78,42 +78,11 @@ fn id_of<'a>(ids: &mut HashMap<&'a str, u64>, call_id: &'a str) -> u64 {
 
 /// The smallest valid cut `k` (keep the longest verbatim tail within `budget`): `1 <= k <= n`, no
 /// call/result pair straddles `k`, the tail `[k, n)` fits, and no pinned tool item lies before it.
-/// `None` for an empty transcript or a pinned tool item.
-///
-/// This mirrors the kernel's `compaction::plan_cut` (ADR 0025); it is replaced by the verified one
-/// when that lands.
+/// `None` for an empty transcript or a pinned tool item. The decision is the verified kernel's
+/// (`aim_kernel::compaction::plan_cut`, ADR 0025).
 #[must_use]
 pub fn plan_cut(items: &[PlanItem], budget: u64) -> Option<usize> {
-    let n = items.len();
-    if n == 0 || items.iter().any(|i| i.pinned && !matches!(i.kind, ItemKind::Message)) {
-        return None;
-    }
-    // For each result, the earliest call it answers.
-    let first_call: Vec<Option<usize>> = items
-        .iter()
-        .enumerate()
-        .map(|(j, item)| match item.kind {
-            ItemKind::ToolResult(r) => items.iter().take(j).position(|c| matches!(c.kind, ItemKind::ToolCall(id) if id == r)),
-            _ => None,
-        })
-        .collect();
-    let mut best = n;
-    let mut tail: u64 = 0;
-    let mut min_call = usize::MAX;
-    // Sweep k downward: the tail [k, n) grows, and so does the set of results in it.
-    for (k, (item, call)) in items.iter().zip(&first_call).enumerate().skip(1).rev() {
-        tail = tail.saturating_add(u64::from(item.tokens));
-        if tail > budget {
-            break;
-        }
-        if let Some(call) = call {
-            min_call = min_call.min(*call);
-        }
-        if min_call >= k {
-            best = k;
-        }
-    }
-    Some(best)
+    aim_kernel::compaction::plan_cut(items, budget).ok()
 }
 
 /// The kept items before the cut (pinned ones), in order.

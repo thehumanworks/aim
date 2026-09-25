@@ -12,3 +12,13 @@ sha256 = "7b09700a52ae6b8b126a036d515d00a5a38012025a731040b46dff167774e425"
 decision = "path::confined"
 adr = "0008"
 sha256 = "8a559150598f4595a7ee9fd6a2c835a758a37f8641e5442ad9d729c4c26ea456"
+
+[[locked]]
+decision = "compaction::cut_ok"
+adr = "0025"
+sha256 = "7ea77f5ce46dc0ba5713501029c62ac29f497d4697cc9ff0ca4617aebc543cb0"
+
+[[locked]]
+decision = "compaction::plan_ok"
+adr = "0025"
+sha256 = "e2a78dbf038d98aa155d8e80f6d803b7f82a18922041c12a35bed2e5cb313b64"
