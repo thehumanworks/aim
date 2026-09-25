@@ -61,6 +61,7 @@ pub(crate) struct Session {
 
 impl Session {
     fn new(token: String, principal: Arc<Principal>, procs: ProcTable, max_workspaces: usize) -> Self {
+        let ceiling = principal.ceiling.clone();
         Self {
             token,
             principal,
@@ -69,7 +70,7 @@ impl Session {
             procs: Arc::new(procs),
             attached: watch::channel(None).0,
             detached_at: Mutex::new(Some(Instant::now())),
-            ceiling: Mutex::new(None),
+            ceiling: Mutex::new(ceiling),
             reservations: Mutex::new(HashMap::new()),
         }
     }
@@ -275,7 +276,7 @@ impl State {
         peer: Peer,
     ) -> Option<(Arc<Session>, Option<Peer>)> {
         let sessions = lock(&self.sessions);
-        let session = sessions.get(token).filter(|s| s.principal.id == principal.id && !s.expired(self.config.resume_ttl))?;
+        let session = sessions.get(token).filter(|s| s.principal.as_ref() == principal && !s.expired(self.config.resume_ttl))?;
         let previous = session.attach(conn, peer);
         Some((Arc::clone(session), previous))
     }
@@ -317,7 +318,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn replacement_attach_outlives_old_detach() {
-        let principal = Arc::new(Principal { id: "test".into(), roots: Vec::new(), read_only: false });
+        let principal = Arc::new(Principal { id: "test".into(), roots: Vec::new(), read_only: false, ceiling: None });
         let procs = ProcTable::new(1, Arc::new(Semaphore::new(1)));
         let session = Arc::new(Session::new("token".into(), principal, procs, 1));
         session.attach(1, peer());

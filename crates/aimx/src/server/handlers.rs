@@ -35,7 +35,7 @@ use serde::de::DeserializeOwned;
 use super::session::{OpenWorkspace, Reservation, Session};
 use super::token::TokenStore;
 use super::{State, lock};
-use crate::authz::confine::normalize;
+use crate::authz::confine::{is_within, normalize};
 use crate::authz::{Access, Grant};
 use crate::tools::{self, ToolCtx};
 use crate::workspace::local::{LocalConfig, LocalWorkspace, OpenRoot};
@@ -317,6 +317,12 @@ impl Conn {
             Grant::new(Arc::clone(&session.principal), Arc::clone(&self.state.protected), root.clone(), normalize(&params.root));
         if let Some(descriptor) = root_descriptor {
             grant = grant.bind_local_root(descriptor);
+        }
+        if let Some(bound) = session.ceiling() {
+            let canonical = grant.ceiling(&bound, self.policy_limits())?;
+            if !canonical.roots.iter().any(|prefix| is_within(prefix, &root) || is_within(&root, prefix)) {
+                return Err(ProtoError::new(ErrorCode::Denied, "workspace is outside the session ceiling roots"));
+            }
         }
         if let Some(ceiling) = params.ceiling.as_ref() {
             session.bind_ceiling(&grant, ceiling, self.policy_limits())?;

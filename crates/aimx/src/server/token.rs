@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::harness::AuthProof;
+use aim_proto::harness::{AuthProof, CallScope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -33,6 +33,8 @@ pub struct TokenStore {
 struct Record {
     digest: String,
     scope: TokenScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ceiling: Option<CallScope>,
     expires_ms: u64,
 }
 
@@ -60,6 +62,20 @@ impl TokenStore {
     /// # Errors
     /// Entropy, ownership, permissions, or storage failure.
     pub fn create(&self, scope: TokenScope, ttl: Duration) -> io::Result<String> {
+        self.create_record(scope, None, ttl)
+    }
+
+    /// Issue a token whose stored W20 scope becomes its bound network session ceiling.
+    /// Absolute normalized paths make the same ceiling meaningful in every opened workspace.
+    ///
+    /// # Errors
+    /// Invalid scope syntax, entropy, ownership, permissions, or storage failure.
+    pub fn create_scoped(&self, ceiling: CallScope, ttl: Duration) -> io::Result<String> {
+        validate_ceiling(&ceiling)?;
+        self.create_record(TokenScope::Write, Some(canonicalize_ceiling(ceiling)?), ttl)
+    }
+
+    fn create_record(&self, scope: TokenScope, ceiling: Option<CallScope>, ttl: Duration) -> io::Result<String> {
         // The registry is atomically replaced, so lock a stable sibling file across the
         // read/modify/write sequence. The issued token is returned only after its record lands.
         let _registry_lock = self.lock_exclusive()?;
@@ -71,6 +87,7 @@ impl TokenStore {
         registry.tokens.push(Record {
             digest: digest(&token),
             scope,
+            ceiling,
             expires_ms: now_ms().saturating_add(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX)),
         });
         self.write(&registry)?;
@@ -117,11 +134,17 @@ impl TokenStore {
         let Some(record) = found else {
             return Err(ProtoError::new(ErrorCode::Unauthenticated, "network bearer invalid or expired"));
         };
+        if record.ceiling.as_ref().is_some_and(|ceiling| validate_ceiling(ceiling).is_err()) {
+            return Err(ProtoError::new(ErrorCode::Unauthenticated, "network bearer has an invalid scope"));
+        }
         Ok((
             Principal {
                 id: format!("token:{}", record.digest),
                 roots: base.roots.clone(),
-                read_only: base.read_only || record.scope == TokenScope::Read,
+                read_only: base.read_only
+                    || record.scope == TokenScope::Read
+                    || record.ceiling.as_ref().is_some_and(|ceiling| !ceiling.ops.iter().any(|op| matches!(op.as_str(), "write" | "exec"))),
+                ceiling: record.ceiling.clone(),
             },
             Duration::from_millis(record.expires_ms.saturating_sub(now)),
         ))
@@ -162,6 +185,31 @@ impl TokenStore {
     }
 }
 
+fn validate_ceiling(ceiling: &CallScope) -> io::Result<()> {
+    for path in ceiling.roots.iter().chain(&ceiling.deny_write) {
+        if !path.starts_with('/')
+            || (path != "/" && path.split('/').skip(1).any(|part| part.is_empty() || part == "." || part == ".." || part.contains('\0')))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "token scope paths must be normalized absolute paths"));
+        }
+    }
+    if ceiling.ops.iter().any(|op| !matches!(op.as_str(), "read" | "write" | "exec")) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "token scope operations must be read, write, or exec"));
+    }
+    Ok(())
+}
+
+fn canonicalize_ceiling(mut ceiling: CallScope) -> io::Result<CallScope> {
+    let canonical = |path: String| -> io::Result<String> {
+        super::canonical_spelling(Path::new(&path))
+            .and_then(|real| real.to_str().map(str::to_owned))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "token scope path cannot be canonicalized as UTF-8"))
+    };
+    ceiling.roots = ceiling.roots.into_iter().map(&canonical).collect::<io::Result<_>>()?;
+    ceiling.deny_write = ceiling.deny_write.into_iter().map(canonical).collect::<io::Result<_>>()?;
+    Ok(ceiling)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
@@ -195,7 +243,7 @@ mod tests {
     fn token_is_stored_hashed_and_expires() {
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore::under_home(dir.path());
-        let base = Principal { id: "local:1".into(), roots: vec!["/tmp".into()], read_only: false };
+        let base = Principal { id: "local:1".into(), roots: vec!["/tmp".into()], read_only: false, ceiling: None };
         let token = store.create(TokenScope::Read, Duration::from_secs(60)).unwrap();
         let disk = fs::read_to_string(&store.path).unwrap();
         assert!(!disk.contains(&token));
@@ -224,10 +272,38 @@ mod tests {
             })
             .collect::<Vec<_>>();
         gate.wait();
-        let base = Principal { id: "local:1".into(), roots: vec!["/tmp".into()], read_only: false };
+        let base = Principal { id: "local:1".into(), roots: vec!["/tmp".into()], read_only: false, ceiling: None };
         for task in tasks {
             let token = task.join().unwrap();
             assert!(store.authenticate(Some(&AuthProof::Bearer { token }), &base).is_ok());
         }
+    }
+
+    #[test]
+    fn scoped_token_persists_ceiling_and_rejects_invalid_paths_or_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::under_home(dir.path());
+        let root = fs::canonicalize(dir.path()).unwrap().to_str().unwrap().to_owned();
+        let base = Principal { id: "local:1".into(), roots: vec![root.clone()], read_only: false, ceiling: None };
+        let ceiling = CallScope {
+            roots: vec![format!("{root}/allowed")],
+            ops: vec!["read".into(), "write".into()],
+            deny_write: vec![format!("{root}/allowed/locked")],
+            max_processes: None,
+            max_output_bytes: None,
+        };
+        let token = store.create_scoped(ceiling.clone(), Duration::from_secs(60)).unwrap();
+        let registry = fs::read_to_string(&store.path).unwrap();
+        assert!(!registry.contains(&token));
+        let reloaded = TokenStore::under_home(dir.path());
+        let authenticated = reloaded.authenticate(Some(&AuthProof::Bearer { token }), &base).unwrap();
+        assert_eq!(authenticated.ceiling, Some(ceiling.clone()));
+        assert!(!authenticated.read_only);
+        let mut invalid = ceiling.clone();
+        invalid.roots = vec!["relative/root".into()];
+        assert_eq!(store.create_scoped(invalid, Duration::from_secs(60)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let mut invalid = ceiling;
+        invalid.ops = vec!["admin".into()];
+        assert_eq!(store.create_scoped(invalid, Duration::from_secs(60)).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 }

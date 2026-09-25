@@ -28,6 +28,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use super::Server;
 use super::token::TokenStore;
+use crate::authz::Principal;
 
 const HTTP_SESSION_IDLE: Duration = Duration::from_mins(30);
 const HTTP_REAP_INTERVAL: Duration = Duration::from_secs(10);
@@ -36,7 +37,7 @@ const HTTP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 struct HttpSession {
     bridge: Arc<HttpConnection>,
     peer: aim_rpc::Peer,
-    principal_id: String,
+    principal: Principal,
     last_used: Mutex<Instant>,
     sse_subscribers: AtomicUsize,
 }
@@ -294,7 +295,7 @@ async fn handle_http_inner(request: HttpRequest<Incoming>, state: HttpState) -> 
             Ok(Err(())) => return response(HttpStatus::PAYLOAD_TOO_LARGE, "request body exceeds limit"),
             Err(_) => return response(HttpStatus::REQUEST_TIMEOUT, "request body timed out"),
         };
-        let Some(session) = state.session(&id, &principal.id, true, expires_in) else {
+        let Some(session) = state.session(&id, &principal, true, expires_in) else {
             return response(HttpStatus::TOO_MANY_REQUESTS, "session admission limit");
         };
         match session.bridge.post_sequenced(sequence, &body).await {
@@ -307,7 +308,7 @@ async fn handle_http_inner(request: HttpRequest<Incoming>, state: HttpState) -> 
             Err(_) => response(HttpStatus::BAD_REQUEST, "invalid or unavailable JSON-RPC request"),
         }
     } else if method == Method::GET && path == "/events" {
-        let Some(session) = state.session(&id, &principal.id, false, expires_in) else {
+        let Some(session) = state.session(&id, &principal, false, expires_in) else {
             return response(HttpStatus::NOT_FOUND, "session unavailable");
         };
         let receiver = session.bridge.subscribe();
@@ -339,11 +340,11 @@ async fn handle_http_inner(request: HttpRequest<Incoming>, state: HttpState) -> 
 }
 
 impl HttpState {
-    fn session(&self, id: &str, principal_id: &str, create: bool, expires_in: Duration) -> Option<Arc<HttpSession>> {
+    fn session(&self, id: &str, principal: &Principal, create: bool, expires_in: Duration) -> Option<Arc<HttpSession>> {
         let mut sessions = lock(&self.sessions);
         prune_http_sessions(&mut sessions);
         if let Some(session) = sessions.get(id) {
-            if session.principal_id != principal_id {
+            if &session.principal != principal {
                 return None;
             }
             *lock(&session.last_used) = Instant::now();
@@ -360,11 +361,11 @@ impl HttpState {
             max_response_wait: None,
         };
         let (bridge, reader, writer) = HttpConnection::new(config);
-        let peer = self.server.connect_network_bound(reader, writer, Arc::clone(&self.tokens), principal_id.to_owned());
+        let peer = self.server.connect_network_bound(reader, writer, Arc::clone(&self.tokens), principal.id.clone());
         let session = Arc::new(HttpSession {
             bridge: Arc::new(bridge),
             peer,
-            principal_id: principal_id.to_owned(),
+            principal: principal.clone(),
             last_used: Mutex::new(Instant::now()),
             sse_subscribers: AtomicUsize::new(0),
         });
@@ -425,9 +426,12 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
+    use aim_proto::content::Content;
+    use aim_proto::error::ErrorCode;
     use aim_proto::harness::{
-        BackendSpec, Command as HarnessCommand, ExecRead, ExecReadParams, ExecSpawn, ExecSpawnParams, GenerationRange, Initialize,
-        InitializeParams, PeerInfo, ToolsList, ToolsListParams, WorkspaceOpen, WorkspaceOpenParams,
+        BackendSpec, CallScope, Command as HarnessCommand, ExecRead, ExecReadParams, ExecSpawn, ExecSpawnParams, FsRead, FsReadParams,
+        FsWrite, FsWriteParams, GenerationRange, Initialize, InitializeParams, PeerInfo, Precondition, ToolsList, ToolsListParams,
+        WorkspaceOpen, WorkspaceOpenParams,
     };
     use aim_proto::ids::IdempotencyKey;
     use aim_rpc::{NoHandler, Peer, PeerConfig};
@@ -472,11 +476,15 @@ mod tests {
             allowed_origins: Vec::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         };
-        let first = state.session("one", "test-principal", true, Duration::from_secs(60)).unwrap();
-        assert!(state.session("two", "test-principal", true, Duration::from_secs(60)).is_none());
+        let first = state.session("one", &state.server.config().principal, true, Duration::from_secs(60)).unwrap();
+        assert!(state.session("two", &state.server.config().principal, true, Duration::from_secs(60)).is_none());
         let lease = SseLease::new(Arc::clone(&first));
         drop(lease);
-        assert!(state.session("two", "test-principal", true, Duration::from_secs(60)).is_some());
+        assert!(state.session("two", &state.server.config().principal, true, Duration::from_secs(60)).is_some());
+        let mut changed = state.server.config().principal.clone();
+        changed.ceiling =
+            Some(CallScope { roots: Vec::new(), ops: Vec::new(), deny_write: Vec::new(), max_processes: None, max_output_bytes: None });
+        assert!(state.session("two", &changed, false, Duration::from_secs(60)).is_none());
         server.shutdown().await;
     }
 
@@ -738,5 +746,192 @@ mod tests {
         task.abort();
         unix_task.abort();
         server.shutdown().await;
+    }
+
+    async fn scoped_network_peer(address: SocketAddr) -> Peer {
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (socket, _) = tokio_tungstenite::client_async(format!("ws://{address}/rpc"), stream).await.unwrap();
+        let duplex = aim_rpc::ws::websocket_duplex(socket, aim_rpc::DEFAULT_MAX_MESSAGE_BYTES);
+        let (reader, writer) = tokio::io::split(duplex);
+        Peer::spawn(reader, writer, NoHandler, PeerConfig::default())
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one network conformance scenario checks token scope, narrowing, resume, and legacy compatibility"
+    )]
+    async fn scoped_token_network_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("allowed")).unwrap();
+        std::fs::create_dir(dir.path().join("other")).unwrap();
+        std::fs::write(dir.path().join("allowed/read.txt"), "allowed").unwrap();
+        std::fs::write(dir.path().join("allowed/locked.txt"), "locked").unwrap();
+        std::fs::write(dir.path().join("outside.txt"), "outside").unwrap();
+        let root = dir.path().to_str().unwrap().to_owned();
+        let canonical_root = std::fs::canonicalize(dir.path()).unwrap().to_str().unwrap().to_owned();
+        let server = Server::new(ServerConfig::new(local_principal(&[dir.path()], false).unwrap(), ProtectedPaths::default()));
+        let tokens = Arc::new(TokenStore::under_home(dir.path()));
+        let ceiling = CallScope {
+            roots: vec![format!("{canonical_root}/allowed")],
+            ops: vec!["read".into(), "write".into()],
+            deny_write: vec![format!("{canonical_root}/allowed/locked.txt")],
+            max_processes: None,
+            max_output_bytes: None,
+        };
+        let token = tokens.create_scoped(ceiling, Duration::from_secs(60)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let options = NetworkOptions {
+            address,
+            protocol: NetworkProtocol::WebSocket,
+            tls: None,
+            behind_proxy: false,
+            allowed_origins: Vec::new(),
+            max_connections: 4,
+        };
+        let serving = tokio::spawn({
+            let server = server.clone();
+            let tokens = Arc::clone(&tokens);
+            async move { server.serve_network_listener(listener, options, tokens).await }
+        });
+        let peer = scoped_network_peer(address).await;
+        let initialized = peer.call::<Initialize>(init_params(Some(AuthProof::Bearer { token: token.clone() }))).await.unwrap();
+        assert_eq!(
+            peer.call::<WorkspaceOpen>(WorkspaceOpenParams {
+                root: dir.path().join("other").to_str().unwrap().to_owned(),
+                backend: BackendSpec::Local,
+                ceiling: None,
+            })
+            .await
+            .unwrap_err()
+            .code,
+            ErrorCode::Denied
+        );
+        let workspace = peer
+            .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.clone(), backend: BackendSpec::Local, ceiling: None })
+            .await
+            .unwrap();
+        let read = |path: &str| FsReadParams { workspace: workspace.id.clone(), path: path.into(), range: None, scope: None, hash: false };
+        assert_eq!(peer.call::<FsRead>(read("allowed/read.txt")).await.unwrap().content.into_bytes(), b"allowed");
+        assert_eq!(peer.call::<FsRead>(read("outside.txt")).await.unwrap_err().code, ErrorCode::Denied);
+        let write = |path: &str, key: &str| FsWriteParams {
+            workspace: workspace.id.clone(),
+            path: path.into(),
+            content: Content::Utf8 { text: "changed".into() },
+            precondition: Precondition::Any,
+            create_dirs: false,
+            idempotency_key: IdempotencyKey::new(key),
+            scope: None,
+        };
+        assert_eq!(peer.call::<FsWrite>(write("allowed/locked.txt", "locked")).await.unwrap_err().code, ErrorCode::Denied);
+        assert_eq!(std::fs::read_to_string(dir.path().join("allowed/locked.txt")).unwrap(), "locked");
+        peer.call::<FsWrite>(write("allowed/new.txt", "new")).await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("allowed/new.txt")).unwrap(), "changed");
+        let spawn = ExecSpawnParams {
+            workspace: workspace.id.clone(),
+            command: HarnessCommand::Shell { script: "true".into() },
+            cwd: Some("allowed".into()),
+            env: std::collections::BTreeMap::new(),
+            pty: None,
+            stdin: false,
+            timeout_ms: None,
+            idempotency_key: IdempotencyKey::new("exec-denied"),
+            scope: None,
+        };
+        assert_eq!(peer.call::<ExecSpawn>(spawn).await.unwrap_err().code, ErrorCode::Denied);
+        let broad = CallScope {
+            roots: vec![canonical_root.clone()],
+            ops: vec!["read".into(), "write".into(), "exec".into()],
+            deny_write: Vec::new(),
+            max_processes: None,
+            max_output_bytes: None,
+        };
+        assert_eq!(
+            peer.call::<WorkspaceOpen>(WorkspaceOpenParams {
+                root: root.clone(),
+                backend: BackendSpec::Local,
+                ceiling: Some(broad.clone())
+            })
+            .await
+            .unwrap_err()
+            .code,
+            ErrorCode::Denied
+        );
+        let narrowed = CallScope {
+            roots: vec![format!("{canonical_root}/allowed")],
+            ops: vec!["read".into()],
+            deny_write: Vec::new(),
+            max_processes: None,
+            max_output_bytes: None,
+        };
+        peer.call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.clone(), backend: BackendSpec::Local, ceiling: Some(narrowed) })
+            .await
+            .unwrap();
+        assert_eq!(peer.call::<FsWrite>(write("allowed/new.txt", "after-narrow")).await.unwrap_err().code, ErrorCode::Denied);
+        peer.close();
+        peer.closed().await;
+        let resumed = scoped_network_peer(address).await;
+        let mut resume = init_params(Some(AuthProof::Bearer { token: token.clone() }));
+        resume.resume = Some(initialized.resume_token.clone());
+        assert!(resumed.call::<Initialize>(resume).await.unwrap().resumed);
+        assert_eq!(resumed.call::<FsRead>(read("outside.txt")).await.unwrap_err().code, ErrorCode::Denied);
+        assert_eq!(resumed.call::<FsWrite>(write("allowed/new.txt", "after-resume")).await.unwrap_err().code, ErrorCode::Denied);
+        assert_eq!(
+            resumed
+                .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.clone(), backend: BackendSpec::Local, ceiling: Some(broad) })
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        resumed.close();
+        resumed.closed().await;
+        let registry_path = dir.path().join(".aim/tokens.json");
+        let mut registry: serde_json::Value = serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+        registry["tokens"][0]["ceiling"]["ops"] = serde_json::json!(["read", "write", "exec"]);
+        std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        let changed = scoped_network_peer(address).await;
+        let mut changed_resume = init_params(Some(AuthProof::Bearer { token }));
+        changed_resume.resume = Some(initialized.resume_token);
+        assert!(!changed.call::<Initialize>(changed_resume).await.unwrap().resumed);
+        assert_eq!(changed.call::<FsRead>(read("allowed/read.txt")).await.unwrap_err().code, ErrorCode::NotFound);
+        changed.close();
+        let legacy = tokens.create(super::super::token::TokenScope::Read, Duration::from_secs(60)).unwrap();
+        let legacy_peer = scoped_network_peer(address).await;
+        legacy_peer.call::<Initialize>(init_params(Some(AuthProof::Bearer { token: legacy }))).await.unwrap();
+        let legacy_workspace =
+            legacy_peer.call::<WorkspaceOpen>(WorkspaceOpenParams { root, backend: BackendSpec::Local, ceiling: None }).await.unwrap();
+        assert_eq!(
+            legacy_peer
+                .call::<FsRead>(FsReadParams {
+                    workspace: legacy_workspace.id.clone(),
+                    path: "outside.txt".into(),
+                    range: None,
+                    scope: None,
+                    hash: false
+                })
+                .await
+                .unwrap()
+                .content
+                .into_bytes(),
+            b"outside"
+        );
+        let mut denied_write = write("allowed/new.txt", "legacy-write");
+        denied_write.workspace = legacy_workspace.id;
+        assert_eq!(legacy_peer.call::<FsWrite>(denied_write).await.unwrap_err().code, ErrorCode::Denied);
+        legacy_peer.close();
+        serving.abort();
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn scoped_token_limits_network_requests_and_resume() {
+        scoped_token_network_roundtrip().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live loopback network bearer smoke"]
+    async fn live_scoped_token_limits_network_requests_and_resume() {
+        scoped_token_network_roundtrip().await;
     }
 }

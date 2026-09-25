@@ -131,7 +131,7 @@ pub fn local_principal(roots: &[impl AsRef<Path>], read_only: bool) -> io::Resul
         let real = real.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root is not valid UTF-8"))?;
         canonical.push(real.to_owned());
     }
-    Ok(Principal { id: format!("local:{}", rustix::process::getuid().as_raw()), roots: canonical, read_only })
+    Ok(Principal { id: format!("local:{}", rustix::process::getuid().as_raw()), roots: canonical, read_only, ceiling: None })
 }
 
 /// Reads the default protected set for `home` (`~/.aim/gate`, `~/.aim/ledger`, `~/.aim/protected`).

@@ -234,7 +234,7 @@ mod scope_tests {
         symlink("../private", root.join("allowed/link")).unwrap();
         let workspace = LocalWorkspace::open(root.to_str().unwrap(), LocalConfig::default()).await.unwrap();
         let root = workspace.root().to_owned();
-        let principal = Arc::new(Principal { id: "test".into(), roots: vec![root.clone()], read_only: false });
+        let principal = Arc::new(Principal { id: "test".into(), roots: vec![root.clone()], read_only: false, ceiling: None });
         let grant = Grant::new(principal, Arc::new(ProtectedPaths::default()), root.clone(), None)
             .scoped(
                 None,
@@ -324,7 +324,7 @@ mod scope_tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = LocalWorkspace::open(dir.path().to_str().unwrap(), LocalConfig::default()).await.unwrap();
         let root = workspace.root().to_owned();
-        let principal = Arc::new(Principal { id: "test".into(), roots: vec![root.clone()], read_only: false });
+        let principal = Arc::new(Principal { id: "test".into(), roots: vec![root.clone()], read_only: false, ceiling: None });
         let grant = Grant::new(principal, Arc::new(ProtectedPaths::default()), root.clone(), None);
         let scoped = workspace.scoped(grant).unwrap();
         let key = IdempotencyKey::new("scope-process-test");

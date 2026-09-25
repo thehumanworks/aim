@@ -169,7 +169,7 @@ async fn serve_agentless(connection: Connection, options: &ForwardOptions) -> Re
     let workspace = AgentlessWorkspace::open(connection.clone(), root).await.map_err(|err| err.to_string())?;
     let platform = bootstrap::probe(&connection).await.map_err(|err| format!("probe: {err:?}"))?;
     let root = workspace.root().to_owned();
-    let principal = Principal { id: format!("ssh:{}", options.destination), roots: vec![root], read_only: false };
+    let principal = Principal { id: format!("ssh:{}", options.destination), roots: vec![root], read_only: false, ceiling: None };
     let protected = ProtectedPaths::defaults(&platform.home, None);
     let server = Server::new_agentless(ServerConfig::new(principal, protected), Arc::new(workspace));
     server.serve_stdio().await;
