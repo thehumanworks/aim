@@ -20,10 +20,11 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType};
 use oxc_transformer::{TransformOptions, Transformer};
 use rquickjs::prelude::{Async, Func};
-use rquickjs::{AsyncContext, AsyncRuntime, Promise, Value as JsValue};
+use rquickjs::{AsyncContext, AsyncRuntime, CaughtError, Ctx, Promise, Value as JsValue};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::budget::{Charge, EventKind, MAX_EVENTS, MAX_STORE_BYTES, OutputBudget, truncate_middle};
 use crate::protocol::{CallTool, CellOutput, Execute, ExecuteResult, Output, ToolCall};
 
 const BOOTSTRAP: &str = r"
@@ -31,7 +32,29 @@ const __aimToolSpecs = JSON.parse(__aimToolsJson);
 const __aimToolNames = new Set(__aimToolSpecs.map(t => t.name));
 const ALL_TOOLS = Object.freeze(__aimToolSpecs.map(t => Object.freeze({name:t.name,description:t.description})));
 const __aimStore = Object.assign(Object.create(null), JSON.parse(__aimStoreJson));
-function store(key, value) { __aimStore[String(key)] = value; }
+const __aimStoreSizes = Object.create(null);
+let __aimStoreSize = 0;
+for (const key of Object.keys(__aimStore)) {
+  __aimStoreSizes[key] = key.length + (JSON.stringify(__aimStore[key]) ?? '').length;
+  __aimStoreSize += __aimStoreSizes[key];
+}
+function store(key, value) {
+  const name = String(key);
+  const encoded = JSON.stringify(value);
+  const size = encoded === undefined ? 0 : name.length + encoded.length;
+  const next = __aimStoreSize - (__aimStoreSizes[name] ?? 0) + size;
+  if (next > __aimStoreLimit) {
+    throw new Error(`store is limited to ${__aimStoreLimit} bytes of JSON (this would make ${next}); store(key, undefined) removes a key`);
+  }
+  __aimStoreSize = next;
+  if (encoded === undefined) {
+    delete __aimStore[name];
+    delete __aimStoreSizes[name];
+  } else {
+    __aimStore[name] = JSON.parse(encoded);
+    __aimStoreSizes[name] = size;
+  }
+}
 function load(key) { return __aimStore[String(key)]; }
 function __aimFormat(value) {
   if (typeof value === 'string') return value;
@@ -44,11 +67,21 @@ function audio(value) { __aimEmit(__aimFormat(value), false, false); }
 function generatedImage(value) { __aimEmit(__aimFormat(value), false, false); }
 function notify(value) { __aimEmit(__aimFormat(value), true, false); }
 function yield_control() { __aimEmit('', true, true); }
+globalThis.console = Object.freeze(Object.fromEntries(['log', 'info', 'warn', 'error', 'debug'].map(level =>
+  [level, (...values) => text(values.map(__aimFormat).join(' '))])));
+globalThis.global = globalThis;
 function exit() { throw new Error('__AIM_EXIT__'); }
 function describe(name) { return __aimToolSpecs.find(t => t.name === name); }
 function search(query) {
   const q = String(query).toLowerCase();
   return __aimToolSpecs.filter(t => (t.name + ' ' + t.description).toLowerCase().includes(q));
+}
+function __aimResult(result) {
+  if (result === null || typeof result !== 'object' || !Array.isArray(result.content)) return result;
+  const joined = result.content.filter(part => part && part.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n');
+  Object.defineProperty(result, 'text', {value: joined, enumerable: false});
+  Object.defineProperty(result, 'toString', {value: () => joined, enumerable: false});
+  return result;
 }
 function __aimTool(name) {
   if (typeof name !== 'string') return undefined;
@@ -57,7 +90,7 @@ function __aimTool(name) {
   return async (arguments_) => {
     const response = JSON.parse(await __aimCallTool(canonical, JSON.stringify(arguments_ ?? {})));
     if (!response.ok) throw new Error(response.error);
-    return response.result;
+    return __aimResult(response.result);
   };
 }
 const __aimFunctions = new Proxy(Object.create(null), {
@@ -100,16 +133,23 @@ pub struct QuickJsRuntime;
 
 impl CodeRuntime for QuickJsRuntime {
     fn execute(&self, request: Execute, parent: Peer) -> Pin<Box<dyn Future<Output = Result<ExecuteResult, ProtoError>> + Send>> {
-        Box::pin(run_cell(request, parent))
+        let limit = request.output_limit_bytes;
+        Box::pin(async move { run_cell(request, parent).await.map_err(|error| bounded_error(error, limit)) })
     }
 }
 
-#[derive(Default)]
+/// A failure within the cell's output budget: a script can throw a message of any size, and the
+/// model sees it, so it is cut as output is (head and tail, UTF-8 safe, with a warning line).
+#[must_use]
+pub fn bounded_error(mut error: ProtoError, limit_bytes: usize) -> ProtoError {
+    error.message = truncate_middle(&error.message, limit_bytes);
+    error
+}
+
 struct Emitted {
     output: String,
-    bytes: usize,
     yielded: bool,
-    exceeded: bool,
+    budget: OutputBudget,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -180,6 +220,61 @@ impl<'a> Visit<'a> for Finder {
     }
 }
 
+/// Makes a cell's last top-level expression statement its returned value, as a REPL does
+/// (ADR 0076): a script that ends with `summary` returns it, and one that ends with `main()` or a
+/// `.then(...)` chain is awaited instead of ending before its calls finish. Source that does not
+/// parse on its own (a top-level `return`, say) is left as it is.
+fn return_last_expression(code: &str) -> String {
+    let allocator = Allocator::default();
+    let Ok(source_type) = SourceType::from_path(Path::new("cell.ts")) else { return code.to_owned() };
+    let parsed = Parser::new(&allocator, code, source_type).parse();
+    if !parsed.diagnostics.is_empty() {
+        return code.to_owned();
+    }
+    let Some(Statement::ExpressionStatement(statement)) = parsed.program.body.last() else { return code.to_owned() };
+    let span = statement.expression.span();
+    let (Ok(start), Ok(end), Ok(after)) = (usize::try_from(span.start), usize::try_from(span.end), usize::try_from(statement.span.end))
+    else {
+        return code.to_owned();
+    };
+    match (code.get(..start), code.get(start..end), code.get(after..)) {
+        (Some(before), Some(expression), Some(rest)) => format!("{before}return ({expression});{rest}"),
+        _ => code.to_owned(),
+    }
+}
+
+/// A script's exception as the model should read it: its name and message (ADR 0076). The stack
+/// is left out: its line numbers are those of the wrapped, type-stripped source.
+fn script_error(ctx: &Ctx<'_>, err: rquickjs::Error) -> ProtoError {
+    match CaughtError::from_error(ctx, err) {
+        CaughtError::Exception(exception) => {
+            let name = exception.get::<_, String>("name").unwrap_or_else(|_| "Error".to_owned());
+            let message = exception.message().unwrap_or_default();
+            // QuickJS reports its own limits (memory, stack) as an `InternalError`.
+            let code = if name == "InternalError" && (message.contains("memory") || message.contains("stack overflow")) {
+                ErrorCode::LimitExceeded
+            } else {
+                ErrorCode::InvalidParams
+            };
+            // Models often write Node: say where files and commands are instead.
+            let hint = if ["require is not defined", "could not load module", "fetch is not defined", "process is not defined"]
+                .iter()
+                .any(|node| message.contains(node))
+            {
+                " (a cell is not Node: it has no modules, fs, fetch or process; reach files and commands through tools.*)"
+            } else {
+                ""
+            };
+            ProtoError::new(code, format!("the script threw {name}: {message}{hint}"))
+        }
+        CaughtError::Value(value) => {
+            let shown = value.as_string().and_then(|text| text.to_string().ok()).unwrap_or_else(|| format!("a {}", value.type_name()));
+            ProtoError::new(ErrorCode::InvalidParams, format!("the script threw {shown}"))
+        }
+        CaughtError::Error(err) => js_error(err),
+    }
+}
+
 fn prepare_program(source: &str) -> Result<String, ProtoError> {
     let allocator = Allocator::default();
     let source_type =
@@ -212,7 +307,7 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
     if request.timeout_ms == 0 || request.memory_limit_bytes == 0 || request.output_limit_bytes == 0 {
         return Err(ProtoError::new(ErrorCode::InvalidParams, "cell limits must be positive"));
     }
-    let code = if request.program_args.is_some() { prepare_program(&request.code)? } else { request.code.clone() };
+    let code = if request.program_args.is_some() { prepare_program(&request.code)? } else { return_last_expression(&request.code) };
     let source = strip_types(&format!(
         "(async function() {{\ntry {{\n{code}\n}} catch (e) {{ if (e?.message !== '__AIM_EXIT__') throw e; }}\n}})()"
     ))?;
@@ -222,8 +317,14 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
     runtime.set_max_stack_size(512 * 1024).await;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline))).await;
     let context = AsyncContext::full(&runtime).await.map_err(js_error)?;
-    let emitted = Arc::new(Mutex::new(Emitted::default()));
-    let (event_tx, mut event_rx) = mpsc::channel::<CellOutput>(128);
+    let emitted = Arc::new(Mutex::new(Emitted {
+        output: String::new(),
+        yielded: false,
+        budget: OutputBudget::new(request.output_limit_bytes, MAX_EVENTS),
+    }));
+    // Unbounded, but the budget admits at most MAX_EVENTS events and output_limit_bytes bytes, so
+    // a burst of helper calls never fails the cell with a full queue.
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<CellOutput>();
     let event_peer = parent.clone();
     let forwarder = tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
@@ -239,7 +340,6 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
     let allowed: HashSet<String> = request.tools.iter().map(|spec| spec.name.clone()).collect();
     let cell_id = request.cell_id.clone();
     let session_id = request.session_id.clone();
-    let max_bytes = request.output_limit_bytes;
     let next_call = Arc::new(AtomicU64::new(0));
     let execution = tokio::time::timeout(
         Duration::from_millis(request.timeout_ms),
@@ -248,6 +348,7 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
             globals.set("__aimToolsJson", specs_json).map_err(js_error)?;
             globals.set("__aimStoreJson", store_json).map_err(js_error)?;
             globals.set("__aimProgramArgsJson", program_args_json).map_err(js_error)?;
+            globals.set("__aimStoreLimit", MAX_STORE_BYTES).map_err(js_error)?;
             let output_state = Arc::clone(&emitted);
             let output_tx = event_tx.clone();
             let output_cell = cell_id.clone();
@@ -255,23 +356,26 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
                 .set(
                     "__aimEmit",
                     Func::from(move |text: String, immediate: bool, yielded: bool| -> rquickjs::Result<()> {
+                        let kind = match (immediate, yielded) {
+                            (_, true) => EventKind::Yield,
+                            (true, false) => EventKind::Notify,
+                            (false, false) => EventKind::Text,
+                        };
                         let mut state = locked(&output_state);
-                        let next = state.bytes.saturating_add(text.len());
-                        if next > max_bytes {
-                            state.exceeded = true;
-                            return Err(rquickjs::Error::new_from_js_message("output", "limit", "cell output limit exceeded"));
+                        state.yielded |= yielded;
+                        // Output over the budget is dropped and counted; it never throws, so a
+                        // cell is never failed after its side effects because it printed too much.
+                        if state.budget.charge(kind, text.len()) != Charge::Keep {
+                            return Ok(());
                         }
-                        state.bytes = next;
-                        if yielded {
-                            state.yielded = true;
-                        } else if !immediate {
+                        if kind == EventKind::Text {
                             state.output.push_str(&text);
                             state.output.push('\n');
                         }
                         drop(state);
-                        output_tx
-                            .try_send(CellOutput { cell_id: output_cell.clone(), text, immediate, yielded })
-                            .map_err(|_| rquickjs::Error::new_from_js_message("output", "queue", "output queue full"))
+                        // Only a finished forwarder closes the channel; the cell is ending then.
+                        drop(output_tx.send(CellOutput { cell_id: output_cell.clone(), text, immediate, yielded }));
+                        Ok(())
                     }),
                 )
                 .map_err(js_error)?;
@@ -328,8 +432,8 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
                 )
                 .map_err(js_error)?;
             ctx.eval::<(), _>(BOOTSTRAP).map_err(js_error)?;
-            let promise: Promise<'_> = ctx.eval(source).map_err(js_error)?;
-            let outcome: JsValue<'_> = promise.into_future().await.map_err(js_error)?;
+            let promise: Promise<'_> = ctx.eval(source).map_err(|err| script_error(&ctx, err))?;
+            let outcome: JsValue<'_> = promise.into_future().await.map_err(|err| script_error(&ctx, err))?;
             let returned = if outcome.is_undefined() {
                 None
             } else if let Some(value) = outcome.as_string() {
@@ -348,24 +452,29 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
     drop(event_tx);
     drop(forwarder.await);
     let mut state = locked(&emitted);
-    if state.exceeded {
-        return Err(ProtoError::new(ErrorCode::LimitExceeded, "cell output limit exceeded"));
-    }
     let (returned, stored) = match execution {
         Err(_) if Instant::now() >= deadline => return Err(ProtoError::new(ErrorCode::Timeout, "cell deadline exceeded")),
         other => other?,
     };
+    let mut from_return = false;
     if state.output.is_empty()
         && let Some(value) = returned
     {
-        if value.len() > max_bytes {
-            return Err(ProtoError::new(ErrorCode::LimitExceeded, "cell output limit exceeded"));
-        }
-        state.output = value;
+        // A returned value is output too: what does not fit is dropped and counted.
+        let kept = state.budget.fit(value.len());
+        value.get(..value.floor_char_boundary(kept)).unwrap_or_default().clone_into(&mut state.output);
+        from_return = true;
     }
     let store: HashMap<String, Value> = serde_json::from_str(&stored)
         .map_err(|err| ProtoError::new(ErrorCode::InvalidParams, format!("store contains non-JSON data: {err}")))?;
-    Ok(ExecuteResult { output: state.output.clone(), yielded: state.yielded, store })
+    Ok(ExecuteResult {
+        output: std::mem::take(&mut state.output),
+        returned: from_return,
+        yielded: state.yielded,
+        store,
+        dropped_bytes: state.budget.dropped_bytes(),
+        dropped_events: state.budget.dropped_events(),
+    })
 }
 
 fn js_error(err: rquickjs::Error) -> ProtoError {

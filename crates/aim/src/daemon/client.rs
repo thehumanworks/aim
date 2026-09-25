@@ -578,7 +578,7 @@ impl SessionClient for DaemonClient {
             }
             let transcript: Vec<Item> =
                 serde_json::from_slice(&bytes).map_err(|_| ProtoError::new(ErrorCode::Internal, "transcript snapshot is malformed"))?;
-            let snapshot = SessionAttachResult { summary: paged.summary, transcript, surfaces: paged.surfaces };
+            let snapshot = SessionAttachResult { summary: paged.summary, transcript, surfaces: paged.surfaces, options: paged.options };
             tokio::select! {
                 () = ready.cancelled() => {},
                 () = peer.closed() => return Err(ProtoError::new(ErrorCode::Unavailable, "connection closed")),

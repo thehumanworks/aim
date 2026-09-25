@@ -100,6 +100,7 @@ impl SessionClient for Scripted {
                         allow: Some(["Edit", "Glob", "Grep", "LS", "Read", "Write"].into_iter().map(str::to_owned).collect()),
                         deny: Vec::new(),
                     }),
+                    code_mode: None,
                 },
                 state: SessionState::Idle,
                 persistence: Persistence::Persistent,
@@ -127,7 +128,7 @@ impl SessionClient for Scripted {
             let updates: UpdateStream = Box::pin(async_stream::stream! {
                 while let Ok(update) = receiver.recv().await { yield update; }
             });
-            Ok((SessionAttachResult { summary, transcript: vec![], surfaces: vec![] }, updates))
+            Ok((SessionAttachResult { summary, transcript: vec![], surfaces: vec![], options: None }, updates))
         })
     }
     fn prompt(&self, id: String, parts: Vec<Part>) -> BoxFuture<Result<PromptOutcome, ProtoError>> {

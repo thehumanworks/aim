@@ -1,0 +1,883 @@
+{
+  "binary_sha256": {
+    "aim": "091f7f9587241a77d5b19df8c2cdfc27217601a6123be7f3d954f5a2d3b1e987",
+    "aim_coderun": "a135d442bc9ec286787eef88c08ebf5613fc5faea6169755a1e207eb6890564b",
+    "aimx": "3224a7822cdf3cc3c15ebf2b345638fcb02e4e46e7b9d2b5e248d130bf90bdab",
+    "codex": "8b93eddd656ee85e07785fed7b0c6f445491abfba80d52e278d0afd1fe680a4e",
+    "pi": "0fcda879f854b95368a4c217782a78808f7fea61cf60cc1e6fbec4f5b5d700f9",
+    "python": "ab15cbe78b02b5fc939765827e0b1c2dc3668def22c6952f06a369bfbde01163"
+  },
+  "budget_used_including_transport_reserve_usd": 0.0,
+  "finished_unix": 1790321710.6384,
+  "hardware": {
+    "machine": "arm64",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "python": "3.14.7"
+  },
+  "manifest_sha256": "03b5927e9d084c7d8ba43fd6838b5ba4f4cafabe686235dcef69fc1e545f3529",
+  "prewarm": [
+    {
+      "append_only_steps": 0,
+      "auxiliary_requests": 1,
+      "borrowed_codex_auth_unchanged": true,
+      "case": "W1",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 6005,
+      "first_request_instructions_chars": 1419,
+      "first_request_ms": 59.26,
+      "first_request_tokens_estimate": 1502,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 501,
+          "name": "Read"
+        },
+        {
+          "bytes": 378,
+          "name": "Write"
+        },
+        {
+          "bytes": 597,
+          "name": "Edit"
+        },
+        {
+          "bytes": 225,
+          "name": "LS"
+        },
+        {
+          "bytes": 472,
+          "name": "Bash"
+        },
+        {
+          "bytes": 296,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 632,
+          "name": "run_code"
+        },
+        {
+          "bytes": 427,
+          "name": "save_program"
+        },
+        {
+          "bytes": 320,
+          "name": "run_program"
+        },
+        {
+          "bytes": 196,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 10,
+      "first_request_tools_json_bytes": 4055,
+      "first_token_ms": 64.059,
+      "harness": "aim_codex",
+      "harness_peak_rss_mb": 26.39,
+      "helpers_peak_rss_mb": 15.96,
+      "http_exchanges": 2,
+      "ite": 1507.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 43.5,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
+      "repetition": -1,
+      "request_json_bytes": [
+        6005
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          6005,
+          1732
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1502,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "stable_head_ratio_median": null,
+      "stable_head_ratios": [],
+      "timed_out": false,
+      "tool_calls_by_name": {},
+      "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 1502,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 133.05
+    }
+  ],
+  "recorded_spend_usd": 0.0,
+  "runs": [
+    {
+      "append_only_steps": 4,
+      "auxiliary_requests": 1,
+      "borrowed_codex_auth_unchanged": true,
+      "case": "even_sum",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 6260,
+      "first_request_instructions_chars": 1419,
+      "first_request_ms": 409.01,
+      "first_request_tokens_estimate": 1565,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 501,
+          "name": "Read"
+        },
+        {
+          "bytes": 378,
+          "name": "Write"
+        },
+        {
+          "bytes": 597,
+          "name": "Edit"
+        },
+        {
+          "bytes": 225,
+          "name": "LS"
+        },
+        {
+          "bytes": 472,
+          "name": "Bash"
+        },
+        {
+          "bytes": 296,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 510,
+          "name": "exec"
+        },
+        {
+          "bytes": 315,
+          "name": "wait"
+        },
+        {
+          "bytes": 427,
+          "name": "save_program"
+        },
+        {
+          "bytes": 320,
+          "name": "run_program"
+        },
+        {
+          "bytes": 196,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 11,
+      "first_request_tools_json_bytes": 4249,
+      "first_token_ms": 2071.233,
+      "harness": "aim_codex",
+      "harness_peak_rss_mb": 31.21,
+      "helpers_peak_rss_mb": 29.74,
+      "http_exchanges": 6,
+      "ite": 5088.2,
+      "max_tool_output_chars": 609,
+      "missing_success_cost": true,
+      "model": "gpt-6-sol",
+      "passed": true,
+      "peak_rss_mb": 62.29,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {
+        "file_path": 1
+      },
+      "read_failure_classes": {},
+      "repetition": 0,
+      "request_json_bytes": [
+        6260,
+        6929,
+        7559,
+        8027,
+        8602
+      ],
+      "request_lcp_bytes": [
+        6258,
+        6927,
+        7557,
+        8025
+      ],
+      "request_response_sizes": [
+        [
+          6260,
+          30243
+        ],
+        [
+          6929,
+          25492
+        ],
+        [
+          7559,
+          35179
+        ],
+        [
+          8027,
+          27267
+        ],
+        [
+          8602,
+          33046
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1050,
+          "output_tokens": 38,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1182,
+          "output_tokens": 20,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1315,
+          "output_tokens": 56,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 1152,
+          "input_tokens": 1389,
+          "output_tokens": 25,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 1280,
+          "input_tokens": 1481,
+          "output_tokens": 33,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 5,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "stable_head_ratio_median": 1.0,
+      "stable_head_ratios": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "timed_out": false,
+      "tool_calls_by_name": {
+        "Bash": 1,
+        "Edit": 1,
+        "Read": 1,
+        "exec": 1
+      },
+      "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 2432,
+        "cost_usd": null,
+        "input_tokens": 6417,
+        "output_tokens": 172,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 13922.41
+    },
+    {
+      "append_only_steps": 3,
+      "auxiliary_requests": 1,
+      "borrowed_codex_auth_unchanged": true,
+      "case": "slug",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 6246,
+      "first_request_instructions_chars": 1419,
+      "first_request_ms": 390.33,
+      "first_request_tokens_estimate": 1562,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 501,
+          "name": "Read"
+        },
+        {
+          "bytes": 378,
+          "name": "Write"
+        },
+        {
+          "bytes": 597,
+          "name": "Edit"
+        },
+        {
+          "bytes": 225,
+          "name": "LS"
+        },
+        {
+          "bytes": 472,
+          "name": "Bash"
+        },
+        {
+          "bytes": 296,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 510,
+          "name": "exec"
+        },
+        {
+          "bytes": 315,
+          "name": "wait"
+        },
+        {
+          "bytes": 427,
+          "name": "save_program"
+        },
+        {
+          "bytes": 320,
+          "name": "run_program"
+        },
+        {
+          "bytes": 196,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 11,
+      "first_request_tools_json_bytes": 4249,
+      "first_token_ms": 2770.471,
+      "harness": "aim_codex",
+      "harness_peak_rss_mb": 31.56,
+      "helpers_peak_rss_mb": 17.63,
+      "http_exchanges": 5,
+      "ite": 5418.2,
+      "max_tool_output_chars": 814,
+      "missing_success_cost": true,
+      "model": "gpt-6-sol",
+      "passed": true,
+      "peak_rss_mb": 50.48,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {
+        "file_path": 2
+      },
+      "read_failure_classes": {},
+      "repetition": 0,
+      "request_json_bytes": [
+        6246,
+        7270,
+        8290,
+        8775
+      ],
+      "request_lcp_bytes": [
+        6244,
+        7268,
+        8288
+      ],
+      "request_response_sizes": [
+        [
+          6246,
+          24861
+        ],
+        [
+          7270,
+          25401
+        ],
+        [
+          8290,
+          36432
+        ],
+        [
+          8775,
+          29284
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1044,
+          "output_tokens": 76,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1298,
+          "output_tokens": 51,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1481,
+          "output_tokens": 58,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 1152,
+          "input_tokens": 1557,
+          "output_tokens": 30,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 4,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200
+      ],
+      "stable_head_ratio_median": 1.0,
+      "stable_head_ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "timed_out": false,
+      "tool_calls_by_name": {
+        "Bash": 3,
+        "Edit": 1,
+        "Read": 2
+      },
+      "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 1152,
+        "cost_usd": null,
+        "input_tokens": 5380,
+        "output_tokens": 215,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 15896.1
+    },
+    {
+      "append_only_steps": 4,
+      "auxiliary_requests": 1,
+      "borrowed_codex_auth_unchanged": true,
+      "case": "ledger",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 6231,
+      "first_request_instructions_chars": 1419,
+      "first_request_ms": 873.05,
+      "first_request_tokens_estimate": 1558,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 501,
+          "name": "Read"
+        },
+        {
+          "bytes": 378,
+          "name": "Write"
+        },
+        {
+          "bytes": 597,
+          "name": "Edit"
+        },
+        {
+          "bytes": 225,
+          "name": "LS"
+        },
+        {
+          "bytes": 472,
+          "name": "Bash"
+        },
+        {
+          "bytes": 296,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 510,
+          "name": "exec"
+        },
+        {
+          "bytes": 315,
+          "name": "wait"
+        },
+        {
+          "bytes": 427,
+          "name": "save_program"
+        },
+        {
+          "bytes": 320,
+          "name": "run_program"
+        },
+        {
+          "bytes": 196,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 11,
+      "first_request_tools_json_bytes": 4249,
+      "first_token_ms": 4132.74,
+      "harness": "aim_codex",
+      "harness_peak_rss_mb": 30.83,
+      "helpers_peak_rss_mb": 17.53,
+      "http_exchanges": 6,
+      "ite": 5744.4,
+      "max_tool_output_chars": 500,
+      "missing_success_cost": true,
+      "model": "gpt-6-sol",
+      "passed": true,
+      "peak_rss_mb": 49.68,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {
+        "file_path": 2
+      },
+      "read_failure_classes": {},
+      "repetition": 0,
+      "request_json_bytes": [
+        6231,
+        6610,
+        6904,
+        7566,
+        8126
+      ],
+      "request_lcp_bytes": [
+        6229,
+        6608,
+        6902,
+        7564
+      ],
+      "request_response_sizes": [
+        [
+          6231,
+          24871
+        ],
+        [
+          6610,
+          23667
+        ],
+        [
+          6904,
+          25850
+        ],
+        [
+          7566,
+          41244
+        ],
+        [
+          8126,
+          27621
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1043,
+          "output_tokens": 19,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1095,
+          "output_tokens": 14,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1128,
+          "output_tokens": 20,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1262,
+          "output_tokens": 78,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 1024,
+          "input_tokens": 1358,
+          "output_tokens": 25,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 5,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "stable_head_ratio_median": 1.0,
+      "stable_head_ratios": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "timed_out": false,
+      "tool_calls_by_name": {
+        "Bash": 1,
+        "Edit": 1,
+        "LS": 1,
+        "Read": 2
+      },
+      "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 1024,
+        "cost_usd": null,
+        "input_tokens": 5886,
+        "output_tokens": 156,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 19801.15
+    },
+    {
+      "append_only_steps": 3,
+      "auxiliary_requests": 1,
+      "borrowed_codex_auth_unchanged": true,
+      "case": "normalize",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 6236,
+      "first_request_instructions_chars": 1419,
+      "first_request_ms": 427.87,
+      "first_request_tokens_estimate": 1559,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 501,
+          "name": "Read"
+        },
+        {
+          "bytes": 378,
+          "name": "Write"
+        },
+        {
+          "bytes": 597,
+          "name": "Edit"
+        },
+        {
+          "bytes": 225,
+          "name": "LS"
+        },
+        {
+          "bytes": 472,
+          "name": "Bash"
+        },
+        {
+          "bytes": 296,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 510,
+          "name": "exec"
+        },
+        {
+          "bytes": 315,
+          "name": "wait"
+        },
+        {
+          "bytes": 427,
+          "name": "save_program"
+        },
+        {
+          "bytes": 320,
+          "name": "run_program"
+        },
+        {
+          "bytes": 196,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 11,
+      "first_request_tools_json_bytes": 4249,
+      "first_token_ms": 2306.74,
+      "harness": "aim_codex",
+      "harness_peak_rss_mb": 31.31,
+      "helpers_peak_rss_mb": 17.42,
+      "http_exchanges": 5,
+      "ite": 4644.4,
+      "max_tool_output_chars": 543,
+      "missing_success_cost": true,
+      "model": "gpt-6-sol",
+      "passed": true,
+      "peak_rss_mb": 59.44,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {
+        "file_path": 2
+      },
+      "read_failure_classes": {},
+      "repetition": 0,
+      "request_json_bytes": [
+        6236,
+        6901,
+        7614,
+        8131
+      ],
+      "request_lcp_bytes": [
+        6234,
+        6899,
+        7612
+      ],
+      "request_response_sizes": [
+        [
+          6236,
+          24597
+        ],
+        [
+          6901,
+          25850
+        ],
+        [
+          7614,
+          36882
+        ],
+        [
+          8131,
+          28916
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1040,
+          "output_tokens": 47,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1131,
+          "output_tokens": 20,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1263,
+          "output_tokens": 61,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 1024,
+          "input_tokens": 1342,
+          "output_tokens": 30,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 4,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200
+      ],
+      "stable_head_ratio_median": 1.0,
+      "stable_head_ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "timed_out": false,
+      "tool_calls_by_name": {
+        "Bash": 1,
+        "Edit": 1,
+        "LS": 1,
+        "Read": 2
+      },
+      "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 1024,
+        "cost_usd": null,
+        "input_tokens": 4776,
+        "output_tokens": 158,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 19322.26
+    }
+  ],
+  "source_sha": "7fa1d2b7c4d6febac263511637230bfdcee1058e",
+  "spend_cap_usd": 1.0,
+  "started_unix": 1790321640.609529,
+  "summary": [
+    {
+      "harness": "aim_codex",
+      "ite_per_passed": 5223.8,
+      "p50_wall_ms": 17609.18,
+      "pass_rate": 1.0,
+      "pass_rate_ci95": [
+        0.51,
+        1.0
+      ],
+      "passed": 4,
+      "runs": 4,
+      "usd_per_passed": null
+    }
+  ],
+  "tier": "live"
+}

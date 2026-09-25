@@ -232,3 +232,121 @@ fn adr_0038_fields_are_additive_and_old_records_read_as_explicit() {
     assert_eq!(serde_json::to_value(&rejected).unwrap(), json!({"type": "config_rejected", "effort": "ultra", "message": "not offered"}));
     assert_eq!(aim_proto::daemon::AUTO_EFFORT, "auto");
 }
+
+/// A reader built before ADR 0066: `EventBody` as it was, without the nested tool events.
+mod before_adr_0066 {
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum EventBody {
+        TurnStarted,
+        Item {
+            item: Value,
+        },
+        TurnEnded {
+            stop: Value,
+        },
+        #[serde(untagged)]
+        Unknown(Value),
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum SessionUpdate {
+        ToolStarted { call_id: String, name: String, arguments: String },
+        ToolFinished { call_id: String, name: String, result: Value },
+    }
+}
+
+#[test]
+fn adr_0066_nested_tool_records_round_trip_and_old_readers_keep_them_as_unknown() {
+    use aim_proto::daemon::SessionUpdate;
+    use aim_proto::event::{EVENT_SCHEMA, EventBody, SessionEvent};
+    use aim_proto::tool::ToolResult;
+
+    let started = EventBody::NestedToolStarted {
+        parent: "call_run_code".into(),
+        call_id: "0199a0c0-0000-7000-8000-000000000001:0".into(),
+        name: "Bash".into(),
+        arguments: r#"{"command":"ls"}"#.into(),
+    };
+    let finished = EventBody::NestedToolFinished {
+        parent: "call_run_code".into(),
+        call_id: "0199a0c0-0000-7000-8000-000000000001:0".into(),
+        name: "Bash".into(),
+        result: ToolResult::text("src"),
+    };
+    for body in [started, finished] {
+        let event = SessionEvent { schema: EVENT_SCHEMA, seq: 3, turn: 1, ts_ms: 1, body };
+        let wire = serde_json::to_value(&event).unwrap();
+        // This build reads its own records back.
+        assert_eq!(serde_json::from_value::<SessionEvent>(wire.clone()).unwrap(), event);
+        // An older build keeps them verbatim as unknown and writes them back unchanged.
+        let old: before_adr_0066::EventBody = serde_json::from_value(wire["body"].clone()).unwrap();
+        assert!(matches!(old, before_adr_0066::EventBody::Unknown(_)), "{old:?}");
+        assert_eq!(serde_json::to_value(&old).unwrap(), wire["body"]);
+    }
+    // The pre-0066 kinds still read as before.
+    let old: before_adr_0066::EventBody = serde_json::from_value(json!({"kind": "turn_started"})).unwrap();
+    assert_eq!(old, before_adr_0066::EventBody::TurnStarted);
+
+    // `parent` is additive on the wire: absent for the model's own calls, ignored by old clients.
+    let own = SessionUpdate::ToolStarted { call_id: "c".into(), name: "Read".into(), arguments: "{}".into(), parent: None };
+    assert_eq!(serde_json::to_value(&own).unwrap(), json!({"type": "tool_started", "call_id": "c", "name": "Read", "arguments": "{}"}));
+    let nested =
+        SessionUpdate::ToolFinished { call_id: "n".into(), name: "Read".into(), result: ToolResult::text("x"), parent: Some("c".into()) };
+    let wire = serde_json::to_value(&nested).unwrap();
+    assert_eq!(wire["parent"], "c");
+    assert_eq!(serde_json::from_value::<SessionUpdate>(wire.clone()).unwrap(), nested);
+    let old: before_adr_0066::SessionUpdate = serde_json::from_value(wire).unwrap();
+    assert!(matches!(old, before_adr_0066::SessionUpdate::ToolFinished { call_id, .. } if call_id == "n"));
+}
+
+/// ADR 0074: a session's options are one additive update and one additive attach field. An old
+/// client drops the update (its parser refuses the unknown `type`) and ignores the field.
+#[test]
+fn adr_0074_session_options_are_additive() {
+    use aim_proto::daemon::{ChoiceValue, SessionAttachPagedResult, SessionAttachResult, SessionOptions, SessionUpdate};
+    let options = SessionOptions {
+        models: vec![
+            ChoiceValue { value: "gpt-6-sol".into(), name: Some("GPT-6 Sol".into()), description: Some("400k context".into()) },
+            ChoiceValue { value: "opus[1m]".into(), name: None, description: None },
+        ],
+        efforts: vec![ChoiceValue { value: "low".into(), name: None, description: Some("default".into()) }],
+        auto_effort: Some("Jev picks the effort per request".into()),
+    };
+    let update = SessionUpdate::Options { options: options.clone() };
+    let wire = serde_json::to_value(&update).unwrap();
+    assert_eq!(
+        wire,
+        json!({"type": "options", "options": {
+            "models": [{"value": "gpt-6-sol", "name": "GPT-6 Sol", "description": "400k context"}, {"value": "opus[1m]"}],
+            "efforts": [{"value": "low", "description": "default"}],
+            "auto_effort": "Jev picks the effort per request"
+        }})
+    );
+    assert_eq!(serde_json::from_value::<SessionUpdate>(wire.clone()).unwrap(), update);
+    assert!(
+        serde_json::from_value::<before_adr_0066::SessionUpdate>(wire).is_err(),
+        "an older client's parser refuses the unknown update, so it drops it and reads on"
+    );
+    // Missing lists read as empty, and a missing `auto_effort` as a session that refuses `auto`.
+    assert_eq!(serde_json::from_value::<SessionOptions>(json!({})).unwrap(), SessionOptions::default());
+    assert_eq!(serde_json::to_value(SessionOptions::default()).unwrap(), json!({"models": [], "efforts": []}));
+
+    let summary = json!({"meta": {"id": "s", "created_ms": 1, "workspace": "/w", "location": "local", "provider": "p", "model": "m"},
+                         "state": "idle", "persistence": "persistent", "last_activity_ms": 1, "turns": 0});
+    let old = json!({"summary": summary, "transcript": []});
+    let parsed: SessionAttachResult = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(parsed.options, None, "a reply without options reads as none");
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), old, "and serializes as before");
+    let with = SessionAttachResult { options: Some(options.clone()), ..parsed };
+    let wire = serde_json::to_value(&with).unwrap();
+    assert_eq!(wire["options"]["efforts"][0]["value"], "low");
+    assert_eq!(serde_json::from_value::<SessionAttachResult>(wire).unwrap(), with);
+    let paged: SessionAttachPagedResult =
+        serde_json::from_value(json!({"summary": summary, "snapshot_id": "x", "total_bytes": 2, "first_chunk": "W10="})).unwrap();
+    assert_eq!(paged.options, None);
+}

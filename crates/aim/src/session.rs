@@ -116,6 +116,20 @@ impl Recorder {
             }
             AgentEvent::Compacted { replaced, items, .. } => EventBody::Compacted { replaced: *replaced, items: items.clone() },
             AgentEvent::Ui { message } => EventBody::Ui { message: message.clone() },
+            // A nested call (a code cell's) is recorded under its parent; the model's own calls
+            // are recorded as transcript items (ADR 0066).
+            AgentEvent::ToolStarted { call_id, name, arguments, parent: Some(parent) } => EventBody::NestedToolStarted {
+                parent: parent.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            },
+            AgentEvent::ToolFinished { call_id, name, result, parent: Some(parent) } => EventBody::NestedToolFinished {
+                parent: parent.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                result: result.clone(),
+            },
             AgentEvent::StateChanged { .. }
             | AgentEvent::TurnStarted { .. }
             | AgentEvent::RequestStarted { .. }
@@ -127,7 +141,9 @@ impl Recorder {
             | AgentEvent::SteerDelivered { .. }
             | AgentEvent::SteersReturned { .. }
             // A rejection changes nothing: the log keeps state, not requests (ADR 0038).
-            | AgentEvent::ConfigRejected { .. } => return Ok(()),
+            | AgentEvent::ConfigRejected { .. }
+            // What a session can switch to is the backend's data of the moment (ADR 0074).
+            | AgentEvent::Options { .. } => return Ok(()),
         };
         self.record(body).await
     }

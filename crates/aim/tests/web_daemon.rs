@@ -39,6 +39,7 @@ fn summary() -> SessionSummary {
             title: None,
             parent: None,
             agent: None,
+            code_mode: None,
         },
         state: SessionState::Idle,
         persistence: Persistence::Ephemeral,
@@ -64,7 +65,7 @@ impl SessionClient for ProbeHost {
                 SessionUpdate::TextDelta { delta: "one".into() },
                 SessionUpdate::TextDelta { delta: "two".into() },
             ]));
-            Ok((SessionAttachResult { summary: summary(), transcript: vec![], surfaces: vec![] }, stream))
+            Ok((SessionAttachResult { summary: summary(), transcript: vec![], surfaces: vec![], options: None }, stream))
         })
     }
     fn prompt(&self, _: String, _: Vec<Part>) -> BoxFuture<Result<PromptOutcome, ProtoError>> {

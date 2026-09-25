@@ -86,6 +86,7 @@ fn spec() -> SessionSpec {
         effort: None,
         agent: None,
         persistence: Persistence::Ephemeral,
+        code_mode: None,
     }
 }
 

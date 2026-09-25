@@ -344,7 +344,7 @@ impl Client {
                     s.streaming.clear();
                 }
             }
-            SessionUpdate::ToolStarted { call_id, name, arguments } => {
+            SessionUpdate::ToolStarted { call_id, name, arguments, .. } => {
                 s.rows.push(Row::Tool { name, detail: format!("{call_id}\n{arguments}"), done: false });
             }
             SessionUpdate::ToolFinished { call_id, result, .. } => {
@@ -547,7 +547,7 @@ fn App() -> impl IntoView {
                                 workspace: workspace.get_untracked(), location: Location::default(), provider: provider.get_untracked(),
                                 model: (!model.get_untracked().is_empty()).then(|| model.get_untracked()),
                                 effort: (!effort.get_untracked().is_empty()).then(|| effort.get_untracked()),
-                                agent: None, persistence: if private.get_untracked() { Persistence::Ephemeral } else { Persistence::Persistent },
+                                agent: None, persistence: if private.get_untracked() { Persistence::Ephemeral } else { Persistence::Persistent }, code_mode: None
                             });
                         }
                     }>

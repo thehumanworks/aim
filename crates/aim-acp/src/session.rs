@@ -54,6 +54,7 @@ impl AcpSession {
         new_session_result: Value,
         events: SessionInbox,
     ) -> Self {
+        let config_options = config_options::with_model_variants(config_options, &shared.config.model_variants);
         Self {
             shared,
             id,
@@ -159,21 +160,25 @@ impl AcpSession {
         self.prompt(&parts).await
     }
 
-    /// Sets a configuration option to one of its advertised values and confirms the agent
-    /// applied it. Returns the options as the agent now reports them.
+    /// Sets a configuration option to the advertised value `value` resolves to (exactly, by
+    /// case, or for the model by family: docs/adr/0075) and confirms the agent applied it.
+    /// Returns the options as the agent now reports them.
     ///
     /// # Errors
     ///
     /// [`AcpError::ConfigUnavailable`], [`AcpError::ConfigValueRejected`],
-    /// [`AcpError::ConfigNotApplied`], or a request error.
+    /// [`AcpError::ConfigValueAmbiguous`], [`AcpError::ConfigNotApplied`], or a request error.
     pub async fn set_config(&mut self, key: &ConfigKey, value: &str) -> Result<&[ConfigOption], AcpError> {
-        let (id, mut params) = config_options::set_params(&self.config_options, key, value)?;
+        // `value` may be an alias (`opus`); the agent must then report the advertised value it
+        // resolved to (docs/adr/0075).
+        let (id, resolved, mut params) = config_options::set_params(&self.config_options, key, value)?;
         if let Some(object) = params.as_object_mut() {
             object.insert("sessionId".into(), Value::String(self.id.clone()));
         }
         let result = self.shared.request("session/set_config_option", params, Some(self.shared.request_timeout)).await?;
-        let options = parse_config_options(result.get("configOptions"));
-        config_options::confirm(&options, &id, value)?;
+        let options =
+            config_options::with_model_variants(parse_config_options(result.get("configOptions")), &self.shared.config.model_variants);
+        config_options::confirm(&options, &id, &resolved)?;
         self.config_options = options;
         Ok(&self.config_options)
     }
@@ -244,7 +249,7 @@ impl AcpSession {
     fn update_event(&mut self, raw: Value) -> AcpEvent {
         let update = parse_update(&raw, &mut self.tool_calls);
         if let Update::ConfigOptions { options } = &update {
-            self.config_options.clone_from(options);
+            self.config_options = config_options::with_model_variants(options.clone(), &self.shared.config.model_variants);
         }
         AcpEvent::Update { update, raw }
     }

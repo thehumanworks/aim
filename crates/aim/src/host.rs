@@ -25,15 +25,15 @@ use aim_llm_codex::media::{MediaClient, MediaConfig};
 use aim_proto::conversation::{Item, Part};
 use aim_proto::daemon::{
     Location, MediaTranscribeParams, MediaTranscribeResult, Persistence, PromptOutcome, SessionAttachResult, SessionConfigParams,
-    SessionListParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
+    SessionListParams, SessionOptions, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::event::{EffortSource, EventBody, SessionAgent, SessionEvent, SessionMeta};
+use aim_proto::event::{CodeModeSetting, EffortSource, EventBody, SessionAgent, SessionEvent, SessionMeta};
 use futures_core::Stream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AgentConfig, Backend, InForce, ToolHost};
+use crate::agent::{Agent, AgentConfig, Backend, BackendFuture, InForce, ToolHost};
 use crate::context;
 use crate::harness::HarnessClient;
 use crate::jev::Decider;
@@ -171,6 +171,9 @@ pub struct Built {
     /// Ends what the backend's session needs besides the backend itself (e.g. the workspace
     /// connection); run after the backend has shut down.
     pub shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send>,
+    /// The code mode the session got after its guards (ADR 0076); `None` for a backend without
+    /// code mode.
+    pub code_mode: Option<CodeModeSetting>,
 }
 
 /// Builds sessions' backends: the native loop, Claude Code over ACP, or a fake in tests.
@@ -194,19 +197,24 @@ pub struct NativeServices {
     /// factory decides for the session and may offer none; they are composed after the workspace's
     /// and media tools (which keep their names) and before the agent's allowlist.
     pub tools: Vec<ToolsFactory>,
-    /// Code mode (ADR 0018): the `aim-coderun` worker. Sessions get `run_code` (or codex's
+    /// Code mode (ADR 0018, 0076): the `aim-coderun` worker. Sessions get `run_code` (or codex's
     /// `exec`/`wait`, when the catalog asks for it) and the saved-program tools over their final,
-    /// allowlist-narrowed tools, unless an agent's allowlist excludes `run_code`.
+    /// allowlist-narrowed tools, unless an agent's allowlist excludes `run_code`; the mode decides
+    /// which direct tools stay visible beside them.
     pub code: Option<CodeConfig>,
 }
 
-/// Where code mode runs and where programs are kept.
+/// Where code mode runs, where programs are kept, and in which mode. A `CodeConfig` stands for a
+/// worker that was found on a platform that sandboxes it ([`crate::providers::code_mode`]).
 #[derive(Clone, Debug)]
 pub struct CodeConfig {
     /// The `aim-coderun` worker binary.
     pub worker: PathBuf,
     /// The user's program repository (`~/.aim/programs`).
     pub user_programs: PathBuf,
+    /// What this process asks for (ADR 0076: its `AIM_CODE_MODE`, else the default). A session's
+    /// own setting overrides it; `Off` composes no code tools.
+    pub mode: crate::coderun::mode::Mode,
 }
 
 /// Offers a session extra tools, or none (see [`NativeServices::tools`]).
@@ -249,15 +257,18 @@ pub fn native_backends_with(
             let (provider, default_model) =
                 providers(&spec.provider, spec.model.as_deref()).map_err(|e| err(ErrorCode::InvalidParams, e))?;
             let workspace = workspaces(&spec).await?;
-            let guess = spec.model.clone().unwrap_or_else(|| default_model.clone());
-            let window = async {
-                match resources.skill_budget {
-                    Some(_) => None,
-                    None => context::context_window(provider.as_ref(), &guess).await,
+            // Codex needs the catalog to select its code-mode contract. OpenAI-compatible
+            // profiles use portable run_code; their catalog can refresh the compaction window
+            // after the first small request instead of holding up that request.
+            let capabilities = async {
+                if matches!(provider.id(), "openrouter" | "ai-gateway") {
+                    None
+                } else {
+                    tokio::time::timeout(context::WINDOW_LOOKUP, provider.catalog()).await.ok().and_then(Result::ok)
                 }
             };
-            let (catalog, mut window) =
-                tokio::join!(resources::discover(&resources, workspace.project.as_deref(), &workspace.location, ""), window);
+            let (catalog, models) =
+                tokio::join!(resources::discover(&resources, workspace.project.as_deref(), &workspace.location, ""), capabilities);
             for diagnostic in &catalog.diagnostics {
                 tracing::info!(path = %diagnostic.path, problem = ?diagnostic.problem, "resource: {}", diagnostic.message);
             }
@@ -278,11 +289,9 @@ pub fn native_backends_with(
                 }
                 None => (spec.model.clone().unwrap_or(default_model), spec.effort.clone()),
             };
-            // The skill budget is a share of the window of the model the session runs, which an
-            // agent may have chosen (REV8-15).
-            if resources.skill_budget.is_none() && model != guess {
-                window = context::context_window(provider.as_ref(), &model).await;
-            }
+            // A named agent can select another model; the fetched catalog covers both ids.
+            let model_info = models.as_ref().and_then(|models| models.iter().find(|entry| entry.id == model));
+            let window = model_info.and_then(|entry| entry.context_window);
             // An effort that is not set is automatic. A set one is explicit for a new session, and
             // keeps its recorded source on resume (older logs, with no source, resume as they did).
             let effort_source = match (&effort, &recorded) {
@@ -294,12 +303,14 @@ pub fn native_backends_with(
             // the source, so `effort: "auto"` can hand the effort back later.
             let decider = if spec.persistence == Persistence::Persistent { services.decider.clone() } else { None };
             let start = if effort_source == EffortSource::Auto && effort.is_none() && decider.is_some() {
-                starting_effort(provider.as_ref(), &model).await
+                model_info.and_then(crate::agent::ladder_start)
             } else {
                 None
             };
+            // One exposure decision selects the code tools below and the prompt's code-mode section (ADR 0076).
+            let (code_mode, code) = code_exposure(services.code.as_ref(), spec.code_mode, agent.as_ref().map(|(_, policy)| policy));
             let budget = resources.skill_budget.unwrap_or_else(|| resources::instructions::skill_budget(window));
-            let prefix = context::instructions(&catalog, agent.as_ref().map(|(agent, _)| agent), budget);
+            let prefix = context::instructions(&catalog, agent.as_ref().map(|(agent, _)| agent), budget, code.is_some());
             for diagnostic in &prefix.diagnostics {
                 tracing::info!(path = %diagnostic.path, "instructions: {}", diagnostic.message);
             }
@@ -309,12 +320,13 @@ pub fn native_backends_with(
                 Some((agent, _)) => format!("aim:{root}:agent:{}", agent.meta.name),
                 None => format!("aim:{root}"),
             };
-            let Connected { mut tools, location, shutdown, .. } = workspace;
+            let Connected { mut tools, location, mut shutdown, project, .. } = workspace;
             // Media services are composed before the agent's allowlist, which then applies to them
             // too. A missing credential omits the tools rather than making every call fail. Private
             // and ephemeral sessions do not send prompts to them: there is no per-session opt-in
             // yet, so theirs stays off (ADR 0042).
-            if let Some(media) = &services.media
+            if spec.persistence == Persistence::Persistent
+                && let Some(media) = &services.media
                 && let Some(media) = media().await
             {
                 tools = Arc::new(Dispatcher::with_policy(tools, media, spec.persistence == Persistence::Persistent));
@@ -322,14 +334,14 @@ pub fn native_backends_with(
             let mut tools_spec = spec.clone();
             tools_spec.workspace = root.clone();
             tools = with_extra_tools(tools, &services.tools, &tools_spec).await;
-            let code_permitted = agent.as_ref().is_none_or(|(_, policy)| policy.permits("run_code"));
             let (mut tools, record) = match &agent {
                 Some((agent, policy)) => (narrowed(tools, agent, policy), Some(policy.record(&agent.meta.name))),
                 None => (tools, None),
             };
-            if let Some(code) = services.code.as_ref().filter(|_| code_permitted) {
-                let agent = agent.as_ref().map(|(agent, policy)| (agent, policy));
-                tools = with_code_mode(tools, code, agent, provider.as_ref(), &model, &session_id, &spec.location, &root).await;
+            if let Some((code, exposure)) = code {
+                let cells;
+                (tools, cells) = with_code_mode(tools, code, exposure.direct, agent.as_ref(), model_info, &session_id, project);
+                shutdown = cells_first(cells, shutdown);
             }
             let config = AgentConfig {
                 model: model.clone(),
@@ -341,21 +353,15 @@ pub fn native_backends_with(
                 parallel_tool_calls: true,
                 max_requests,
             };
-            let mut native = Agent::with_transcript(provider, tools, config, transcript).with_effort_source(effort_source);
+            let native = Agent::with_transcript(provider, tools, config, transcript).with_catalog(models);
+            let mut native = native.with_initial_window(window).with_effort_source(effort_source);
             if let Some(decider) = decider {
                 native = native.with_decider(decider);
             }
             let backend: Box<dyn Backend> = Box::new(WithSkills::new(Box::new(native), Arc::new(catalog)));
-            Ok(Built { backend, model, root, location, agent: record, shutdown })
+            Ok(Built { backend, model, root, location, agent: record, shutdown, code_mode: Some(code_mode) })
         })
     })
-}
-
-/// The level automatic effort starts from before its first decision: the catalog's default, else
-/// its lowest level (some catalogs omit a default; guessing what the endpoint would choose for
-/// `effort: None` would give the controller no real index).
-async fn starting_effort(provider: &dyn ModelProvider, model: &str) -> Option<String> {
-    crate::agent::ladder_start(&provider.catalog().await.ok()?.into_iter().find(|entry| entry.id == model)?)
 }
 
 /// `tools` narrowed to `policy`, the ceiling of `agent`.
@@ -370,27 +376,65 @@ async fn with_extra_tools(tools: Arc<dyn ToolHost>, factories: &[ToolsFactory], 
     if extra.is_empty() { tools } else { Arc::new(crate::agent::tools::Compose::new(tools, extra)) }
 }
 
+/// Ends a session's code cells before its workspace shuts down, so no cell holds the harness,
+/// and never waits on them for more than two seconds (ADR 0066).
+fn cells_first(
+    cells: crate::coderun::CodeModeHandle,
+    workspace: Box<dyn FnOnce() -> BoxFuture<()> + Send>,
+) -> Box<dyn FnOnce() -> BoxFuture<()> + Send> {
+    Box::new(move || {
+        Box::pin(async move {
+            cells.close(Duration::from_secs(2)).await;
+            workspace().await;
+        })
+    })
+}
+
+/// A session's code mode (ADR 0076): the session's own setting, else this process's; then the
+/// guards. A `CodeConfig` stands for a worker found on a sandboxing platform, and a ceiling without
+/// `run_code` never gets code tools, whatever was asked. Returns the effective mode and, when code
+/// mode applies, what composes it.
+fn code_exposure<'a>(
+    code: Option<&'a CodeConfig>,
+    session: Option<CodeModeSetting>,
+    ceiling: Option<&ToolPolicy>,
+) -> (CodeModeSetting, Option<(&'a CodeConfig, crate::coderun::mode::Exposure)>) {
+    use crate::coderun::mode;
+    let permitted = ceiling.is_none_or(|policy| policy.permits("run_code"));
+    let daemon = code.map_or(mode::CodeModeRequest::Unset, |code| mode::CodeModeRequest::Set(code.mode));
+    let platform = code.is_some() || cfg!(target_os = "macos");
+    let exposure = mode::decide_for_session(session, daemon, code.is_some(), platform, permitted);
+    (mode::to_setting(exposure.mode), code.filter(|_| exposure.code).map(|code| (code, exposure)))
+}
+
 /// Adds code mode and the saved-program tools over `tools`, the session's final (narrowed) set,
-/// so nested calls in a cell reach exactly the tools the session may use.
-#[expect(clippy::too_many_arguments, reason = "one session's composition inputs, kept explicit")]
-async fn with_code_mode(
+/// so nested calls in a cell reach exactly the tools the session may use, and shows the direct
+/// tools `direct` selects beside them (ADR 0076). Also returns the handle that ends the
+/// session's cells.
+pub(crate) fn with_code_mode(
     tools: Arc<dyn ToolHost>,
     code: &CodeConfig,
-    agent: Option<(&resources::agents::AgentDef, &ToolPolicy)>,
-    provider: &dyn ModelProvider,
-    model: &str,
+    direct: crate::coderun::mode::Direct,
+    agent: Option<&(resources::agents::AgentDef, ToolPolicy)>,
+    model: Option<&aim_llm::ModelInfo>,
     session_id: &str,
-    location: &Location,
-    root: &str,
-) -> Arc<dyn ToolHost> {
-    let catalog = provider.catalog().await.unwrap_or_default();
-    let mode = catalog.iter().find(|m| m.id == model).map_or(crate::coderun::CodeMode::RunCode, crate::coderun::CodeMode::from_model);
-    let host = crate::coderun::CodeToolHost::new(Arc::clone(&tools), code.worker.clone(), session_id.to_owned(), mode);
-    // Project programs live in the workspace; remote workspaces get user programs only for now.
-    let project = matches!(location, Location::Local).then(|| PathBuf::from(root).join(".agents/programs"));
-    let store = Arc::new(crate::programs::ProgramStore::new(code.user_programs.clone(), project));
-    let programs: Arc<dyn ToolHost> = Arc::new(crate::coderun::ProgramToolHost::new(host, store));
-    let composed: Arc<dyn ToolHost> = Arc::new(crate::agent::tools::Compose::new(tools, vec![programs]));
+    project: Option<Arc<dyn Files>>,
+) -> (Arc<dyn ToolHost>, crate::coderun::CodeModeHandle) {
+    let hidden = crate::coderun::mode::COMPACT_HIDDEN;
+    let mode = model.map_or(crate::coderun::CodeMode::RunCode, crate::coderun::CodeMode::from_model);
+    let host = crate::coderun::CodeToolHost::new(Arc::clone(&tools), code.worker.clone(), session_id.to_owned(), mode)
+        .with_direct(direct, &hidden);
+    let cells = host.handle();
+    let store = Arc::new(crate::programs::ProgramStore::new(code.user_programs.clone()));
+    let mut programs = crate::coderun::ProgramToolHost::new(host, store);
+    // Project programs are files in the workspace, read and written through it (ADR 0066).
+    if let Some(project) = project {
+        programs = programs.with_project(crate::programs::project::ProjectPrograms::new(project, Arc::clone(&tools)));
+    }
+    let programs: Arc<dyn ToolHost> = Arc::new(programs);
+    // The model sees the mode's direct set; the others stay callable inside cells (ADR 0056, 0076).
+    let direct: Arc<dyn ToolHost> = Arc::new(crate::coderun::DirectCodeTools::new(tools, direct, &hidden));
+    let composed: Arc<dyn ToolHost> = Arc::new(crate::agent::tools::Compose::new(direct, vec![programs]));
     // The model-visible code and program tools obey the agent's allowlist too: `save_program`,
     // `run_program` and `list_programs` need their own permission; codex's `exec`/`wait` are
     // `run_code` under another name.
@@ -400,9 +444,9 @@ async fn with_code_mode(
             if let Some(allow) = top.allow.as_mut() {
                 allow.extend(["exec".to_owned(), "wait".to_owned()]);
             }
-            narrowed(composed, agent, &top)
+            (narrowed(composed, agent, &top), cells)
         }
-        None => composed,
+        None => (composed, cells),
     }
 }
 
@@ -530,6 +574,56 @@ struct Live {
     /// The session's UI surfaces (ADR 0064): published under the transcript lock, reached by the
     /// `ui_*` tools through the outlet each turn runs in.
     ui: Arc<crate::ui::SessionUi>,
+    /// What the session can switch to (ADR 0074): the latest options, published under the
+    /// transcript lock so `attach` sees them in its snapshot or on its stream, and the
+    /// configuration generation lookups are tagged with.
+    options: Mutex<Offered>,
+}
+
+/// A session's latest options, and the generation of its configuration: bumped before every
+/// announced change and at close, so a lookup for an older configuration never publishes, even
+/// when it resolved before it could be aborted (ADR 0074).
+#[derive(Default)]
+struct Offered {
+    generation: u64,
+    latest: Option<SessionOptions>,
+}
+
+/// Starts a new configuration generation; returns it. Lookups tagged with an older one are stale.
+/// With `model_changed` the latest options are dropped too (they are another model's), under the
+/// transcript lock, so an attach never pairs them with the new model: it gets no options, and the
+/// new ones follow on its stream.
+fn next_options_generation(live: &Live, model_changed: bool) -> u64 {
+    let _ordered = lock(&live.transcript);
+    let mut offered = lock(&live.options);
+    offered.generation = offered.generation.wrapping_add(1);
+    if model_changed {
+        offered.latest = None;
+    }
+    offered.generation
+}
+
+impl Live {
+    /// A session's shared state, idle with nothing sent yet, and its control channel's receiver.
+    fn new(
+        summary: SessionSummary,
+        transcript: Vec<Item>,
+        capacity: usize,
+        ui: Arc<crate::ui::SessionUi>,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<Control>) {
+        let (updates, _) = broadcast::channel(capacity.max(16));
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let live = Self {
+            summary: Mutex::new(summary),
+            transcript: Mutex::new(transcript),
+            updates,
+            control,
+            close_requested: CancellationToken::new(),
+            ui,
+            options: Mutex::new(Offered::default()),
+        };
+        (Arc::new(live), control_rx)
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -623,7 +717,7 @@ impl SessionHost {
         let context = resume.as_ref().map(|r| model_items_of(&r.events)).unwrap_or_default();
         let prior = resume.as_ref().map(|r| Recorded { agent: r.meta.agent.clone(), effort_source: last_config(&r.meta, &r.events).2 });
         let request = BackendRequest { spec: spec.clone(), session_id: session_id.clone(), transcript: context, recorded: prior };
-        let Built { mut backend, model, root, location, agent, shutdown } = (self.config.backends)(request).await?;
+        let Built { mut backend, model, root, location, agent, shutdown, code_mode } = (self.config.backends)(request).await?;
 
         let store: Arc<dyn SessionStore> = match spec.persistence {
             Persistence::Persistent => Arc::clone(&self.config.store),
@@ -643,6 +737,8 @@ impl SessionHost {
                 title: None,
                 parent: None,
                 agent,
+                // Stored as it is now, so a resumed session asks for the same (ADR 0076).
+                code_mode,
             };
             let created = Recorder::create(Arc::clone(&store), meta.clone()).await;
             match created {
@@ -668,7 +764,7 @@ impl SessionHost {
                 Err(e) => Err(e),
             }
         };
-        let (meta, recorder, announced) = match opened {
+        let (mut meta, recorder, announced) = match opened {
             Ok(opened) => opened,
             Err(e) => {
                 backend.shutdown().await;
@@ -676,6 +772,10 @@ impl SessionHost {
                 return Err(err(ErrorCode::Internal, e.to_string()));
             }
         };
+        // What the session got now, after the guards (a resumed one may get less than it recorded,
+        // e.g. without the worker, and a backend without code mode gives none); the stored record
+        // keeps what it had (ADR 0076).
+        meta.code_mode = code_mode;
         // Shutdown began while this session was starting: it must not go live.
         if self.closing.load(Ordering::SeqCst) {
             backend.shutdown().await;
@@ -683,25 +783,20 @@ impl SessionHost {
             return Err(shutting_down());
         }
 
-        let summary = SessionSummary {
+        let mut summary = SessionSummary {
             meta: meta.clone(),
             state: SessionState::Idle,
             persistence: spec.persistence,
             last_activity_ms: session::now_ms(),
             turns: recorder.turns(),
         };
-        let (updates, _) = broadcast::channel(self.config.update_capacity.max(16));
-        let (control, control_rx) = mpsc::unbounded_channel();
-        let live = Arc::new(Live {
-            summary: Mutex::new(summary.clone()),
-            transcript: Mutex::new(transcript),
-            updates,
-            control,
-            close_requested: CancellationToken::new(),
-            ui,
-        });
+        // A resumed session's summary shows the model it resumed with, not the one it began with.
+        if let Some(now) = &announced {
+            summary.meta.model.clone_from(&now.model);
+        }
+        let (live, control_rx) = Live::new(summary.clone(), transcript, self.config.update_capacity, ui);
         lock(&self.sessions).insert(meta.id.clone(), Arc::clone(&live));
-        let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location, announced };
+        let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location, announced, options: None };
         let sessions = Arc::clone(&self.sessions);
         let id = meta.id.clone();
         tokio::spawn(async move {
@@ -740,6 +835,8 @@ impl SessionHost {
             // The agent is applied again, within the ceiling it recorded (ADR 0038).
             agent: meta.agent.as_ref().map(|agent| agent.name.clone()),
             persistence: Persistence::Persistent,
+            // It asks for the code mode it had; the guards apply again (ADR 0076).
+            code_mode: meta.code_mode,
         };
         self.start(spec, Some(Resume { meta, events })).await?;
         self.live(id)
@@ -795,6 +892,8 @@ struct Actor {
     /// The configuration last announced (`ConfigChanged`), to tell whether a refused change left
     /// something changed (ADR 0038).
     announced: Option<InForce>,
+    /// The options lookup in flight (ADR 0074); a newer configuration aborts it.
+    options: Option<tokio::task::JoinHandle<()>>,
 }
 
 fn set_state(live: &Live, state: SessionState) {
@@ -840,7 +939,34 @@ async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<Strin
         let _unwatched = live.updates.send(update);
         return;
     }
+    if let SessionUpdate::ConfigChanged { model, .. } = &update {
+        // The summary and the stream change in one step under the transcript lock that `attach`
+        // takes to snapshot and subscribe: an attach sees the old model and then this update, or
+        // the new model and not this update, never the old model and then the new model's options
+        // (ADR 0074, REV-T1b B2).
+        let _ordered = lock(&live.transcript);
+        lock(&live.summary).meta.model.clone_from(model);
+        let _unwatched = live.updates.send(update);
+        return;
+    }
     let _unwatched = live.updates.send(update);
+}
+
+/// Publishes what a session's backend says it can switch to (ADR 0074), when the configuration it
+/// was looked up for (`generation`) is still current, unless nothing changed and nothing is
+/// `forced` (after a model change clients expect the new model's options, even equal ones). The
+/// generation is checked and the update sent under the options lock, which also orders every
+/// generation bump before its `ConfigChanged`; and under the transcript lock, like items and
+/// surfaces, so `attach` sees it in its snapshot or on its stream. It is not recorded.
+async fn publish_options(live: Arc<Live>, lookup: BackendFuture<'static, Option<SessionOptions>>, forced: bool, generation: u64) {
+    let Some(options) = lookup.await else { return };
+    let _ordered = lock(&live.transcript);
+    let mut offered = lock(&live.options);
+    if offered.generation != generation || (!forced && offered.latest.as_ref() == Some(&options)) {
+        return;
+    }
+    offered.latest = Some(options.clone());
+    let _unwatched = live.updates.send(SessionUpdate::Options { options });
 }
 
 fn in_force_of(update: &SessionUpdate) -> Option<InForce> {
@@ -854,6 +980,8 @@ fn in_force_of(update: &SessionUpdate) -> Option<InForce> {
 
 impl Actor {
     async fn run(mut self, mut control: mpsc::UnboundedReceiver<Control>) {
+        // Never on the create path: the options arrive when the backend knows them (ADR 0074).
+        self.refresh_options(false);
         let mut pending_config: Option<(Option<String>, Option<String>)> = None;
         while let Some(message) = control.recv().await {
             match message {
@@ -883,8 +1011,24 @@ impl Actor {
                 break;
             }
         }
+        if let Some(lookup) = self.options.take() {
+            lookup.abort();
+        }
+        // Nothing looked up before the close publishes after it.
+        next_options_generation(&self.live, false);
         set_state(&self.live, SessionState::Closed);
         self.backend.shutdown().await;
+    }
+
+    /// Asks the backend again what the session can switch to (the model, or an agent's options,
+    /// changed), dropping a lookup for an older configuration. `forced` sends the answer even when
+    /// it did not change (the model did).
+    fn refresh_options(&mut self, forced: bool) {
+        if let Some(lookup) = self.options.take() {
+            lookup.abort();
+        }
+        let generation = lock(&self.live.options).generation;
+        self.options = Some(tokio::spawn(publish_options(Arc::clone(&self.live), self.backend.options(), forced, generation)));
     }
 
     /// Applies a change accepted during the turn that just ended and reports its outcome:
@@ -937,6 +1081,10 @@ impl Actor {
     /// Records and broadcasts `in_force`; an error when the log could not keep it (nothing is
     /// broadcast then, and the session closes).
     async fn announce(&mut self, in_force: InForce) -> Result<(), String> {
+        // Options looked up for the configuration before this one are stale from here on, before
+        // any client learns of the change (ADR 0074).
+        let model_changed = self.announced.as_ref().is_none_or(|before| before.model != in_force.model);
+        next_options_generation(&self.live, model_changed);
         let update = SessionUpdate::ConfigChanged {
             model: in_force.model.clone(),
             effort: in_force.effort.clone(),
@@ -947,6 +1095,7 @@ impl Actor {
             return Err(why.clone());
         }
         self.announced = Some(in_force);
+        self.refresh_options(model_changed);
         Ok(())
     }
 
@@ -957,7 +1106,7 @@ impl Actor {
         control: &mut mpsc::UnboundedReceiver<Control>,
         pending_config: &mut Option<(Option<String>, Option<String>)>,
     ) -> bool {
-        let Self { live, backend, recorder, broken, root, location, announced } = self;
+        let Self { live, backend, recorder, broken, root, location, announced, .. } = self;
         if let Err(e) = recorder.begin_turn().await {
             // Nothing ran: report the failure as this turn's only terminal event and close.
             let why = format!("store: the session log could not be written ({e}); the session is closed");
@@ -1174,8 +1323,12 @@ impl SessionClient for SessionHost {
             let live = host.live_or_resume(&session).await?;
             let transcript = lock(&live.transcript);
             let rx = live.updates.subscribe();
-            let result =
-                SessionAttachResult { summary: lock(&live.summary).clone(), transcript: transcript.clone(), surfaces: live.ui.snapshot() };
+            let result = SessionAttachResult {
+                summary: lock(&live.summary).clone(),
+                transcript: transcript.clone(),
+                surfaces: live.ui.snapshot(),
+                options: lock(&live.options).latest.clone(),
+            };
             drop(transcript);
             Ok((result, updates_of(rx)))
         })
@@ -1220,5 +1373,142 @@ impl SessionClient for SessionHost {
             live.close_requested.cancel();
             live.control.send(Control::Close).map_err(|_| err(ErrorCode::Unavailable, "session closed"))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use aim_proto::daemon::{ChoiceValue, Persistence, SessionOptions, SessionState, SessionSummary, SessionUpdate};
+    use aim_proto::event::{EffortSource, SessionEvent, SessionMeta};
+
+    use super::{Arc, BoxFuture, Live, Mutex, PoisonError, lock, next_options_generation, publish, publish_options};
+    use crate::session::Recorder;
+    use crate::store::{MemoryStore, SessionStore, StoreError, StoredSessionSummary};
+
+    fn options(model: &str) -> SessionOptions {
+        let level = ChoiceValue { value: format!("{model}-level"), name: None, description: None };
+        SessionOptions { models: Vec::new(), efforts: vec![level], auto_effort: None }
+    }
+
+    fn meta() -> SessionMeta {
+        SessionMeta {
+            id: "s".into(),
+            created_ms: 0,
+            workspace: "/w".into(),
+            location: "local".into(),
+            provider: "p".into(),
+            model: "m1".into(),
+            title: None,
+            parent: None,
+            agent: None,
+            code_mode: None,
+        }
+    }
+
+    fn live() -> Arc<Live> {
+        let meta = meta();
+        let summary =
+            SessionSummary { meta, state: SessionState::Idle, persistence: Persistence::Ephemeral, last_activity_ms: 0, turns: 0 };
+        Live::new(summary, Vec::new(), 16, Arc::new(crate::ui::SessionUi::restore("s", &[]))).0
+    }
+
+    /// REV-T1 B1: a lookup that resolves after the configuration changed (too late for its abort)
+    /// publishes nothing, before or after the newer options; nor does one after close.
+    #[tokio::test]
+    async fn a_lookup_for_an_older_configuration_never_publishes() {
+        let live = live();
+        let mut updates = live.updates.subscribe();
+        let (release, gate) = tokio::sync::oneshot::channel::<SessionOptions>();
+        let before = lock(&live.options).generation;
+        let stale = tokio::spawn(publish_options(Arc::clone(&live), Box::pin(async move { gate.await.ok() }), false, before));
+        // The model changes while m1's lookup is in flight; m2's lookup publishes first.
+        let current = next_options_generation(&live, true);
+        publish_options(Arc::clone(&live), Box::pin(async { Some(options("m2")) }), true, current).await;
+        // Then m1's answer arrives.
+        release.send(options("m1")).unwrap();
+        stale.await.unwrap();
+        assert_eq!(lock(&live.options).latest, Some(options("m2")), "the snapshot keeps the current model's options");
+        assert_eq!(updates.try_recv().unwrap(), SessionUpdate::Options { options: options("m2") });
+        assert!(updates.try_recv().is_err(), "the stale answer was dropped");
+        // A close starts a generation of its own: nothing looked up before it publishes.
+        let open = lock(&live.options).generation;
+        next_options_generation(&live, false);
+        publish_options(Arc::clone(&live), Box::pin(async { Some(options("m3")) }), true, open).await;
+        assert!(updates.try_recv().is_err());
+        assert_eq!(lock(&live.options).latest, Some(options("m2")));
+        // A model change drops the old model's options from the snapshot at once; an effort change
+        // keeps them.
+        next_options_generation(&live, false);
+        assert_eq!(lock(&live.options).latest, Some(options("m2")));
+        next_options_generation(&live, true);
+        assert_eq!(lock(&live.options).latest, None);
+    }
+
+    /// A memory store that says when an append went through.
+    struct Signaling {
+        inner: MemoryStore,
+        appended: Mutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl SessionStore for Signaling {
+        fn create(&self, meta: SessionMeta) -> BoxFuture<Result<(), StoreError>> {
+            self.inner.create(meta)
+        }
+
+        fn append(&self, session: String, events: Vec<SessionEvent>) -> BoxFuture<Result<(), StoreError>> {
+            let appended = self.appended.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            let written = self.inner.append(session, events);
+            Box::pin(async move {
+                let result = written.await;
+                // The test is gone when this fails.
+                let _gone = appended.send(());
+                result
+            })
+        }
+
+        fn load(&self, session: String) -> BoxFuture<Result<(SessionMeta, Vec<SessionEvent>), StoreError>> {
+            self.inner.load(session)
+        }
+
+        fn list(&self, limit: u32) -> BoxFuture<Result<Vec<SessionMeta>, StoreError>> {
+            self.inner.list(limit)
+        }
+
+        fn summarize(&self, limit: u32) -> BoxFuture<Result<Vec<StoredSessionSummary>, StoreError>> {
+            self.inner.summarize(limit)
+        }
+    }
+
+    /// REV-T1b B2: a model change reaches the summary and the stream in one step under the lock an
+    /// attach snapshots and subscribes under. While an attach holds it, the change is logged but
+    /// neither in the summary nor on the stream; once it lets go, it is in both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_change_reaches_the_summary_and_the_stream_in_one_step() {
+        let live = live();
+        let (appended, logged) = std::sync::mpsc::channel();
+        let store: Arc<dyn SessionStore> = Arc::new(Signaling { inner: MemoryStore::default(), appended: Mutex::new(appended) });
+        let mut recorder = Recorder::create(store, meta()).await.unwrap();
+        // An attach in progress: it holds the transcript lock while it snapshots and subscribes.
+        let attach = lock(&live.transcript);
+        let mut updates = live.updates.subscribe();
+        let changed = {
+            let live = Arc::clone(&live);
+            tokio::spawn(async move {
+                let mut broken = None;
+                let update = SessionUpdate::ConfigChanged { model: "m2".into(), effort: None, effort_source: EffortSource::Explicit };
+                publish(&live, &mut recorder, &mut broken, update).await;
+            })
+        };
+        logged.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Time for the rest of the transition, were it not waiting for the attach to finish.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(lock(&live.summary).meta.model, "m1", "the attach sees the old model");
+        assert!(updates.try_recv().is_err(), "and gets the change on its stream, not before its snapshot");
+        drop(attach);
+        changed.await.unwrap();
+        assert_eq!(lock(&live.summary).meta.model, "m2");
+        assert!(matches!(updates.try_recv(), Ok(SessionUpdate::ConfigChanged { .. })));
     }
 }

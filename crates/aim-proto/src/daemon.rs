@@ -107,6 +107,10 @@ pub struct SessionSpec {
     /// Kept or ephemeral.
     #[serde(default)]
     pub persistence: Persistence,
+    /// The code mode the client asks for (ADR 0076); the daemon's own `AIM_CODE_MODE`, else the
+    /// default, when absent. The host's guards still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<crate::event::CodeModeSetting>,
 }
 
 /// What a session is doing.
@@ -174,21 +178,28 @@ pub enum SessionUpdate {
     },
     /// A tool call started running.
     ToolStarted {
-        /// Provider call id.
+        /// Provider call id, or, for a nested call, an id unique in the session.
         call_id: String,
         /// Tool name.
         name: String,
         /// Raw arguments.
         arguments: String,
+        /// The call that made this one: the `run_code`, `exec` or `wait` call whose code cell
+        /// called this tool (ADR 0066). `None` for the model's own calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
     },
     /// A tool call finished (or was answered while winding down).
     ToolFinished {
-        /// Provider call id.
+        /// Provider call id, or, for a nested call, an id unique in the session.
         call_id: String,
         /// Tool name.
         name: String,
         /// Its result.
         result: ToolResult,
+        /// The call that made this one (ADR 0066); `None` for the model's own calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
     },
     /// Steering was accepted and will go with the next request.
     SteerQueued,
@@ -240,6 +251,14 @@ pub enum SessionUpdate {
         effort: Option<String>,
         /// Why (no secrets).
         message: String,
+    },
+    /// What this session can switch to now (ADR 0074): the models of its provider and the
+    /// current model's effort ladder. Sent when the backend knows them (never on the create or
+    /// attach path) and again when they change; the latest is replayed to attaching clients in
+    /// [`SessionAttachResult::options`]. Not recorded in the session log.
+    Options {
+        /// The choices.
+        options: SessionOptions,
     },
     /// The model's context was compacted: its first `replaced` items were replaced by `items`
     /// (a provider compaction item or a summary). The user's transcript keeps everything.
@@ -320,6 +339,10 @@ pub struct SessionAttachResult {
     /// records where in the transcript it was created.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<crate::ui::model::Surface>,
+    /// The latest [`SessionUpdate::Options`] as of the same instant (ADR 0074), when the session
+    /// has sent one; later ones follow on the stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<SessionOptions>,
 }
 
 method!(
@@ -342,6 +365,9 @@ pub struct SessionAttachPagedResult {
     /// limits, so they travel whole in this reply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<crate::ui::model::Surface>,
+    /// The session's latest options at the snapshot boundary (ADR 0074).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<SessionOptions>,
 }
 
 method!(
@@ -433,6 +459,39 @@ pub struct SessionConfigParams {
 /// The `effort` value that makes a session's effort automatic again (ADR 0038). Reserved: a
 /// catalog level with this name cannot be pinned through `session.set_config`.
 pub const AUTO_EFFORT: &str = "auto";
+
+/// One value a session can switch to (ADR 0074): what `session.set_config` takes, and how to show
+/// it. Values are the provider's or agent's data, never aim enums.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ChoiceValue {
+    /// The value `session.set_config` takes (a model id, an effort level).
+    pub value: String,
+    /// Display name, when the source gives one that differs from the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// A short description (the agent's, or facts from the catalog such as the context window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// What a session can switch to (ADR 0074), as its backend knows it: the models of its provider
+/// (a native provider's catalog without hidden models; an ACP agent's advertised `model` values)
+/// and the effort ladder of the model in force (empty: no effort control is known). [`AUTO_EFFORT`]
+/// is never listed in `efforts`: `auto_effort` says whether the session takes it.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionOptions {
+    /// Models, in the source's order.
+    #[serde(default)]
+    pub models: Vec<ChoiceValue>,
+    /// The current model's effort levels, least effort first.
+    #[serde(default)]
+    pub efforts: Vec<ChoiceValue>,
+    /// `Some` when `session.set_config` takes [`AUTO_EFFORT`], saying what it does in this session
+    /// (native sessions always take it; an ACP agent only when it advertises it). `None`: the
+    /// session refuses it, and clients neither offer nor send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_effort: Option<String>,
+}
 
 method!(
     /// `session.set_config` — change model or effort. When idle it applies at once and a refusal is

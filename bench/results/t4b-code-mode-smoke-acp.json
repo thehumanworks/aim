@@ -1,0 +1,61 @@
+{
+  "binary_sha256": {
+    "aim": "46efeebea7f19c12cc7ad31cb0162089826550270c28923a1917d05a213c1b4f",
+    "aim_coderun": "dadb0f55ab3d56c06d2c20c83fd93cb43878bb6fff45ae0ee43b91719770c448",
+    "aimx": "65b6d2ffa8260f7289dde8855b0c97c1dcd666eed06153e507cd18413d341dac"
+  },
+  "finished_unix": 1790351123.1969988,
+  "manifest_sha256": "6b2f0005f4923ae1e1b2c9014db935439981a31c99511be4e32d77a3d2165957",
+  "runs": [
+    {
+      "case": "todo_table",
+      "direct_tool_calls": 3,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__bash": 2,
+        "mcp__aim__write": 1
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "harness": "acp_claude@off",
+      "ite": 25368.95,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 0,
+      "requests": 4,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 14455,
+        "cache_read_input_tokens": 41272,
+        "input_tokens": 8,
+        "output_tokens": 633
+      },
+      "usage": {
+        "cache_write_tokens": 14455,
+        "cached_input_tokens": 41272,
+        "input_tokens": 55735,
+        "output_tokens": 633,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 14230.99
+    }
+  ],
+  "source_sha": "6b1878f18d05f38990ab93fc28f0cb4195d34f66",
+  "started_unix": 1790351108.828204,
+  "subscription_runs": 1,
+  "summary": [
+    {
+      "harness": "acp_claude@off",
+      "ite_per_passed": 25368.95,
+      "mean_direct_tool_calls": 3,
+      "mean_requests": 4,
+      "p50_wall_ms": 14230.99,
+      "pass_rate": 1.0,
+      "passed": 1,
+      "runs": 1
+    }
+  ],
+  "tier": "acp_live"
+}

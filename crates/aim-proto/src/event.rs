@@ -40,6 +40,36 @@ pub struct SessionMeta {
     /// (ADR 0038). Absent for the default agent and in logs written before ADR 0038.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<SessionAgent>,
+    /// The session's effective code mode (ADR 0076): stored as it was when the session was
+    /// created (a resumed session asks for it again), and in a live session's summary what the
+    /// host gave it after its guards. Absent in logs written before ADR 0076 and for backends
+    /// without code mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<CodeModeSetting>,
+}
+
+/// A code-mode setting (ADR 0076): a session's request, or what it got.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeModeSetting {
+    /// No code or program tools; every direct tool.
+    Off,
+    /// The code and program tools beside a compact set of direct tools.
+    On,
+    /// Only the code and program tools.
+    Only,
+}
+
+impl CodeModeSetting {
+    /// The setting as `AIM_CODE_MODE`, `--code-mode` and the TUI's status line spell it.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Only => "only",
+        }
+    }
 }
 
 /// A session's named agent and its tool ceiling, as recorded at creation (ADR 0038).
@@ -162,6 +192,29 @@ pub enum EventBody {
     Ui {
         /// The message.
         message: crate::ui::UiEnvelope,
+    },
+    /// A tool call made by another call started: a code cell's nested call (ADR 0066). The
+    /// model's own calls are recorded as transcript items instead.
+    NestedToolStarted {
+        /// The `run_code`, `exec` or `wait` call whose cell made it.
+        parent: String,
+        /// Its id, unique in the session.
+        call_id: String,
+        /// Tool name.
+        name: String,
+        /// Raw arguments.
+        arguments: String,
+    },
+    /// A nested tool call finished (ADR 0066).
+    NestedToolFinished {
+        /// The `run_code`, `exec` or `wait` call whose cell made it.
+        parent: String,
+        /// Its id, as in [`EventBody::NestedToolStarted`].
+        call_id: String,
+        /// Tool name.
+        name: String,
+        /// Its result.
+        result: crate::tool::ToolResult,
     },
     /// An event kind this build does not know; preserved verbatim.
     #[serde(untagged)]

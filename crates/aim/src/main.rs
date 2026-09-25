@@ -88,6 +88,9 @@ enum Command {
         /// Most model requests in the turn.
         #[arg(long, default_value_t = 64)]
         max_requests: u32,
+        /// Code mode: off, on or only (ADR 0076). Without it, `AIM_CODE_MODE` applies.
+        #[arg(long = "code-mode", value_parser = aim::coderun::mode::parse_flag)]
+        code_mode: Option<aim_proto::event::CodeModeSetting>,
         /// The prompt (read from stdin when omitted or `-`).
         prompt: Vec<String>,
     },
@@ -133,6 +136,29 @@ enum Command {
         /// Board action.
         #[command(subcommand)]
         action: board_cli::BoardAction,
+    },
+    /// Serve a workspace's tools in code mode over MCP stdio: the relay a strict `acp:claude`
+    /// session gets when code mode is on (ADR 0076). Started by aim, not by hand.
+    #[command(name = "code-mcp", hide = true)]
+    CodeMcp {
+        /// Workspace root (on the workspace's host).
+        #[arg(long)]
+        root: String,
+        /// SSH destination of a remote workspace.
+        #[arg(long)]
+        ssh: Option<String>,
+        /// The aimx binary that connects the workspace.
+        #[arg(long)]
+        aimx: PathBuf,
+        /// The `aim-coderun` worker.
+        #[arg(long)]
+        coderun: PathBuf,
+        /// The user's program repository.
+        #[arg(long)]
+        programs: PathBuf,
+        /// `on` or `only`.
+        #[arg(long = "code-mode")]
+        code_mode: String,
     },
     /// Inspect and trust user MCP servers, or serve aim's tools to an MCP client.
     Mcp {
@@ -364,7 +390,9 @@ async fn list_sessions(limit: u32) -> Result<i32, String> {
     let store = SqliteStore::open(&cli::aim_home().join("aim.db")).map_err(|e| e.to_string())?;
     let sessions = store.list(limit).await.map_err(|e| e.to_string())?;
     for s in sessions {
-        eprintln!("{}  {}  {}/{}  {}", s.id, s.created_ms, s.provider, s.model, s.workspace);
+        // The code mode it was created with (ADR 0076); older sessions recorded none.
+        let code = s.code_mode.map(|mode| format!("  code:{}", mode.label())).unwrap_or_default();
+        eprintln!("{}  {}  {}/{}  {}{code}", s.id, s.created_ms, s.provider, s.model, s.workspace);
     }
     Ok(0)
 }
@@ -449,15 +477,28 @@ async fn mcp_command(
 
 #[expect(clippy::too_many_lines, reason = "the CLI command dispatcher keeps daemon status and stop adjacent")]
 async fn main_async(args: Args) -> Result<i32, String> {
+    // Where code mode is chosen from this process's environment, an invalid AIM_CODE_MODE is
+    // said on stderr: the CLI has no log subscriber (ADR 0076). `aim run` says it with its own
+    // setting below, and the TUI in its transcript.
+    if matches!(args.command, Some(Command::Mcp { stdio: true, .. } | Command::Daemon { .. }))
+        && let Some(warning) = aim::coderun::mode::invalid_env_warning()
+    {
+        eprintln!("aim: {warning}");
+    }
     let Some(command) = args.command else { return tui(args.tui).await };
     match command {
         Command::Tui(tui_args) => tui(tui_args).await,
-        Command::Run { provider: p, model, effort, cwd, ssh, remote, aimx, ephemeral, json, max_requests, prompt } => {
+        Command::Run { provider: p, model, effort, cwd, ssh, remote, aimx, ephemeral, json, max_requests, code_mode, prompt } => {
             let prompt = read_prompt(&prompt)?;
             if prompt.trim().is_empty() {
                 return Err("empty prompt".to_owned());
             }
-            let options = RunOptions { provider: p, model, effort, cwd, ssh, remote, aimx, ephemeral, json, max_requests, prompt };
+            let (code_mode, warning) = aim::coderun::mode::client_setting_from_env(code_mode);
+            if let Some(warning) = warning {
+                eprintln!("aim: {warning}");
+            }
+            let options =
+                RunOptions { provider: p, model, effort, cwd, ssh, remote, aimx, ephemeral, json, max_requests, prompt, code_mode };
             cli::run(options, provider).await
         }
         Command::Search { query } => search_cli(&query).await,
@@ -477,6 +518,14 @@ async fn main_async(args: Args) -> Result<i32, String> {
         }
         Command::Board { action } => Box::pin(board_cli::run(&cli::aim_home(), action)).await,
         Command::Mcp { stdio, cwd, ssh, aimx, action } => mcp_command(stdio, cwd, ssh, aimx, action).await,
+        Command::CodeMcp { root, ssh, aimx, coderun, programs, code_mode } => {
+            let mode = aim::mcp::proxy::relay_mode(&code_mode)?;
+            let location = ssh.map_or(aim_proto::daemon::Location::Local, |destination| aim_proto::daemon::Location::Ssh { destination });
+            let code = aim::host::CodeConfig { worker: coderun, user_programs: programs, mode };
+            let relay = aim::mcp::proxy::CodeRelay { root, location, aimx, code };
+            aim::mcp::proxy::serve(&relay, tokio::io::stdin(), tokio::io::stdout()).await?;
+            Ok(0)
+        }
         Command::Daemon {
             socket,
             web,

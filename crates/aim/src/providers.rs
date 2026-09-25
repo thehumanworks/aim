@@ -12,6 +12,7 @@
 //!   local built-ins. Both are agent backends, not model providers: sessions run them through
 //!   [`crate::acp::with_acp`].
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -53,6 +54,8 @@ fn with_base_url(mut profile: Profile, var: &str) -> Profile {
 pub const CODEX_DEFAULT_MODEL: &str = "gpt-6-sol";
 
 static CODEX: Mutex<Option<Arc<CodexProvider>>> = Mutex::new(None);
+type GatewayMap = HashMap<(String, String), Arc<OpenAiProvider>>;
+static GATEWAYS: Mutex<Option<GatewayMap>> = Mutex::new(None);
 
 /// The process's codex provider (created on first use).
 ///
@@ -78,14 +81,36 @@ pub const GATEWAY_DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5";
 /// Provider ids this build knows.
 pub const KNOWN: &[&str] = &["openrouter", "ai-gateway", "codex", "acp:claude", "acp:claude-native"];
 
+/// One line about a provider of [`KNOWN`], for completion and help (`None` for other ids).
+#[must_use]
+pub fn summary(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "openrouter" => "OpenRouter gateway (OPENROUTER_API_KEY)",
+        "ai-gateway" => "Vercel AI Gateway (AI_GATEWAY_API_KEY)",
+        "codex" => "ChatGPT subscription (aim login, or the Codex CLI's)",
+        "acp:claude" => "Claude Code over ACP, with aim's tools",
+        "acp:claude-native" => "Claude Code over ACP, with its own local tools",
+        _ => return None,
+    })
+}
+
 /// Builds provider `id` and resolves the model (`model`, else the provider's default).
 ///
 /// # Errors
 /// A message for the user: unknown provider, or one this build cannot construct.
 pub fn build(id: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, String), String> {
     let gateway = |profile: Profile| -> Result<(Arc<dyn ModelProvider>, String), String> {
-        let provider = OpenAiProvider::new(profile).map_err(|e| format!("{id}: {e}"))?;
-        Ok((Arc::new(provider), model.unwrap_or(GATEWAY_DEFAULT_MODEL).to_owned()))
+        let key = (profile.id.clone(), profile.base_url.clone());
+        let mut slot = GATEWAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        let gateways = slot.get_or_insert_with(HashMap::new);
+        let provider = if let Some(provider) = gateways.get(&key) {
+            Arc::clone(provider)
+        } else {
+            let provider = Arc::new(OpenAiProvider::new(profile).map_err(|e| format!("{id}: {e}"))?);
+            gateways.insert(key, Arc::clone(&provider));
+            provider
+        };
+        Ok((provider as Arc<dyn ModelProvider>, model.unwrap_or(GATEWAY_DEFAULT_MODEL).to_owned()))
     };
     match id {
         "openrouter" => gateway(with_base_url(Profile::openrouter(), "AIM_OPENROUTER_BASE_URL")),
@@ -122,18 +147,29 @@ pub fn services() -> crate::host::NativeServices {
     }
 }
 
-/// Code mode, when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this
+/// Code mode as `AIM_CODE_MODE` asks (ADR 0076; unset means the default, `on`; an invalid value
+/// means off), when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this
 /// executable. It runs sandboxed on macOS and refuses to run on Linux until its bubblewrap profile
-/// exists (ADR 0018), so it is offered on macOS only.
+/// exists (ADR 0018), so it is offered on macOS only. `None` when it cannot run; otherwise its
+/// `mode` is what this process asks for (ADR 0076), which a session's own setting overrides.
 pub(crate) fn code_mode() -> Option<crate::host::CodeConfig> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
+    code_mode_as(crate::coderun::mode::requested_from_env())
+}
+
+/// [`code_mode`] with an explicit request.
+pub(crate) fn code_mode_as(requested: crate::coderun::mode::CodeModeRequest) -> Option<crate::host::CodeConfig> {
     let worker = std::env::var_os("AIM_CODERUN")
         .map(PathBuf::from)
         .or_else(|| std::env::current_exe().ok().map(|exe| exe.with_file_name("aim-coderun")))
-        .filter(|path| path.exists())?;
-    Some(crate::host::CodeConfig { worker, user_programs: crate::cli::aim_home().join("programs") })
+        .filter(|path| path.exists());
+    let platform = cfg!(target_os = "macos");
+    // Logs why this process's own request cannot run, if it cannot.
+    let _process = crate::coderun::mode::decide(requested, worker.is_some(), platform, true);
+    // What this process asks for, before the guards: sessions without a setting of their own get
+    // it, and a session asking for code mode still needs the worker (ADR 0076).
+    let mode = crate::coderun::mode::decide(requested, true, true, true).mode;
+    let worker = worker.filter(|_| platform)?;
+    Some(crate::host::CodeConfig { worker, user_programs: crate::cli::aim_home().join("programs"), mode })
 }
 
 type SearchParts = (Arc<crate::search::SearchEngine>, Arc<crate::store::SqliteStore>);
@@ -328,7 +364,8 @@ mod tests {
     use aim_proto::daemon::{Location, Persistence, SessionSpec};
     use aim_proto::ids::IdempotencyKey;
 
-    use super::board_tools_at;
+    use super::{board_tools_at, build};
+    use std::sync::Arc;
 
     fn spec(persistence: Persistence) -> SessionSpec {
         SessionSpec {
@@ -339,6 +376,7 @@ mod tests {
             effort: None,
             agent: None,
             persistence,
+            code_mode: None,
         }
     }
 
@@ -355,6 +393,13 @@ mod tests {
             board.call("board_list".to_owned(), serde_json::json!({}), IdempotencyKey::new("list")).await.expect("real board list");
         assert!(!listed.is_error);
         assert!(aim_home.join("aim.db").exists());
+    }
+
+    #[test]
+    fn gateway_sessions_share_one_provider_and_catalog_cache() {
+        let (first, _) = build("openrouter", Some("test/model")).expect("provider");
+        let (second, _) = build("openrouter", Some("other/model")).expect("provider");
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
 

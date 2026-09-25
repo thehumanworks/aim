@@ -41,6 +41,8 @@ pub struct Options {
     pub close_on_exit: bool,
     /// Keep superseded completion requests running (tests of the app's fence).
     pub keep_superseded_completions: bool,
+    /// A warning to show when the UI starts (an invalid `AIM_CODE_MODE`, ADR 0076).
+    pub notice: Option<String>,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -268,6 +270,21 @@ impl Screen {
         Ok(())
     }
 
+    /// `/clear`: erases the screen and the scrollback and forgets what was drawn, so the next paint
+    /// starts at the top. In fullscreen the main screen under the alternate one (the inline
+    /// history) is purged too.
+    fn clear(&mut self) -> std::io::Result<()> {
+        self.cache.clear();
+        self.inline.reset();
+        match &mut self.alternate {
+            Some(terminal) => {
+                write_out(&format!("\x1b[?2026h\x1b[?1049l{}\x1b[?1049h\x1b[?2026l", inline::CLEAR_ALL))?;
+                terminal.clear()
+            }
+            None => write_out(inline::CLEAR_ALL),
+        }
+    }
+
     /// Leaves the terminal as a shell expects it: the transcript in scrollback, no block.
     fn finish(&mut self, app: &mut App) -> std::io::Result<()> {
         if self.alternate.take().is_some() {
@@ -389,7 +406,8 @@ impl Runner {
                     let _gone = self.inputs.send(Input::Failed(format!("could not save history: {error}")));
                 }
             }
-            Effect::Quit => {}
+            // The screen's own effect: `execute` ran it before handing the rest over.
+            Effect::ClearScreen | Effect::Quit => {}
         }
     }
 
@@ -420,6 +438,14 @@ impl Runner {
                     };
                     if inputs.send(attached).is_err() {
                         return;
+                    }
+                    // The latest options as of the snapshot, applied like the update they replay
+                    // (ADR 0074).
+                    if let Some(options) = result.options {
+                        let update = SessionUpdate::Options { options };
+                        if inputs.send(Input::Update { session: session.clone(), attempt, update }).is_err() {
+                            return;
+                        }
                     }
                     while let Some(update) = updates.next().await {
                         if inputs.send(Input::Update { session: session.clone(), attempt, update }).is_err() {
@@ -467,6 +493,9 @@ pub async fn run(client: Arc<dyn SessionClient>, options: Options) -> Result<i32
     let hyperlinks = hyperlinks();
     let config = AppConfig { spec: options.spec.clone(), hyperlinks, home: env("HOME"), persist_history: options.history.is_some() };
     let mut app = App::new(Theme::detect(env), config, options.fullscreen);
+    if let Some(notice) = &options.notice {
+        app.warn(notice.clone());
+    }
     app.handle(Input::Resize(size.0, size.1));
 
     let mut modes = Modes::enter().map_err(|e| format!("terminal: {e}"))?;
@@ -528,11 +557,11 @@ async fn event_loop(
             biased;
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) => {
-                    runner.run(app.handle(Input::Key(key)));
+                    execute(screen, runner, app.handle(Input::Key(key)));
                     scheduler.urgent(Instant::now());
                 }
                 Some(Ok(Event::Paste(text))) => {
-                    runner.run(app.handle(Input::Paste(text)));
+                    execute(screen, runner, app.handle(Input::Paste(text)));
                     scheduler.urgent(Instant::now());
                 }
                 Some(Ok(Event::Resize(width, height))) => {
@@ -550,11 +579,11 @@ async fn event_loop(
                 scheduler.urgent(Instant::now());
             }
             Some(input) = received.recv() => {
-                handle_received(app, runner, scheduler, input);
+                handle_received(app, screen, runner, scheduler, input);
                 // Coalesce whatever else already arrived into the same frame.
                 for _ in 0..512 {
                     let Ok(input) = received.try_recv() else { break };
-                    handle_received(app, runner, scheduler, input);
+                    handle_received(app, screen, runner, scheduler, input);
                 }
             }
             () = async { if let Some(at) = deadline { tokio::time::sleep_until(at).await } }, if deadline.is_some() => {}
@@ -580,9 +609,19 @@ async fn event_loop(
     }
 }
 
-fn handle_received(app: &mut App, runner: &mut Runner, scheduler: &mut Scheduler, input: Input) {
+/// Runs the app's effects: the screen's own here, first, then the rest by the runner.
+fn execute(screen: &mut Screen, runner: &mut Runner, effects: Vec<Effect>) {
+    if effects.contains(&Effect::ClearScreen)
+        && let Err(error) = screen.clear()
+    {
+        tracing::debug!(%error, "clearing the terminal");
+    }
+    runner.run(effects);
+}
+
+fn handle_received(app: &mut App, screen: &mut Screen, runner: &mut Runner, scheduler: &mut Scheduler, input: Input) {
     let streamed = matches!(input, Input::Update { .. } | Input::Tick);
-    runner.run(app.handle(input));
+    execute(screen, runner, app.handle(input));
     if streamed {
         scheduler.stream(Instant::now());
     } else {

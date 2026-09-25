@@ -11,11 +11,13 @@
 //! - `markdown`, `text` — Markdown to styled, wrapped rows; `theme` — colours in one place;
 //! - `composer` — the multiline editor, paste chips, history and reverse search;
 //! - `complete` — the async completion broker and its sources; `commands` — slash commands;
+//! - `choices` — what `/new`, `/clear`, `/provider`, `/model` and `/effort` derive and offer;
 //! - `view` — the pinned block, fullscreen and picker layouts;
 //! - `inline` — the scrollback writer; `schedule` — the frame scheduler;
 //! - `shell` — terminal I/O and effects; `history` — the prompt history file.
 
 mod app;
+mod choices;
 mod commands;
 mod complete;
 mod composer;
@@ -36,6 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aim_proto::daemon::{Location, Persistence, SessionSpec};
+use aim_proto::event::CodeModeSetting;
 
 pub use complete::{Candidate, Kind, Request, Source, SourceFactory, Sources};
 pub use shell::Options;
@@ -75,6 +78,10 @@ pub struct TuiArgs {
     /// Most model requests per turn.
     #[arg(long, default_value_t = 64)]
     pub max_requests: u32,
+    /// Code mode for the sessions this UI starts: off, on or only (ADR 0076). Without it, this
+    /// shell's `AIM_CODE_MODE` applies, else the daemon's own setting.
+    #[arg(long = "code-mode", value_parser = crate::coderun::mode::parse_flag)]
+    pub code_mode: Option<CodeModeSetting>,
     /// Test only: run against a scripted provider and a fake workspace described by this file.
     #[cfg(feature = "test-support")]
     #[arg(long, hide = true)]
@@ -101,6 +108,9 @@ impl TuiArgs {
     pub fn options(&self) -> Result<Options, String> {
         let root = self.root()?;
         let home = crate::cli::aim_home();
+        // The client's own setting travels with every session it starts, so a daemon started
+        // earlier with another environment still gives the user what they asked for (ADR 0076).
+        let (code_mode, notice) = crate::coderun::mode::client_setting_from_env(self.code_mode);
         let spec = SessionSpec {
             workspace: root.to_string_lossy().into_owned(),
             location: self.remote.as_ref().map_or(Location::Local, |url| Location::Remote { url: url.clone() }),
@@ -109,6 +119,7 @@ impl TuiArgs {
             effort: self.effort.clone(),
             agent: None,
             persistence: if self.ephemeral { Persistence::Ephemeral } else { Persistence::Persistent },
+            code_mode,
         };
         Ok(Options {
             spec,
@@ -118,6 +129,7 @@ impl TuiArgs {
             sources: Sources::factory(Some(home.join("skills"))),
             close_on_exit: true,
             keep_superseded_completions: false,
+            notice,
         })
     }
 }
@@ -145,5 +157,20 @@ mod remote_tests {
         let options = args.options().unwrap();
         assert_eq!(options.spec.workspace, "/remote-only/project");
         assert_eq!(options.spec.location, Location::Remote { url: "wss://example.test/rpc".to_owned() });
+    }
+
+    /// T4c (ADR 0076): the `--code-mode` flag is what the TUI's sessions ask for.
+    #[test]
+    fn the_code_mode_flag_goes_into_the_session_spec() {
+        use aim_proto::event::CodeModeSetting;
+        let args = TuiArgs {
+            cwd: PathBuf::from("/remote-only/project"),
+            remote: Some("wss://example.test/rpc".to_owned()),
+            code_mode: Some(CodeModeSetting::On),
+            ..TuiArgs::default()
+        };
+        let options = args.options().unwrap();
+        assert_eq!(options.spec.code_mode, Some(CodeModeSetting::On));
+        assert_eq!(options.notice, None, "a flag leaves no warning");
     }
 }

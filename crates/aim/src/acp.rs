@@ -31,7 +31,7 @@ use aim_acp::{
 use aim_proto::conversation::{Item, Part, StopReason};
 use aim_proto::daemon::{Location, Persistence, SessionSpec, SessionUpdate};
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::event::EffortSource;
+use aim_proto::event::{CodeModeSetting, EffortSource};
 use aim_proto::harness::{FsRead, FsReadParams, FsRemove, FsRemoveParams};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::ToolResult;
@@ -133,7 +133,12 @@ impl Bridge {
             return;
         }
         self.started.insert(call_id.to_owned(), (name.to_owned(), arguments.to_owned()));
-        out.push(SessionUpdate::ToolStarted { call_id: call_id.to_owned(), name: name.to_owned(), arguments: arguments.to_owned() });
+        out.push(SessionUpdate::ToolStarted {
+            call_id: call_id.to_owned(),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+            parent: None,
+        });
     }
 
     fn finish(&mut self, call_id: &str, result: ToolResult, out: &mut Vec<SessionUpdate>) {
@@ -141,29 +146,14 @@ impl Bridge {
             return;
         }
         let name = self.started.get(call_id).map(|(name, _)| name.clone()).unwrap_or_default();
-        out.push(SessionUpdate::ToolFinished { call_id: call_id.to_owned(), name, result });
+        out.push(SessionUpdate::ToolFinished { call_id: call_id.to_owned(), name, result, parent: None });
     }
 }
 
-/// Whether `value` is one the agent advertises for `key` (by category, else by conventional id).
+/// Whether `value` resolves to a value the agent advertises for `key`, by the same rule the
+/// session applies when it sets it (docs/adr/0075). The error lists what the agent offers.
 fn check_option(options: &[ConfigOption], key: &ConfigKey, value: &str) -> Result<(), String> {
-    let (category, id) = match key {
-        ConfigKey::Model => ("model", "model"),
-        ConfigKey::Effort => ("thought_level", "effort"),
-        ConfigKey::Mode => ("mode", "mode"),
-        ConfigKey::Id(id) => ("", id.as_str()),
-    };
-    let option = options
-        .iter()
-        .find(|o| (!category.is_empty() && o.category.as_deref() == Some(category)) || o.id == id)
-        .ok_or_else(|| format!("the agent offers no {} option", key.label()))?;
-    match &option.kind {
-        aim_acp::ConfigKind::Select { values, .. } if !values.iter().any(|v| v.value == value) => {
-            let offered: Vec<&str> = values.iter().map(|v| v.value.as_str()).collect();
-            Err(format!("{} `{value}` is not offered (offers: {})", key.label(), offered.join(", ")))
-        }
-        _ => Ok(()),
-    }
+    aim_acp::resolve_config_value(options, key, value).map(drop).map_err(|error| error.to_string())
 }
 
 /// The model and effort an agent reports in its configuration options.
@@ -173,6 +163,42 @@ pub fn current_config(options: &[ConfigOption]) -> (String, Option<String>) {
         options.iter().find(|o| o.category.as_deref() == Some(category) || o.id == category).and_then(ConfigOption::current)
     };
     (find("model").unwrap_or_default(), find("thought_level").or_else(|| find("effort")))
+}
+
+/// What an agent advertises for its model and effort, as session options (ADR 0074): the values
+/// of the option with category `model` (else id `model`) and `thought_level` (else id `effort`).
+/// `None` when it advertises neither as a select.
+#[must_use]
+pub fn advertised_options(options: &[ConfigOption]) -> Option<aim_proto::daemon::SessionOptions> {
+    let values = |category: &str, id: &str| {
+        let option = options.iter().find(|o| o.category.as_deref() == Some(category) || o.id == id)?;
+        match &option.kind {
+            aim_acp::ConfigKind::Select { values, .. } => Some(
+                values
+                    .iter()
+                    .map(|v| aim_proto::daemon::ChoiceValue {
+                        value: v.value.clone(),
+                        name: (!v.name.is_empty() && v.name != v.value).then(|| v.name.clone()),
+                        description: v.description.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        }
+    };
+    let (models, efforts) = (values("model", "model"), values("thought_level", "effort"));
+    if models.is_none() && efforts.is_none() {
+        return None;
+    }
+    // `auto` is taken only when the agent advertises it (claude-agent-acp 0.81.2 does not); it is
+    // then reported as `auto_effort`, not as a level.
+    let (autos, efforts): (Vec<_>, Vec<_>) = efforts
+        .unwrap_or_default()
+        .into_iter()
+        .partition(|v| v.value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase() == aim_proto::daemon::AUTO_EFFORT);
+    let auto_effort =
+        autos.into_iter().next().map(|v| v.description.or(v.name).unwrap_or_else(|| "the agent's automatic effort".to_owned()));
+    Some(aim_proto::daemon::SessionOptions { models: models.unwrap_or_default(), efforts, auto_effort })
 }
 
 fn emit(events: &UnboundedSender<AgentEvent>, update: SessionUpdate) {
@@ -212,7 +238,11 @@ impl AcpBackend {
         Ok(Self { client, session, scratch: None })
     }
 
-    async fn start_strict(agent: AcpAgentConfig, spec: &SessionSpec, aimx: &Path) -> Result<(Self, String, String), String> {
+    async fn start_strict(
+        agent: AcpAgentConfig,
+        spec: &SessionSpec,
+        aimx: &Path,
+    ) -> Result<(Self, String, String, CodeModeSetting), String> {
         let (root, location, scratch, project, remote) = match &spec.location {
             Location::Local => {
                 let root = std::fs::canonicalize(&spec.workspace).map_err(|err| format!("{}: {err}", spec.workspace))?;
@@ -234,9 +264,11 @@ impl AcpBackend {
             }
         };
         let cwd = scratch.as_ref().map_or_else(|| PathBuf::from(&root), |dir| dir.path().to_path_buf());
-        let relay = aimx_relay(aimx, &root, &spec.location);
+        let aim = aim_executable();
+        let (relay, route, code_mode) =
+            strict_relay(aim.as_deref(), aimx, &root, &spec.location, crate::providers::code_mode(), spec.code_mode);
         let client = AcpClient::spawn(agent.with_cwd(cwd.clone())).await.map_err(|err| err.to_string())?;
-        let mut options = SessionOptions::strict_aim(&cwd, relay.clone()).map_err(|err| err.to_string())?;
+        let mut options = SessionOptions::strict_aim_via(&cwd, relay.clone(), route.clone()).map_err(|err| err.to_string())?;
         options.system_prompt_append = Some(authority_prompt(&root, &location, project.as_ref()));
         let mut session = match remote {
             None => {
@@ -244,7 +276,8 @@ impl AcpBackend {
                 let nonce = uuid::Uuid::new_v4().to_string();
                 challenge.write_all(nonce.as_bytes()).map_err(|err| format!("writing aim read challenge: {err}"))?;
                 challenge.flush().map_err(|err| format!("flushing aim read challenge: {err}"))?;
-                let witness = client.verify_local_aim_read_authority(relay, challenge.path(), &nonce).await.map_err(authority_error)?;
+                let witness =
+                    client.verify_local_aim_read_authority(relay, &route, challenge.path(), &nonce).await.map_err(authority_error)?;
                 client.new_aim_session(options, &witness).await.map_err(authority_error)?
             }
             Some(remote) => {
@@ -255,7 +288,7 @@ impl AcpBackend {
                 let nonce = uuid::Uuid::new_v4().to_string();
                 let workspace = remote.client.workspace().id.clone();
                 let witness = client
-                    .verify_ssh_aim_authority(relay, &remote_path, &local_path, &nonce, || async {
+                    .verify_ssh_aim_authority(relay, &route, &remote_path, &local_path, &nonce, || async {
                         let read = remote
                             .client
                             .peer()
@@ -294,7 +327,7 @@ impl AcpBackend {
         if let Some(effort) = spec.effort.as_deref() {
             session.set_config(&ConfigKey::Effort, effort).await.map_err(|err| err.to_string())?;
         }
-        Ok((Self { client, session, scratch }, root, location))
+        Ok((Self { client, session, scratch }, root, location, code_mode))
     }
 
     /// The model and effort in force.
@@ -451,7 +484,8 @@ impl Backend for AcpBackend {
                     // last answer, so `config()` reports what the agent last said. Idle updates
                     // carry nothing a turn needs (the bridge ignores them).
                     drop(self.session.take_idle_events());
-                    return Err(format!("{} `{value}`: {error}", key.label()));
+                    // Never repeat the request: it may be a mistyped secret (ADR 0075).
+                    return Err(format!("{}: {error}", key.label()));
                 }
             }
             // Switching models can change other options (e.g. the mode): report what the agent
@@ -463,6 +497,12 @@ impl Backend for AcpBackend {
     fn wants_environment(&self) -> bool {
         // Claude Code builds its own environment context and reads CLAUDE.md itself.
         false
+    }
+
+    fn options(&self) -> BackendFuture<'static, Option<aim_proto::daemon::SessionOptions>> {
+        // Fresh after every `set_config`: the agent answers each with its options (ADR 0074).
+        let options = advertised_options(self.session.config_options());
+        Box::pin(async move { options })
     }
 
     fn shutdown(self: Box<Self>) -> BackendFuture<'static, ()> {
@@ -501,6 +541,55 @@ pub fn agent_for(provider: &str) -> Option<AcpAgentConfig> {
     }
 }
 
+/// The `aim` executable that serves the code-mode relay: `$AIM_BIN`, else this process when it is
+/// `aim`. An embedder (a test binary, say) has none unless it names one, and its strict sessions
+/// keep `aimx mcp`, rather than spawning itself as the relay.
+fn aim_executable() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("AIM_BIN") {
+        return Some(PathBuf::from(path));
+    }
+    std::env::current_exe().ok().filter(|exe| exe.file_name().is_some_and(|name| name == "aim"))
+}
+
+/// The strict relay for a workspace, its kind, and the session's effective code mode. The mode is
+/// the session's own setting, else this process's (ADR 0076), after the guards (the worker, and
+/// aim's own executable to serve the relay). When it is on or only, the relay is aim's code-mode
+/// relay (`aim code-mcp`), which connects the workspace through `aimx` and shows the mode's direct
+/// tools beside `run_code`; otherwise it is `aimx mcp`, as before.
+fn strict_relay(
+    aim: Option<&Path>,
+    aimx: &Path,
+    root: &str,
+    location: &Location,
+    code: Option<crate::host::CodeConfig>,
+    session: Option<CodeModeSetting>,
+) -> (McpServerSpec, aim_acp::AimRoute, CodeModeSetting) {
+    use crate::coderun::mode;
+    let daemon = code.as_ref().map_or(mode::CodeModeRequest::Unset, |code| mode::CodeModeRequest::Set(code.mode));
+    // An ACP session has no named agent (refused above), so its ceiling permits `run_code`.
+    let exposure = mode::decide_for_session(session, daemon, code.is_some(), code.is_some() || cfg!(target_os = "macos"), true);
+    let Some(code) = code.filter(|_| exposure.code) else {
+        return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx, mode::to_setting(exposure.mode));
+    };
+    // The worker is there, but the relay is aim itself: without its executable there is none.
+    let Some(aim) = aim else {
+        tracing::warn!(
+            "code mode `{}` is off for this Claude session: aim's executable was not found for the code-mode relay (set AIM_BIN)",
+            mode::label(exposure.mode)
+        );
+        return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx, CodeModeSetting::Off);
+    };
+    // The relay serves the session's effective mode, not this process's.
+    let code = crate::host::CodeConfig { mode: exposure.mode, ..code };
+    // The built-ins aim replaces, by the names the relay shows them under.
+    let builtins: Vec<&str> = aim_acp::DEFAULT_ALIASES.iter().map(|(name, _)| *name).collect();
+    let direct = mode::direct_names(exposure.direct, &builtins, &mode::COMPACT_HIDDEN);
+    let relay = crate::mcp::proxy::CodeRelay { root: root.to_owned(), location: location.clone(), aimx: aimx.to_path_buf(), code };
+    let spec =
+        McpServerSpec::Stdio { name: aim_acp::AIM_MCP_SERVER.to_owned(), command: aim.to_path_buf(), args: relay.args(), env: relay.env() };
+    (spec, aim_acp::AimRoute::Code { direct }, mode::to_setting(exposure.mode))
+}
+
 fn aimx_relay(aimx: &Path, root: &str, location: &Location) -> McpServerSpec {
     let mut args = vec!["mcp".to_owned(), "--stdio".to_owned(), "--root".to_owned(), root.to_owned()];
     if let Location::Ssh { destination } = location {
@@ -520,6 +609,7 @@ fn authority_prompt(root: &str, location: &str, project: Option<&(String, String
             "Your workspace is remote ({location}) at {root}. File and shell operations use the aim MCP tools on that remote host. Your local ACP cwd is only a scratch directory."
         )
     };
+    prompt.push_str(" Put independent aim reads, searches and listings in one response: they run concurrently.");
     if let Some((name, text)) = project {
         let _ = write!(prompt, "\n\n# Project instructions ({name}, from the {location} workspace)\n\n{text}");
     }
@@ -558,7 +648,7 @@ pub fn with_acp_at(native: BackendFactory, aimx: PathBuf) -> BackendFactory {
                     "this session's context lives in Claude Code, and resuming it (session/load) is not wired yet; start a new session",
                 ));
             }
-            let (backend, root, location) = if spec.provider == "acp:claude-native" {
+            let (backend, root, location, code_mode) = if spec.provider == "acp:claude-native" {
                 if !matches!(spec.location, Location::Local) {
                     return Err(unavailable("Claude Code native tools cannot act on a remote workspace"));
                 }
@@ -568,13 +658,14 @@ pub fn with_acp_at(native: BackendFactory, aimx: PathBuf) -> BackendFactory {
                 let backend = AcpBackend::start(agent, root.clone(), spec.model.as_deref(), spec.effort.as_deref())
                     .await
                     .map_err(|e| unavailable(&format!("{}: {e}", spec.provider)))?;
-                (backend, root.to_string_lossy().into_owned(), "local:native-tools".to_owned())
+                // Claude's own tools: aim's code mode does not apply.
+                (backend, root.to_string_lossy().into_owned(), "local:native-tools".to_owned(), CodeModeSetting::Off)
             } else {
                 AcpBackend::start_strict(agent, &spec, &aimx).await.map_err(|e| unavailable(&format!("{}: {e}", spec.provider)))?
             };
             let (model, _) = backend.config();
             let shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send> = Box::new(|| Box::pin(async {}));
-            Ok(Built { backend: Box::new(backend), model, root, location, agent: None, shutdown })
+            Ok(Built { backend: Box::new(backend), model, root, location, agent: None, shutdown, code_mode: Some(code_mode) })
         });
         fut
     })
@@ -589,12 +680,13 @@ mod tests {
     use super::{AcpBackend, authority_prompt};
     use crate::agent::Backend as _;
 
-    /// Options of an agent whose effort `high` exists only with model `a`.
+    /// Options of an agent whose effort `high` exists only with model `a`, and which, like
+    /// claude-agent-acp, offers Opus only as `opus[1m]`.
     fn options(model: &str) -> Value {
         let efforts: &[&str] = if model == "a" { &["low", "high"] } else { &["low"] };
         json!([
             {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": model,
-             "options": [{"value": "a", "name": "A"}, {"value": "b", "name": "B"}]},
+             "options": [{"value": "a", "name": "A"}, {"value": "b", "name": "B"}, {"value": "opus[1m]", "name": "Opus 5.5"}]},
             {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "low",
              "options": efforts.iter().map(|e| json!({"value": e, "name": e})).collect::<Vec<_>>()}
         ])
@@ -639,11 +731,136 @@ mod tests {
         // Both values are valid for model `a`, so the check passes; the model step then changes
         // the effort options and the effort step fails (REV8-3).
         let refused = backend.set_config(Some("b".into()), Some("high".into())).await.unwrap_err();
-        assert!(refused.contains("high"), "{refused}");
+        assert!(refused.starts_with("effort: the requested effort is not offered"), "{refused}");
         let now = backend.set_config(None, None).await.unwrap();
         assert_eq!((now.model.as_str(), now.effort.as_deref()), ("b", Some("low")), "what the agent really has in force");
         // `auto` is not an effort this agent offers.
         assert!(backend.set_config(None, Some("auto".into())).await.unwrap_err().contains("not offered"));
+    }
+
+    #[tokio::test]
+    async fn a_model_alias_resolves_to_the_advertised_value() {
+        let mut backend = scripted_agent().await;
+        // The agent is sent `opus[1m]` and reports it back as current.
+        let now = backend.set_config(Some("opus".into()), Some("Low".into())).await.unwrap();
+        assert_eq!((now.model.as_str(), now.effort.as_deref()), ("opus[1m]", Some("low")));
+        // An unknown model is refused before anything changes, naming what the agent offers.
+        let refused = backend.set_config(Some("gpt-6".into()), None).await.unwrap_err();
+        assert!(refused.contains("`opus[1m]` (Opus 5.5)") && refused.contains("`a` (A)"), "{refused}");
+        assert_eq!(backend.set_config(None, None).await.unwrap().model, "opus[1m]");
+    }
+
+    fn values(choices: &[aim_proto::daemon::ChoiceValue]) -> Vec<&str> {
+        choices.iter().map(|c| c.value.as_str()).collect()
+    }
+
+    /// ADR 0074: the options follow the agent's answers, so the effort ladder changes with the model.
+    #[tokio::test]
+    async fn advertised_options_follow_the_agents_answers() {
+        let mut backend = scripted_agent().await;
+        let options = backend.options().await.unwrap();
+        assert_eq!(values(&options.models), ["a", "b", "opus[1m]"]);
+        assert_eq!(options.models[0].name.as_deref(), Some("A"));
+        assert_eq!(values(&options.efforts), ["low", "high"]);
+        backend.set_config(Some("b".into()), None).await.unwrap();
+        assert_eq!(values(&backend.options().await.unwrap().efforts), ["low"]);
+    }
+
+    /// ADR 0074: what claude-agent-acp 0.81.2 advertised in a recorded session (the fixture's
+    /// `session/new` answer) becomes the session's options, descriptions included.
+    #[test]
+    fn claude_agent_acp_models_and_efforts_become_options() {
+        let fixture = include_str!("../../aim-acp/tests/fixtures/aim_tools_turn.jsonl");
+        let answer = fixture
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|frame| frame["msg"]["result"].get("configOptions").cloned())
+            .unwrap();
+        let options = super::advertised_options(&aim_acp::parse_config_options(Some(&answer))).unwrap();
+        assert_eq!(values(&options.models), ["default", "opus[1m]", "claude-fable-5-1[1m]", "sonnet", "haiku"]);
+        assert_eq!(options.models[0].description.as_deref(), Some("Opus (1M context)"));
+        assert_eq!(options.models[1].name.as_deref(), Some("Opus 5.5"));
+        assert_eq!(values(&options.efforts), ["default", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(options.auto_effort, None, "claude-agent-acp does not take `auto`");
+        assert_eq!(super::advertised_options(&[]), None, "an agent without model or effort options offers none");
+        // An agent that advertises `auto` takes it; it is reported apart from the levels.
+        let with_auto = json!([{"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "Auto",
+                                "options": [{"value": "low", "name": "Low"}, {"value": "Auto", "name": "Auto", "description": "adaptive"}]}]);
+        let options = super::advertised_options(&aim_acp::parse_config_options(Some(&with_auto))).unwrap();
+        assert_eq!((values(&options.efforts), options.auto_effort.as_deref()), (vec!["low"], Some("adaptive")));
+    }
+
+    /// ADR 0076: with code mode on or only, a strict session's one `aim` MCP server is aim's
+    /// code-mode relay and Claude's built-ins alias only the direct tools that relay shows; with
+    /// code mode off it stays `aimx mcp` with the default aliases. This is the `session/new`
+    /// payload the client sends.
+    #[test]
+    fn strict_sessions_point_at_the_code_mode_relay_when_code_mode_is_on() {
+        use std::path::Path;
+
+        use aim_proto::daemon::Location;
+        use aim_proto::event::CodeModeSetting;
+
+        use crate::coderun::mode::Mode;
+        use crate::host::CodeConfig;
+
+        let (aim, aimx) = (Path::new("/opt/aim/aim"), Path::new("/opt/aim/aimx"));
+        let code = |mode| CodeConfig { worker: "/opt/aim/aim-coderun".into(), user_programs: "/home/u/.aim/programs".into(), mode };
+        let params = |code: Option<CodeConfig>, session: Option<CodeModeSetting>, location: &Location| {
+            let (relay, route, _) = super::strict_relay(Some(aim), aimx, "/w", location, code, session);
+            SessionOptions::strict_aim_via("/w", relay, route).unwrap().new_session_params()
+        };
+        // T4c: a daemon whose own mode is off serves a session that asks for `on` through the relay.
+        let on = params(Some(code(Mode::Off)), Some(CodeModeSetting::On), &Location::Local);
+        assert_eq!(on["mcpServers"][0]["name"], "aim");
+        assert_eq!(on["mcpServers"][0]["command"], "/opt/aim/aim");
+        assert_eq!(
+            on["mcpServers"][0]["args"],
+            json!([
+                "code-mcp",
+                "--root",
+                "/w",
+                "--aimx",
+                "/opt/aim/aimx",
+                "--coderun",
+                "/opt/aim/aim-coderun",
+                "--programs",
+                "/home/u/.aim/programs",
+                "--code-mode",
+                "on"
+            ])
+        );
+        let options = &on["_meta"]["claudeCode"]["options"];
+        assert_eq!(options["env"]["MCP_TOOL_TIMEOUT"], "630000", "Claude waits as long as the relay's longest call");
+        assert_eq!(
+            options["toolAliases"],
+            json!({"Bash": "mcp__aim__Bash", "Edit": "mcp__aim__Edit", "Read": "mcp__aim__Read", "Write": "mcp__aim__Write"}),
+            "no alias points at a tool `on` hides (Glob, Grep)"
+        );
+        assert_eq!(
+            (&options["tools"], &options["allowedTools"], &options["strictMcpConfig"]),
+            (&json!([]), &json!(["mcp__aim"]), &json!(true))
+        );
+        let only = params(Some(code(Mode::Only)), None, &Location::Ssh { destination: "box".into() });
+        assert_eq!(only["mcpServers"][0]["args"][10], "only");
+        assert_eq!((&only["mcpServers"][0]["args"][11], &only["mcpServers"][0]["args"][12]), (&json!("--ssh"), &json!("box")));
+        assert_eq!(only["_meta"]["claudeCode"]["options"]["toolAliases"], json!({}), "`only` shows no direct tool to alias");
+        let off = params(None, Some(CodeModeSetting::On), &Location::Local);
+        assert_eq!(off["mcpServers"][0]["command"], "/opt/aim/aimx");
+        assert_eq!(off["mcpServers"][0]["args"], json!(["mcp", "--stdio", "--root", "/w"]));
+        assert_eq!(off["_meta"]["claudeCode"]["options"]["toolAliases"]["Glob"], "mcp__aim__glob");
+        assert!(off["_meta"]["claudeCode"]["options"]["env"].get("MCP_TOOL_TIMEOUT").is_none(), "aimx mcp is unchanged");
+        // Without the worker a request for `on` gets `aimx mcp`, and the session says it is off.
+        let (_, route, effective) = super::strict_relay(Some(aim), aimx, "/w", &Location::Local, None, Some(CodeModeSetting::On));
+        assert_eq!((route, effective), (aim_acp::AimRoute::Aimx, CodeModeSetting::Off));
+        // Without aim's own executable there is no relay either: `aimx mcp`, and the session is off.
+        let (relay, route, effective) =
+            super::strict_relay(None, aimx, "/w", &Location::Local, Some(code(Mode::Off)), Some(CodeModeSetting::On));
+        assert_eq!((route, effective), (aim_acp::AimRoute::Aimx, CodeModeSetting::Off));
+        assert!(matches!(relay, aim_acp::McpServerSpec::Stdio { command, .. } if command == aimx));
+        // A session that asks for `off` gets `aimx mcp` from a daemon whose own mode is on.
+        let asked_off = params(Some(code(Mode::On)), Some(CodeModeSetting::Off), &Location::Local);
+        assert_eq!(asked_off["mcpServers"][0]["command"], "/opt/aim/aimx");
     }
 
     #[test]
@@ -652,5 +869,6 @@ mod tests {
         assert!(prompt.contains("workspace is remote (ssh:example) at /remote/work"));
         assert!(prompt.contains("AGENTS.md, from the ssh:example workspace"));
         assert!(prompt.contains("Use the project rules."));
+        assert!(prompt.contains("in one response"), "the batching guidance reaches ACP sessions too");
     }
 }

@@ -112,6 +112,10 @@ pub fn status(app: &App, width: usize) -> Line<'static> {
         if s.persistence == Persistence::Ephemeral {
             rest.push("ephemeral".into());
         }
+        // What the host gave the session, after its guards (ADR 0076).
+        if let Some(code) = s.code_mode {
+            rest.push(format!("code:{}", code.label()));
+        }
     }
     let t = app.tokens;
     if t.input > 0 || t.output > 0 {
@@ -593,6 +597,7 @@ mod tests {
                 title: None,
                 parent: None,
                 agent: None,
+                code_mode: None,
             },
             state,
             persistence: Persistence::Persistent,
@@ -610,6 +615,7 @@ mod tests {
             effort: Some("low".into()),
             agent: None,
             persistence: Persistence::Persistent,
+            code_mode: None,
         };
         let config = AppConfig { spec, hyperlinks: false, home: Some("/home/me".into()), persist_history: false };
         let mut app = App::new(Theme::plain(), config, false);
@@ -659,6 +665,25 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| paint(frame.area(), frame.buffer_mut())).unwrap();
         text_rows(terminal.backend().buffer())
+    }
+
+    /// T4c (ADR 0076): the status line says which code mode the host gave the session, and says
+    /// nothing for a backend without one.
+    #[test]
+    fn the_status_line_shows_the_session_s_code_mode() {
+        use aim_proto::event::CodeModeSetting;
+        let line = |code_mode| {
+            let mut app = app();
+            let mut attached = summary("s1", "/home/me/aim", SessionState::Idle, 0);
+            attached.meta.code_mode = code_mode;
+            let attempt = app.attempt();
+            app.handle(Input::Attached { summary: attached, transcript: Vec::new(), surfaces: Vec::new(), resync: false, attempt });
+            status(&app, 120).spans.iter().map(|span| span.content.to_string()).collect::<String>()
+        };
+        assert!(line(Some(CodeModeSetting::On)).contains(" · code:on"), "{}", line(Some(CodeModeSetting::On)));
+        assert!(line(Some(CodeModeSetting::Only)).contains(" · code:only"));
+        assert!(line(Some(CodeModeSetting::Off)).contains(" · code:off"));
+        assert!(!line(None).contains("code:"), "{}", line(None));
     }
 
     #[test]

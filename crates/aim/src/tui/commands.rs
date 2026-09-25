@@ -21,8 +21,10 @@ impl Command {
 /// Every command, in the order the popup lists them.
 pub const COMMANDS: &[Command] = &[
     Command { name: "model", args: "<id>", help: "switch model (applies from the next turn when one is running)" },
-    Command { name: "effort", args: "<level>", help: "set reasoning effort" },
-    Command { name: "new", args: "", help: "start a new session in this workspace" },
+    Command { name: "effort", args: "<level>", help: "set reasoning effort (auto lets aim choose)" },
+    Command { name: "provider", args: "<id>", help: "start a new session on another provider (its default model)" },
+    Command { name: "new", args: "", help: "start a new session here; the chat so far stays above" },
+    Command { name: "clear", args: "", help: "clear the chat and the screen, then start a new session" },
     Command { name: "sessions", args: "", help: "pick a session to attach or resume" },
     Command { name: "cancel", args: "", help: "cancel the running turn" },
     Command { name: "fullscreen", args: "", help: "toggle the fullscreen layout" },
@@ -55,5 +57,7 @@ mod tests {
         assert_eq!(parse("hello"), None);
         assert!(find("sessions").is_some());
         assert!(find("model").is_some_and(Command::takes_argument));
+        assert!(find("provider").is_some_and(Command::takes_argument));
+        assert!(find("clear").is_some_and(|c| !c.takes_argument()));
     }
 }

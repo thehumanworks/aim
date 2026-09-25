@@ -17,6 +17,7 @@ fn meta(id: &str, created_ms: i64) -> SessionMeta {
         title: None,
         parent: None,
         agent: None,
+        code_mode: None,
     }
 }
 

@@ -1,0 +1,7 @@
+{
+  "borrowed_codex_auth_unchanged": true,
+  "etag_revalidation_ms": 271,
+  "first_catalog_ms": 372,
+  "method": "ignored live_catalog test; read-only catalog GET, no generation",
+  "source_sha": "7fa1d2b7c4d6febac263511637230bfdcee1058e"
+}

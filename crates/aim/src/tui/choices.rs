@@ -1,0 +1,358 @@
+//! What the TUI offers and derives when the user switches (ADR 0074): the session `/new`,
+//! `/clear` and `/provider` create, which efforts `/effort` sends, and the values `/model`,
+//! `/effort` and `/provider` complete. The decisions are the kernel's (`aim_kernel::switch`); this
+//! module only maps strings to the ids it decides over and back.
+
+use aim_kernel::switch::{self, AutoEffort, EffortRequest, Shape, Switch};
+use aim_proto::daemon::{AUTO_EFFORT, ChoiceValue, Location, Persistence, SessionSpec};
+
+use super::app::SessionView;
+use super::complete::Hint;
+use crate::coderun::mode;
+
+/// Collision-free ids for the values one decision involves: equal values get equal ids.
+struct Registry<T> {
+    values: Vec<T>,
+}
+
+impl<T: PartialEq + Clone> Registry<T> {
+    fn new() -> Self {
+        Self { values: Vec::new() }
+    }
+
+    fn id(&mut self, value: &T) -> u64 {
+        let index = self.values.iter().position(|v| v == value).unwrap_or_else(|| {
+            self.values.push(value.clone());
+            self.values.len() - 1
+        });
+        // A registry never holds more than a handful of values.
+        u64::try_from(index).unwrap_or(u64::MAX)
+    }
+
+    fn value(&self, id: u64) -> Option<T> {
+        self.values.get(usize::try_from(id).ok()?).cloned()
+    }
+}
+
+/// Ids for model and effort values: case and inner whitespace are folded, as ADR 0075's resolver
+/// folds them, so `Low` and `low` get one id; the first spelling registered is the one kept.
+struct Folded {
+    keys: Vec<String>,
+    spellings: Vec<String>,
+}
+
+/// `text` as model and effort values are compared.
+fn fold(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+impl Folded {
+    fn new() -> Self {
+        Self { keys: Vec::new(), spellings: Vec::new() }
+    }
+
+    fn id(&mut self, text: &str) -> u64 {
+        let key = fold(text);
+        let index = self.keys.iter().position(|k| *k == key).unwrap_or_else(|| {
+            self.keys.push(key);
+            self.spellings.push(text.to_owned());
+            self.keys.len() - 1
+        });
+        // A registry never holds more than a catalog's worth of values.
+        u64::try_from(index).unwrap_or(u64::MAX)
+    }
+
+    fn spelling(&self, id: u64) -> Option<String> {
+        self.spellings.get(usize::try_from(id).ok()?).cloned()
+    }
+}
+
+/// A switch the user asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SwitchTo {
+    /// `/new`.
+    New,
+    /// `/clear`.
+    Clear,
+    /// `/provider <id>`.
+    Provider(String),
+}
+
+/// The spec of the session a switch creates, from the attached session (else the configured spec),
+/// or `None` when the switch changes nothing (`/provider` naming the provider in use). A provider
+/// change never carries the model or effort (`aim_kernel::switch::provider_switch_resets_model_and_effort`).
+pub fn derive_spec(attached: Option<&SessionView>, configured: &SessionSpec, to: &SwitchTo) -> Option<SessionSpec> {
+    let mut text = Registry::<String>::new();
+    let mut places = Registry::<Location>::new();
+    let mut values = Folded::new();
+    let mut shape = |provider: &str,
+                     location: &Location,
+                     workspace: &str,
+                     persistence,
+                     model: Option<&str>,
+                     effort: Option<&str>,
+                     code: Option<aim_proto::event::CodeModeSetting>| Shape {
+        provider: text.id(&provider.to_owned()),
+        location: places.id(location),
+        workspace: text.id(&workspace.to_owned()),
+        persistent: persistence == Persistence::Persistent,
+        model: model.map(|m| values.id(m)),
+        effort: effort.map(|e| values.id(e)),
+        code_mode: code.map(mode::from_setting),
+    };
+    let attached = attached.map(|s| {
+        // An agent that reports no model (an empty id) has none to carry.
+        let model = Some(s.model.as_str()).filter(|m| !m.is_empty());
+        shape(&s.provider, &s.location, &s.workspace, s.persistence, model, s.effort.as_deref(), s.code_mode)
+    });
+    let configured_shape = shape(
+        &configured.provider,
+        &configured.location,
+        &configured.workspace,
+        configured.persistence,
+        configured.model.as_deref(),
+        configured.effort.as_deref(),
+        configured.code_mode,
+    );
+    let switch = match to {
+        SwitchTo::New => Switch::New,
+        SwitchTo::Clear => Switch::Clear,
+        SwitchTo::Provider(provider) => Switch::Provider(text.id(provider)),
+    };
+    let out = switch::derive(attached, configured_shape, switch)?;
+    Some(SessionSpec {
+        workspace: text.value(out.workspace)?,
+        location: places.value(out.location)?,
+        provider: text.value(out.provider)?,
+        model: match out.model {
+            Some(id) => Some(values.spelling(id)?),
+            None => None,
+        },
+        effort: match out.effort {
+            Some(id) => Some(values.spelling(id)?),
+            None => None,
+        },
+        agent: configured.agent.clone(),
+        persistence: if out.persistent { Persistence::Persistent } else { Persistence::Ephemeral },
+        // The session's code mode travels with every switch (`aim_kernel::switch::switches_keep_place_and_privacy`).
+        code_mode: out.code_mode.map(mode::to_setting),
+    })
+}
+
+/// What `/effort <requested>` sends, or `None` when it is refused here
+/// (`aim_kernel::switch::effort_sent`): a level off a known `ladder` (empty: not known, the
+/// session decides), or `auto` where the session refuses it. Values match with case folded. With
+/// `canonical` the ladder's spelling of the level (and `auto`) is sent, for backends that match
+/// exactly (the native loop); otherwise the value as typed, for a backend that resolves values
+/// itself (ACP, ADR 0075).
+pub fn effort_to_send(ladder: &[ChoiceValue], auto: AutoEffort, requested: &str, canonical: bool) -> Option<String> {
+    let mut values = Folded::new();
+    let ids: Vec<u64> = ladder.iter().map(|c| values.id(&c.value)).collect();
+    let request = if fold(requested) == AUTO_EFFORT { EffortRequest::Auto } else { EffortRequest::Level(values.id(requested)) };
+    if !switch::effort_sent(&ids, auto, request) {
+        return None;
+    }
+    Some(match (canonical, request) {
+        (false, _) => requested.to_owned(),
+        (true, EffortRequest::Auto) => AUTO_EFFORT.to_owned(),
+        (true, EffortRequest::Level(id)) => values.spelling(id)?,
+    })
+}
+
+/// What the popup says about a choice: its name and description, without repeating the value
+/// (`low`, "Low") or a name the description starts with ("Fable 5.1", "Fable 5.1 · Most capable…").
+fn detail(choice: &ChoiceValue) -> String {
+    let description = choice.description.as_deref().filter(|d| !d.is_empty());
+    let name = choice
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case(&choice.value))
+        .filter(|name| description.is_none_or(|d| !d.starts_with(name)));
+    [name, description].into_iter().flatten().collect::<Vec<_>>().join(" · ")
+}
+
+/// `/effort` candidates (`aim_kernel::switch::effort_candidates`): the ladder's levels (or, before
+/// the session said, values seen for its provider), each once, and `auto` only where the session
+/// takes it, described by `auto_detail`.
+pub fn effort_hints(ladder: Option<&[ChoiceValue]>, seen: &[String], auto: AutoEffort, auto_detail: &str) -> Vec<Hint> {
+    let choices: Vec<ChoiceValue> = match ladder {
+        Some(ladder) => ladder.to_vec(),
+        None => seen.iter().map(|value| ChoiceValue { value: value.clone(), name: None, description: None }).collect(),
+    };
+    let mut values = Folded::new();
+    let ids: Vec<u64> = choices.iter().map(|c| values.id(&c.value)).collect();
+    let auto_id = values.id(AUTO_EFFORT);
+    switch::effort_candidates(&ids, auto_id, auto)
+        .into_iter()
+        .filter_map(|id| {
+            let value = values.spelling(id)?;
+            let detail = if id == auto_id {
+                auto_detail.to_owned()
+            } else {
+                choices.iter().find(|c| c.value == value).map(detail).unwrap_or_default()
+            };
+            Some(Hint { value, detail })
+        })
+        .collect()
+}
+
+/// `/model` candidates: the session's models, or (before it said) models seen for its provider.
+pub fn model_hints(models: Option<&[ChoiceValue]>, seen: &[String]) -> Vec<Hint> {
+    match models {
+        Some(models) => models.iter().map(|c| Hint { value: c.value.clone(), detail: detail(c) }).collect(),
+        None => seen.iter().map(|value| Hint { value: value.clone(), detail: String::new() }).collect(),
+    }
+}
+
+/// `/provider` candidates: every provider this build knows, with a line about each.
+pub fn provider_hints() -> Vec<Hint> {
+    crate::providers::KNOWN
+        .iter()
+        .map(|id| Hint { value: (*id).to_owned(), detail: crate::providers::summary(id).unwrap_or_default().to_owned() })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use aim_proto::daemon::SessionState;
+
+    use super::*;
+
+    fn view(provider: &str, model: &str, effort: Option<&str>) -> SessionView {
+        SessionView {
+            id: "s1".into(),
+            workspace: "/srv/app".into(),
+            provider: provider.into(),
+            location: Location::Ssh { destination: "box".into() },
+            model: model.into(),
+            effort: effort.map(Into::into),
+            state: SessionState::Idle,
+            persistence: Persistence::Ephemeral,
+            options: None,
+            stale_efforts: false,
+            code_mode: None,
+        }
+    }
+
+    fn configured() -> SessionSpec {
+        SessionSpec {
+            workspace: "/w".into(),
+            location: Location::Local,
+            provider: "codex".into(),
+            model: Some("gpt-6-sol".into()),
+            effort: Some("high".into()),
+            agent: Some("reader".into()),
+            persistence: Persistence::Persistent,
+            code_mode: None,
+        }
+    }
+
+    fn choice(value: &str) -> ChoiceValue {
+        ChoiceValue { value: value.into(), name: None, description: None }
+    }
+
+    /// T4c (ADR 0076): `/new`, `/clear` and `/provider` carry the attached session's code mode;
+    /// without one attached, the client's setting.
+    #[test]
+    fn switches_carry_the_code_mode() {
+        use aim_proto::event::CodeModeSetting;
+        let mut attached = view("codex", "gpt-6-sol", None);
+        attached.code_mode = Some(CodeModeSetting::Only);
+        let mut client = configured();
+        client.code_mode = Some(CodeModeSetting::On);
+        for to in [SwitchTo::New, SwitchTo::Clear, SwitchTo::Provider("openrouter".into())] {
+            let spec = derive_spec(Some(&attached), &client, &to).expect("a new session");
+            assert_eq!(spec.code_mode, Some(CodeModeSetting::Only), "{to:?}");
+        }
+        assert_eq!(derive_spec(None, &client, &SwitchTo::New).expect("a new session").code_mode, Some(CodeModeSetting::On));
+        attached.code_mode = None;
+        assert_eq!(derive_spec(Some(&attached), &client, &SwitchTo::Clear).expect("a new session").code_mode, None);
+    }
+
+    #[test]
+    fn new_and_clear_copy_the_attached_session_and_provider_resets_the_model() {
+        let attached = view("openrouter", "openai/gpt-4.1-mini", Some("low"));
+        for to in [SwitchTo::New, SwitchTo::Clear] {
+            let spec = derive_spec(Some(&attached), &configured(), &to).unwrap();
+            assert_eq!(spec.provider, "openrouter");
+            assert_eq!((spec.model.as_deref(), spec.effort.as_deref()), (Some("openai/gpt-4.1-mini"), Some("low")));
+            assert_eq!((spec.workspace.as_str(), &spec.location), ("/srv/app", &Location::Ssh { destination: "box".into() }));
+            assert_eq!(spec.persistence, Persistence::Ephemeral, "as private as the attached session");
+            assert_eq!(spec.agent.as_deref(), Some("reader"));
+        }
+        let spec = derive_spec(Some(&attached), &configured(), &SwitchTo::Provider("codex".into())).unwrap();
+        assert_eq!(spec.provider, "codex");
+        assert_eq!((spec.model, spec.effort), (None, None), "never a model chosen under another provider");
+        assert_eq!(spec.workspace, "/srv/app");
+        assert_eq!(derive_spec(Some(&attached), &configured(), &SwitchTo::Provider("openrouter".into())), None);
+        // Without an attached session the configured spec is the base.
+        let spec = derive_spec(None, &configured(), &SwitchTo::Provider("openrouter".into())).unwrap();
+        assert_eq!((spec.provider.as_str(), spec.model, spec.persistence), ("openrouter", None, Persistence::Persistent));
+        assert_eq!(derive_spec(None, &configured(), &SwitchTo::New), Some(configured()));
+        // An agent that reports no model carries none.
+        let spec = derive_spec(Some(&view("acp:claude", "", None)), &configured(), &SwitchTo::New).unwrap();
+        assert_eq!(spec.model, None);
+        // Values keep their spelling through the folded registry.
+        let spec = derive_spec(Some(&view("codex", "GPT-6-Sol", Some("High"))), &configured(), &SwitchTo::New).unwrap();
+        assert_eq!((spec.model.as_deref(), spec.effort.as_deref()), (Some("GPT-6-Sol"), Some("High")));
+    }
+
+    fn hint_values(hints: Vec<Hint>) -> Vec<String> {
+        hints.into_iter().map(|h| h.value).collect()
+    }
+
+    #[test]
+    fn efforts_are_the_ladder_and_auto_where_taken() {
+        let ladder = [choice("low"), choice("high"), choice("Low")];
+        assert_eq!(hint_values(effort_hints(Some(&ladder), &[], AutoEffort::Taken, "Jev")), ["low", "high", "auto"]);
+        assert_eq!(hint_values(effort_hints(Some(&ladder), &[], AutoEffort::Refused, "")), ["low", "high"], "an agent that refuses auto");
+        assert_eq!(hint_values(effort_hints(Some(&ladder), &[], AutoEffort::Unknown, "")), ["low", "high"], "not known: not offered");
+        let auto = effort_hints(Some(&ladder), &[], AutoEffort::Taken, "Jev picks the effort per request").pop().unwrap();
+        assert_eq!((auto.value.as_str(), auto.detail.as_str()), ("auto", "Jev picks the effort per request"));
+        // Before the session said: values seen for its provider, `auto` counted as `auto`.
+        assert_eq!(hint_values(effort_hints(None, &["auto".into(), "max".into()], AutoEffort::Unknown, "")), ["max"]);
+        assert_eq!(hint_values(effort_hints(None, &["Auto".into(), "max".into()], AutoEffort::Taken, "")), ["max", "Auto"]);
+    }
+
+    #[test]
+    fn efforts_match_with_case_folded_and_are_sent_as_the_backend_wants() {
+        let ladder = [choice("low"), choice("high")];
+        // The native loop matches exactly: it gets the ladder's spelling.
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Taken, "Low", true).as_deref(), Some("low"));
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Taken, " HIGH ", true).as_deref(), Some("high"));
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Taken, "AUTO", true).as_deref(), Some("auto"));
+        // An ACP agent resolves values itself (ADR 0075): it gets them as typed.
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Refused, "Low", false).as_deref(), Some("Low"));
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Refused, "auto", false), None, "never to a session that refuses it");
+        assert_eq!(effort_to_send(&ladder, AutoEffort::Taken, "ultra", true), None);
+        assert_eq!(
+            effort_to_send(&[], AutoEffort::Unknown, "ultra", true).as_deref(),
+            Some("ultra"),
+            "an unknown ladder: the session decides"
+        );
+        assert_eq!(
+            effort_to_send(&[], AutoEffort::Unknown, "auto", false).as_deref(),
+            Some("auto"),
+            "unknown support: the session decides"
+        );
+    }
+
+    #[test]
+    fn details_do_not_repeat_the_value_or_the_name() {
+        let with = |value: &str, name: Option<&str>, description: Option<&str>| {
+            detail(&ChoiceValue { value: value.into(), name: name.map(Into::into), description: description.map(Into::into) })
+        };
+        assert_eq!(with("low", Some("Low"), None), "");
+        assert_eq!(with("claude-fable-5-1[1m]", Some("Fable 5.1"), Some("Fable 5.1 · Most capable")), "Fable 5.1 · Most capable");
+        assert_eq!(with("opus[1m]", Some("Opus 5.5"), Some("Opus 5.5 with 1M context")), "Opus 5.5 with 1M context");
+        assert_eq!(with("default", Some("Default (recommended)"), Some("Opus (1M context)")), "Default (recommended) · Opus (1M context)");
+        assert_eq!(with("gpt-6-sol", Some("GPT-6-Sol"), Some("272k context")), "272k context", "a name that only differs in case");
+    }
+
+    #[test]
+    fn providers_complete_with_a_line_each() {
+        let hints = provider_hints();
+        assert_eq!(hints.len(), crate::providers::KNOWN.len());
+        assert!(hints.iter().all(|h| !h.detail.is_empty()), "{hints:?}");
+    }
+}

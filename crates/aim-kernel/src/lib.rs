@@ -29,12 +29,16 @@ extern crate alloc;
 
 pub mod agent_tools;
 pub mod board;
+pub mod cells;
+pub mod code_mode;
 pub mod compaction;
 pub mod dedup;
 pub mod discovery;
 pub mod effort;
 pub mod job;
+pub mod model_match;
 pub mod negotiate;
 pub mod path;
 pub mod policy;
+pub mod switch;
 pub mod turn;

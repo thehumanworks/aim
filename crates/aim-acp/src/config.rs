@@ -11,6 +11,24 @@ use crate::error::AcpError;
 /// (`npm:@agentclientprotocol/claude-agent-acp`).
 pub const CLAUDE_AGENT_ACP: &str = "claude-agent-acp";
 
+/// How an agent spells a variant of a model value, such as a context size (docs/adr/0075). A
+/// profile declares the spellings its agent accepts; aim folds only those, so another ACP agent
+/// never has `-1m` read as a variant it does not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "syntax", rename_all = "snake_case")]
+pub enum VariantSyntax {
+    /// A trailing `[<digits><unit>]`: `opus[1m]` is `opus` with variant `1m`.
+    Bracketed {
+        /// The unit letter after the digits (`m`: millions of tokens of context).
+        unit: char,
+    },
+    /// A trailing `-<digits><unit>`: `opus-1m` is `opus` with variant `1m`.
+    Dashed {
+        /// The unit letter after the digits.
+        unit: char,
+    },
+}
+
 /// A named ACP agent and how to start it over stdio.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpAgentConfig {
@@ -29,19 +47,34 @@ pub struct AcpAgentConfig {
     /// unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    /// How the agent spells variants of its model values (docs/adr/0075). Empty: a requested
+    /// model matches exactly, ignoring case, or by family, and no suffix is read as a variant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_variants: Vec<VariantSyntax>,
 }
 
 impl AcpAgentConfig {
     /// A profile running `command` with no arguments.
     #[must_use]
     pub fn new(profile_name: impl Into<String>, command: impl Into<PathBuf>) -> Self {
-        Self { profile_name: profile_name.into(), command: command.into(), args: Vec::new(), env: BTreeMap::new(), cwd: None }
+        Self {
+            profile_name: profile_name.into(),
+            command: command.into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            model_variants: Vec::new(),
+        }
     }
 
-    /// The `claude` profile: the `claude-agent-acp` adapter from `PATH` (pinned via mise).
+    /// The `claude` profile: the `claude-agent-acp` adapter from `PATH` (pinned via mise). Its
+    /// model values carry a context size as `[1m]`, and the adapter reads `-1m` as the same
+    /// (claude-agent-acp 0.81.2 `dist/session-model.js:3-4`).
     #[must_use]
     pub fn claude() -> Self {
-        Self::new("claude", CLAUDE_AGENT_ACP)
+        let mut config = Self::new("claude", CLAUDE_AGENT_ACP);
+        config.model_variants = vec![VariantSyntax::Bracketed { unit: 'm' }, VariantSyntax::Dashed { unit: 'm' }];
+        config
     }
 
     /// Appends arguments.
@@ -129,6 +162,7 @@ impl core::fmt::Debug for AcpAgentConfig {
             .field("args", &"***")
             .field("env_count", &self.env.len())
             .field("cwd", &"***")
+            .field("model_variants", &self.model_variants)
             .finish()
     }
 }
@@ -165,8 +199,12 @@ mod tests {
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"profile_name": "claude", "command": "claude-agent-acp", "args": ["--hide-claude-auth"], "cwd": "/tmp"})
+            serde_json::json!({"profile_name": "claude", "command": "claude-agent-acp", "args": ["--hide-claude-auth"], "cwd": "/tmp",
+                               "model_variants": [{"syntax": "bracketed", "unit": "m"}, {"syntax": "dashed", "unit": "m"}]})
         );
+        // A profile that declares no variant syntax has none.
+        let other = serde_json::from_value::<AcpAgentConfig>(serde_json::json!({"profile_name": "x", "command": "x-acp"})).unwrap();
+        assert!(other.model_variants.is_empty());
         assert_eq!(serde_json::from_value::<AcpAgentConfig>(json).unwrap(), config);
         assert_eq!(config.provider_id(), "acp:claude");
     }

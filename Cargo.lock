@@ -143,8 +143,10 @@ name = "aim-acp"
 version = "0.0.0"
 dependencies = [
  "agent-client-protocol",
+ "aim-kernel",
  "aim-proto",
  "futures",
+ "proptest",
  "rustix",
  "serde",
  "serde_json",

@@ -334,6 +334,7 @@ async fn board_and_session_actors_share_one_wal_file() {
             title: None,
             parent: None,
             agent: None,
+            code_mode: None,
         })
         .await
         .unwrap();
@@ -431,6 +432,7 @@ async fn claims_stay_fast_with_200_mib_of_accepted_evidence_and_session_writes()
             title: None,
             parent: None,
             agent: None,
+            code_mode: None,
         })
         .await
         .unwrap();

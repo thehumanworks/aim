@@ -39,6 +39,8 @@ pub mod tools;
 
 #[cfg(test)]
 mod jev_tests;
+#[cfg(test)]
+mod window_tests;
 
 pub use backend::{Backend, BackendFuture, InForce};
 pub use tools::ToolHost;
@@ -179,6 +181,9 @@ enum Window {
     Known(Option<u64>),
 }
 
+/// Conservative context size while a catalog refresh is in flight (ADR 0056).
+const FALLBACK_CONTEXT_WINDOW: u64 = 8_192;
+
 /// The native agent: a provider, a tool host and a transcript.
 pub struct Agent {
     provider: Arc<dyn ModelProvider>,
@@ -189,13 +194,21 @@ pub struct Agent {
     turns: u64,
     /// The model's context window, once the catalog was asked.
     window: Window,
+    /// A catalog refresh never delays a small first request.
+    window_lookup: Option<tokio::task::JoinHandle<Option<u64>>>,
     /// The provider-measured context size (last request plus its response) and the transcript
     /// length it covers.
     measured: Option<(u64, usize)>,
     decider: Option<Arc<dyn Decider>>,
     explicit_effort: bool,
     decisions_since_change: u32,
+    /// The provider's catalog as this session last saw it, for its options (ADR 0074); shared
+    /// with the lookups [`Backend::options`] hands out.
+    catalog: SharedCatalog,
 }
+
+/// A session's last-seen provider catalog.
+type SharedCatalog = Arc<std::sync::Mutex<Option<Arc<Vec<aim_llm::ModelInfo>>>>>;
 
 fn emit(events: &UnboundedSender<AgentEvent>, event: AgentEvent) {
     // A closed receiver only means nobody is watching; the turn carries on.
@@ -228,11 +241,48 @@ impl Agent {
             next_call: 0,
             turns: 0,
             window: Window::Unasked,
+            window_lookup: None,
             measured: None,
             decider: None,
             explicit_effort,
             decisions_since_change: 2,
+            catalog: SharedCatalog::default(),
         }
+    }
+
+    /// Reuse the catalog fetched while the session was built for its options (ADR 0074). `None`
+    /// (not fetched at start) leaves the first options lookup to fetch it in the background.
+    #[must_use]
+    pub(crate) fn with_catalog(self, models: Option<Vec<aim_llm::ModelInfo>>) -> Self {
+        if let Some(models) = models.filter(|models| !models.is_empty()) {
+            self.remember_catalog(&models);
+        }
+        self
+    }
+
+    /// Keeps `models` as the session's catalog (a fresher fetch replaces an older one).
+    pub(crate) fn remember_catalog(&self, models: &[aim_llm::ModelInfo]) {
+        *self.catalog.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(models.to_vec()));
+    }
+
+    /// The shared catalog slot.
+    pub(crate) fn catalog_handle(&self) -> SharedCatalog {
+        Arc::clone(&self.catalog)
+    }
+
+    /// Whether Jev advises this session's effort (the host attaches it to persistent sessions).
+    pub(crate) fn has_decider(&self) -> bool {
+        self.decider.is_some()
+    }
+
+    /// Reuse the capability snapshot fetched while the session was built. `None` leaves the
+    /// existing lazy lookup in place (for providers whose catalog was unavailable at startup).
+    #[must_use]
+    pub(crate) fn with_initial_window(mut self, window: Option<u64>) -> Self {
+        if let Some(window) = window {
+            self.window = Window::Known(Some(window));
+        }
+        self
     }
 
     /// Enable bounded advice for a persistent session. The host never calls this for private or
@@ -435,8 +485,16 @@ impl Agent {
         dangling.len()
     }
 
-    /// Starts a complete tool call; returns its future (owned, so it runs concurrently).
-    fn start_call(&self, specs: &[ToolSpec], id: CallId, name: &str, arguments: &str) -> tools::BoxFuture<(CallId, ToolResult)> {
+    /// Starts a complete tool call; returns its future (owned, so it runs concurrently). The call
+    /// runs inside `context`, so a host can name it as the parent of calls it makes (ADR 0066).
+    fn start_call(
+        &self,
+        specs: &[ToolSpec],
+        id: CallId,
+        context: tools::ToolCallContext,
+        name: &str,
+        arguments: &str,
+    ) -> tools::BoxFuture<(CallId, ToolResult)> {
         // UUIDv7 keys carry their minting time, so the harness can age them out of its
         // idempotency horizon instead of ever re-running an old key (FIX4).
         let key = IdempotencyKey::new(uuid::Uuid::now_v7().simple().to_string());
@@ -448,14 +506,15 @@ impl Agent {
         };
         match args {
             Ok(args) => {
-                let call = self.tools.call(name.to_owned(), args, key);
-                Box::pin(async move {
+                let name = name.to_owned();
+                let call = context.enter(|| self.tools.call(name.clone(), args, key));
+                Box::pin(context.scope(async move {
                     let result = match call.await {
                         Ok(result) => result,
                         Err(err) => ToolResult::error(format!("{}: {}", err.code, err.message)),
                     };
-                    (id, result)
-                })
+                    (id, tools::bound_bash_result(&name, result))
+                }))
             }
             Err(err) => {
                 let result = ToolResult::error(format!("the arguments are not valid JSON ({err}); call the tool again with a JSON object"));
@@ -476,7 +535,10 @@ impl Agent {
                 }
                 ToolResult::error(why)
             };
-            emit(events, AgentEvent::ToolFinished { call_id: call.call_id.clone(), name: call.name.clone(), result: result.clone() });
+            emit(
+                events,
+                AgentEvent::ToolFinished { call_id: call.call_id.clone(), name: call.name.clone(), result: result.clone(), parent: None },
+            );
             self.push(Item::ToolResult { call_id: call.call_id, result }, events);
         }
     }
@@ -544,8 +606,13 @@ impl Agent {
                                 if turn.apply(TurnEvent::CallComplete { id }).is_err() {
                                     return Ended::Failed(AgentError::Protocol(format!("tool call {call_id} arrived outside streaming")));
                                 }
-                                emit(ctx.events, AgentEvent::ToolStarted { call_id: call_id.clone(), name: name.clone(), arguments: arguments.clone() });
-                                response.running.push(self.start_call(specs, id, name, arguments));
+                                emit(ctx.events, AgentEvent::ToolStarted { call_id: call_id.clone(), name: name.clone(), arguments: arguments.clone(), parent: None });
+                                let context = tools::ToolCallContext {
+                                    call_id: call_id.clone(),
+                                    events: ctx.events.clone(),
+                                    cancel: ctx.cancel.clone(),
+                                };
+                                response.running.push(self.start_call(specs, id, context, name, arguments));
                                 response.dispatched.push(Dispatched { id, call_id: call_id.clone(), name: name.clone() });
                             }
                             let decide = matches!(&item, Item::ToolCall { .. }) && response.decision.is_none();
@@ -767,6 +834,9 @@ impl Agent {
 
     /// Forgets the model's window (the model changed).
     pub(crate) fn forget_window(&mut self) {
+        if let Some(lookup) = self.window_lookup.take() {
+            lookup.abort();
+        }
         self.window = Window::Unasked;
         self.decisions_since_change = 2;
         if !self.explicit_effort {
@@ -774,17 +844,36 @@ impl Agent {
         }
     }
 
-    /// The model's context window, from the provider's catalog (asked once per model).
-    async fn window(&mut self) -> Option<u64> {
+    /// The model's context window. A fallback can only prove this request is safely below the
+    /// compaction threshold; a possible compaction waits for the bounded catalog lookup.
+    async fn window(&mut self, estimate: u64, force: bool) -> Option<u64> {
         if let Window::Known(window) = self.window {
             return window;
         }
-        let window = match self.provider.catalog().await {
-            Ok(models) => models.iter().find(|m| m.id == self.config.model).and_then(|m| m.context_window),
-            Err(err) => {
-                tracing::debug!(%err, "no catalog: the context window is unknown");
-                None
-            }
+        if !matches!(self.provider.id(), "openrouter" | "ai-gateway") {
+            let window = tokio::time::timeout(crate::context::WINDOW_LOOKUP, self.provider.catalog())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|models| models.iter().find(|entry| entry.id == self.config.model).and_then(|entry| entry.context_window));
+            self.window = Window::Known(window);
+            return window;
+        }
+        if self.window_lookup.is_none() {
+            let provider = Arc::clone(&self.provider);
+            let model = self.config.model.clone();
+            self.window_lookup = Some(tokio::spawn(async move {
+                let models = tokio::time::timeout(crate::context::WINDOW_LOOKUP, provider.catalog()).await.ok()?.ok()?;
+                models.iter().find(|entry| entry.id == model).and_then(|entry| entry.context_window)
+            }));
+        }
+        let below_fallback = !force && estimate.saturating_mul(100) < FALLBACK_CONTEXT_WINDOW.saturating_mul(compact::COMPACT_AT_PERCENT);
+        if below_fallback && !self.window_lookup.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
+            return Some(FALLBACK_CONTEXT_WINDOW);
+        }
+        let window = match self.window_lookup.take() {
+            Some(lookup) => lookup.await.ok().flatten(),
+            None => None,
         };
         self.window = Window::Known(window);
         window
@@ -820,7 +909,7 @@ impl Agent {
     ) -> Compaction {
         let before = self.context_estimate(specs);
         let known = tokio::select! {
-            known = self.window() => known,
+            known = self.window(before, force) => known,
             () = cancel.cancelled() => return Compaction::Cancelled,
         };
         let window = match known {

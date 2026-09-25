@@ -71,6 +71,59 @@ async fn typescript_nested_calls_and_output() {
     assert!(!events[0].immediate);
 }
 
+/// ADR 0076: a nested result's `.text` (and its string form) is its text, `Promise.all` runs
+/// calls together, and the added fields stay out of the result's JSON.
+#[tokio::test]
+async fn nested_results_expose_their_text_and_run_together() {
+    let (result, _) = execute(
+        "const [a, b] = await Promise.all([tools.add({a:1,b:2}), tools.add({a:3,b:4})]); text(a.text + ',' + `${b}` + ',' + JSON.stringify(a).includes('\"text\":\"3\"') + ',' + Object.keys(a).includes('text'));",
+        None,
+        1024,
+        2_000,
+        16 << 20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.output, "3,7,true,false\n");
+}
+
+/// ADR 0076, from a live run where a model's cells failed silently: the last expression is the
+/// cell's value (a promise chain is awaited, not dropped), `console.log` is `text`, and an
+/// exception reaches the model by name and message.
+#[tokio::test]
+async fn scripts_written_like_node_return_their_output_and_their_errors() {
+    let last = execute("const r = await tools.add({a:2,b:2});\n({ sum: Number(r.text) })", None, 1024, 2_000, 16 << 20).await.unwrap();
+    assert_eq!((last.0.output.as_str(), last.0.returned), ("{\"sum\":4}", true));
+    let chained = execute(
+        "async function go() { return (await tools.add({a:1,b:1})).text; }\ngo().then(v => console.log('got', v))",
+        None,
+        1024,
+        2_000,
+        16 << 20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(chained.0.output, "got 2\n", "the chain was awaited and console.log is text");
+    let thrown =
+        execute("const { tools: t } = global; await t.add({a:1,b:2}); missing.call();", None, 1024, 2_000, 16 << 20).await.unwrap_err();
+    assert!(thrown.message.contains("ReferenceError") && thrown.message.contains("missing"), "{}", thrown.message);
+    let node = execute("const fs = require('fs');", None, 1024, 2_000, 16 << 20).await.unwrap_err();
+    assert!(node.message.contains("not Node") && node.message.contains("tools.*"), "{}", node.message);
+    let returned = execute("return 7", None, 1024, 2_000, 16 << 20).await.unwrap();
+    assert_eq!(returned.0.output, "7", "a top-level return still works");
+}
+
+/// A script may throw a message of any size; the worker bounds it like output (codex review B1).
+#[tokio::test]
+async fn a_huge_exception_is_bounded_like_output() {
+    for code in ["throw new Error('x'.repeat(1_000_000));", "throw 'é'.repeat(500_000);"] {
+        let error = execute(code, None, 1024, 5_000, 64 << 20).await.unwrap_err();
+        assert!(error.message.len() <= 1024, "{} bytes", error.message.len());
+        assert!(error.message.starts_with("Warning: truncated output"), "{}", error.message);
+        assert!(error.message.contains("bytes truncated"), "{}", error.message);
+    }
+}
+
 #[tokio::test]
 async fn global_this_exposes_tools_and_index() {
     let (result, _) = execute(
@@ -117,9 +170,61 @@ async fn store_and_program_args_and_return() {
 }
 
 #[tokio::test]
-async fn output_limit_is_enforced() {
-    let err = execute("text('too long')", None, 3, 2_000, 16 << 20).await.unwrap_err();
-    assert_eq!(err.code, ErrorCode::LimitExceeded);
+async fn output_over_the_limit_is_dropped_and_counted_not_failed() {
+    let (result, events) = execute("text('ok'); text('too long'); store('kept', 1); text('x')", None, 5, 2_000, 16 << 20).await.unwrap();
+    assert_eq!(result.output, "ok\n", "kept output is a prefix");
+    assert_eq!((result.dropped_events, result.dropped_bytes), (2, 9));
+    assert_eq!(result.store.get("kept"), Some(&json!(1)), "the store survives an output overflow (REV13a M8)");
+    assert_eq!(events.len(), 1);
+}
+
+#[tokio::test]
+async fn empty_text_calls_are_charged_against_the_limit() {
+    // REV13a M2: each empty text('') used to add an uncharged '\n', so a loop printed 1 MB.
+    let code = "for (let i = 0; i < 1000000; i++) { try { text('') } catch (e) {} }";
+    let (result, _) = execute(code, None, 40_000, 20_000, 16 << 20).await.unwrap();
+    assert!(result.output.len() <= 40_000, "{} bytes", result.output.len());
+    assert!(result.dropped_events > 900_000);
+}
+
+#[tokio::test]
+async fn zero_byte_notifications_are_bounded_and_coalesced() {
+    // REV13a M3: a notify('') flood grew the parent's memory without bound.
+    let code = "for (let i = 0; i < 200000; i++) { notify(''); yield_control(); } text('done')";
+    let (result, events) = execute(code, None, 40_000, 20_000, 16 << 20).await.unwrap();
+    assert!(events.len() <= aim_coderun::budget::MAX_EVENTS, "{} events reached the parent", events.len());
+    assert_eq!(events.len(), 2, "consecutive markers coalesce into one, then the text");
+    assert!(result.yielded);
+    assert_eq!(result.output, "done\n");
+}
+
+#[tokio::test]
+async fn distinct_notifications_stop_at_the_event_cap() {
+    let code = "for (let i = 0; i < 10000; i++) { notify(String(i % 10)); }";
+    let (result, events) = execute(code, None, 1_000_000, 20_000, 16 << 20).await.unwrap();
+    assert_eq!(events.len(), aim_coderun::budget::MAX_EVENTS);
+    assert_eq!(result.dropped_events, 10_000 - u64::try_from(aim_coderun::budget::MAX_EVENTS).unwrap());
+}
+
+#[tokio::test]
+async fn a_large_returned_value_is_cut_not_failed() {
+    let (result, _) = execute("return 'x'.repeat(100)", None, 10, 2_000, 16 << 20).await.unwrap();
+    assert_eq!(result.output, "x".repeat(10));
+    assert!(result.returned);
+    assert_eq!(result.dropped_bytes, 90);
+}
+
+#[tokio::test]
+async fn store_is_bounded_at_store_time_and_undefined_removes_a_key() {
+    let limit = aim_coderun::budget::MAX_STORE_BYTES;
+    let code = format!(
+        "store('a', 1); let refused = false; try {{ store('big', 'x'.repeat({limit})) }} catch (e) {{ refused = String(e.message).includes('store is limited') }} store('gone', 2); store('gone', undefined); text(refused)"
+    );
+    let (result, _) = execute(&code, None, 1024, 5_000, 64 << 20).await.unwrap();
+    assert_eq!(result.output, "true\n");
+    assert_eq!(result.store.get("a"), Some(&json!(1)));
+    assert!(!result.store.contains_key("big"));
+    assert!(!result.store.contains_key("gone"));
 }
 
 #[tokio::test]

@@ -34,6 +34,7 @@ struct Scripted {
     calls: AtomicUsize,
     deltas: usize,
     delay: Duration,
+    models: Vec<ModelInfo>,
 }
 
 impl ModelProvider for Scripted {
@@ -41,7 +42,8 @@ impl ModelProvider for Scripted {
         "scripted"
     }
     fn catalog(&self) -> LlmFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
-        Box::pin(async { Ok(Vec::new()) })
+        let models = self.models.clone();
+        Box::pin(async move { Ok(models) })
     }
     fn stream(&self, _request: Request) -> LlmFuture<'_, Result<EventStream, LlmError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -109,7 +111,11 @@ impl SessionClient for EndsOnAttach {
 }
 
 fn host(deltas: usize, delay: Duration) -> (Arc<dyn SessionClient>, Arc<Scripted>) {
-    let provider = Arc::new(Scripted { calls: AtomicUsize::new(0), deltas, delay });
+    host_with(deltas, delay, Vec::new())
+}
+
+fn host_with(deltas: usize, delay: Duration, models: Vec<ModelInfo>) -> (Arc<dyn SessionClient>, Arc<Scripted>) {
+    let provider = Arc::new(Scripted { calls: AtomicUsize::new(0), deltas, delay, models });
     let cloned = Arc::clone(&provider);
     let workspaces: WorkspaceFactory = Arc::new(|spec: &SessionSpec| {
         let root = spec.workspace.clone();
@@ -139,6 +145,7 @@ fn spec() -> SessionSpec {
         effort: None,
         agent: None,
         persistence: Persistence::Ephemeral,
+        code_mode: None,
     }
 }
 
@@ -175,12 +182,15 @@ impl Drop for DetachedDaemonGuard<'_> {
     }
 }
 
-async fn started(
-    deltas: usize,
-    delay: Duration,
-) -> (TempDir, Arc<dyn SessionClient>, Arc<Scripted>, tokio::task::JoinHandle<Result<(), ProtoError>>) {
+type Started = (TempDir, Arc<dyn SessionClient>, Arc<Scripted>, tokio::task::JoinHandle<Result<(), ProtoError>>);
+
+async fn started(deltas: usize, delay: Duration) -> Started {
+    started_with(deltas, delay, Vec::new()).await
+}
+
+async fn started_with(deltas: usize, delay: Duration, models: Vec<ModelInfo>) -> Started {
     let dir = private_tempdir();
-    let (host, provider) = host(deltas, delay);
+    let (host, provider) = host_with(deltas, delay, models);
     let socket = socket_path(dir.path());
     let background = tokio::spawn({
         let home = dir.path().to_path_buf();
@@ -756,4 +766,48 @@ async fn live_daemon_codex_turn() {
     client.disconnect();
     tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
     host.shutdown().await.unwrap();
+}
+
+fn model(id: &str, efforts: &[&str]) -> ModelInfo {
+    ModelInfo {
+        id: id.into(),
+        display_name: id.into(),
+        context_window: None,
+        efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
+        default_effort: None,
+        tiers: Vec::new(),
+        tools: true,
+        images: false,
+        hidden: false,
+        native: None,
+    }
+}
+
+/// ADR 0074: a daemon client gets the session's options in its (paged) attach reply, and a new
+/// set after a model change on its stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_options_reach_daemon_clients_on_attach_and_on_the_stream() {
+    let (dir, host, _, task) = started_with(1, Duration::from_millis(1), vec![model("m", &["low", "high"]), model("n", &["max"])]).await;
+    let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
+    let session = client.create(spec()).await.unwrap().meta.id;
+    // The options are published in the background; wait until the host has them.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while host.attach(session.clone()).await.unwrap().0.options.is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "the options never arrived");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (snapshot, mut updates) = client.attach(session.clone()).await.unwrap();
+    let options = snapshot.options.expect("replayed in the attach reply");
+    let values = |choices: &[aim_proto::daemon::ChoiceValue]| choices.iter().map(|c| c.value.clone()).collect::<Vec<_>>();
+    assert_eq!(values(&options.models), ["m", "n"]);
+    assert_eq!(values(&options.efforts), ["low", "high"]);
+    client.set_config(SessionConfigParams { session, model: Some("n".into()), effort: None }).await.unwrap();
+    let next = loop {
+        let update = tokio::time::timeout(Duration::from_secs(5), updates.next()).await.unwrap().expect("stream ended early");
+        if let SessionUpdate::Options { options } = update {
+            break options;
+        }
+    };
+    assert_eq!(values(&next.efforts), ["max"]);
+    task.abort();
 }

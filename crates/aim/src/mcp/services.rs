@@ -191,16 +191,37 @@ impl AimServices {
     }
 }
 
-/// Add code mode's saved-program tools to aim's MCP service catalog when its worker is present.
-/// The wrapped host remains the authority for every nested program call.
+/// Add code mode's `run_code` and saved-program tools to aim's MCP service catalog as
+/// `AIM_CODE_MODE` asks, when its worker is present (ADR 0076): `off` serves the services alone,
+/// `on` serves them beside the code tools (none is hidden: each service is a primary action), and
+/// `only` serves the code tools alone. The wrapped host remains the authority for every nested call.
 #[must_use]
 pub fn with_programs(host: Arc<dyn ToolHost>, aim_home: &Path) -> Arc<dyn ToolHost> {
-    let Some(code) = crate::providers::code_mode() else { return host };
-    let runtime = crate::coderun::CodeToolHost::new(Arc::clone(&host), code.worker, "aim-mcp", crate::coderun::CodeMode::RunCode);
-    let project = std::env::current_dir().ok().map(|root| root.join(".agents/programs"));
-    let store = Arc::new(crate::programs::ProgramStore::new(aim_home.join("programs"), project));
-    let programs: Arc<dyn ToolHost> = Arc::new(crate::coderun::ProgramToolHost::new(runtime, store));
-    Arc::new(crate::agent::tools::Compose::new(host, vec![programs]))
+    with_code_mode(host, aim_home, crate::providers::code_mode())
+}
+
+/// [`with_programs`] with an explicit code-mode configuration (`None`: off).
+#[must_use]
+pub fn with_code_mode(host: Arc<dyn ToolHost>, aim_home: &Path, code: Option<crate::host::CodeConfig>) -> Arc<dyn ToolHost> {
+    let Some(code) = code else { return host };
+    let exposure = crate::coderun::mode::decide(crate::coderun::mode::CodeModeRequest::Set(code.mode), true, true, true);
+    if !exposure.code {
+        return host;
+    }
+    let runtime = crate::coderun::CodeToolHost::new(Arc::clone(&host), code.worker, "aim-mcp", crate::coderun::CodeMode::RunCode)
+        .with_direct(exposure.direct, &[]);
+    let store = Arc::new(crate::programs::ProgramStore::new(aim_home.join("programs")));
+    let mut programs = crate::coderun::ProgramToolHost::new(runtime, store);
+    // Project programs are read from the working directory's `.agents/programs`. They are written
+    // only through a workspace's `Write` tool (ADR 0066), which this service does not offer, so
+    // saving one here is refused with a clear message.
+    if let Ok(root) = std::env::current_dir() {
+        let files: Arc<dyn crate::resources::files::Files> = Arc::new(LocalFiles::new(root));
+        programs = programs.with_project(crate::programs::project::ProjectPrograms::new(files, Arc::clone(&host)));
+    }
+    let programs: Arc<dyn ToolHost> = Arc::new(programs);
+    let direct: Arc<dyn ToolHost> = Arc::new(crate::coderun::DirectCodeTools::new(host, exposure.direct, &[]));
+    Arc::new(crate::agent::tools::Compose::new(direct, vec![programs]))
 }
 
 impl ToolHost for AimServices {

@@ -278,7 +278,7 @@ async fn remote_project_resources() {
     // Two round trips (listings with the fixed reads, then the listed files) plus one for Claude's
     // namespaced commands.
     assert_eq!(log.iter().filter(|l| l.starts_with("fs.read_many")).count(), 2, "{log:?}");
-    let prefix = aim::context::instructions(&catalog, None, 4096).text;
+    let prefix = aim::context::instructions(&catalog, None, 4096, false).text;
     assert!(prefix.contains("## AGENTS.md (remote, ssh:example)"), "{prefix}");
     assert!(prefix.contains(".agents/skills/haiku/SKILL.md; remote, ssh:example"), "{prefix}");
 }
@@ -368,7 +368,7 @@ async fn instruction_budget_is_shared_and_cuts_are_marked() {
     ]);
     let config = ResourceConfig { bounds: Bounds { max_file_bytes: 64 * 1024, ..Bounds::default() }, ..ResourceConfig::default() };
     let catalog = resources::discover(&config, Some(&files), "local", "").await;
-    let prefix = aim::context::instructions(&catalog, None, 4096);
+    let prefix = aim::context::instructions(&catalog, None, 4096, false);
     assert!(prefix.text.contains(&format!(
         "[… truncated: {} of {} bytes shown; read AGENTS.md for the rest]",
         instructions::MAX_PROJECT_INSTRUCTIONS,
@@ -393,7 +393,7 @@ async fn skill_catalog_fits_its_budget() {
     let catalog = resources::discover(&ResourceConfig::default(), Some(&files), "local", "").await;
     assert_eq!(catalog.skills.len(), 120);
     for budget in [instructions::DEFAULT_SKILL_BUDGET, instructions::skill_budget(Some(200_000))] {
-        let prefix = aim::context::instructions(&catalog, None, budget);
+        let prefix = aim::context::instructions(&catalog, None, budget, false);
         let listing: usize =
             prefix.text.lines().filter(|l| l.starts_with("- skill-") || l.starts_with("- …and")).map(|l| l.len() + 1).sum();
         assert!(listing <= budget, "{listing} > {budget}");
@@ -687,6 +687,7 @@ fn spec(agent: Option<&str>) -> SessionSpec {
         effort: None,
         agent: agent.map(str::to_owned),
         persistence: Persistence::Ephemeral,
+        code_mode: None,
     }
 }
 
@@ -1112,7 +1113,7 @@ async fn live_prefix(aimx: &Path, repo: &Path, agent: Option<&str>) -> String {
     let catalog = resources::discover(&ResourceConfig::default(), Some(&files), "local", "").await;
     harness.shutdown().await;
     let agent = agent.and_then(|name| catalog.agent(name));
-    aim::context::instructions(&catalog, agent, instructions::DEFAULT_SKILL_BUDGET).text
+    aim::context::instructions(&catalog, agent, instructions::DEFAULT_SKILL_BUDGET, false).text
 }
 
 /// REV12: code mode's program tools obey the agent's allowlist. An agent allowed `Read` and
@@ -1127,7 +1128,11 @@ async fn program_tools_obey_the_agent_allowlist() {
         media: None,
         decider: None,
         tools: Vec::new(),
-        code: Some(CodeConfig { worker: "/nonexistent/aim-coderun".into(), user_programs: programs.path().join("programs") }),
+        code: Some(CodeConfig {
+            worker: "/nonexistent/aim-coderun".into(),
+            user_programs: programs.path().join("programs"),
+            mode: aim::coderun::mode::Mode::On,
+        }),
     };
     let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(reader_project(Some("Read, run_code"))));
     let for_tools = Arc::clone(&tools);
@@ -1150,4 +1155,155 @@ async fn program_tools_obey_the_agent_allowlist() {
         "{got:?}"
     );
     assert!(!programs.path().join("programs").exists(), "nothing was committed");
+}
+
+/// `Read`, `Glob` (a tool code mode `on` hides) and `Write`.
+struct CodeModeWorkspace;
+
+impl ToolHost for CodeModeWorkspace {
+    fn specs(&self) -> Vec<ToolSpec> {
+        ["Read", "Glob", "Write"]
+            .into_iter()
+            .map(|name| ToolSpec {
+                name: name.into(),
+                description: name.into(),
+                input_schema: json!({"type": "object"}),
+                input: aim_proto::tool::ToolInput::default(),
+                annotations: ToolAnnotations::default(),
+            })
+            .collect()
+    }
+
+    fn call(&self, name: String, _arguments: Value, _key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
+        Box::pin(async move { Ok(ToolResult::text(name)) })
+    }
+}
+
+/// ADR 0076: each code mode's tools in a native session. `off` (no `CodeConfig`) offers the
+/// workspace alone, `on` hides the compact set, `only` offers the code tools alone; an agent whose
+/// ceiling lacks `run_code` keeps its direct tools even under `only`, and one allowing `run_code`
+/// but not the program tools gets `run_code` alone. The instructions carry the "# Code mode"
+/// section exactly when `run_code` is offered.
+#[tokio::test]
+async fn code_modes_compose_their_tool_lists_and_never_widen_a_ceiling() {
+    let programs = tempfile::tempdir().unwrap();
+    let code = |mode| CodeConfig { worker: "/nonexistent/aim-coderun".into(), user_programs: programs.path().join("programs"), mode };
+    let cases: [(Option<aim::coderun::mode::Mode>, Option<&str>, &[&str]); 5] = [
+        (None, None, &["Read", "Glob", "Write"]),
+        (Some(aim::coderun::mode::Mode::On), None, &["Read", "Write", "run_code", "save_program", "run_program", "list_programs"]),
+        (Some(aim::coderun::mode::Mode::Only), None, &["run_code", "save_program", "run_program", "list_programs"]),
+        (Some(aim::coderun::mode::Mode::Only), Some("Read, Glob"), &["Read", "Glob"]),
+        (Some(aim::coderun::mode::Mode::Only), Some("Read, run_code"), &["run_code"]),
+    ];
+    for (mode, agent_tools, expected) in cases {
+        let services = NativeServices { code: mode.map(code), ..NativeServices::default() };
+        let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(reader_project(agent_tools)));
+        let f = fixture_on(Arc::new(MemoryStore::default()), Vec::new(), vec![text("done")], services, move |spec| Connected {
+            tools: Arc::new(CodeModeWorkspace) as Arc<dyn ToolHost>,
+            root: spec.workspace.clone(),
+            location: "local".into(),
+            project: Some(Arc::clone(&files)),
+            shutdown: Box::new(|| Box::pin(async {})),
+        });
+        let session =
+            if agent_tools.is_some() { persistent("reader") } else { SessionSpec { persistence: Persistence::Persistent, ..spec(None) } };
+        let id = f.host.create(session).await.unwrap().meta.id;
+        let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+        f.host.prompt(id, vec![Part::Text { text: "go".into() }]).await.unwrap();
+        until_idle(&mut updates).await;
+        let (offered, instructions): (Vec<String>, String) = {
+            let seen = f.provider.seen.lock().unwrap();
+            (seen[0].tools.iter().map(|t| t.name.clone()).collect(), seen[0].instructions.clone())
+        };
+        assert_eq!(offered, expected, "mode {mode:?}, agent tools {agent_tools:?}");
+        // The code-mode section goes exactly to sessions offered the code tool.
+        let code = offered.iter().any(|name| name == "run_code");
+        assert_eq!(instructions.contains("# Code mode"), code, "mode {mode:?}, agent tools {agent_tools:?}");
+        assert!(instructions.starts_with(aim::context::SYSTEM_PROMPT.trim_end()), "the system prompt comes first");
+    }
+}
+
+/// T4c (ADR 0076): a session's own code mode wins over the daemon's, its guards still apply, the
+/// summary publishes what it got, and a resumed session asks for what it had.
+#[tokio::test]
+async fn a_session_s_code_mode_wins_is_guarded_and_is_kept_on_resume() {
+    use aim::coderun::mode::Mode;
+    use aim_proto::event::CodeModeSetting;
+    type Case<'a> = (Option<Mode>, Option<&'a str>, Option<CodeModeSetting>, &'a [&'a str], CodeModeSetting);
+
+    let programs = tempfile::tempdir().unwrap();
+    let code = |mode| CodeConfig { worker: "/nonexistent/aim-coderun".into(), user_programs: programs.path().join("programs"), mode };
+    // (daemon's CodeConfig, agent tools, session setting) → (offered, effective).
+    let cases: [Case<'_>; 5] = [
+        (
+            Some(Mode::Off),
+            None,
+            Some(CodeModeSetting::On),
+            &["Read", "Write", "run_code", "save_program", "run_program", "list_programs"],
+            CodeModeSetting::On,
+        ),
+        (Some(Mode::On), None, Some(CodeModeSetting::Off), &["Read", "Glob", "Write"], CodeModeSetting::Off),
+        (Some(Mode::Off), None, None, &["Read", "Glob", "Write"], CodeModeSetting::Off),
+        // Guards after precedence: no worker, or a ceiling without run_code, leaves it off.
+        (None, None, Some(CodeModeSetting::Only), &["Read", "Glob", "Write"], CodeModeSetting::Off),
+        (Some(Mode::Off), Some("Read, Glob"), Some(CodeModeSetting::Only), &["Read", "Glob"], CodeModeSetting::Off),
+    ];
+    for (daemon, agent_tools, session_mode, expected, effective) in cases {
+        let services = NativeServices { code: daemon.map(code), ..NativeServices::default() };
+        let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(reader_project(agent_tools)));
+        let f = fixture_on(Arc::new(MemoryStore::default()), Vec::new(), vec![text("done")], services, move |spec| Connected {
+            tools: Arc::new(CodeModeWorkspace) as Arc<dyn ToolHost>,
+            root: spec.workspace.clone(),
+            location: "local".into(),
+            project: Some(Arc::clone(&files)),
+            shutdown: Box::new(|| Box::pin(async {})),
+        });
+        let mut session =
+            if agent_tools.is_some() { persistent("reader") } else { SessionSpec { persistence: Persistence::Persistent, ..spec(None) } };
+        session.code_mode = session_mode;
+        let created = f.host.create(session).await.unwrap();
+        assert_eq!(created.meta.code_mode, Some(effective), "the summary says what it got: {daemon:?} {agent_tools:?} {session_mode:?}");
+        let id = created.meta.id;
+        let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+        f.host.prompt(id, vec![Part::Text { text: "go".into() }]).await.unwrap();
+        until_idle(&mut updates).await;
+        let offered: Vec<String> = f.provider.seen.lock().unwrap()[0].tools.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(offered, expected, "{daemon:?} {agent_tools:?} {session_mode:?}");
+    }
+
+    // Resume: a session created `on` under a daemon whose own mode is off comes back `on`.
+    let store = Arc::new(MemoryStore::default());
+    let services = NativeServices { code: Some(code(Mode::Off)), ..NativeServices::default() };
+    let f = fixture_on(Arc::clone(&store), Vec::new(), vec![text("first"), text("second")], services, move |spec| Connected {
+        tools: Arc::new(CodeModeWorkspace) as Arc<dyn ToolHost>,
+        root: spec.workspace.clone(),
+        location: "local".into(),
+        project: None,
+        shutdown: Box::new(|| Box::pin(async {})),
+    });
+    let mut session = SessionSpec { persistence: Persistence::Persistent, ..spec(None) };
+    session.code_mode = Some(CodeModeSetting::On);
+    let id = f.host.create(session).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    f.host.prompt(id.clone(), vec![Part::Text { text: "go".into() }]).await.unwrap();
+    until_idle(&mut updates).await;
+    f.host.close(id.clone()).await.unwrap();
+    // Another host (as after a daemon restart) on the same store, whose own mode is still off.
+    let services = NativeServices { code: Some(code(Mode::Off)), ..NativeServices::default() };
+    let g = fixture_on(Arc::clone(&store), Vec::new(), vec![text("second")], services, move |spec| Connected {
+        tools: Arc::new(CodeModeWorkspace) as Arc<dyn ToolHost>,
+        root: spec.workspace.clone(),
+        location: "local".into(),
+        project: None,
+        shutdown: Box::new(|| Box::pin(async {})),
+    });
+    let (resumed, mut updates) = g.host.attach(id.clone()).await.unwrap();
+    assert_eq!(resumed.summary.meta.code_mode, Some(CodeModeSetting::On), "resumed as it was");
+    g.host.prompt(id, vec![Part::Text { text: "again".into() }]).await.unwrap();
+    until_idle(&mut updates).await;
+    let seen = g.provider.seen.lock().unwrap();
+    assert!(
+        seen.first().is_some_and(|request| request.tools.iter().any(|t| t.name == "run_code")),
+        "the resumed session still offers run_code"
+    );
 }

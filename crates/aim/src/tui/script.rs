@@ -10,7 +10,8 @@
 //!                 [{"kind": "call", "name": "echo", "arguments": {"text": "hi", "delay_ms": 300}}]],
 //!   "seed_items": 1000,
 //!   "completion_delays": [{"query": "a", "ms": 800}],
-//!   "keep_superseded": true
+//!   "keep_superseded": true,
+//!   "catalog": [{"id": "scripted-model", "name": "Scripted", "efforts": ["low", "high"]}]
 //! }
 //! ```
 //!
@@ -18,7 +19,10 @@
 //! `delay_ms` (an error result when `error` is true). `seed_items` stores a session with that many
 //! items and attaches it at start (for the transcript-size measurements). A `{"kind":
 //! "echo_input"}` step answers with the request's last user text, so a test can see what reached
-//! the model. Scripted sessions get the UI tools (`ui_show`, …; ADR 0064).
+//! the model. Scripted sessions get the UI tools (`ui_show`, …; ADR 0064). `catalog` is what the
+//! provider's catalog lists (empty by default), so a scripted session advertises its models and
+//! efforts (ADR 0074); list `scripted-model` (the session's model) too, or model and effort
+//! changes are refused as not in the catalog.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -77,6 +81,42 @@ pub enum Step {
     EchoInput,
 }
 
+/// A model the scripted catalog lists.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CatalogModel {
+    /// Model id.
+    pub id: String,
+    /// Display name (the id when absent).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Effort ladder, least first.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    /// Default effort.
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    /// Hidden from pickers.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+impl CatalogModel {
+    fn info(&self) -> ModelInfo {
+        ModelInfo {
+            id: self.id.clone(),
+            display_name: self.name.clone().unwrap_or_else(|| self.id.clone()),
+            context_window: None,
+            efforts: self.efforts.clone(),
+            default_effort: self.default_effort.clone(),
+            tiers: Vec::new(),
+            tools: true,
+            images: false,
+            hidden: self.hidden,
+            native: None,
+        }
+    }
+}
+
 /// A completion source delay.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Delay {
@@ -107,11 +147,19 @@ pub struct Script {
     /// Workspace of the seeded session, when not the launch directory.
     #[serde(default)]
     pub seed_workspace: Option<String>,
+    /// What the provider's catalog lists.
+    #[serde(default)]
+    pub catalog: Vec<CatalogModel>,
+    /// Offer code mode as a host with the worker would, whose own setting is `off` (ADR 0076): a
+    /// session gets it only when it asks (`--code-mode`). No cell runs: the worker path is not real.
+    #[serde(default)]
+    pub code_worker: bool,
 }
 
 struct Scripted {
     responses: Mutex<VecDeque<Vec<Step>>>,
     counter: Mutex<u64>,
+    catalog: Vec<ModelInfo>,
 }
 
 /// The request's last user text.
@@ -182,7 +230,8 @@ impl ModelProvider for Scripted {
     }
 
     fn catalog(&self) -> LlmFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
-        Box::pin(async { Ok(Vec::new()) })
+        let catalog = self.catalog.clone();
+        Box::pin(async move { Ok(catalog) })
     }
 
     fn stream(&self, request: LlmRequest) -> LlmFuture<'_, Result<EventStream, LlmError>> {
@@ -283,6 +332,7 @@ async fn seed(store: &MemoryStore, spec: &SessionSpec, items: usize) -> Result<S
         title: Some("seeded".into()),
         parent: None,
         agent: None,
+        code_mode: None,
     };
     store.create(meta).await.map_err(|e| e.to_string())?;
     let events: Vec<SessionEvent> = (0..items)
@@ -321,7 +371,8 @@ pub async fn run(path: &Path, args: &TuiArgs) -> Result<i32, String> {
     if script.seed_items > 0 {
         options.attach = Some(seed(&store, &seed_spec, script.seed_items).await?);
     }
-    let provider = Arc::new(Scripted { responses: Mutex::new(script.responses.into()), counter: Mutex::new(0) });
+    let catalog = script.catalog.iter().map(CatalogModel::info).collect();
+    let provider = Arc::new(Scripted { responses: Mutex::new(script.responses.into()), counter: Mutex::new(0), catalog });
     let providers: crate::host::ProviderFactory =
         Arc::new(move |_name, _model| Ok((Arc::clone(&provider) as Arc<dyn ModelProvider>, "scripted-model".to_owned())));
     let host = SessionHost::new(HostConfig {
@@ -332,7 +383,15 @@ pub async fn run(path: &Path, args: &TuiArgs) -> Result<i32, String> {
             workspaces(),
             args.max_requests,
             crate::resources::ResourceConfig::user(crate::cli::aim_home()),
-            NativeServices { tools: vec![crate::ui::tools_factory()], ..NativeServices::default() },
+            NativeServices {
+                tools: vec![crate::ui::tools_factory()],
+                code: script.code_worker.then(|| crate::host::CodeConfig {
+                    worker: "/nonexistent/aim-coderun".into(),
+                    user_programs: std::env::temp_dir().join("aim-script-programs"),
+                    mode: crate::coderun::mode::Mode::Off,
+                }),
+                ..NativeServices::default()
+            },
         ),
         update_capacity: 4096,
     });

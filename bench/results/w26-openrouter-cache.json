@@ -1,0 +1,146 @@
+{
+  "cohorts": {
+    "after": {
+      "cached_tokens": 5120,
+      "cost_micro_usd": 3180,
+      "input_tokens": 11710,
+      "probe_test_injected_into_baseline_archive": false,
+      "source_sha": "7fa1d2b7c4d6febac263511637230bfdcee1058e",
+      "steps": [
+        {
+          "cached_tokens": 0,
+          "cost_micro_usd": 443,
+          "input_tokens": 1099,
+          "step": 1
+        },
+        {
+          "cached_tokens": 0,
+          "cost_micro_usd": 449,
+          "input_tokens": 1115,
+          "step": 2
+        },
+        {
+          "cached_tokens": 0,
+          "cost_micro_usd": 456,
+          "input_tokens": 1131,
+          "step": 3
+        },
+        {
+          "cached_tokens": 1024,
+          "cost_micro_usd": 155,
+          "input_tokens": 1147,
+          "step": 4
+        },
+        {
+          "cached_tokens": 0,
+          "cost_micro_usd": 468,
+          "input_tokens": 1163,
+          "step": 5
+        },
+        {
+          "cached_tokens": 1024,
+          "cost_micro_usd": 168,
+          "input_tokens": 1179,
+          "step": 6
+        },
+        {
+          "cached_tokens": 1024,
+          "cost_micro_usd": 174,
+          "input_tokens": 1195,
+          "step": 7
+        },
+        {
+          "cached_tokens": 1024,
+          "cost_micro_usd": 180,
+          "input_tokens": 1211,
+          "step": 8
+        },
+        {
+          "cached_tokens": 1024,
+          "cost_micro_usd": 187,
+          "input_tokens": 1227,
+          "step": 9
+        },
+        {
+          "cached_tokens": 0,
+          "cost_micro_usd": 500,
+          "input_tokens": 1243,
+          "step": 10
+        }
+      ]
+    },
+    "before": {
+      "cached_tokens": 5120,
+      "cost_micro_usd": 3180,
+      "input_tokens": 11710,
+      "probe_test_injected_into_baseline_archive": true,
+      "source_sha": "263efb6bf03db41f50d9205aa120ff13934a7d29",
+      "steps": [
+        {
+          "cached_tokens": 0,
+          "cost_micro_usd": 443,
+          "input_tokens": 1099,
+          "step": 1
+        },
+        {
+          "cached_tokens": 0,
+          "cost_micro_usd": 449,
+          "input_tokens": 1115,
+          "step": 2
+        },
+        {
+          "cached_tokens": 0,
+          "cost_micro_usd": 456,
+          "input_tokens": 1131,
+          "step": 3
+        },
+        {
+          "cached_tokens": 0,
+          "cost_micro_usd": 462,
+          "input_tokens": 1147,
+          "step": 4
+        },
+        {
+          "cached_tokens": 1024,
+          "cost_micro_usd": 161,
+          "input_tokens": 1163,
+          "step": 5
+        },
+        {
+          "cached_tokens": 0,
+          "cost_micro_usd": 475,
+          "input_tokens": 1179,
+          "step": 6
+        },
+        {
+          "cached_tokens": 1024,
+          "cost_micro_usd": 174,
+          "input_tokens": 1195,
+          "step": 7
+        },
+        {
+          "cached_tokens": 1024,
+          "cost_micro_usd": 180,
+          "input_tokens": 1211,
+          "step": 8
+        },
+        {
+          "cached_tokens": 1024,
+          "cost_micro_usd": 187,
+          "input_tokens": 1227,
+          "step": 9
+        },
+        {
+          "cached_tokens": 1024,
+          "cost_micro_usd": 193,
+          "input_tokens": 1243,
+          "step": 10
+        }
+      ]
+    }
+  },
+  "method": "ignored live provider test; same ten serial requests and stable instruction/session prefix",
+  "model": "openai/gpt-4.1-mini",
+  "prompt_cache_key_field_configured": false,
+  "session_id_stable": true
+}

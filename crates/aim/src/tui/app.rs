@@ -10,14 +10,18 @@ use std::collections::BTreeMap;
 
 use aim_proto::conversation::{Item, Part, RateLimits, StopReason};
 use aim_proto::daemon::{
-    Location, Persistence, PromptOutcome, SessionConfigParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
+    Location, Persistence, PromptOutcome, SessionConfigParams, SessionOptions, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
+use aim_proto::event::CodeModeSetting;
 use aim_proto::ui::model::{Change, Surface, Surfaces};
 use aim_proto::ui::{Placement, UiAction, UiMessage};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use aim_kernel::switch::AutoEffort;
+
+use super::choices::{self, SwitchTo};
 use super::commands::{self, COMMANDS};
-use super::complete::{self, Candidate, Completed, Context, Kind, Request, Trigger};
+use super::complete::{self, Candidate, Completed, Context, Hint, Kind, Request, Trigger};
 use super::composer::Composer;
 use super::markdown::RenderOpts;
 use super::surfaces::{self, Slot};
@@ -147,6 +151,9 @@ pub enum Effect {
     SaveHistory(String),
     /// Read the history file (asked once, when a persistent session is first attached).
     LoadHistory,
+    /// Clear the terminal for `/clear`: the visible screen and, where the terminal allows, its
+    /// scrollback. Comes before the effects that start the next session.
+    ClearScreen,
     /// Exit.
     Quit,
 }
@@ -170,6 +177,13 @@ pub struct SessionView {
     pub state: SessionState,
     /// Kept or ephemeral.
     pub persistence: Persistence,
+    /// What it can switch to, once it said (ADR 0074).
+    pub options: Option<SessionOptions>,
+    /// The model changed after `options` arrived: their efforts are the old model's until the
+    /// session sends new ones.
+    pub stale_efforts: bool,
+    /// The code mode the host gave it (ADR 0076), when its backend has one.
+    pub code_mode: Option<CodeModeSetting>,
 }
 
 /// Where a sent prompt is, from the UI's point of view.
@@ -383,8 +397,21 @@ pub struct App {
     pending_deliveries: usize,
     /// Effects raised inside state changes, returned by the next `handle`.
     outbox: Vec<Effect>,
-    models: Vec<String>,
-    efforts: Vec<String>,
+    /// Models seen so far, by provider: completion until a session sends its options.
+    models: Vec<(String, String)>,
+    /// Efforts seen so far, by provider.
+    efforts: Vec<(String, String)>,
+    /// The session being created or attached, as far as it is known.
+    opening: Option<Opening>,
+}
+
+/// A session being opened: the spec it is created from, or the provider of a picked one.
+#[derive(Clone, Debug, Default)]
+struct Opening {
+    /// Its provider, when known.
+    provider: Option<String>,
+    /// What it is created from (`None` when an existing session is attached).
+    spec: Option<SessionSpec>,
 }
 
 /// The history file's state: read only once a persistent session needs it.
@@ -437,10 +464,9 @@ impl App {
     pub fn new(theme: Theme, config: AppConfig, fullscreen: bool) -> Self {
         let composer = Composer::default();
         let bound = (config.spec.workspace.clone(), config.spec.location == Location::Local);
-        let mut models = Vec::new();
-        models.extend(config.spec.model.clone());
-        let mut efforts = Vec::new();
-        efforts.extend(config.spec.effort.clone());
+        let provider = &config.spec.provider;
+        let models = config.spec.model.iter().map(|m| (provider.clone(), m.clone())).collect();
+        let efforts = config.spec.effort.iter().map(|e| (provider.clone(), e.clone())).collect();
         Self {
             theme,
             config,
@@ -481,6 +507,7 @@ impl App {
             outbox: Vec::new(),
             models,
             efforts,
+            opening: None,
         }
     }
 
@@ -501,6 +528,7 @@ impl App {
 
     fn create(&mut self, spec: SessionSpec) -> Effect {
         self.connecting = true;
+        self.opening = Some(Opening { provider: Some(spec.provider.clone()), spec: Some(spec.clone()) });
         Effect::Create { spec, attempt: self.next_attempt() }
     }
 
@@ -559,6 +587,11 @@ impl App {
 
     fn notice(&mut self, level: Level, text: impl Into<String>) {
         self.transcript.push(Entry::Notice { level, text: text.into() });
+    }
+
+    /// Shows a warning in the transcript (e.g. an invalid `AIM_CODE_MODE` at start, ADR 0076).
+    pub fn warn(&mut self, text: impl Into<String>) {
+        self.notice(Level::Warn, text);
     }
 
     /// Applies one input.
@@ -657,6 +690,7 @@ impl App {
     /// Creating or attaching failed: prompts waiting for it go back to the composer.
     fn connection_failed(&mut self, message: &str) {
         self.connecting = false;
+        self.opening = None;
         let queued: Vec<String> = std::mem::take(&mut self.queued).iter().map(|q| q.text().to_owned()).collect();
         if !queued.is_empty() {
             self.refill(&queued);
@@ -696,19 +730,24 @@ impl App {
         }
     }
 
-    fn remember_config(&mut self, model: &str, effort: Option<&str>) {
-        if !self.models.iter().any(|m| m == model) {
-            self.models.push(model.to_owned());
+    /// Records a model (and effort) seen for `provider`, for completion before a session sends its
+    /// options.
+    fn remember_config(&mut self, provider: &str, model: &str, effort: Option<&str>) {
+        let seen = (provider.to_owned(), model.to_owned());
+        if !model.is_empty() && !self.models.contains(&seen) {
+            self.models.push(seen);
         }
-        if let Some(effort) = effort
-            && !self.efforts.iter().any(|e| e == effort)
-        {
-            self.efforts.push(effort.to_owned());
+        if let Some(effort) = effort {
+            let seen = (provider.to_owned(), effort.to_owned());
+            if !self.efforts.contains(&seen) {
+                self.efforts.push(seen);
+            }
         }
     }
 
     fn on_attached(&mut self, summary: &SessionSummary, items: &[Item], surfaces: Vec<Surface>, resync: bool) -> Vec<Effect> {
         self.connecting = false;
+        let opening = if resync { None } else { self.opening.take() };
         let meta = &summary.meta;
         let same = self.session.as_ref().is_some_and(|s| s.id == meta.id);
         if resync && same {
@@ -752,17 +791,29 @@ impl App {
         }
         let location = location_of(&meta.location);
         let local = location == Location::Local;
+        let same = self.session.as_ref().filter(|s| s.id == meta.id);
+        // The effort it was created with; the configured one only belongs to its own provider.
+        let effort = same.and_then(|s| s.effort.clone()).or_else(|| match &opening {
+            Some(Opening { spec: Some(spec), .. }) => spec.effort.clone(),
+            _ => self.config.spec.effort.clone().filter(|_| meta.provider == self.config.spec.provider),
+        });
+        // Options belong to their session: another one's never linger (ADR 0074). A model that
+        // changed while the stream was down makes the kept ladder another model's.
+        let (options, stale_efforts) = same.map_or((None, false), |s| (s.options.clone(), s.stale_efforts || s.model != meta.model));
         self.session = Some(SessionView {
             id: meta.id.clone(),
             workspace: meta.workspace.clone(),
             provider: meta.provider.clone(),
             location,
             model: meta.model.clone(),
-            effort: self.session.as_ref().filter(|s| s.id == meta.id).and_then(|s| s.effort.clone()).or(self.config.spec.effort.clone()),
+            effort,
             state: summary.state,
             persistence: summary.persistence,
+            options,
+            stale_efforts,
+            code_mode: meta.code_mode,
         });
-        self.remember_config(&meta.model.clone(), None);
+        self.remember_config(&meta.provider, &meta.model, None);
         if (meta.workspace.clone(), local) != self.bound {
             self.bound = (meta.workspace.clone(), local);
             self.outbox.push(Effect::Rebind { workspace: meta.workspace.clone(), local });
@@ -854,6 +905,12 @@ impl App {
                 self.transcript.push_item(&item);
             }
             SessionUpdate::ToolStarted { .. } | SessionUpdate::ToolFinished { .. } | SessionUpdate::SteerQueued => {}
+            SessionUpdate::Options { options } => {
+                if let Some(session) = &mut self.session {
+                    session.options = Some(options);
+                    session.stale_efforts = false;
+                }
+            }
             SessionUpdate::Ui { message } => self.on_ui(&message.message),
             // Which chips went out is told by the user items that follow, not by position: the
             // oldest chip may be a turn's first prompt whose answer is merely late.
@@ -868,8 +925,11 @@ impl App {
             }
             SessionUpdate::RateLimits { limits } => self.limits = Some(limits),
             SessionUpdate::ConfigChanged { model, effort, .. } => {
-                self.remember_config(&model, effort.as_deref());
+                let provider = self.session.as_ref().map(|s| s.provider.clone()).unwrap_or_default();
+                self.remember_config(&provider, &model, effort.as_deref());
                 if let Some(session) = &mut self.session {
+                    // Another model has another ladder: the session sends it next.
+                    session.stale_efforts |= session.model != model;
                     session.model.clone_from(&model);
                     session.effort.clone_from(&effort);
                 }
@@ -1230,8 +1290,9 @@ impl App {
         match result {
             Ok(sessions) => {
                 for s in &sessions {
-                    if !self.models.contains(&s.meta.model) {
-                        self.models.push(s.meta.model.clone());
+                    let seen = (s.meta.provider.clone(), s.meta.model.clone());
+                    if !s.meta.model.is_empty() && !self.models.contains(&seen) {
+                        self.models.push(seen);
                     }
                 }
                 picker.sessions = Some(sessions);
@@ -1333,20 +1394,48 @@ impl App {
                 Vec::new()
             }
             ("model", Some(_)) => self.configure(raw, Some(arg.to_owned()), None),
-            ("effort", Some(_)) => self.configure(raw, None, Some(arg.to_owned())),
-            ("new", _) => {
-                // A new session like the attached one: same provider, place, workspace and model.
-                let mut spec = self.config.spec.clone();
-                if let Some(s) = &self.session {
-                    spec.provider.clone_from(&s.provider);
-                    spec.location = s.location.clone();
-                    // As private as the attached session: an ephemeral one never begets a kept one.
-                    spec.persistence = s.persistence;
-                    spec.workspace.clone_from(&s.workspace);
-                    spec.model = Some(s.model.clone());
-                    spec.effort.clone_from(&s.effort);
+            ("effort", Some(_)) => {
+                // What the session told decides here; what it has not told, it decides (ADR 0074).
+                let (auto, _) = self.auto_effort();
+                let (model, ladder) = self.known_ladder().map_or((String::new(), Vec::new()), |(model, ladder)| (model, ladder.to_vec()));
+                // An ACP agent resolves values itself (ADR 0075); the native loop matches exactly.
+                let canonical = self.session.as_ref().is_none_or(|s| !s.provider.starts_with(crate::acp::ACP_PREFIX));
+                if let Some(value) = choices::effort_to_send(&ladder, auto, arg, canonical) {
+                    return self.configure(raw, None, Some(value));
+                }
+                let offered: Vec<String> = choices::effort_hints(Some(&ladder), &[], auto, "").into_iter().map(|h| h.value).collect();
+                let message = format!("effort `{arg}` is not offered by {model} (offers: {})", offered.join(", "));
+                self.refill(&[raw.to_owned()]);
+                self.notice(Level::Error, message);
+                Vec::new()
+            }
+            ("provider", _) if arg.is_empty() => {
+                let current = self.target_provider().unwrap_or("unknown").to_owned();
+                let known = crate::providers::KNOWN.join(", ");
+                self.notice(Level::Info, format!("provider: {current} · usage: /provider <id> (known: {known})"));
+                Vec::new()
+            }
+            ("provider", _) => {
+                // The kernel decides what the new session keeps (ADR 0074): the place and privacy,
+                // never a model or effort chosen under the old provider.
+                let Some(spec) = self.derive(&SwitchTo::Provider(arg.to_owned())) else {
+                    self.notice(Level::Info, format!("already on provider {arg}"));
+                    return Vec::new();
+                };
+                if !crate::providers::KNOWN.contains(&arg) {
+                    let known = crate::providers::KNOWN.join(", ");
+                    self.notice(Level::Error, format!("unknown provider `{arg}` (known: {known})"));
+                    return Vec::new();
                 }
                 vec![self.create(spec)]
+            }
+            // A new session like the attached one; the chat so far stays above it.
+            ("new", _) => self.derive(&SwitchTo::New).map(|spec| self.create(spec)).into_iter().collect(),
+            // The same, on a cleared chat and screen.
+            ("clear", _) => {
+                let Some(spec) = self.derive(&SwitchTo::Clear) else { return Vec::new() };
+                self.clear_chat();
+                vec![Effect::ClearScreen, self.create(spec)]
             }
             ("sessions", _) => {
                 self.picker = Some(Picker::default());
@@ -1382,6 +1471,92 @@ impl App {
     fn quit(&mut self) -> Vec<Effect> {
         self.quitting = true;
         vec![Effect::Quit]
+    }
+
+    /// The session a switch creates (ADR 0074): from the one being created while a create is in
+    /// flight, else from the attached one (else the configured spec). `None`: nothing to create.
+    fn derive(&self, to: &SwitchTo) -> Option<SessionSpec> {
+        match self.opening.as_ref().and_then(|o| o.spec.as_ref()).filter(|_| self.connecting) {
+            Some(pending) => choices::derive_spec(None, pending, to),
+            None => choices::derive_spec(self.session.as_ref(), &self.config.spec, to),
+        }
+    }
+
+    /// The provider completion and `/provider` refer to: the session being opened (when known),
+    /// else the attached one, else the configured one.
+    fn target_provider(&self) -> Option<&str> {
+        if self.connecting {
+            return self.opening.as_ref().and_then(|o| o.provider.as_deref());
+        }
+        Some(self.session.as_ref().map_or(self.config.spec.provider.as_str(), |s| s.provider.as_str()))
+    }
+
+    /// The attached session's options, unless another session is being opened.
+    fn current_options(&self) -> Option<&SessionOptions> {
+        self.session.as_ref().filter(|_| !self.connecting).and_then(|s| s.options.as_ref())
+    }
+
+    /// The current model and its ladder, when the session told it and it is still current.
+    fn known_ladder(&self) -> Option<(String, &[aim_proto::daemon::ChoiceValue])> {
+        let session = self.session.as_ref().filter(|s| !self.connecting && !s.stale_efforts)?;
+        let ladder = session.options.as_ref()?.efforts.as_slice();
+        Some((session.model.clone(), ladder))
+    }
+
+    /// Whether the attached session takes `auto`, and what it does there: unknown until its
+    /// options arrive, and again after a model change until the next ones (ADR 0074).
+    fn auto_effort(&self) -> (AutoEffort, String) {
+        let options = self.session.as_ref().filter(|s| !self.connecting && !s.stale_efforts).and_then(|s| s.options.as_ref());
+        match options.map(|o| o.auto_effort.as_ref()) {
+            None => (AutoEffort::Unknown, String::new()),
+            Some(Some(detail)) => (AutoEffort::Taken, detail.clone()),
+            Some(None) => (AutoEffort::Refused, String::new()),
+        }
+    }
+
+    /// Values seen for the target provider.
+    fn seen(&self, list: &[(String, String)]) -> Vec<String> {
+        let provider = self.target_provider();
+        list.iter().filter(|(p, _)| Some(p.as_str()) == provider).map(|(_, value)| value.clone()).collect()
+    }
+
+    /// What a command's argument completes from.
+    fn hints(&self, command: &str) -> Vec<Hint> {
+        match command {
+            "model" => {
+                let models = self.current_options().map(|o| o.models.as_slice()).filter(|m| !m.is_empty());
+                choices::model_hints(models, &self.seen(&self.models))
+            }
+            "effort" => {
+                let (auto, detail) = self.auto_effort();
+                choices::effort_hints(self.known_ladder().map(|(_, ladder)| ladder), &self.seen(&self.efforts), auto, &detail)
+            }
+            "provider" => choices::provider_hints(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `/clear`: the chat, what streamed, the session's surfaces and counters are gone. The
+    /// session itself is left as `/new` leaves it.
+    fn clear_chat(&mut self) {
+        self.transcript.clear();
+        self.live_text.clear();
+        self.live_reasoning.clear();
+        self.steers.clear();
+        self.pending_deliveries = 0;
+        self.tokens = Tokens::default();
+        self.limits = None;
+        self.jev_effort = None;
+        self.request = 0;
+        self.turn_seconds = 0;
+        self.surfaces = Surfaces::default();
+        self.live_surfaces.clear();
+        self.toasts.clear();
+        self.focus = None;
+        self.scroll.offset = 0;
+        self.scroll.limit = 0;
+        self.hint = None;
+        self.invalidate_completion();
     }
 
     fn interrupt(&mut self) -> Vec<Effect> {
@@ -1434,8 +1609,7 @@ impl App {
         match found {
             Some(context) if self.popup.dismissed != Some(context.start) => {
                 let hints = match &context.trigger {
-                    Trigger::Argument { command } if command == "model" => self.models.clone(),
-                    Trigger::Argument { command } if command == "effort" => self.efforts.clone(),
+                    Trigger::Argument { command } => self.hints(command),
                     _ => Vec::new(),
                 };
                 if self.popup.context.as_ref().is_none_or(|c| c.trigger != context.trigger || c.start != context.start) {
@@ -1537,12 +1711,13 @@ impl App {
                 picker.selected = 0;
             }
             KeyCode::Enter => {
-                let chosen = picker.visible().get(picker.selected).map(|s| s.meta.id.clone());
+                let chosen = picker.visible().get(picker.selected).map(|s| (s.meta.id.clone(), s.meta.provider.clone()));
                 self.picker = None;
-                if let Some(id) = chosen {
+                if let Some((id, provider)) = chosen {
                     if self.session.as_ref().is_some_and(|s| s.id == id) {
                         return Vec::new();
                     }
+                    self.opening = Some(Opening { provider: Some(provider), spec: None });
                     return vec![self.attach(id, false)];
                 }
             }

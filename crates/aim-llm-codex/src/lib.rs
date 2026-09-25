@@ -255,7 +255,7 @@ impl CodexProvider {
         }
         let mut builder = Self::authorized(self.client.post(format!("{}/responses", self.config.base_url)), &credentials)
             .header(ACCEPT, "text/event-stream")
-            .json(&body);
+            .json(&wire::OrderedResponses(&body));
         // Turn state is scoped to (session, turn); without both it is neither sent nor kept.
         let turn = request.session_id.as_deref().zip(request.turn_id.as_deref());
         if let Some(session) = &request.session_id {

@@ -217,6 +217,7 @@ fn spec(persistence: Persistence) -> SessionSpec {
         effort: None,
         agent: None,
         persistence,
+        code_mode: None,
     }
 }
 
@@ -807,6 +808,15 @@ impl Backend for TwoStep {
 /// A host whose sessions run `TwoStep`, built once `gate` opens (open from the start when
 /// `None`); counts backend-session shutdowns.
 fn two_step_host(store: Arc<dyn SessionStore>, gate: Option<Arc<tokio::sync::Semaphore>>) -> (SessionHost, Arc<AtomicUsize>) {
+    two_step_host_with(store, gate, None)
+}
+
+/// [`two_step_host`] whose backends report `code_mode` (ADR 0076).
+fn two_step_host_with(
+    store: Arc<dyn SessionStore>,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+    code_mode: Option<aim_proto::event::CodeModeSetting>,
+) -> (SessionHost, Arc<AtomicUsize>) {
     let shutdowns = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&shutdowns);
     let backends: BackendFactory = Arc::new(move |request: BackendRequest| {
@@ -828,10 +838,34 @@ fn two_step_host(store: Arc<dyn SessionStore>, gate: Option<Arc<tokio::sync::Sem
                 location: "local".into(),
                 agent: None,
                 shutdown,
+                code_mode,
             })
         })
     });
     (SessionHost::new(HostConfig { store, backends, update_capacity: 256 }), shutdowns)
+}
+
+/// ADR 0076 §7 (codex review of T4c, B1): a resumed session reports the code mode its new backend
+/// gives it; a backend without code mode reports none, whatever the stored record says, and the
+/// stored record keeps what the session had.
+#[tokio::test]
+async fn a_resumed_session_reports_the_code_mode_its_new_backend_gives() {
+    use aim_proto::event::CodeModeSetting;
+
+    let store = Arc::new(MemoryStore::default());
+    let (first, _) = two_step_host_with(Arc::clone(&store) as Arc<dyn SessionStore>, None, Some(CodeModeSetting::On));
+    let created = first.create(spec(Persistence::Persistent)).await.unwrap();
+    assert_eq!(created.meta.code_mode, Some(CodeModeSetting::On));
+    let id = created.meta.id;
+    first.close(id.clone()).await.unwrap();
+    for (backend, shown) in [(None, None), (Some(CodeModeSetting::Off), Some(CodeModeSetting::Off))] {
+        let (host, _) = two_step_host_with(Arc::clone(&store) as Arc<dyn SessionStore>, None, backend);
+        let (resumed, _updates) = host.attach(id.clone()).await.unwrap();
+        assert_eq!(resumed.summary.meta.code_mode, shown, "the live summary follows the backend it resumed on");
+        host.close(id.clone()).await.unwrap();
+    }
+    let (stored, _) = store.load(id).await.unwrap();
+    assert_eq!(stored.code_mode, Some(CodeModeSetting::On), "the stored record keeps what the session had");
 }
 
 #[tokio::test]
@@ -948,6 +982,7 @@ async fn a_log_from_before_adr_0038_resumes_as_it_did() {
             title: None,
             parent: None,
             agent: None,
+            code_mode: None,
         };
         store.create(meta).await.unwrap();
         let body: EventBody = serde_json::from_value(json!({"kind": "config_changed", "model": "m1", "effort": effort})).unwrap();
@@ -1040,7 +1075,11 @@ fn composed_services() -> NativeServices {
     });
     NativeServices {
         tools: vec![mcp, board],
-        code: Some(aim::host::CodeConfig { worker: "/missing-test-worker".into(), user_programs: "/missing-test-programs".into() }),
+        code: Some(aim::host::CodeConfig {
+            worker: "/missing-test-worker".into(),
+            user_programs: "/missing-test-programs".into(),
+            mode: aim::coderun::mode::Mode::On,
+        }),
         ..NativeServices::default()
     }
 }
@@ -1159,4 +1198,186 @@ async fn extra_tool_factories_receive_the_connected_root_for_resume_stability() 
     let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
     assert_eq!(observed.lock().unwrap().as_slice(), ["/canonical/workspace"]);
     f.host.close(id).await.unwrap();
+}
+
+// ------------------------------------------------------------------------------------------------
+// ADR 0074: what a session can switch to
+// ------------------------------------------------------------------------------------------------
+
+fn options_of(update: &SessionUpdate) -> Option<&aim_proto::daemon::SessionOptions> {
+    match update {
+        SessionUpdate::Options { options } => Some(options),
+        _ => None,
+    }
+}
+
+fn values(choices: &[aim_proto::daemon::ChoiceValue]) -> Vec<&str> {
+    choices.iter().map(|c| c.value.as_str()).collect()
+}
+
+/// Options are published off the create path, replayed to every later attach, and re-sent with the
+/// new model's ladder when the model changes; hidden models are left out.
+#[tokio::test]
+async fn options_are_published_replayed_on_attach_and_follow_the_model() {
+    let m2 = ModelInfo {
+        id: "m2".into(),
+        display_name: "Model Two".into(),
+        efforts: vec!["minimal".into(), "high".into()],
+        default_effort: Some("high".into()),
+        context_window: Some(1_000_000),
+        ..ladder_model()
+    };
+    let hidden = ModelInfo { id: "internal".into(), hidden: true, ..ladder_model() };
+    let m3 = ModelInfo { id: "m3".into(), display_name: "m3".into(), ..ladder_model() };
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, Vec::new(), vec![ladder_model(), m2, hidden, m3]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let (first, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    // Either the snapshot has them or they follow on the stream, never both.
+    let options = match first.options {
+        Some(options) => options,
+        None => until(&mut updates, |u| options_of(u).is_some()).await.last().and_then(options_of).cloned().unwrap(),
+    };
+    assert_eq!(values(&options.models), ["m1", "m2", "m3"], "hidden models are left out");
+    assert_eq!(options.models[1].name.as_deref(), Some("Model Two"));
+    assert_eq!(options.models[1].description.as_deref(), Some("1M context"));
+    assert_eq!(options.models[0].name, None, "a display name equal to the id adds nothing");
+    assert_eq!(values(&options.efforts), ["low", "medium", "high"], "the ladder of the model in force");
+    assert_eq!(
+        options.auto_effort.as_deref(),
+        Some("unpinned: kept until a model change, then the provider's default"),
+        "the native loop takes `auto`; without a decider it only unpins the effort"
+    );
+
+    // A client attaching later gets them in its snapshot.
+    let (late, _late_updates) = f.host.attach(id.clone()).await.unwrap();
+    assert_eq!(late.options.as_ref(), Some(&options));
+
+    // Switching models re-sends the options with that model's ladder.
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m2".into()), effort: None }).await.unwrap();
+    let got = until(&mut updates, |u| options_of(u).is_some()).await;
+    let switched = got.last().and_then(options_of).unwrap();
+    assert_eq!(values(&switched.efforts), ["minimal", "high"]);
+    assert_eq!(switched.efforts[1].description.as_deref(), Some("default"));
+    assert_eq!(values(&switched.models), ["m1", "m2", "m3"]);
+    let (again, _) = f.host.attach(id.clone()).await.unwrap();
+    assert_eq!(again.options.as_ref(), Some(switched), "the latest options are replayed");
+
+    // A model with the same options still gets them sent: clients learn its ladder is current.
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m1".into()), effort: None }).await.unwrap();
+    until(&mut updates, |u| options_of(u).is_some()).await;
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m3".into()), effort: None }).await.unwrap();
+    let got = until(&mut updates, |u| options_of(u).is_some()).await;
+    assert_eq!(values(&got.last().and_then(options_of).unwrap().efforts), ["low", "medium", "high"], "m3 shares m1's ladder");
+
+    // An effort change keeps the model: nothing new is sent.
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("high".into()) }).await.unwrap();
+    let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
+    assert!(got.iter().all(|u| options_of(u).is_none()), "{got:?}");
+    f.host.close(id).await.unwrap();
+    let rest = until(&mut updates, |u| matches!(u, SessionUpdate::StateChanged { state: SessionState::Closed })).await;
+    assert!(rest.iter().all(|u| options_of(u).is_none()), "unchanged options are not sent again: {rest:?}");
+}
+
+/// A provider whose catalog is empty (or that never answers) sends no options, and a session
+/// whose catalog stalls still starts and runs turns.
+#[tokio::test]
+async fn a_session_without_a_catalog_sends_no_options_and_is_not_held_up() {
+    let f = fixture(vec![text("hello")]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let (first, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    assert_eq!(first.options, None);
+    f.host.prompt(id.clone(), user("hi")).await.unwrap();
+    let got = until(&mut updates, is_idle).await;
+    assert!(got.iter().all(|u| options_of(u).is_none()), "{got:?}");
+
+    let stalled = fixture(vec![text("hello")]);
+    stalled.provider.stall_catalog.store(true, Ordering::SeqCst);
+    let id =
+        tokio::time::timeout(Duration::from_secs(10), stalled.host.create(spec(Persistence::Ephemeral))).await.unwrap().unwrap().meta.id;
+    let (first, mut updates) = tokio::time::timeout(Duration::from_secs(1), stalled.host.attach(id.clone())).await.unwrap().unwrap();
+    assert_eq!(first.options, None, "no options yet, and attach did not wait for them");
+    stalled.host.prompt(id, user("hi")).await.unwrap();
+    until(&mut updates, is_idle).await;
+}
+
+/// A client attaching after a model change is told the model in force, by the live session and by
+/// one resumed from the store (REV: the summary kept the model the session began with).
+#[tokio::test]
+async fn attach_reports_the_model_in_force_after_a_change_and_a_resume() {
+    let m2 = ModelInfo { id: "m2".into(), display_name: "m2".into(), ..ladder_model() };
+    let store = Arc::new(MemoryStore::default());
+    let first = fixture_full(Arc::clone(&store) as Arc<dyn SessionStore>, Arc::clone(&store), Vec::new(), vec![ladder_model(), m2.clone()]);
+    let id = first.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    first.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m2".into()), effort: None }).await.unwrap();
+    let (attached, _) = first.host.attach(id.clone()).await.unwrap();
+    assert_eq!(attached.summary.meta.model, "m2");
+    let listed = first.host.list(SessionListParams::default()).await.unwrap();
+    assert_eq!(listed.iter().find(|s| s.meta.id == id).map(|s| s.meta.model.as_str()), Some("m2"));
+    first.host.shutdown().await.unwrap();
+
+    // A restarted host resumes it with the model its log ended with, and says so.
+    let second = fixture_full(Arc::clone(&store) as Arc<dyn SessionStore>, store, Vec::new(), vec![ladder_model(), m2]);
+    let (resumed, _) = second.host.attach(id).await.unwrap();
+    assert_eq!(resumed.summary.meta.model, "m2");
+}
+
+/// Jev's `auto`: a persistent session with a decider says Jev picks the effort.
+#[tokio::test]
+async fn options_say_what_auto_does_in_an_advised_session() {
+    let counting = Arc::new(Counting::default());
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_services(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, Vec::new(), vec![ladder_model()], advised(&counting));
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (first, mut updates) = f.host.attach(id).await.unwrap();
+    let options = match first.options {
+        Some(options) => options,
+        None => until(&mut updates, |u| options_of(u).is_some()).await.last().and_then(options_of).cloned().unwrap(),
+    };
+    assert_eq!(options.auto_effort.as_deref(), Some("Jev picks the effort per request"));
+}
+
+/// REV-T1b B2: clients attaching while the model keeps changing never see a model next to another
+/// model's ladder, whether from their snapshot or from the updates that follow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attaches_racing_model_changes_never_pair_a_model_with_another_ladder() {
+    let m2 = ModelInfo { id: "m2".into(), display_name: "m2".into(), efforts: vec!["minimal".into(), "max".into()], ..ladder_model() };
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, Vec::new(), vec![ladder_model(), m2]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let ladder_of =
+        |options: &aim_proto::daemon::SessionOptions| if values(&options.efforts) == ["low", "medium", "high"] { "m1" } else { "m2" };
+    let switcher = {
+        let (host, id) = (f.host.clone(), id.clone());
+        tokio::spawn(async move {
+            for round in 0..40 {
+                let model = if round % 2 == 0 { "m2" } else { "m1" };
+                host.set_config(SessionConfigParams { session: id.clone(), model: Some(model.into()), effort: None }).await.unwrap();
+            }
+        })
+    };
+    let mut attaches = Vec::new();
+    for _ in 0..40 {
+        let (host, id) = (f.host.clone(), id.clone());
+        attaches.push(tokio::spawn(async move { host.attach(id).await.unwrap() }));
+        tokio::task::yield_now().await;
+    }
+    switcher.await.unwrap();
+    // Let the last lookup land, then end every stream.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    f.host.close(id).await.unwrap();
+    for attach in attaches {
+        let (snapshot, mut updates) = attach.await.unwrap();
+        let mut model = snapshot.summary.meta.model.clone();
+        if let Some(options) = &snapshot.options {
+            assert_eq!(ladder_of(options), model, "the snapshot pairs its model with its own ladder");
+        }
+        for update in until(&mut updates, |u| matches!(u, SessionUpdate::StateChanged { state: SessionState::Closed })).await {
+            match update {
+                SessionUpdate::ConfigChanged { model: now, .. } => model = now,
+                SessionUpdate::Options { options } => assert_eq!(ladder_of(&options), model, "options follow their model"),
+                _ => {}
+            }
+        }
+    }
 }

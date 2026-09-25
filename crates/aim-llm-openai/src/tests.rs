@@ -241,7 +241,7 @@ async fn an_idle_stream_times_out_as_transport() -> Result<(), Box<dyn std::erro
     let (base, _server) = serve(partial, Some(Duration::from_secs(5))).await?;
     let mut profile = local(base);
     profile.quirks.idle_timeout_secs = Some(1);
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let error = collect(&OpenAiProvider::new(profile)?, request()).await.err().ok_or("expected an error")?;
     assert_eq!(error.kind, LlmErrorKind::Transport);
     assert!(started.elapsed() < Duration::from_secs(4));
@@ -323,6 +323,17 @@ const CATALOG: &str = r#"{"data":[
     {"id":"text/only","architecture":{"input_modalities":["text"]},"supported_parameters":["tools"]},
     {"id":"vision/model","architecture":{"input_modalities":["text","image"]},"supported_parameters":["tools"]}
 ]}"#;
+
+#[tokio::test]
+async fn concurrent_catalog_callers_share_one_fetch() -> Result<(), Box<dyn std::error::Error>> {
+    let (base, server) = serve(json_response("200 OK", CATALOG), None).await?;
+    let provider = OpenAiProvider::new(local(base))?;
+    let (first, second) = tokio::join!(provider.catalog(), provider.catalog());
+    assert_eq!(first?, second?);
+    assert_eq!(provider.catalog().await?.len(), 2);
+    assert!(String::from_utf8_lossy(&server.await?).starts_with("GET /v1/models"));
+    Ok(())
+}
 
 /// REV4-B Minor 5: a model the provider has not seen yet learns its image support from the
 /// catalog before a tool-result image is mapped; a text-only model gets the placeholder.
@@ -444,5 +455,43 @@ async fn env_referenced_headers_are_validated() -> Result<(), Box<dyn std::error
     assert!(header("x-a = { env = \"A\", value = \"literal\" }").is_err(), "unknown key");
     assert_eq!(OpenAiProvider::new(header("x-a = { env = \"\" }")?).err().map(|e| e.kind), Some(LlmErrorKind::InvalidRequest));
     assert_eq!(OpenAiProvider::new(header("Authorization = { env = \"A\" }")?).err().map(|e| e.kind), Some(LlmErrorKind::InvalidRequest));
+    Ok(())
+}
+
+/// Ten serial real requests with a stable prefix and session affinity. Only numeric usage is
+/// printed so this probe can compare provider-reported cache reuse across source revisions.
+#[tokio::test]
+#[ignore = "live: ten paid OpenRouter requests for the W26 cache probe"]
+async fn live_openrouter_cache_ten_steps() -> Result<(), LlmError> {
+    let provider = OpenAiProvider::new(Profile::openrouter())?;
+    let mut request = request();
+    request.instructions = format!("Reply OK to each step. {}", "Keep this instruction prefix stable. ".repeat(180));
+    request.cache_key = Some("aim:w26:cache-probe".into());
+    request.session_id = Some("aim-w26-cache-probe".into());
+    request.max_output_tokens = Some(32);
+    let mut totals = (0_u64, 0_u64, 0_u64);
+    for step in 1..=10 {
+        if step > 1 {
+            request.items.push(Item::Assistant { id: None, parts: vec![Part::Text { text: "OK".into() }], native: None });
+            request.items.push(Item::User { parts: vec![Part::Text { text: format!("Reply OK to step {step}.") }] });
+        }
+        request.turn_id = Some(format!("turn-{step}"));
+        let events = collect(&provider, request.clone()).await?;
+        let usage = events
+            .iter()
+            .find_map(|event| if let StreamEvent::Completed { usage, .. } = event { Some(usage) } else { None })
+            .ok_or_else(|| LlmError::new(LlmErrorKind::Protocol, "live cache probe has no completion usage"))?;
+        totals.0 = totals.0.saturating_add(usage.input_tokens);
+        totals.1 = totals.1.saturating_add(usage.cached_input_tokens);
+        totals.2 = totals.2.saturating_add(usage.cost_micro_usd.unwrap_or(0));
+        eprintln!(
+            "cache step={step} input={} cached={} cost_micro_usd={:?}",
+            usage.input_tokens, usage.cached_input_tokens, usage.cost_micro_usd
+        );
+        if totals.2 > 100_000 {
+            return Err(LlmError::new(LlmErrorKind::InvalidRequest, "live cache probe exceeded its $0.10 spend guard"));
+        }
+    }
+    eprintln!("cache ten steps input={} cached={} cost_micro_usd={}", totals.0, totals.1, totals.2);
     Ok(())
 }

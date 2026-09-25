@@ -1,10 +1,14 @@
-//! Git-backed saved code-mode programs (ADR 0018).
+//! Saved code-mode programs (ADR 0018, ADR 0066).
 //!
-//! A program's source and manifest live in a Git repository, while trusted content hashes live
-//! outside that repository. Pulling a changed program therefore cannot import its trust. Running
-//! a program must use [`ProgramTools`], so both the recorded grant and the current host's tool
-//! catalog constrain nested calls. The underlying host remains responsible for session policy,
+//! User programs live in a local Git repository under `~/.aim/programs`. Project programs are
+//! plain files in the workspace's `.agents/programs`, read and written through the session's
+//! workspace ([`project`]); the project's own version control tracks them. Trusted content hashes
+//! live outside both, so pulling a changed program cannot import its trust. Running a program
+//! must use [`ProgramTools`], so both the recorded grant and the current host's tool catalog
+//! constrain nested calls. The underlying host remains responsible for session policy,
 //! dispatcher hooks, audit, and aimx workspace enforcement.
+
+pub mod project;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -26,13 +30,13 @@ use crate::agent::tools::BoxFuture;
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
-/// Which repository owns a program.
+/// Which store owns a program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgramScope {
     /// The user's `~/.aim/programs` repository.
     User,
-    /// The workspace's `.agents/programs` repository.
+    /// The workspace's `.agents/programs` directory, through the workspace.
     Project,
 }
 
@@ -47,7 +51,9 @@ pub enum ProgramLanguage {
 }
 
 impl ProgramLanguage {
-    const fn filename(self) -> &'static str {
+    /// The source file's name.
+    #[must_use]
+    pub const fn filename(self) -> &'static str {
         match self {
             Self::JavaScript => "main.js",
             Self::TypeScript => "main.ts",
@@ -185,6 +191,8 @@ impl ToolHost for ProgramTools {
 pub enum ProgramError {
     /// Invalid input or repository content.
     Invalid(String),
+    /// The workspace refused a write, or the session may not write.
+    Denied(String),
     /// A program or repository was absent.
     Missing(String),
     /// File-system failure.
@@ -201,6 +209,7 @@ impl fmt::Display for ProgramError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(reason) => write!(f, "invalid program: {reason}"),
+            Self::Denied(reason) => write!(f, "program not saved: {reason}"),
             Self::Missing(reason) => write!(f, "missing program: {reason}"),
             Self::Io(error) => write!(f, "program I/O: {error}"),
             Self::Toml(reason) => write!(f, "program TOML: {reason}"),
@@ -227,21 +236,92 @@ pub struct ConfiguredRemote {
     pub branch: String,
 }
 
-/// Git-backed user and optional project program repositories.
+/// The user's Git-backed program repository, and the local trust registry of every program.
 pub struct ProgramStore {
     user_root: PathBuf,
-    project_root: Option<PathBuf>,
     trust_path: PathBuf,
     writes: Mutex<()>,
 }
 
+/// Programs listed, and the entries that could not be loaded (`REV13a` L6).
+#[derive(Debug, Default)]
+pub struct Listing {
+    /// Valid programs.
+    pub programs: Vec<SavedProgram>,
+    /// One line per entry skipped, and why.
+    pub problems: Vec<String>,
+}
+
 impl ProgramStore {
-    /// Creates a store rooted at `~/.aim/programs` and, for a project, `.agents/programs`.
-    /// Paths are supplied rather than discovered so callers can bind the correct workspace.
+    /// Creates a store rooted at `~/.aim/programs`. The root is supplied rather than discovered,
+    /// so tests can bind a temporary one.
     #[must_use]
-    pub fn new(user_root: PathBuf, project_root: Option<PathBuf>) -> Self {
+    pub fn new(user_root: PathBuf) -> Self {
         let trust_path = user_root.with_file_name("program-trust.json");
-        Self { user_root, project_root, trust_path, writes: Mutex::new(()) }
+        Self { user_root, trust_path, writes: Mutex::new(()) }
+    }
+
+    /// Validates `manifest` and `source`, and encodes the manifest as it is stored.
+    ///
+    /// # Errors
+    /// An invalid manifest or source, or one over its size limit.
+    pub fn render(manifest: &ProgramManifest, source: &str) -> Result<String, ProgramError> {
+        validate_manifest(manifest, source)?;
+        let text = toml::to_string_pretty(manifest).map_err(|_| ProgramError::Toml("could not encode manifest".into()))?;
+        if text.len() > MAX_MANIFEST_BYTES {
+            return Err(ProgramError::Invalid("manifest exceeds 256 KiB".into()));
+        }
+        Ok(text)
+    }
+
+    /// Parses a stored manifest.
+    ///
+    /// # Errors
+    /// The manifest is not a valid `program.toml`.
+    pub fn parse_manifest(text: &str) -> Result<ProgramManifest, ProgramError> {
+        toml::from_str(text).map_err(|_| ProgramError::Toml("invalid manifest".into()))
+    }
+
+    /// The README a new program starts with, with its skill-compatible frontmatter.
+    #[must_use]
+    pub fn readme(slug: &str, manifest: &ProgramManifest) -> String {
+        format!(
+            "---\nname: {}\ndescription: {}\n---\n\n# {}\n",
+            json_yaml_string(slug),
+            json_yaml_string(&manifest.description),
+            manifest.name
+        )
+    }
+
+    /// A program from its stored files, checked against the trust registry.
+    ///
+    /// # Errors
+    /// Invalid files, or an unreadable trust registry.
+    pub fn assemble(&self, scope: ProgramScope, slug: &str, files: &project::ProgramFiles) -> Result<SavedProgram, ProgramError> {
+        validate_slug(slug)?;
+        let manifest = Self::parse_manifest(&files.manifest)?;
+        validate_manifest(&manifest, &files.source)?;
+        let sha256 = content_hash(&[files.manifest.as_bytes(), files.source.as_bytes(), files.readme.as_bytes()]);
+        let _guard = self.writes.lock().map_err(|_| ProgramError::Invalid("program store lock is poisoned".into()))?;
+        let trusted = self.trusted_hashes()?.contains(&sha256);
+        Ok(SavedProgram {
+            scope,
+            slug: slug.to_owned(),
+            manifest,
+            source: files.source.clone(),
+            readme: files.readme.clone(),
+            sha256,
+            trusted,
+        })
+    }
+
+    /// Trusts exactly this content hash, as saving a program does.
+    ///
+    /// # Errors
+    /// The trust registry cannot be updated.
+    pub fn trust_hash(&self, sha256: &str) -> Result<(), ProgramError> {
+        let _guard = self.writes.lock().map_err(|_| ProgramError::Invalid("program store lock is poisoned".into()))?;
+        self.add_trust(sha256)
     }
 
     /// Saves a program as one Git commit in its scope. This never contacts a remote.
@@ -253,17 +333,13 @@ impl ProgramStore {
     pub fn save(&self, scope: ProgramScope, slug: &str, manifest: &ProgramManifest, source: &str) -> Result<SavedProgram, ProgramError> {
         let _guard = self.writes.lock().map_err(|_| ProgramError::Invalid("program store lock is poisoned".into()))?;
         validate_slug(slug)?;
-        validate_manifest(manifest, source)?;
+        let manifest_text = Self::render(manifest, source)?;
         let root = self.root(scope)?;
         ensure_repository(root)?;
         let directory = program_directory(root, slug)?;
         fs::create_dir_all(&directory)?;
         if directory.join(".git").symlink_metadata().is_ok() {
             return Err(ProgramError::Invalid("program directory must not be a nested Git repository".into()));
-        }
-        let manifest_text = toml::to_string_pretty(manifest).map_err(|_| ProgramError::Toml("could not encode manifest".into()))?;
-        if manifest_text.len() > MAX_MANIFEST_BYTES {
-            return Err(ProgramError::Invalid("manifest exceeds 256 KiB".into()));
         }
         let old_source = match manifest.language {
             ProgramLanguage::JavaScript => directory.join("main.ts"),
@@ -279,15 +355,7 @@ impl ProgramStore {
         fs::write(directory.join(manifest.language.filename()), source)?;
         let readme = directory.join("README.md");
         if !readme.exists() {
-            fs::write(
-                &readme,
-                format!(
-                    "---\nname: {}\ndescription: {}\n---\n\n# {}\n",
-                    json_yaml_string(slug),
-                    json_yaml_string(&manifest.description),
-                    manifest.name
-                ),
-            )?;
+            fs::write(&readme, Self::readme(slug, manifest))?;
         }
         let readme =
             String::from_utf8(bounded_read(&readme, MAX_MANIFEST_BYTES)?).map_err(|error| ProgramError::Invalid(error.to_string()))?;
@@ -333,33 +401,35 @@ impl ProgramStore {
         Ok(SavedProgram { scope, slug: slug.to_owned(), manifest, source, readme, sha256, trusted })
     }
 
-    /// Lists all valid programs from user and project repositories, preserving their scope.
+    /// Lists the user's programs. An entry that cannot be loaded (malformed, a symlink, …) is
+    /// skipped and reported, instead of hiding every other program (`REV13a` L6).
     ///
     /// # Errors
-    /// Returns [`ProgramError`] if a repository or program cannot be read or parsed.
-    pub fn list(&self) -> Result<Vec<SavedProgram>, ProgramError> {
+    /// Returns [`ProgramError`] if the repository itself cannot be read.
+    pub fn list(&self) -> Result<Listing, ProgramError> {
         let _guard = self.writes.lock().map_err(|_| ProgramError::Invalid("program store lock is poisoned".into()))?;
-        let mut programs = Vec::new();
-        for scope in [ProgramScope::User, ProgramScope::Project] {
-            let Ok(root) = self.root(scope) else { continue };
-            if !root.exists() {
+        let mut listing = Listing::default();
+        let root = &self.user_root;
+        if !root.exists() {
+            return Ok(listing);
+        }
+        validate_root(root)?;
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
                 continue;
             }
-            validate_root(root)?;
-            for entry in fs::read_dir(root)? {
-                let entry = entry?;
-                if !entry.file_type()?.is_dir() {
-                    continue;
-                }
-                let slug = entry.file_name();
-                let Some(slug) = slug.to_str() else { continue };
-                if validate_slug(slug).is_ok() && entry.path().join("program.toml").is_file() {
-                    programs.push(self.load_unlocked(scope, slug)?);
+            let slug = entry.file_name();
+            let Some(slug) = slug.to_str() else { continue };
+            if validate_slug(slug).is_ok() && entry.path().join("program.toml").symlink_metadata().is_ok() {
+                match self.load_unlocked(ProgramScope::User, slug) {
+                    Ok(program) => listing.programs.push(program),
+                    Err(error) => listing.problems.push(format!("user program `{slug}`: {error}")),
                 }
             }
         }
-        programs.sort_by(|a, b| (a.scope != ProgramScope::Project, &a.slug).cmp(&(b.scope != ProgramScope::Project, &b.slug)));
-        Ok(programs)
+        listing.programs.sort_by(|a, b| a.slug.cmp(&b.slug));
+        Ok(listing)
     }
 
     /// Explicitly trusts the exact content currently at this scope and slug. Trust state is
@@ -430,7 +500,8 @@ impl ProgramStore {
     fn root(&self, scope: ProgramScope) -> Result<&Path, ProgramError> {
         match scope {
             ProgramScope::User => Ok(&self.user_root),
-            ProgramScope::Project => self.project_root.as_deref().ok_or_else(|| ProgramError::Missing("project program repository".into())),
+            // Project programs never touch the daemon's disk directly (ADR 0066).
+            ProgramScope::Project => Err(ProgramError::Invalid("project programs are read and written through the workspace".into())),
         }
     }
 
@@ -463,7 +534,7 @@ impl ProgramStore {
     }
 }
 
-fn validate_slug(slug: &str) -> Result<(), ProgramError> {
+pub(crate) fn validate_slug(slug: &str) -> Result<(), ProgramError> {
     if slug.is_empty() || slug.len() > 64 || !slug.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
         return Err(ProgramError::Invalid("slug must use 1–64 ASCII letters, digits, '-' or '_'".into()));
     }

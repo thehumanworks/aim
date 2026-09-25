@@ -61,6 +61,10 @@ impl Backend for WithSkills {
         self.inner.wants_environment()
     }
 
+    fn options(&self) -> BackendFuture<'static, Option<aim_proto::daemon::SessionOptions>> {
+        self.inner.options()
+    }
+
     fn shutdown(self: Box<Self>) -> BackendFuture<'static, ()> {
         self.inner.shutdown()
     }
