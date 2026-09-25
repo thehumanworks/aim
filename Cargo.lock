@@ -17,6 +17,7 @@ version = "0.0.0"
 dependencies = [
  "aim-kernel",
  "aim-llm",
+ "aim-llm-openai",
  "aim-proto",
  "aim-rpc",
  "async-stream",

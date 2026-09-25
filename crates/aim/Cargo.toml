@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 aim-kernel = { path = "../aim-kernel" }
 aim-llm = { path = "../aim-llm" }
+aim-llm-openai = { path = "../aim-llm-openai" }
 aim-proto = { path = "../aim-proto" }
 aim-rpc = { path = "../aim-rpc" }
 clap = { version = "4.6", features = ["derive", "wrap_help"] }

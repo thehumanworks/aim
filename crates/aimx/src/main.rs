@@ -6,7 +6,7 @@
 //! - `aimx version` prints the version and the protocol generations.
 //!
 //! Logs go to stderr (never stdout, which carries the protocol in `--stdio` mode); the level comes
-//! from `AIMX_LOG` (default `info`).
+//! from `AIMX_LOG` (default `warn`: aimx is quiet under its client).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -46,7 +46,7 @@ struct ServeArgs {
 }
 
 fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("AIMX_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = tracing_subscriber::EnvFilter::try_from_env("AIMX_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(filter).init();
 }
 

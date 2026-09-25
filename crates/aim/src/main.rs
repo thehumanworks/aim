@@ -26,7 +26,7 @@ struct Args {
 enum Command {
     /// Run one turn headlessly in a workspace.
     Run {
-        /// Provider: codex, openrouter, ai-gateway.
+        /// Provider: openrouter, ai-gateway (codex and acp:claude as they land).
         #[arg(short, long, default_value = "codex")]
         provider: String,
         /// Model id (the provider's default when omitted).
@@ -61,8 +61,8 @@ enum Command {
     },
 }
 
-fn provider(name: &str, _model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, String), String> {
-    Err(format!("provider `{name}` is not wired into this build yet"))
+fn provider(name: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, String), String> {
+    aim::providers::build(name, model)
 }
 
 fn read_prompt(words: &[String]) -> Result<String, String> {
