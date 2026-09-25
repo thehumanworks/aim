@@ -218,10 +218,11 @@ pub open spec fn reconcile(intent: IntentView, git: GitView) -> Decision {
             Decision::EnsureRescue
         } else if git.source != Some(intent.source) {
             Decision::FinalizeFailed
+        } else if git.scratch != Some(intent.scratch) || !git.scratch_owned {
+            Decision::FinalizeFailed
         } else if git.target_checkout_owned {
             Decision::AdvanceOwned
-        } else if git.checkout_attempt_failed || git.scratch != Some(intent.scratch)
-            || !git.scratch_owned {
+        } else if git.checkout_attempt_failed {
             Decision::FinalizeFailed
         } else {
             Decision::AcquireOwnedCheckout
@@ -379,10 +380,12 @@ pub fn decide_reconcile(intent: &Intent, git: &GitObservation) -> (decision: Dec
         if !option_matches(&git.source, &intent.source) {
             return Decision::FinalizeFailed;
         }
+        if !option_matches(&git.scratch, &intent.scratch) || !git.scratch_owned {
+            return Decision::FinalizeFailed;
+        }
         return if git.target_checkout_owned {
             Decision::AdvanceOwned
-        } else if git.checkout_attempt_failed || !option_matches(&git.scratch, &intent.scratch)
-            || !git.scratch_owned {
+        } else if git.checkout_attempt_failed {
             Decision::FinalizeFailed
         } else {
             Decision::AcquireOwnedCheckout
@@ -470,7 +473,8 @@ pub proof fn theorem_advance_uses_verified_source(intent: IntentView, git: GitVi
         reconcile(intent, git) == Decision::AdvanceOwned ==> intent.phase == Phase::Integrating
             && intent.result is Some && git.source == Some(intent.source) && git.target == Some(
             intent.target,
-        ) && git.rescue == intent.result && git.target_checkout_owned,
+        ) && git.rescue == intent.result && git.scratch == Some(intent.scratch) && git.scratch_owned
+            && git.target_checkout_owned,
 {
 }
 
@@ -488,7 +492,18 @@ pub proof fn theorem_retry_precedes_ref_movement(intent: IntentView, git: GitVie
 pub proof fn theorem_apply_requires_observed_result(intent: IntentView, git: GitView)
     ensures
         reconcile(intent, git) == Decision::MarkApplied ==> intent.phase == Phase::Failed
-            && intent.result is Some && git.target == intent.result,
+            && intent.result is Some && git.target == intent.result && git.apply_requested,
+{
+}
+
+/// A result that was not advanced remains reachable under the owned rescue ref at cleanup.
+pub proof fn theorem_cleanup_preserves_unadvanced_result(intent: IntentView, git: GitView)
+    requires
+        intent.result is Some,
+        git.target != intent.result,
+    ensures
+        cleanup_allowed(intent, git) ==> git.scratch == Some(intent.scratch) && git.scratch_owned
+            && git.rescue == intent.result,
 {
 }
 
