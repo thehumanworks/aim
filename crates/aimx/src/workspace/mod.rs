@@ -22,7 +22,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use aim_proto::content::Content;
-use aim_proto::error::ProtoError;
+use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{
     ByteRange, Caps, EditOutcome, ExactEdit, ExecReadResult, FsListResult, FsReadResult, GlobResult, GrepResult, Meta, Precondition,
     PtySize, Signal, WriteOutcome,
@@ -83,6 +83,28 @@ pub trait Fs: Send + Sync {
 
     /// Renames an entry.
     fn rename<'a>(&'a self, from: &'a str, to: &'a str, overwrite: bool, key: &'a IdempotencyKey) -> BoxFuture<'a, Outcome<()>>;
+
+    /// Copies a file, or a directory tree when `recursive` (`fs.copy`). The destination appears
+    /// atomically; symlinks inside a copied tree are copied as links, never followed. Backends
+    /// that cannot copy answer `unavailable` (the default).
+    fn copy<'a>(&'a self, _req: CopyRequest<'a>) -> BoxFuture<'a, Outcome<()>> {
+        Box::pin(async { Err(ProtoError::new(ErrorCode::Unavailable, "this backend cannot copy")) })
+    }
+}
+
+/// A copy request.
+#[derive(Clone, Debug)]
+pub struct CopyRequest<'a> {
+    /// Confined source path.
+    pub from: &'a str,
+    /// Confined destination path.
+    pub to: &'a str,
+    /// Replace an existing destination file.
+    pub overwrite: bool,
+    /// Copy a directory and everything in it.
+    pub recursive: bool,
+    /// Retry safety.
+    pub key: &'a IdempotencyKey,
 }
 
 /// A file write.
