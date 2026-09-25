@@ -107,6 +107,7 @@ impl Recorder {
             AgentEvent::ItemAdded { item } => EventBody::Item { item: item.clone() },
             AgentEvent::Usage { usage } => EventBody::Usage { usage: usage.clone(), model: self.model.clone() },
             AgentEvent::RateLimits { limits } => EventBody::RateLimits { limits: limits.clone() },
+            AgentEvent::Decision { decision } => EventBody::Decision { decision: decision.clone() },
             AgentEvent::TurnEnded { stop } => EventBody::TurnEnded { stop: stop.clone() },
             AgentEvent::TurnFailed { message } => EventBody::TurnFailed { message: message.clone() },
             AgentEvent::ConfigChanged { model, effort } => {

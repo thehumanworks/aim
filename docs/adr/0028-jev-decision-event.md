@@ -20,6 +20,11 @@ quantized Score and Noul values, chosen index, latency, and reported token cost.
 not contain the transcript or credentials. The current effort is also emitted through
 `ConfigChanged` when it changes.
 
+When automatic effort is enabled, start at the catalog's declared default effort, or its lowest
+supported level when no default is declared. Send that explicit level on the first provider
+request so the controller's current index describes the effort actually in force. If catalog
+lookup fails, keep the provider default and disable automatic advice for that session.
+
 ## Consequences
 
 An additive event enables offline tuning and chronological replay without putting Jev text into

@@ -18,6 +18,7 @@ pub mod context;
 pub mod daemon;
 pub mod harness;
 pub mod host;
+pub mod jev;
 pub mod login;
 pub mod providers;
 pub mod remote;

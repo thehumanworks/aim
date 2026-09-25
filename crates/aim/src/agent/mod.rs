@@ -21,9 +21,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use aim_kernel::effort::{Input as EffortInput, next as next_effort};
 use aim_kernel::turn::{CallId, Event as TurnEvent, Phase, Turn};
 use aim_llm::{EventStream, LlmError, LlmErrorKind, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason};
+use aim_proto::event::DecisionRecord;
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolInput, ToolResult, ToolSpec};
 use futures_util::StreamExt as _;
@@ -35,8 +37,13 @@ pub mod backend;
 pub mod compact;
 pub mod tools;
 
+#[cfg(test)]
+mod jev_tests;
+
 pub use backend::{Backend, BackendFuture};
 pub use tools::ToolHost;
+
+use crate::jev::{Advice, Bundle, Decider};
 
 /// How the agent talks to its model.
 #[derive(Clone, Debug)]
@@ -106,6 +113,13 @@ struct Response {
     running: Running,
 }
 
+/// Advice and the catalog entry it was computed against.
+struct CompletedDecision {
+    advice: Advice,
+    ladder: Vec<String>,
+    default_effort: Option<String>,
+}
+
 /// How a response phase ended.
 enum Ended {
     /// The stream completed with this stop reason.
@@ -143,6 +157,9 @@ pub struct Agent {
     /// The provider-measured context size (last request plus its response) and the transcript
     /// length it covers.
     measured: Option<(u64, usize)>,
+    decider: Option<Arc<dyn Decider>>,
+    explicit_effort: bool,
+    decisions_since_change: u32,
 }
 
 fn emit(events: &UnboundedSender<AgentEvent>, event: AgentEvent) {
@@ -167,7 +184,138 @@ impl Agent {
     /// An agent continuing an existing transcript (e.g. a resumed session).
     #[must_use]
     pub fn with_transcript(provider: Arc<dyn ModelProvider>, tools: Arc<dyn ToolHost>, config: AgentConfig, items: Vec<Item>) -> Self {
-        Self { provider, tools, config, items, next_call: 0, turns: 0, window: Window::Unasked, measured: None }
+        let explicit_effort = config.effort.is_some();
+        Self {
+            provider,
+            tools,
+            config,
+            items,
+            next_call: 0,
+            turns: 0,
+            window: Window::Unasked,
+            measured: None,
+            decider: None,
+            explicit_effort,
+            decisions_since_change: 2,
+        }
+    }
+
+    /// Enable bounded advice for a persistent session. The host never calls this for private or
+    /// ephemeral sessions.
+    #[must_use]
+    pub fn with_decider(mut self, decider: Arc<dyn Decider>) -> Self {
+        self.decider = Some(decider);
+        self.explicit_effort = false;
+        self
+    }
+
+    /// Mark a user-set effort as an override of external advice.
+    pub(crate) fn set_explicit_effort(&mut self) {
+        self.explicit_effort = true;
+    }
+
+    fn recent_digest(&self, goal: &str) -> Option<String> {
+        let recent: Vec<String> = self
+            .items
+            .iter()
+            .rev()
+            .take(8)
+            .rev()
+            .map(|item| match item {
+                Item::User { .. } => "user message".to_owned(),
+                Item::Assistant { parts, .. } => format!(
+                    "assistant: {}",
+                    parts
+                        .iter()
+                        .filter_map(|part| match part {
+                            Part::Text { text } => Some(text.as_str()),
+                            Part::Image { .. } => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+                Item::ToolCall { name, .. } => format!("tool call: {name}"),
+                Item::ToolResult { result, .. } => format!("tool result: {} parts, error={}", result.content.len(), result.is_error),
+                Item::Reasoning { .. } => "reasoning item".to_owned(),
+                Item::Compaction { .. } => "compaction item".to_owned(),
+                Item::Hosted { .. } => "hosted tool item".to_owned(),
+            })
+            .collect();
+        let calls = self.items.iter().filter(|item| matches!(item, Item::ToolCall { .. })).count();
+        crate::jev::digest(goal, &recent, (self.items.len(), calls))
+    }
+
+    fn start_decision(&self, goal: &str) -> Option<tokio::task::JoinHandle<Option<CompletedDecision>>> {
+        if self.explicit_effort {
+            return None;
+        }
+        let decider = Arc::clone(self.decider.as_ref()?);
+        let provider = Arc::clone(&self.provider);
+        let model = self.config.model.clone();
+        let state = self.recent_digest(goal)?;
+        Some(tokio::spawn(async move {
+            let catalog = provider.catalog().await.ok()?;
+            let entry = catalog.into_iter().find(|entry| entry.id == model)?;
+            let ladder = entry.efforts;
+            if !(2..=10).contains(&ladder.len()) {
+                return None;
+            }
+            let advice = decider.decide(Bundle { state, ladder: ladder.clone() }).await?;
+            Some(CompletedDecision { advice, ladder, default_effort: entry.default_effort })
+        }))
+    }
+
+    fn apply_decision(&mut self, advice: Advice, ladder: &[String], default_effort: Option<&str>, events: &UnboundedSender<AgentEvent>) {
+        let Ok(hi) = u32::try_from(ladder.len().saturating_sub(1)) else {
+            return;
+        };
+        let in_force = self.config.effort.as_deref().or(default_effort);
+        let current = in_force.and_then(|effort| ladder.iter().position(|label| label == effort)).unwrap_or(0);
+        let Ok(current) = u32::try_from(current) else {
+            return;
+        };
+        let input = EffortInput {
+            ladder_len: hi.saturating_add(1),
+            lo: 0,
+            hi,
+            current,
+            proposed_bp: advice.proposed_bp,
+            since_change: self.decisions_since_change,
+            hysteresis: 2,
+            override_index: None,
+        };
+        let Some(output) = next_effort(input) else {
+            return;
+        };
+        let record = DecisionRecord {
+            model: self.config.model.clone(),
+            ladder: ladder.to_owned(),
+            current,
+            lo: 0,
+            hi,
+            since_change: input.since_change,
+            hysteresis: input.hysteresis,
+            raw_score: advice.raw_score,
+            raw_confidence: advice.raw_confidence,
+            raw_probabilities: advice.raw_probabilities,
+            raw_noul: advice.raw_noul,
+            proposed_bp: advice.proposed_bp,
+            noul_bp: advice.noul_bp,
+            output,
+            latency_ms: advice.latency_ms,
+            input_tokens: advice.input_tokens,
+            cost_micro_usd: advice.cost_micro_usd,
+        };
+        emit(events, AgentEvent::Decision { decision: record });
+        if output == current {
+            self.decisions_since_change = self.decisions_since_change.saturating_add(1);
+        } else {
+            if let Some(effort) = ladder.get(output as usize) {
+                self.config.effort = Some(effort.clone());
+                emit(events, AgentEvent::ConfigChanged { model: self.config.model.clone(), effort: self.config.effort.clone() });
+            }
+            self.decisions_since_change = 0;
+        }
     }
 
     /// The transcript so far.
@@ -400,6 +548,7 @@ impl Agent {
         self.run(input, events, cancel, Some(inbox)).await
     }
 
+    #[expect(clippy::too_many_lines, reason = "the native turn loop keeps its phases and cancellation paths together")]
     async fn run(
         &mut self,
         input: Vec<Part>,
@@ -407,6 +556,14 @@ impl Agent {
         cancel: &CancellationToken,
         inbox: Option<&mut UnboundedReceiver<Vec<Part>>>,
     ) -> Result<StopReason, AgentError> {
+        let goal = input
+            .iter()
+            .rev()
+            .find_map(|part| match part {
+                Part::Text { text } if !text.starts_with("<environment>") => Some(text.clone()),
+                Part::Text { .. } | Part::Image { .. } => None,
+            })
+            .unwrap_or_default();
         let repaired = self.repair(events);
         if repaired > 0 {
             tracing::warn!(repaired, "answered calls left without results by an earlier turn");
@@ -479,10 +636,22 @@ impl Agent {
             if matches!(stop, StopReason::ToolUse) && response.dispatched.is_empty() {
                 tracing::warn!("the provider stopped for tool use without a complete tool call");
             }
+            // The bundle runs concurrently with outstanding tools. It is sampled once after
+            // results arrive; a later reply cannot alter this or any later request.
+            let decision = if response.dispatched.is_empty() { None } else { self.start_decision(&goal) };
             match self.await_results(&mut turn, &mut response, &mut ctx).await {
                 Some(Ended::Cancelled) => return Ok(self.cancelled(&mut turn, &mut response, &mut ctx)),
                 Some(Ended::Failed(err)) => return self.fail(&mut turn, &mut response, &mut ctx, err),
                 None | Some(Ended::Completed(_)) => {}
+            }
+            if let Some(decision) = decision {
+                if matches!(turn.phase(), Phase::Ready) && decision.is_finished() {
+                    if let Ok(Some(completed)) = decision.await {
+                        self.apply_decision(completed.advice, &completed.ladder, completed.default_effort.as_deref(), events);
+                    }
+                } else {
+                    decision.abort();
+                }
             }
             match turn.phase() {
                 Phase::Cancelling => {
@@ -513,8 +682,12 @@ impl Agent {
     }
 
     /// Forgets the model's window (the model changed).
-    pub(crate) const fn forget_window(&mut self) {
+    pub(crate) fn forget_window(&mut self) {
         self.window = Window::Unasked;
+        self.decisions_since_change = 2;
+        if !self.explicit_effort {
+            self.config.effort = None;
+        }
     }
 
     /// The model's context window, from the provider's catalog (asked once per model).

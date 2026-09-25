@@ -29,6 +29,7 @@ extern crate alloc;
 
 pub mod board;
 pub mod compaction;
+pub mod effort;
 pub mod job;
 pub mod negotiate;
 pub mod path;
