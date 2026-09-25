@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::time::Duration;
 
 use aim_proto::content::Content;
@@ -17,7 +17,7 @@ use globset::{Glob, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::conn::Connection;
 use super::quote;
@@ -31,7 +31,9 @@ pub struct AgentlessWorkspace {
     root: String,
     home: String,
     caps: Caps,
+    mode_query: &'static str,
     channels: Arc<Semaphore>,
+    signal_channel: Arc<Semaphore>,
     process_slots: Arc<Semaphore>,
     mutations: Mutex<()>,
     processes: Mutex<BTreeMap<String, Arc<Process>>>,
@@ -43,12 +45,18 @@ struct Process {
     stdin: Mutex<Option<ChildStdin>>,
     output: Mutex<crate::ring::OutputRing>,
     exit: Mutex<Option<ExitStatus>>,
+    kill_failure: Mutex<Option<ProtoError>>,
     last_signal: AtomicI32,
+    released: AtomicBool,
+    control: Mutex<()>,
     streams_open: AtomicU8,
     notify: Notify,
 }
 
 const MAX_PROCESS_OUTPUT: usize = 8 * 1024 * 1024;
+const INLINE_SCRIPT_LIMIT: usize = 8 * 1024;
+const MAX_SCRIPT_BYTES: usize = 1024 * 1024;
+const PGID_QUERY: &str = "if [ -r \"/proc/$p/stat\" ]; then IFS= read -r stat < \"/proc/$p/stat\" || exit 44; fields=${stat##*) }; set -- $fields; g=$3; else g=$(ps -A -o pid= -o pgid= | awk -v wanted=\"$p\" '$1 == wanted { print $2; exit }'); fi; case \"$g\" in ''|*[!0-9]*) exit 44;; esac;";
 
 impl AgentlessWorkspace {
     /// Open a remote directory, resolving its canonical root on the remote host.
@@ -56,7 +64,8 @@ impl AgentlessWorkspace {
     /// # Errors
     /// Returns a protocol error if the remote root cannot be resolved.
     pub async fn open(connection: Connection, root: &str) -> Outcome<Self> {
-        let output = connection.run(&format!("realpath -- {}", quote(root)), &[]).await?;
+        let root_argument = if root.starts_with('/') { root.to_owned() } else { format!("./{root}") };
+        let output = connection.run(&format!("realpath {}", quote(&root_argument)), &[]).await?;
         let root = realpath_output(output)?;
         if !root.starts_with('/') {
             return Err(error(ErrorCode::InvalidParams, "remote root is not absolute"));
@@ -72,15 +81,21 @@ impl AgentlessWorkspace {
             ("unknown", "unknown")
         };
         let native_search = connection.run("command -v rg >/dev/null 2>&1", &[]).await.is_ok();
-        let isolated_processes = connection.run("command -v perl >/dev/null 2>&1 || command -v setsid >/dev/null 2>&1", &[]).await.is_ok();
+        let mode_query = if connection.run("stat -c %a . >/dev/null 2>&1", &[]).await.is_ok() {
+            "stat -c %a"
+        } else if connection.run("stat -f %Lp . >/dev/null 2>&1", &[]).await.is_ok() {
+            "stat -f %Lp"
+        } else {
+            return Err(error(ErrorCode::Unavailable, "remote stat cannot report file modes"));
+        };
         let caps = Caps {
-            exec: isolated_processes,
-            pty: isolated_processes,
+            exec: true,
+            pty: true,
             watch: false,
             native_search,
             atomic_rename: true,
             resumable: false,
-            max_concurrency: Some(10),
+            max_concurrency: Some(6),
             os: os.to_owned(),
             arch: arch.to_owned(),
             shell: Some("sh".to_owned()),
@@ -90,7 +105,9 @@ impl AgentlessWorkspace {
             root,
             home: platform.home,
             caps,
+            mode_query,
             channels: Arc::new(Semaphore::new(3)),
+            signal_channel: Arc::new(Semaphore::new(1)),
             process_slots: Arc::new(Semaphore::new(6)),
             mutations: Mutex::new(()),
             processes: Mutex::new(BTreeMap::new()),
@@ -110,17 +127,40 @@ impl AgentlessWorkspace {
         self.connection.run_with_status(script, input, false).await
     }
 
+    async fn prepared_process_script(&self, script: &str, id: &ProcId) -> Outcome<(String, Option<String>)> {
+        if script.contains('\0') {
+            return Err(error(ErrorCode::InvalidParams, "remote process script contains NUL"));
+        }
+        if script.len() > MAX_SCRIPT_BYTES {
+            return Err(error(ErrorCode::LimitExceeded, "remote process script is too large"));
+        }
+        if script.len() <= INLINE_SCRIPT_LIMIT {
+            return Ok((script.to_owned(), None));
+        }
+        let run_dir = format!("{}/.aim/run", self.home);
+        let path = format!("{run_dir}/{}.sh", id.as_str());
+        let upload = format!("umask 077; mkdir -p {0} || exit; (set -C; cat > {1})", quote(&run_dir), quote(&path));
+        self.run(&upload, script.as_bytes()).await?;
+        // The remote shell consumes and removes the staged script before evaluating it. `eval`
+        // leaves stdin attached to the user's process, and the final `exec` keeps its PID/PGID.
+        let command = format!(
+            "f={}; trap 'rm -f \"$f\"' EXIT HUP INT TERM; payload=$(cat \"$f\") || exit; rm -f \"$f\" || exit; trap - EXIT HUP INT TERM; eval \"$payload\"",
+            quote(&path)
+        );
+        Ok((command, Some(path)))
+    }
+
     async fn safe(&self, path: &str, may_create: bool) -> Outcome<String> {
         if !path.starts_with('/') || path.split('/').any(|part| part == "..") {
             return Err(error(ErrorCode::Denied, "path is not confined"));
         }
         let script = if may_create {
             format!(
-                "if [ -e {0} ] || [ -L {0} ]; then printf 'E'; realpath -- {0}; else p=$(dirname -- {0}); while [ ! -e \"$p\" ]; do p=$(dirname -- \"$p\"); done; printf 'A%s\\0' \"$p\"; realpath -- \"$p\"; fi",
+                "if [ -e {0} ] || [ -L {0} ]; then printf 'E'; realpath {0}; else p=$(dirname -- {0}); while [ ! -e \"$p\" ]; do p=$(dirname -- \"$p\"); done; printf 'A%s\\0' \"$p\"; realpath \"$p\"; fi",
                 quote(path)
             )
         } else {
-            format!("[ -e {0} ] || [ -L {0} ] || exit 44; realpath -- {0}", quote(path))
+            format!("[ -e {0} ] || [ -L {0} ] || exit 44; realpath {0}", quote(path))
         };
         let (status, output) = self.run_status(&script, &[]).await?;
         if status != 0 {
@@ -274,8 +314,9 @@ impl AgentlessWorkspace {
             ),
         };
         let script = format!(
-            "p={quoted}; d=$(dirname -- \"$p\"); {} [ -d \"$p\" ] && exit 43; t=$(mktemp \"$d/.aimx.XXXXXXXX\") || exit; trap 'rm -f \"$t\"' EXIT HUP INT TERM; cat > \"$t\" || exit; {precondition} if [ -e \"$p\" ]; then mode=$(stat -f %Lp \"$p\" 2>/dev/null || stat -c %a \"$p\") || exit; else mode=$(printf '%o' $((0666 & ~0$(umask)))); fi; chmod \"$mode\" \"$t\" || exit; {} trap - EXIT HUP INT TERM",
+            "p={quoted}; d=$(dirname -- \"$p\"); {} [ -d \"$p\" ] && exit 43; t=$(mktemp \"$d/.aimx.XXXXXXXX\") || exit; trap 'rm -f \"$t\"' EXIT HUP INT TERM; cat > \"$t\" || exit; {precondition} if [ -e \"$p\" ]; then mode=$({} \"$p\" 2>/dev/null) || exit; case \"$mode\" in ''|*[!0-7]*) exit 43;; esac; else mode=$(printf '%o' $((0666 & ~0$(umask)))); fi; chmod \"$mode\" \"$t\" || exit; {} trap - EXIT HUP INT TERM",
             if req.create_dirs { "mkdir -p \"$d\" || exit 43;" } else { "" },
+            self.mode_query,
             if matches!(req.precondition, Precondition::IfAbsent) {
                 "ln \"$t\" \"$p\" || exit 42; rm -f \"$t\";"
             } else {
@@ -389,10 +430,7 @@ impl Drop for AgentlessWorkspace {
         let Ok(processes) = self.processes.try_lock() else { return };
         for process in processes.values() {
             if process.child.try_lock().is_ok_and(|mut child| child.try_wait().is_ok_and(|status| status.is_none())) {
-                let script = format!(
-                    "[ -f {0} ] || exit; read p g < {0} || exit; actual=$(ps -o pgid= -p \"$p\" 2>/dev/null | tr -d ' '); [ \"$actual\" = \"$g\" ] || exit; if [ \"$p\" = \"$g\" ]; then kill -KILL -\"$g\"; else kill -KILL \"$p\"; fi",
-                    quote(&process.remote_marker)
-                );
+                let script = signal_script(&process.remote_marker, Signal::Kill);
                 let mut command = self.connection.command(&script, false);
                 command
                     .as_std_mut()
@@ -473,7 +511,7 @@ impl Fs for AgentlessWorkspace {
                     let metadata = std::str::from_utf8(metadata).map_err(|_| error(ErrorCode::Unavailable, "invalid remote listing"))?;
                     let (kind, size) = metadata.split_once('|').ok_or_else(|| error(ErrorCode::Unavailable, "invalid remote listing"))?;
                     let kind = match kind {
-                        "Regular File" | "regular file" => EntryKind::File,
+                        "Regular File" | "regular file" | "regular empty file" => EntryKind::File,
                         "Directory" | "directory" => EntryKind::Dir,
                         "Symbolic Link" | "symbolic link" => EntryKind::Symlink,
                         _ => EntryKind::Other,
@@ -569,17 +607,73 @@ fn process_script(home: &str, spec: &SpawnSpec<'_>, cwd: &str, marker: &str) -> 
         let _ = write!(script, " export {name}={};", quote(value));
     }
     let pty_setup = spec.pty.map_or_else(String::new, |size| format!("stty rows {} cols {} 2>/dev/null || :;", size.rows, size.cols));
-    let inner = format!(
-        "{pty_setup} p=$$; g=$(ps -o pgid= -p \"$p\" | tr -d ' '); printf '%s %s\\n' \"$p\" \"$g\" > {} || exit; exec {command}",
-        quote(marker)
-    );
-    let _ = write!(
-        script,
-        " if command -v perl >/dev/null 2>&1; then exec perl -MPOSIX -e 'POSIX::setpgid(0,0) == 0 or exit 127; exec(\"/bin/sh\", \"-c\", $ARGV[0])' -- {}; elif command -v setsid >/dev/null 2>&1; then exec setsid sh -c {}; else exit 127; fi",
-        quote(&inner),
-        quote(&inner)
-    );
+    let _ = write!(script, " {pty_setup} p=$$; {PGID_QUERY} printf '%s %s\\n' \"$p\" \"$g\" > {} || exit; exec {command}", quote(marker));
     Ok(script)
+}
+
+fn spawn_waiter(process: &Arc<Process>, permit: OwnedSemaphorePermit) {
+    let waiter = Arc::downgrade(process);
+    tokio::spawn(async move {
+        let _permit = permit;
+        loop {
+            let Some(process) = waiter.upgrade() else { break };
+            let control = process.control.lock().await;
+            let status = process.child.lock().await.try_wait();
+            if let Ok(Some(status)) = status {
+                let mut exit = process.exit.lock().await;
+                if exit.is_none() {
+                    let signal = process.last_signal.load(Ordering::Acquire);
+                    *exit = Some(if signal != 0 {
+                        ExitStatus::Signaled { signal }
+                    } else {
+                        ExitStatus::Exited { code: status.code().unwrap_or(255) }
+                    });
+                }
+                process.notify.notify_waiters();
+                break;
+            }
+            drop(control);
+            drop(process);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+}
+
+fn spawn_timeout(process: &Arc<Process>, connection: Connection, signal_channel: Arc<Semaphore>, timeout: Duration) {
+    let process = Arc::downgrade(process);
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        let Some(process) = process.upgrade() else { return };
+        let _control = process.control.lock().await;
+        if process.released.load(Ordering::Acquire) {
+            return;
+        }
+        let running = process.child.lock().await.try_wait().is_ok_and(|status| status.is_none());
+        if running {
+            let mut killed = false;
+            for attempt in 1..=3 {
+                match remote_signal(&connection, &signal_channel, &process.remote_marker, Signal::Kill).await {
+                    Ok(()) | Err(ProtoError { code: ErrorCode::NotFound, .. }) => {
+                        killed = true;
+                        break;
+                    }
+                    Err(cause) => {
+                        tracing::warn!(attempt, code = ?cause.code, "remote timeout kill failed; retrying");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            if killed {
+                *process.exit.lock().await = Some(ExitStatus::TimedOut);
+                process.notify.notify_waiters();
+                drop(process.child.lock().await.start_kill());
+            } else {
+                tracing::error!("remote timeout kill failed after retries; process remains tracked");
+                *process.kill_failure.lock().await = Some(error(ErrorCode::Unavailable, "remote timeout kill failed"));
+                process.notify.notify_waiters();
+            }
+        }
+    });
 }
 
 impl Exec for AgentlessWorkspace {
@@ -592,10 +686,22 @@ impl Exec for AgentlessWorkspace {
             let permit = Arc::clone(&self.process_slots)
                 .try_acquire_owned()
                 .map_err(|_| error(ErrorCode::LimitExceeded, "too many remote processes"))?;
-            let mut cmd = self.connection.command(&script, spec.pty.is_some());
+            let (command_script, staged_path) = self.prepared_process_script(&script, &id).await?;
+            if let Err(cause) = self.connection.ensure_master().await {
+                if let Some(path) = &staged_path {
+                    drop(self.run(&format!("rm -f -- {}", quote(path)), &[]).await);
+                }
+                return Err(cause);
+            }
+            let mut cmd = self.connection.command(&command_script, spec.pty.is_some());
             cmd.kill_on_drop(true);
             cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-            let mut child = cmd.spawn().map_err(|_| error(ErrorCode::Unavailable, "cannot start remote process"))?;
+            let Ok(mut child) = cmd.spawn() else {
+                if let Some(path) = staged_path {
+                    drop(self.run(&format!("rm -f -- {}", quote(&path)), &[]).await);
+                }
+                return Err(error(ErrorCode::Unavailable, "cannot start remote process"));
+            };
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             let stdin = if spec.stdin { child.stdin.take() } else { None };
@@ -605,7 +711,10 @@ impl Exec for AgentlessWorkspace {
                 stdin: Mutex::new(stdin),
                 output: Mutex::new(crate::ring::OutputRing::new(MAX_PROCESS_OUTPUT)),
                 exit: Mutex::new(None),
+                kill_failure: Mutex::new(None),
                 last_signal: AtomicI32::new(0),
+                released: AtomicBool::new(false),
+                control: Mutex::new(()),
                 streams_open: AtomicU8::new(u8::from(stdout.is_some()) + u8::from(stderr.is_some())),
                 notify: Notify::new(),
             });
@@ -628,45 +737,14 @@ impl Exec for AgentlessWorkspace {
             }
             if !ready {
                 drop(process.child.lock().await.start_kill());
+                if let Some(path) = &staged_path {
+                    drop(self.run(&format!("rm -f -- {}", quote(path)), &[]).await);
+                }
                 return Err(error(ErrorCode::Unavailable, "remote process did not start"));
             }
-            let waiter = Arc::downgrade(&process);
-            tokio::spawn(async move {
-                let _permit = permit;
-                loop {
-                    let Some(process) = waiter.upgrade() else { break };
-                    let status = process.child.lock().await.try_wait();
-                    if let Ok(Some(status)) = status {
-                        let mut exit = process.exit.lock().await;
-                        if exit.is_none() {
-                            let signal = process.last_signal.load(Ordering::Acquire);
-                            *exit = Some(if signal != 0 {
-                                ExitStatus::Signaled { signal }
-                            } else {
-                                ExitStatus::Exited { code: status.code().unwrap_or(255) }
-                            });
-                        }
-                        process.notify.notify_waiters();
-                        break;
-                    }
-                    drop(process);
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            });
+            spawn_waiter(&process, permit);
             if let Some(timeout) = spec.timeout {
-                let connection = self.connection.clone();
-                let process_for_timeout = Arc::downgrade(&process);
-                tokio::spawn(async move {
-                    tokio::time::sleep(timeout).await;
-                    let Some(process_for_timeout) = process_for_timeout.upgrade() else { return };
-                    let running = process_for_timeout.child.lock().await.try_wait().is_ok_and(|status| status.is_none());
-                    if running {
-                        *process_for_timeout.exit.lock().await = Some(ExitStatus::TimedOut);
-                        process_for_timeout.notify.notify_waiters();
-                        drop(remote_signal(&connection, &process_for_timeout.remote_marker, Signal::Kill).await);
-                        drop(process_for_timeout.child.lock().await.start_kill());
-                    }
-                });
+                spawn_timeout(&process, self.connection.clone(), Arc::clone(&self.signal_channel), timeout);
             }
             self.processes.lock().await.insert(id.0.clone(), process);
             Ok(id)
@@ -677,16 +755,22 @@ impl Exec for AgentlessWorkspace {
         Box::pin(async move {
             let process =
                 self.processes.lock().await.get(proc.as_str()).cloned().ok_or_else(|| error(ErrorCode::NotFound, "process not found"))?;
-            if let Ok(Some(status)) = process.child.lock().await.try_wait() {
-                let mut exit = process.exit.lock().await;
-                if exit.is_none() {
-                    let signal = process.last_signal.load(Ordering::Acquire);
-                    *exit = Some(if signal != 0 {
-                        ExitStatus::Signaled { signal }
-                    } else {
-                        ExitStatus::Exited { code: status.code().unwrap_or(255) }
-                    });
+            {
+                let _control = process.control.lock().await;
+                if let Ok(Some(status)) = process.child.lock().await.try_wait() {
+                    let mut exit = process.exit.lock().await;
+                    if exit.is_none() {
+                        let signal = process.last_signal.load(Ordering::Acquire);
+                        *exit = Some(if signal != 0 {
+                            ExitStatus::Signaled { signal }
+                        } else {
+                            ExitStatus::Exited { code: status.code().unwrap_or(255) }
+                        });
+                    }
                 }
+            }
+            if let Some(failure) = process.kill_failure.lock().await.clone() {
+                return Err(failure);
             }
             let snapshot = || async {
                 let output = process.output.lock().await;
@@ -708,6 +792,7 @@ impl Exec for AgentlessWorkspace {
             let mut result = snapshot().await;
             if result.chunks.is_empty() && result.exit.is_none() && !wait.is_zero() {
                 let _ = tokio::time::timeout(wait, &mut notified).await;
+                let _control = process.control.lock().await;
                 if let Ok(Some(status)) = process.child.lock().await.try_wait() {
                     let mut exit = process.exit.lock().await;
                     if exit.is_none() {
@@ -718,6 +803,9 @@ impl Exec for AgentlessWorkspace {
                             ExitStatus::Exited { code: status.code().unwrap_or(255) }
                         });
                     }
+                }
+                if let Some(failure) = process.kill_failure.lock().await.clone() {
+                    return Err(failure);
                 }
                 result = snapshot().await;
             }
@@ -750,29 +838,51 @@ impl Exec for AgentlessWorkspace {
         Box::pin(async move {
             let process =
                 self.processes.lock().await.get(proc.as_str()).cloned().ok_or_else(|| error(ErrorCode::NotFound, "process not found"))?;
+            let _control = process.control.lock().await;
+            if process.released.load(Ordering::Acquire) {
+                return Err(error(ErrorCode::NotFound, "process already released"));
+            }
             if process.child.lock().await.try_wait().is_ok_and(|status| status.is_some()) {
                 return Err(error(ErrorCode::NotFound, "process already exited"));
             }
-            remote_signal(&self.connection, &process.remote_marker, signal).await?;
             let number = match signal {
                 Signal::Interrupt => 2,
                 Signal::Terminate => 15,
                 Signal::Kill => 9,
             };
-            process.last_signal.store(number, Ordering::Release);
-            Ok(())
+            let previous = process.last_signal.swap(number, Ordering::AcqRel);
+            match remote_signal(&self.connection, &self.signal_channel, &process.remote_marker, signal).await {
+                Ok(()) => Ok(()),
+                Err(cause) => {
+                    process.last_signal.store(previous, Ordering::Release);
+                    Err(cause)
+                }
+            }
         })
     }
 
     fn release<'a>(&'a self, proc: &'a ProcId) -> BoxFuture<'a, Outcome<()>> {
         Box::pin(async move {
             let process =
-                self.processes.lock().await.remove(proc.as_str()).ok_or_else(|| error(ErrorCode::NotFound, "process not found"))?;
-            if process.child.lock().await.try_wait().is_ok_and(|status| status.is_none()) {
-                drop(remote_signal(&self.connection, &process.remote_marker, Signal::Kill).await);
+                self.processes.lock().await.get(proc.as_str()).cloned().ok_or_else(|| error(ErrorCode::NotFound, "process not found"))?;
+            let _control = process.control.lock().await;
+            if process.released.load(Ordering::Acquire) {
+                return Err(error(ErrorCode::NotFound, "process already released"));
             }
+            if process.child.lock().await.try_wait().is_ok_and(|status| status.is_none()) {
+                let previous = process.last_signal.swap(9, Ordering::AcqRel);
+                match remote_signal(&self.connection, &self.signal_channel, &process.remote_marker, Signal::Kill).await {
+                    Ok(()) | Err(ProtoError { code: ErrorCode::NotFound, .. }) => {}
+                    Err(cause) => {
+                        process.last_signal.store(previous, Ordering::Release);
+                        return Err(cause);
+                    }
+                }
+            }
+            self.run(&format!("rm -f -- {}", quote(&process.remote_marker)), &[]).await?;
+            process.released.store(true, Ordering::Release);
+            self.processes.lock().await.remove(proc.as_str());
             drop(process.child.lock().await.start_kill());
-            drop(self.run(&format!("rm -f -- {}", quote(&process.remote_marker)), &[]).await);
             Ok(())
         })
     }
@@ -792,16 +902,26 @@ async fn collect_output<R: tokio::io::AsyncRead + Unpin>(mut reader: R, process:
     process.notify.notify_waiters();
 }
 
-async fn remote_signal(connection: &Connection, marker: &str, signal: Signal) -> Outcome<()> {
+fn signal_script(marker: &str, signal: Signal) -> String {
     let name = match signal {
         Signal::Interrupt => "INT",
         Signal::Terminate => "TERM",
         Signal::Kill => "KILL",
     };
-    let script = format!(
-        "[ -f {0} ] || exit 44; read p g < {0} || exit 44; case \"$p:$g\" in *[!0-9:]*|:*) exit 44;; esac; actual=$(ps -o pgid= -p \"$p\" 2>/dev/null | tr -d ' '); [ \"$actual\" = \"$g\" ] || exit 44; if [ \"$g\" = \"$p\" ]; then kill -{name} -\"$g\"; else kill -{name} \"$p\"; fi",
+    format!(
+        "[ -f {0} ] || exit 44; read p marker_g < {0} || exit 44; case \"$p:$marker_g\" in *[!0-9:]*|:*) exit 44;; esac; {PGID_QUERY} [ \"$g\" = \"$marker_g\" ] || exit 44; if [ \"$g\" = \"$p\" ]; then kill -{name} -\"$g\"; else kill -{name} \"$p\"; fi",
         quote(marker)
-    );
+    )
+}
+
+async fn remote_signal(connection: &Connection, channel: &Semaphore, marker: &str, signal: Signal) -> Outcome<()> {
+    // The six long-running process channels and three general transient channels can occupy
+    // nine of sshd's ten slots. This dedicated permit reserves the remaining slot for kills.
+    let _permit = tokio::time::timeout(Duration::from_secs(5), channel.acquire())
+        .await
+        .map_err(|_| error(ErrorCode::Unavailable, "SSH signal channel capacity exhausted"))?
+        .map_err(|_| error(ErrorCode::Unavailable, "SSH signal channel closed"))?;
+    let script = signal_script(marker, signal);
     let (status, _) = connection.run_with_status(&script, &[], false).await?;
     match status {
         0 => Ok(()),
