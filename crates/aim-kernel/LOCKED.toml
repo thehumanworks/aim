@@ -1,0 +1,9 @@
+# LOCKED decisions of aim-kernel and the digest of each spec's transitive closure.
+# PROTECTED (docs/adr/0005): agents and evolution candidates must not edit this file.
+# A change means the decision changed: it needs the maintainer and a superseding ADR,
+# then `mise run locked:update`.
+
+[[locked]]
+decision = "negotiate::agreed"
+adr = "0005"
+sha256 = "7b09700a52ae6b8b126a036d515d00a5a38012025a731040b46dff167774e425"

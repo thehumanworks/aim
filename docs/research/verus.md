@@ -21,17 +21,18 @@ pinned tag. Citation shorthands, all inside that clone:
 
 - **The install works through mise's `github:` backend.** `version_prefix = "release/"` removes the
   prefix from the tag, so the pin is `0.2026.09.20.aef82ed`. `mise lock` writes sha256 checksums
-  that match GitHub's asset digests. The download has no macOS quarantine flag. The zip is 449 MB
-  and unpacks to 1.4 GB, so use `filter_bins` to put only `verus` and `cargo-verus` on PATH.
+  that match GitHub's asset digests, and I confirmed that a wrong checksum blocks the install. The
+  download has no macOS quarantine flag. The zip is 449 MB and unpacks to 1.4 GB, so use
+  `filter_bins` to put only `verus` and `cargo-verus` on PATH.
 - **Each Verus release pins exactly one rustc.** 0.2026.09.20 needs 1.98.1, which is also the
   user's stable toolchain today, but only by coincidence. The `verus` driver always runs
   `rustup run 1.98.1-aarch64-apple-darwin rust_verify`. mise's `rust` backend is rustup under the
   hood, so the two are compatible. The default rustup profile is enough at runtime; `rustc-dev`
   and `llvm-tools` are not needed.
 - **Under `cargo verus`, every crate in the build is compiled by Verus's own rustc_driver** (1.98.1),
-  verified or not, whatever cargo started the build. A run started by cargo 1.97.1 also succeeded.
-  The dependency closure of the verified crates must therefore compile on Verus's rustc. The rest
-  of the workspace does not.
+  verified or not, whatever cargo started the build. Runs started by cargo 1.97.1 and by
+  cargo 1.99-nightly both succeeded. The dependency closure of the verified crates must therefore
+  compile on Verus's rustc. The rest of the workspace does not.
 - **How vstd is consumed:** `cargo-verus` ships inside the release zip. A verified crate adds
   `vstd = "=0.0.0-2026-09-20-0158"` from crates.io (an exact pin taken from Verus's toolchain
   manifest) and `[package.metadata.verus] verify = true`. The first `cargo verus` build verifies
@@ -42,9 +43,9 @@ pinned tag. Citation shorthands, all inside that clone:
     accepts at most 4·max_retries+3 events");
   - a multi-job `Board`;
   - compaction-plan invariants: tool call and result never split, pinned items always kept,
-    token sums never overflow.
+    token sums never overflow. For now a pair means a call immediately followed by its result.
 
-  All 7 bugs I planted deliberately were rejected with precise errors.
+  All 6 bugs I planted deliberately were rejected with precise errors.
 - **A plain `cargo build`/`cargo test`/`clippy` on stable works.** Ghost code is erased; I checked
   the macro expansion and the compiled symbols. No `RUSTC_BOOTSTRAP` or feature flags are needed.
   One trap: importing a spec-only item with `use` breaks the plain build (E0432). The fix is
@@ -55,8 +56,9 @@ pinned tag. Citation shorthands, all inside that clone:
   `+=`, `Default`. The restriction lints `indexing_slicing` and `arithmetic_side_effects` duplicate
   what the proofs already guarantee.
 - **The public API of a verified crate must not have preconditions.** A `requires` clause is only
-  an assumption about the caller. Unverified callers can break it, and Verus does not stop them;
-  I verified that. The pattern that works is private fields + type invariant + `View` +
+  an assumption about the caller. With the requires-fn made `pub`, Verus still verified, and the
+  unverified harness moved an `Open` job straight to `Done { worker: 99 }` at runtime. The
+  pattern that works is private fields + type invariant + `View` +
   `apply() -> Result`. Verus's own checker for this, `-V check-api-safety`, reports false alarms
   on vstd's own specs, so it is unusable today.
 - **`--no-cheating` rejects `assume`, `admit`, `external_body` and `assume_specification`.** This
@@ -159,8 +161,21 @@ It writes the inline form:
 - **Lockfile with checksums.** `mise lock --platform macos-arm64,linux-x64` wrote `mise.lock`
   entries with the URL, `url_api` and a checksum:
   `sha256:3f89fd25…d69377bc` (arm64-macos) and `sha256:7b870fa1…f0447b33` (x86-linux). Both are
-  byte-identical to `gh api repos/verus-lang/verus/releases/assets/<id> --jq .digest`. The
-  `lockfile` setting is not set on this machine.
+  byte-identical to `gh api repos/verus-lang/verus/releases/assets/<id> --jq .digest`.
+  - **The lockfile is used automatically** whenever `mise.lock` exists, with no setting needed
+    (https://mise.jdx.dev/dev-tools/mise-lock.html).
+  - **Checksums are enforced (ran).** I zeroed the arm64 checksum and ran
+    `mise install --force …`, which failed with
+    `Checksum mismatch … Expected: sha256:0000… Actual: sha256:3f89fd25…`.
+  - **Side effect of that failure:** the failed `--force` had **already deleted the existing
+    install**. The next `mise exec` re-installed it automatically once the lock was restored.
+- **`--locked` mode on this machine.** `MISE_LOCKED=1 mise install -n` fails here because of the
+  user's *global* tools: `neovim@latest is not in the lockfile`.
+  - `MISE_LOCKED=1 MISE_LOCKED_SCOPES=project mise install -n` passes (`all tools are installed`).
+  - Putting `[settings] locked = true` and `locked_scopes = ["project"]` in the project
+    `mise.toml` did not change the outcome here.
+  - The `rust` (core backend) lock entry has no URL. UNVERIFIED: whether `--locked` accepts it on a
+    fresh CI machine.
 
 ### F2. Rust toolchain coupling (ran)
 
@@ -188,8 +203,14 @@ It writes the inline form:
   missing and accepts `profile`, `components` and `targets` options
   (https://mise.jdx.dev/lang/rust.html). It is therefore not an alternative to rustup but a front
   end for it, and it is compatible with Verus's `rustup run`.
-- **Mismatch experiment.** `PATH=<verus>:$PATH RUSTUP_TOOLCHAIN=1.97.1 cargo verus verify` (cargo
-  1.97.1) succeeded: `2059 verified` for vstd and `1 verified` for the crate.
+- **Mismatch experiments.** Both directions succeeded, each giving `2059 verified` for vstd and
+  `1 verified` for the crate:
+  - `PATH=<verus>:$PATH RUSTUP_TOOLCHAIN=1.97.1 cargo verus verify` (cargo 1.97.1, older);
+  - `RUSTUP_TOOLCHAIN=nightly` (cargo 1.99.0-nightly 2026-08-07, newer), 30 s cold.
+
+  These tests only cover cargo as the orchestrator. The real constraint is below. UNVERIFIED by
+  experiment: a crate using a std API stabilized after 1.98 would then fail to compile inside
+  `cargo verus`.
   - Why: for crates that are not being verified, `rust_verify` calls
     `run_rustc_compiler_directly` (`verus-src/source/rust_verify/src/main.rs:97-100`). It compiles
     them with its *own* linked 1.98.1 rustc_driver, not the `rustc` cargo passed in.
@@ -200,11 +221,10 @@ It writes the inline form:
     `RUSTC_BOOTSTRAP=1`.
 - **Running without rustup.** `VERUS_USE_RUSTUP=0` alone fails:
   `dyld: Library not loaded: @rpath/librustc_driver-2446825d52b9075b.dylib … no LC_RPATH's found`.
-  Adding `DYLD_LIBRARY_PATH=~/.rustup/toolchains/1.98.1-aarch64-apple-darwin/lib` makes it work
-  (`15 verified`); `DYLD_FALLBACK_LIBRARY_PATH` does not.
-  - UNVERIFIED: macOS System Integrity Protection strips `DYLD_*` variables when a process is
-    launched through `/bin/sh`, so this route may break inside shell-based task runners. Prefer
-    rustup.
+  Setting either `DYLD_LIBRARY_PATH` or `DYLD_FALLBACK_LIBRARY_PATH` to
+  `~/.rustup/toolchains/1.98.1-aarch64-apple-darwin/lib` makes it work (`15 verified`), **but only
+  when `verus` is invoked directly**. Through `mise exec` the same variables are stripped and the
+  dyld error comes back (ran). Prefer the default rustup route.
 
 ### F3. cargo-verus, vstd and the crates.io crates (ran + read)
 
@@ -294,7 +314,7 @@ What is proven (31 items, all automatic or by short induction):
 | Any event history is accepted at most 4·max_retries+3 times (retries bounded ⇒ the lifecycle terminates) | `theorem_bounded_lifecycle` :203 | induction over `Seq<Event>` |
 | The retry counter never overflows `u32` | `#[verifier::type_invariant]` on private fields, :248 | `use_type_invariant` |
 | On a multi-job board, one event changes only its own job, exactly as `next` says | `Board::apply` board.rs:61 (`old@.update(id, post)`) | extensional `=~=` |
-| A compaction plan keeps pinned items and never splits a (ToolCall c, ToolResult c) pair | `plan_ok` compaction.rs:39; `repair_plan` :100 only adds kept items | `for` loop invariant plus a closed-form spec |
+| A compaction plan keeps pinned items and never splits a (ToolCall c, ToolResult c) pair. **Limit:** a pair here means `ToolResult c` *immediately* follows `ToolCall c`. Batched calls (call, call, result, result), as in tny ADR 0069, need a matching-by-id spec. | `plan_ok` compaction.rs:39; `repair_plan` :100 only adds kept items | `for` loop invariant plus a closed-form spec |
 | Token totals never overflow: `Ok(t)` ⇒ t = Σ kept; `Err(Overflow)` ⇔ Σ > u64::MAX | `kept_tokens` :130 | `checked_add` plus a monotonicity lemma |
 
 The mutable-reference syntax changed in recent releases. A postcondition must say `final(self)`
@@ -314,7 +334,7 @@ the crate (`guide/src/reference-type-invariants.md:34`).
 | n3_unbounded_retry | retry without checking the budget | `value may fail to meet its declared type invariant` and `possible arithmetic underflow/overflow` |
 | n4 / n4b | the plan drops the call of a kept result; in n4b the closed-form spec was changed to match, so implementation and spec agree with each other | loop invariant failure (n4); `plan_ok` postcondition failure (n4b), i.e. the decision itself caught it |
 | n5_unchecked_token_sum | `acc + tokens` without `checked_add` | `possible arithmetic underflow/overflow` |
-| n6_pub_requires_api | makes the requires-fn `pub` | **verifies (15 verified, 0 errors)**: nothing stops unverified callers from breaking a precondition |
+| n6_pub_requires_api | makes the requires-fn `pub` | **verifies (15 verified, 0 errors)**. The same change in the lab kernel still gave `31 verified`, and the unverified harness then ran `Job::new(3).complete_unchecked(99)`, printing `DEMO pub-requires: Done { worker: 99 }`: the job skipped the lifecycle at runtime (the change was reverted afterwards) |
 
 **(a) Verification timings** (kernel = 31 items; `/usr/bin/time -p`):
 
@@ -369,8 +389,12 @@ Adding `Board` later produced `new_without_default` and one more `const fn` sugg
 - **Restriction lints report what is already proven.** With `-W clippy::indexing_slicing
   -W clippy::arithmetic_side_effects`, clippy flags 10 indexings and 8 arithmetic operations that
   Verus has already proven in bounds and free of overflow.
-- **rustfmt leaves `verus!` bodies alone:** `cargo fmt --check` only reported diffs outside
-  `verus!`.
+- **rustfmt leaves `verus!` bodies alone (ran).** I put a deliberately misformatted
+  `pub fn   ugly_inside( x:u64 )->u64{x+0}` inside `verus!` and a similar one outside;
+  `cargo fmt --check` reported only the one outside.
+- **Clippy and rustfmt only ever see the erased code.** They check exec code only; spec and proof
+  code is covered solely by Verus itself and `verusfmt`. The brief's "strict clippy" therefore
+  applies only to the exec half of a verified crate.
 
 **(d) Unverified crate depending on the verified one.** `aim-harness/Cargo.toml` contains only
 `aim-kernel.workspace = true` (a path dependency), and the harness calls only `Job::apply`,
@@ -507,12 +531,15 @@ aim/
     rustc);
   - the kernel's dependency closure stays on vstd, with `rust-version` set to Verus's rustc.
 
-  The cost is two toolchains installed. Nothing leaks, because `rustup run` isolates Verus.
+  The cost is two toolchains installed. Nothing leaks, because `rustup run` isolates Verus. A
+  newer cargo orchestrating the build is fine (tested with 1.99-nightly). What must not happen is
+  code that needs a newer rustc ending up inside the `cargo verus` build.
 - **Release channel.** Use weekly stable releases, not rolling; bump monthly or when a needed
   feature lands (the toy used `final()`, which is recent). Watch for `vstd` exact pins and syntax
   changes on each bump.
 - **CI (x86_64 Linux, since no linux-arm64 Verus exists):**
-  - `mise install --locked`;
+  - `mise install --locked`. On developer machines that have unlocked global tools, use
+    `MISE_LOCKED_SCOPES=project`;
   - `mise run verify:kernel -- --no-cheating`, run after `cargo clean -p aim-kernel` or in a fresh
     target dir, so the flag is not skipped by the cache;
   - the ordinary `check` job on any platform.
@@ -526,7 +553,7 @@ aim/
 | # | Decision | Property to prove | Effort |
 |---|---|---|---|
 | 1 | Blackboard job lifecycle ("fiverr for agents") | The `next` table; terminal states absorb; exclusive claim; only the holder progresses; ≤ 4·max_retries+3 accepted events; `Board` changes only the addressed job | done (<1 s) |
-| 2 | Compaction plan invariants (tny ADR 0069 "provider sees a sound transcript", `refs/tny/docs/adr/0069-native-loop-stream-error-recovery.md:110-120`) | Pinned items kept; call and result never split; repair only adds; overflow-free token totals. Next step: the kept subsequence contains no orphan results (a sequence-filter lemma). | done / medium |
+| 2 | Compaction plan invariants (tny ADR 0069 "provider sees a sound transcript", `refs/tny/docs/adr/0069-native-loop-stream-error-recovery.md:110-120`) | Done for strictly adjacent pairs: pinned items kept; call and result never split; repair only adds; overflow-free token totals. Next steps: batch-aware pairing (every call id in a batch has exactly one result, matched by id), and a proof that the kept subsequence contains no orphan results (a sequence-filter lemma). | done (adjacent) / medium |
 | 3 | Session event log | `append` ⇒ `final@ == old@.push(e)`; sequence numbers strictly increase; `fork(at)` ⇒ `child@ == parent@.take(at)` and the parent is unchanged; replay is a pure fold | low |
 | 4 | Permission policy evaluation | Deny overrides allow; default deny, failing closed on unknown input (tny ADR 0059); monotone: adding a deny rule never grants anything and adding an allow rule never revokes a deny | medium (quantifiers over the rule sequence) |
 | 5 | Token budget arithmetic | All counters are checked `u64`; reserve/commit never exceeds the budget; the compaction trigger is monotone in usage | low |

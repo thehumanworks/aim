@@ -1,0 +1,17 @@
+[package]
+name = "aim-kernel"
+description = "aim's verified functional core: every locked decision, specified and proved with Verus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+vstd.workspace = true
+
+[package.metadata.verus]
+verify = true
+
+[lints]
+workspace = true

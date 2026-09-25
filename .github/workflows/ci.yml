@@ -1,0 +1,38 @@
+# The same gates agents run locally (AGENTS.md): `mise run check` and `mise run verify`.
+# Verification runs on x86_64 Linux: Verus publishes no linux-arm64 build (docs/research/verus.md).
+# Live smoke tests (`mise run smoke`) need the maintainer's credentials and run outside CI.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run check
+
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          install: true
+          cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: target/verus
+      - run: mise run verify

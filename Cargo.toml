@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+repository = "https://github.com/thehumanworks/aim"
+
+[workspace.dependencies]
+# Must equal the vstd listed in Verus's toolchain manifest for the pinned Verus release
+# (verus source/cargo-verus/toolchain-manifests/<version>.toml). Bumped together with Verus.
+vstd = "=0.0.0-2026-09-20-0158"
+aim-kernel = { path = "crates/aim-kernel" }
+
+# Lint policy: docs/adr/0004. Every member opts in with `[lints] workspace = true`.
+# `mise run check` passes `-D warnings`, so every `warn` below fails the gate.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+redundant_lifetimes = "warn"
+let_underscore_drop = "warn"
+trivial_numeric_casts = "warn"
+unit_bindings = "warn"
+# `verus_only` gates imports that exist only for proofs (a plain build would fail with E0432).
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(verus_only)',
+  'cfg(verus_keep_ghost)',
+  'cfg(verus_keep_ghost_body)',
+] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+# Pedantic opt-outs (each is style noise with no bug-finding value here).
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# Restriction picks: panics and silent failure are bugs in a daemon.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "warn"
+dbg_macro = "deny"
+exit = "deny"
+get_unwrap = "deny"
+indexing_slicing = "warn"
+string_slice = "deny"
+mem_forget = "deny"
+undocumented_unsafe_blocks = "deny"
+large_stack_arrays = "deny"
+infinite_loop = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+lossy_float_literal = "deny"
+float_cmp_const = "deny"
+clone_on_ref_ptr = "warn"
+unused_result_ok = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+# Exceptions must be explicit, justified and self-cleaning: `#[expect(lint, reason = "…")]`.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 1

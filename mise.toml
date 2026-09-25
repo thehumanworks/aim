@@ -1,0 +1,58 @@
+# aim toolchain and tasks. Every tool is pinned here (docs/adr/0003); `mise install` sets up a
+# working checkout, `mise run check` is the quality gate and `mise run verify` checks the proofs.
+#
+# Rust and Verus move together: each Verus release pins exactly one rustc (read it from the tag's
+# `rust-toolchain.toml`), and `cargo verus` compiles the verified crate's whole dependency closure
+# with that rustc. Bump both in one commit, then refresh `mise.lock`.
+
+[tools]
+rust = { version = "1.98.1", components = "rustfmt,clippy", targets = "wasm32-unknown-unknown" }
+
+# Verus tags look like `release/0.2026.09.20.aef82ed`; `version_prefix` strips `release/`.
+# The archive also carries z3/rust_verify/…; only the two entry points go on PATH.
+[tools."github:verus-lang/verus"]
+version = "0.2026.09.20.aef82ed"
+version_prefix = "release/"
+filter_bins = ["verus", "cargo-verus"]
+
+# rustfmt does not format inside `verus! {}`; verusfmt does (kernel only).
+[tools."github:verus-lang/verusfmt"]
+version = "0.7.3"
+
+[settings]
+lockfile = true
+
+[tasks.check]
+description = "Quality gate: fmt, clippy (-D warnings), tests, repository invariants"
+run = [
+  "cargo fmt --all --check",
+  "verusfmt --check crates/aim-kernel/src/*.rs",
+  "cargo clippy --workspace --all-targets --locked -- -D warnings",
+  "cargo test --workspace --locked",
+  "cargo xtask check",
+]
+
+[tasks.verify]
+description = "Verify aim-kernel with Verus (--no-cheating: no assume/admit/external_body)"
+# Changing Verus flags does not invalidate cargo's cache, so always re-verify the kernel crate.
+run = [
+  "cargo clean -p aim-kernel --target-dir target/verus",
+  # --no-cheating applies to aim-kernel only: vstd itself legitimately contains trusted axioms.
+  "cargo verus verify -p aim-kernel --target-dir target/verus --fwd-verus-args-to roots -- --no-cheating --time",
+]
+
+[tasks."verify:fast"]
+description = "Re-verify the kernel only (vstd proofs come from cache); for the edit loop"
+run = "cargo verus focus -p aim-kernel --target-dir target/verus"
+
+[tasks.fmt]
+description = "Format everything (rustfmt + verusfmt for the kernel)"
+run = ["cargo fmt --all", "verusfmt crates/aim-kernel/src/*.rs"]
+
+[tasks.smoke]
+description = "Live smoke tests against real services (needs credentials; required before merging integrations)"
+run = "cargo test --workspace --locked -- --ignored live_"
+
+[tasks."locked:update"]
+description = "Re-record LOCKED spec digests after a maintainer-approved decision change (with its ADR)"
+run = "cargo xtask locked --update"

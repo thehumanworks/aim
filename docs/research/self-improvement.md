@@ -7,6 +7,10 @@ marks an unresolved empirical or protocol claim.
 
 ## TL;DR
 
+> **Lead's note (2026-09-25):** the `UNVERIFIED` claim below about per-item/per-field token attribution was
+> settled by a live call — the ChatGPT codex backend returns `usage.attribution` with per-item and
+> per-request-field accounting. See [`live-probes.md`](live-probes.md). Live evidence supersedes the source-only doubt.
+
 - **FACT:** Darwin Gödel Machine (DGM) improved its coding-agent code in an archive search, reporting 20→50%
   on a 50-task SWE-bench Verified subset and 14.2→30.7% on full Polyglot. Its fixed outer evolution mechanism
   was outside self-modification. [DGM paper](https://arxiv.org/html/2505.22954), [Sakana
