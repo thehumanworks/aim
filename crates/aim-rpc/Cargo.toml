@@ -1,0 +1,24 @@
+[package]
+name = "aim-rpc"
+description = "JSON-RPC 2.0 peer for aim's protocols: framing, correlation, cancellation, typed routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+aim-proto = { path = "../aim-proto" }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53", features = ["rt", "macros", "sync", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+schemars = "1.2"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "io-util", "time", "test-util"] }
+
+[lints]
+workspace = true

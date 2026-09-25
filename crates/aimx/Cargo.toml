@@ -1,0 +1,22 @@
+[package]
+name = "aimx"
+description = "aim's execution layer: workspaces, tools and their enforcement, served over aim-harness/1 and MCP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "aimx"
+path = "src/main.rs"
+
+[dependencies]
+aim-kernel = { path = "../aim-kernel" }
+aim-proto = { path = "../aim-proto" }
+aim-rpc = { path = "../aim-rpc" }
+futures-core = "0.3"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[lints]
+workspace = true
