@@ -16,6 +16,7 @@ doc = false
 
 [dependencies]
 agent-client-protocol = "2.2"
+aim-kernel = { path = "../aim-kernel" }
 aim-proto = { path = "../aim-proto" }
 futures = "0.3"
 rustix = { version = "1", default-features = false, features = ["std", "process"] }
@@ -25,6 +26,7 @@ tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync
 tokio-util = { version = "0.7", features = ["codec"] }
 
 [dev-dependencies]
+proptest = "1.9"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time", "fs"] }
 
 [lints]

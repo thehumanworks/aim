@@ -150,25 +150,10 @@ impl Bridge {
     }
 }
 
-/// Whether `value` is one the agent advertises for `key` (by category, else by conventional id).
+/// Whether `value` resolves to a value the agent advertises for `key`, by the same rule the
+/// session applies when it sets it (docs/adr/0075). The error lists what the agent offers.
 fn check_option(options: &[ConfigOption], key: &ConfigKey, value: &str) -> Result<(), String> {
-    let (category, id) = match key {
-        ConfigKey::Model => ("model", "model"),
-        ConfigKey::Effort => ("thought_level", "effort"),
-        ConfigKey::Mode => ("mode", "mode"),
-        ConfigKey::Id(id) => ("", id.as_str()),
-    };
-    let option = options
-        .iter()
-        .find(|o| (!category.is_empty() && o.category.as_deref() == Some(category)) || o.id == id)
-        .ok_or_else(|| format!("the agent offers no {} option", key.label()))?;
-    match &option.kind {
-        aim_acp::ConfigKind::Select { values, .. } if !values.iter().any(|v| v.value == value) => {
-            let offered: Vec<&str> = values.iter().map(|v| v.value.as_str()).collect();
-            Err(format!("{} `{value}` is not offered (offers: {})", key.label(), offered.join(", ")))
-        }
-        _ => Ok(()),
-    }
+    aim_acp::resolve_config_value(options, key, value).map(drop).map_err(|error| error.to_string())
 }
 
 /// The model and effort an agent reports in its configuration options.
@@ -594,12 +579,13 @@ mod tests {
     use super::{AcpBackend, authority_prompt};
     use crate::agent::Backend as _;
 
-    /// Options of an agent whose effort `high` exists only with model `a`.
+    /// Options of an agent whose effort `high` exists only with model `a`, and which, like
+    /// claude-agent-acp, offers Opus only as `opus[1m]`.
     fn options(model: &str) -> Value {
         let efforts: &[&str] = if model == "a" { &["low", "high"] } else { &["low"] };
         json!([
             {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": model,
-             "options": [{"value": "a", "name": "A"}, {"value": "b", "name": "B"}]},
+             "options": [{"value": "a", "name": "A"}, {"value": "b", "name": "B"}, {"value": "opus[1m]", "name": "Opus 5.5"}]},
             {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "low",
              "options": efforts.iter().map(|e| json!({"value": e, "name": e})).collect::<Vec<_>>()}
         ])
@@ -649,6 +635,18 @@ mod tests {
         assert_eq!((now.model.as_str(), now.effort.as_deref()), ("b", Some("low")), "what the agent really has in force");
         // `auto` is not an effort this agent offers.
         assert!(backend.set_config(None, Some("auto".into())).await.unwrap_err().contains("not offered"));
+    }
+
+    #[tokio::test]
+    async fn a_model_alias_resolves_to_the_advertised_value() {
+        let mut backend = scripted_agent().await;
+        // The agent is sent `opus[1m]` and reports it back as current.
+        let now = backend.set_config(Some("opus".into()), Some("Low".into())).await.unwrap();
+        assert_eq!((now.model.as_str(), now.effort.as_deref()), ("opus[1m]", Some("low")));
+        // An unknown model is refused before anything changes, naming what the agent offers.
+        let refused = backend.set_config(Some("gpt-6".into()), None).await.unwrap_err();
+        assert!(refused.contains("`opus[1m]` (Opus 5.5)") && refused.contains("`a` (A)"), "{refused}");
+        assert_eq!(backend.set_config(None, None).await.unwrap().model, "opus[1m]");
     }
 
     #[test]

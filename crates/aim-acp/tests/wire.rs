@@ -657,6 +657,46 @@ async fn config_values_are_validated_against_what_the_agent_advertised() {
     );
 }
 
+/// claude-agent-acp 0.81.2 advertises no plain `opus` (fixture line 6). aim resolves the alias to
+/// the advertised `opus[1m]`, sends that, and confirms it against the value the agent reports
+/// (docs/adr/0075).
+#[tokio::test]
+async fn a_model_alias_is_sent_as_the_advertised_value_and_confirmed_by_it() {
+    let mut frames = initialize_frames();
+    let session_result = transcript("permission_turn.jsonl")
+        .into_iter()
+        .find_map(|(_, m)| m.get("result").filter(|r| r.get("sessionId").is_some()).cloned())
+        .unwrap();
+    // The agent reports its canonical value as current, as the adapter does after
+    // `setSessionConfigOption` (acp-agent.js: "Use the canonical option value").
+    let mut applied = session_result["configOptions"].clone();
+    for option in applied.as_array_mut().unwrap() {
+        if option["id"] == "model" {
+            option["currentValue"] = json!("opus[1m]");
+        }
+    }
+    frames.extend([
+        (true, json!({"jsonrpc": "2.0", "id": "n", "method": "session/new"})),
+        (false, json!({"jsonrpc": "2.0", "id": "n", "result": session_result})),
+        (true, json!({"jsonrpc": "2.0", "id": "c", "method": "session/set_config_option"})),
+        (false, json!({"jsonrpc": "2.0", "id": "c", "result": {"configOptions": applied}})),
+    ]);
+    let (client, agent) = replay(frames, None).await;
+    let mut session = client.new_session(SessionOptions::new("/tmp/x")).await.unwrap();
+    // Unknown and ambiguous values never reach the agent; the error lists what it offers.
+    let error = session.set_config(&ConfigKey::Model, "gpt-6").await.unwrap_err();
+    assert!(matches!(&error, AcpError::ConfigValueRejected { allowed, .. } if allowed.len() == 5), "{error}");
+    assert!(error.to_string().contains("`opus[1m]` (Opus 5.5)"), "{error}");
+    let options = session.set_config(&ConfigKey::Model, "opus").await.unwrap();
+    let model = options.iter().find(|o| o.id == "model").unwrap();
+    assert_eq!(model.current().as_deref(), Some("opus[1m]"));
+    let received = agent.await.unwrap();
+    assert_eq!(
+        sent(&received, "session/set_config_option")["params"],
+        json!({"sessionId": session.id(), "configId": "model", "value": "opus[1m]"})
+    );
+}
+
 #[test]
 fn yolo_prefers_allow_once_and_otherwise_cancels() {
     let option = |id: &str, kind| PermissionOption { id: id.into(), name: id.into(), kind };

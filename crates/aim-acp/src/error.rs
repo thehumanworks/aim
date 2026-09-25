@@ -4,6 +4,8 @@
 use aim_proto::error::ErrorCode;
 use serde_json::Value;
 
+use crate::config_options::ConfigValue;
+
 /// The JSON-RPC error code ACP assigns to `authRequired`.
 pub const AUTH_REQUIRED_CODE: i32 = -32000;
 
@@ -83,14 +85,27 @@ pub enum AcpError {
         /// The requested option (`model`, `effort`, `mode`, or an id).
         key: String,
     },
-    /// The requested value is not one of the option's advertised values.
+    /// The requested value does not resolve to any of the option's advertised values
+    /// (docs/adr/0075).
     ConfigValueRejected {
         /// The option id.
         id: String,
         /// The requested value.
         value: String,
-        /// The advertised values.
-        allowed: Vec<String>,
+        /// The advertised values (value and display name, redacted).
+        allowed: Vec<ConfigValue>,
+    },
+    /// The requested value matches more than one advertised value equally well, so aim picks
+    /// none of them (docs/adr/0075).
+    ConfigValueAmbiguous {
+        /// The option id.
+        id: String,
+        /// The requested value.
+        value: String,
+        /// Two of the advertised values it matches (redacted).
+        matches: Vec<ConfigValue>,
+        /// The advertised values (value and display name, redacted).
+        allowed: Vec<ConfigValue>,
     },
     /// The agent accepted `session/set_config_option` but did not apply the value.
     ConfigNotApplied {
@@ -119,7 +134,7 @@ impl AcpError {
             Self::Rpc { .. } | Self::Protocol { .. } => ErrorCode::Internal,
             Self::Timeout { .. } => ErrorCode::Timeout,
             Self::UnknownAuthMethod { .. } | Self::ConfigUnavailable { .. } => ErrorCode::NotFound,
-            Self::NotTerminalAuth { .. } | Self::ConfigValueRejected { .. } => ErrorCode::InvalidParams,
+            Self::NotTerminalAuth { .. } | Self::ConfigValueRejected { .. } | Self::ConfigValueAmbiguous { .. } => ErrorCode::InvalidParams,
             Self::ConfigNotApplied { .. } | Self::TurnStillRunning | Self::InvalidState(_) => ErrorCode::PreconditionFailed,
             Self::QueueOverflow => ErrorCode::LimitExceeded,
         }
@@ -159,12 +174,38 @@ impl core::fmt::Display for AcpError {
             Self::UnknownAuthMethod { .. } => f.write_str("the agent advertises no matching login method"),
             Self::NotTerminalAuth { .. } => f.write_str("the login method is not a terminal login"),
             Self::ConfigUnavailable { .. } => f.write_str("the session has no matching configuration option"),
-            Self::ConfigValueRejected { .. } => f.write_str("the configuration value was not advertised"),
+            Self::ConfigValueRejected { id, value, allowed } => {
+                write!(f, "{id} `{value}` is not offered; the agent offers {}", Offered(allowed))
+            }
+            Self::ConfigValueAmbiguous { id, value, matches, allowed } => {
+                write!(f, "{id} `{value}` is ambiguous: it matches {}; the agent offers {}", Offered(matches), Offered(allowed))
+            }
             Self::ConfigNotApplied { .. } => f.write_str("the agent did not apply the configuration value"),
             Self::TurnStillRunning => f.write_str("the previous turn is still running after cancellation"),
             Self::QueueOverflow => f.write_str("ACP session update queue exceeded its memory limit"),
             Self::InvalidState(_) => f.write_str("ACP client state does not permit the operation"),
         }
+    }
+}
+
+/// Advertised values as `` `value` (Name) `` pairs: the capability data a user needs to pick one.
+struct Offered<'a>(&'a [ConfigValue]);
+
+impl core::fmt::Display for Offered<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("no values");
+        }
+        for (i, value) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "`{}`", value.value)?;
+            if !value.name.is_empty() && value.name != value.value {
+                write!(f, " ({})", value.name)?;
+            }
+        }
+        Ok(())
     }
 }
 
