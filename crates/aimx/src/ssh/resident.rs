@@ -94,8 +94,16 @@ async fn wait_for_socket(socket: &Path, child: &mut std::process::Child, deadlin
         if UnixStream::connect(socket).await.is_ok() {
             return Ok(child_running);
         }
-        if child_running && child.try_wait()?.is_some() {
-            child_running = false;
+        if child_running {
+            match child.try_wait() {
+                Ok(Some(_)) => child_running = false,
+                Ok(None) => {}
+                Err(err) => {
+                    drop(child.kill());
+                    drop(child.wait());
+                    return Err(err);
+                }
+            }
         }
         if Instant::now() >= deadline {
             if child_running {
