@@ -1,5 +1,6 @@
 //! Contract tests of the UI protocol (ADR 0064, ADR 0017 Verification): envelopes and events
 //! round-trip, the fold is shared, schemas exist, and the A2UI adapter preserves aim's messages.
+#![expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "fixture helpers read a known file")]
 
 use aim_proto::daemon::{SessionAttachPagedResult, SessionAttachResult, SessionUpdate};
 use aim_proto::event::EventBody;

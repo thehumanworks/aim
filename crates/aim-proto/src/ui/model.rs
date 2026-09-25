@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{Component, DataOp, Placement, ROOT_ID, UiMessage};
+use super::{Component, DataOp, Placement, ROOT_ID, UiAction, UiMessage};
 
 /// Why a message or data operation could not apply.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -121,6 +121,20 @@ impl Surface {
     #[must_use]
     pub fn prop<'a>(&'a self, component: &'a Component, name: &str) -> Option<std::borrow::Cow<'a, Value>> {
         component.props.get(name).map(|value| self.resolve(value))
+    }
+
+    /// The action a press of button `id` sends: its `action.name`, and its `action.context` with
+    /// bindings resolved against the data (so every client sends the same action).
+    #[must_use]
+    pub fn action(&self, id: &str) -> Option<UiAction> {
+        let action = self.component(id)?.prop("action")?;
+        let name = action.get("name")?.as_str()?.to_owned();
+        let context = action
+            .get("context")
+            .and_then(Value::as_object)
+            .map(|context| context.iter().map(|(k, v)| (k.clone(), self.resolve(v).into_owned())).collect())
+            .unwrap_or_default();
+        Some(UiAction { name, surface_id: self.id.clone(), source_component_id: id.to_owned(), context })
     }
 
     /// Serialized size in bytes (what limits are measured on).
@@ -396,6 +410,22 @@ mod tests {
         assert_eq!(*s.resolve(&json!({"path": "/missing"})), Value::Null);
         assert_eq!(*s.resolve(&json!({"path": "/p", "x": 1})), json!({"path": "/p", "x": 1}), "not a binding");
         assert_eq!(*s.resolve(&json!("text")), json!("text"));
+    }
+
+    #[test]
+    fn a_button_press_resolves_its_context() {
+        let mut s = surface();
+        s.upsert(&[Component::new("go", "Button").with("action", json!({"name": "deploy", "context": {"n": {"path": "/n"}, "k": "v"}}))]);
+        s.apply_data(&op("/n", json!(3))).unwrap_or_default();
+        let action = s.action("go").unwrap_or_else(|| UiAction {
+            name: String::new(),
+            surface_id: String::new(),
+            source_component_id: String::new(),
+            context: Map::new(),
+        });
+        assert_eq!((action.name.as_str(), action.surface_id.as_str(), action.source_component_id.as_str()), ("deploy", "s", "go"));
+        assert_eq!(Value::Object(action.context), json!({"n": 3, "k": "v"}));
+        assert!(s.action("missing").is_none());
     }
 
     #[test]
