@@ -1,0 +1,17 @@
+[package]
+name = "aim-proto"
+description = "aim's wire and durable types: aim-harness/1, aim-daemon/1, tools, errors (no I/O, wasm-safe)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = "0.23"
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

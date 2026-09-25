@@ -21,3 +21,27 @@ Rules (enforced by `mise run check`):
 
 | ADR | Decision |
 | --- | --- |
+| [0001](0001-record-architecture-decisions.md) | Record numbered, append-only architecture decisions with verification evidence. |
+| [0002](0002-two-applications-and-a-gate.md) | Keep aimx and aim independent, with a separate trusted evolution gate. |
+| [0003](0003-tooling-pinned-through-mise.md) | Pin Rust, Verus, and other tools through mise. |
+| [0004](0004-strict-lint-policy.md) | Enforce strict workspace Clippy and Rust lint policy. |
+| [0005](0005-verified-kernel.md) | Keep pure decisions in a Verus-verified kernel and lock protocol negotiation. |
+| [0006](0006-core-protocols-and-edges.md) | Own core protocols and adapt standard protocols at the edges. |
+| [0007](0007-event-sourced-sessions.md) | Persist typed session events with private in-memory sessions. |
+| [0008](0008-execution-enforcement-in-aimx.md) | Admit tool calls in aim and enforce every call in aimx. |
+| [0009](0009-ssh-shadowing.md) | Shadow workspace tools over SSH with a resident remote aimx and agentless fallback. |
+| [0010](0010-codex-chatgpt-backend.md) | Implement a narrow ChatGPT Codex backend with independent OAuth. |
+| [0011](0011-openai-compatible-profiles.md) | Configure OpenAI-compatible providers through named profiles and data quirks. |
+| [0012](0012-claude-code-via-acp.md) | Run Claude Code through the pinned ACP client and explicit tool authority modes. |
+| [0013](0013-jev-decisions.md) | Batch Jev advice and verify bounded integer effort decisions. |
+| [0014](0014-dot-agents-layout-and-imports.md) | Use .agents and ~/.aim layouts with provenance and opt-in executable imports. |
+| [0015](0015-tui-screen-model.md) | Use inline scrollback, overlay screens, and one semantic transcript. |
+| [0016](0016-wasm-component-plugins.md) | Host capability-limited WebAssembly component plugins. |
+| [0017](0017-declarative-ui-protocol-and-themes.md) | Render built-in and authored UI through one declarative protocol. |
+| [0018](0018-code-mode.md) | Run code mode in sandboxed workers through the tool dispatcher. |
+| [0019](0019-blackboard-ledger.md) | Make the SQLite job and attempt ledger the swarm's sole authority. |
+| [0020](0020-gate-only-self-improvement.md) | Promote autonomous changes only through the isolated evolution gate. |
+| [0021](0021-yolo-with-narrowing-ceilings.md) | Default to yolo while preserving narrowing ceilings and protected paths. |
+| [0022](0022-live-smoke-tests-required.md) | Require live smoke evidence for every integration. |
+| [0023](0023-rust-web-ui-leptos.md) | Build the web UI in Rust with Leptos and shared protocol types. |
+| [0024](0024-benchmark-manifest.md) | Define comparable benchmark tiers and a quality-first pass condition. |
