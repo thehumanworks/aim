@@ -42,6 +42,17 @@ pub(super) fn aimx_binary() -> PathBuf {
         .clone()
 }
 
+fn aim_binary() -> PathBuf {
+    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            assert!(Command::new("cargo").args(["build", "-q", "-p", "aim", "--bin", "aim"]).status().expect("build aim").success());
+            let executable = std::env::current_exe().expect("test executable");
+            executable.parent().expect("deps directory").parent().expect("target directory").join("aim")
+        })
+        .clone()
+}
+
 fn spawn_forward(sshd: &Sshd, root: &Path, bootstrap: &str) -> (Peer, tokio::process::Child) {
     let local_home = sshd.dir.path().join("local_home");
     std::fs::create_dir_all(&local_home).expect("local home");
@@ -507,6 +518,34 @@ async fn live_ssh_transparent_reconnect_after_channel_killed() {
     peer.call::<ExecRelease>(ExecReleaseParams { proc }).await.expect("release");
     peer.close();
     child.kill().await.expect("stop forwarder");
+}
+
+#[tokio::test]
+#[ignore = "uses a real OpenRouter turn through a private user-space sshd"]
+async fn live_ssh_aim_run_openrouter_edits_and_executes_remote_file() {
+    assert!(std::env::var_os("OPENROUTER_API_KEY").is_some(), "OpenRouter credential is required for this live test");
+    let sshd = Sshd::start(false);
+    let remote = sshd.dir.path().join("provider_remote");
+    let local = sshd.dir.path().join("provider_local");
+    std::fs::create_dir(&remote).expect("remote workspace");
+    std::fs::create_dir(&local).expect("local workspace");
+    std::fs::write(local.join("probe.sh"), "local sentinel\n").expect("local sentinel");
+    let started = Instant::now();
+    let output = Command::new(aim_binary())
+        .arg("run")
+        .args(["--ssh", "aim-test", "-p", "openrouter", "--model", "openai/gpt-4.1-mini", "--ephemeral", "--max-requests", "6", "--aimx"])
+        .arg(aimx_binary())
+        .arg("-C")
+        .arg(&remote)
+        .arg("Use Write to create probe.sh containing exactly '#!/bin/sh\nprintf ssh-ok\n'. Then use Bash to run 'sh probe.sh'. Reply with the command output.")
+        .env("AIM_SSH_CONFIG", &sshd.config)
+        .output()
+        .expect("aim run");
+    eprintln!("aim_ssh_openrouter_turn_ms={}", started.elapsed().as_millis());
+    assert!(output.status.success(), "aim run status: {}", output.status);
+    assert_eq!(std::fs::read_to_string(remote.join("probe.sh")).expect("remote script"), "#!/bin/sh\nprintf ssh-ok\n");
+    assert_eq!(std::fs::read_to_string(local.join("probe.sh")).expect("local sentinel"), "local sentinel\n");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ssh-ok"), "agent should report execution output");
 }
 
 async fn exercise_agentless(sshd: &Sshd, connection: Connection) {
