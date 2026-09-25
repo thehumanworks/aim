@@ -25,6 +25,7 @@ fn spawn_params(ws: &WorkspaceId, script: &str, key: &IdempotencyKey) -> ExecSpa
         stdin: false,
         timeout_ms: None,
         idempotency_key: key.clone(),
+        scope: None,
     }
 }
 
@@ -60,7 +61,7 @@ async fn live_processes_are_capped_per_session_and_in_all() {
     .await;
     let a = connect(&env.socket).await;
     initialize(&a, None).await;
-    let params = WorkspaceOpenParams { root: env.root.to_str().unwrap().to_owned(), backend: BackendSpec::default() };
+    let params = WorkspaceOpenParams { root: env.root.to_str().unwrap().to_owned(), backend: BackendSpec::default(), ceiling: None };
     let info = a.peer.call::<WorkspaceOpen>(params).await.unwrap();
     assert_eq!(info.caps.max_concurrency, Some(2), "the per-session cap is advertised");
     let ws_a = info.id;
@@ -77,6 +78,7 @@ async fn live_processes_are_capped_per_session_and_in_all() {
         name: "Bash".into(),
         arguments: json!({"command": "touch tool-started"}),
         idempotency_key: Some(key()),
+        scope: None,
     };
     let result = a.peer.call::<ToolsCall>(bash).await.unwrap();
     assert!(result.is_error, "{result:?}");
@@ -84,7 +86,7 @@ async fn live_processes_are_capped_per_session_and_in_all() {
     assert!(!env.path("started").exists() && !env.path("tool-started").exists(), "nothing ran");
 
     // Releasing one admits the next; the refusal was not recorded, so the same key now runs.
-    a.peer.call::<ExecRelease>(ExecReleaseParams { proc: p1 }).await.unwrap();
+    a.peer.call::<ExecRelease>(ExecReleaseParams { proc: p1, scope: None }).await.unwrap();
     spawn(&a, &ws_a, "touch started; sleep 30", &k3).await.unwrap();
     for _ in 0..100 {
         if env.path("started").exists() {
@@ -158,7 +160,7 @@ async fn workspaces_per_session_are_capped() {
     std::fs::create_dir(env.path("sub")).unwrap();
     let (client, _, ws) = session(&env).await;
     assert_eq!(open(&client, &env.root).await, ws, "reopening the same root is not a new workspace");
-    let params = WorkspaceOpenParams { root: env.path("sub").to_str().unwrap().to_owned(), backend: BackendSpec::default() };
+    let params = WorkspaceOpenParams { root: env.path("sub").to_str().unwrap().to_owned(), backend: BackendSpec::default(), ceiling: None };
     assert_eq!(client.peer.call::<WorkspaceOpen>(params).await.unwrap_err().code, ErrorCode::LimitExceeded);
 }
 
@@ -172,8 +174,8 @@ async fn ptys_are_capped_while_they_run() {
     assert_eq!(client.peer.call::<ExecSpawn>(pty(&k)).await.unwrap_err().code, ErrorCode::LimitExceeded);
     // Pipes are not ptys.
     spawn(&client, &ws, "true", &key()).await.unwrap();
-    client.peer.call::<ExecSignal>(ExecSignalParams { proc: first.clone(), signal: Signal::Kill }).await.unwrap();
-    client.peer.call::<ExecWait>(ExecWaitParams { proc: first, timeout_ms: Some(5000) }).await.unwrap();
+    client.peer.call::<ExecSignal>(ExecSignalParams { proc: first.clone(), signal: Signal::Kill, scope: None }).await.unwrap();
+    client.peer.call::<ExecWait>(ExecWaitParams { proc: first, timeout_ms: Some(5000), scope: None }).await.unwrap();
     eventually(|| client.peer.call::<ExecSpawn>(pty(&k))).await;
 }
 
@@ -186,6 +188,7 @@ async fn mutations_in_flight_are_capped() {
         name: "Bash".into(),
         arguments: json!({"command": "sleep 1"}),
         idempotency_key: Some(key()),
+        scope: None,
     };
     let peer = client.peer.clone();
     let running = tokio::spawn(async move { peer.call::<ToolsCall>(slow).await });
@@ -197,6 +200,7 @@ async fn mutations_in_flight_are_capped() {
         precondition: Precondition::Any,
         create_dirs: false,
         idempotency_key: key(),
+        scope: None,
     };
     assert_eq!(client.peer.call::<FsWrite>(write.clone()).await.unwrap_err().code, ErrorCode::LimitExceeded);
     running.await.unwrap().unwrap();

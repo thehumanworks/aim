@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::common::{Client, env, key, session};
 
 async fn call(client: &Client, ws: &WorkspaceId, name: &str, arguments: Value) -> ToolResult {
-    let params = ToolsCallParams { workspace: ws.clone(), name: name.into(), arguments, idempotency_key: Some(key()) };
+    let params = ToolsCallParams { workspace: ws.clone(), name: name.into(), arguments, idempotency_key: Some(key()), scope: None };
     client.peer.call::<ToolsCall>(params).await.unwrap()
 }
 
@@ -96,10 +96,15 @@ async fn read_write_edit_ls() {
     assert_eq!(text(&call(&client, &ws, "LS", json!({"path": "empty"})).await), "(empty directory)");
 
     // Escapes are policy errors, not model-visible results.
-    let params =
-        ToolsCallParams { workspace: ws.clone(), name: "Read".into(), arguments: json!({"file_path": "../x"}), idempotency_key: None };
+    let params = ToolsCallParams {
+        workspace: ws.clone(),
+        name: "Read".into(),
+        arguments: json!({"file_path": "../x"}),
+        idempotency_key: None,
+        scope: None,
+    };
     assert_eq!(client.peer.call::<ToolsCall>(params).await.unwrap_err().code, ErrorCode::Denied);
-    let params = ToolsCallParams { workspace: ws, name: "Nope".into(), arguments: json!({}), idempotency_key: None };
+    let params = ToolsCallParams { workspace: ws, name: "Nope".into(), arguments: json!({}), idempotency_key: None, scope: None };
     assert_eq!(client.peer.call::<ToolsCall>(params).await.unwrap_err().code, ErrorCode::NotFound);
 }
 
@@ -168,7 +173,13 @@ async fn bash_foreground_background_and_handles() {
     let handle = big.handle.clone().expect("a handle to the full output");
     let full = client
         .peer
-        .call::<ExecRead>(ExecReadParams { proc: ProcId::new(handle.as_str()), after_seq: 0, max_bytes: Some(8 * 1024 * 1024), wait_ms: 0 })
+        .call::<ExecRead>(ExecReadParams {
+            proc: ProcId::new(handle.as_str()),
+            after_seq: 0,
+            max_bytes: Some(8 * 1024 * 1024),
+            wait_ms: 0,
+            scope: None,
+        })
         .await
         .unwrap();
     let all: String = full.chunks.into_iter().map(|c| String::from_utf8(c.data.into_bytes()).unwrap()).collect();

@@ -35,6 +35,7 @@ fn grep(ws: &WorkspaceId, pattern: &str) -> GrepParams {
         fixed_strings: false,
         context: 0,
         max_matches: None,
+        scope: None,
     }
 }
 
@@ -119,6 +120,7 @@ async fn glob_respects_gitignore_and_is_sorted() {
         patterns: patterns.iter().map(|p| (*p).to_owned()).collect(),
         path: path.map(str::to_owned),
         max_results: max,
+        scope: None,
     };
     let found = client.peer.call::<Glob>(glob(&["**/*.rs"], None, None)).await.unwrap();
     assert_eq!(found.paths, ["src/deep/mod.rs", "src/lib.rs", "src/main.rs"]);
