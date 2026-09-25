@@ -84,6 +84,9 @@ fn hash_file(file: &mut File) -> io::Result<ContentHash> {
 }
 
 fn bounded_bytes(file: &mut (impl io::Read + io::Seek), start: u64, count: u64) -> io::Result<Vec<u8>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     file.seek(SeekFrom::Start(start))?;
     let mut out = Vec::new();
     file.take(count).read_to_end(&mut out)?;
@@ -750,7 +753,8 @@ mod tests {
         assert_eq!(source.bytes_read, 17);
         assert_eq!(source.pos, (1 << 20) + 17);
 
-        assert!(bounded_bytes(&mut source, 1 << 20, 0).unwrap().is_empty());
+        assert!(bounded_bytes(&mut source, u64::MAX, 0).unwrap().is_empty());
         assert_eq!(source.bytes_read, 17);
+        assert_eq!(source.pos, (1 << 20) + 17);
     }
 }

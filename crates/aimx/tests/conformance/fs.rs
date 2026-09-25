@@ -399,6 +399,20 @@ async fn prefix_reads_report_size_without_hashing_the_rest() {
     assert!(result.hash.is_none());
     assert!(!result.truncated);
 
+    let past_end = client
+        .peer
+        .call::<FsRead>(FsReadParams {
+            workspace: ws.clone(),
+            path: "huge".into(),
+            range: Some(ByteRange { start: u64::MAX, len: 4 }),
+            scope: None,
+            hash: false,
+        })
+        .await
+        .unwrap();
+    assert!(past_end.content.into_bytes().is_empty());
+    assert!(!past_end.truncated);
+
     let result = client
         .peer
         .call::<FsReadMany>(FsReadManyParams {

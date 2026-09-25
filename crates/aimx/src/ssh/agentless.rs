@@ -240,7 +240,9 @@ impl AgentlessWorkspace {
         let target = self.safe(path, false).await?;
         let start = range.map_or(0, |range| range.start);
         let count = range.map_or(max_bytes, |range| range.len.min(max_bytes));
-        let body = if !hash {
+        let body = if !hash && (count == 0 || start > i64::MAX.unsigned_abs()) {
+            ":".to_owned()
+        } else if !hash {
             // POSIX dd with bs=1 limits the remote file reads exactly, even when a pipe's
             // producer would otherwise read ahead of head -c.
             format!("dd if=\"$p\" bs=1 skip={start} count={count} 2>/dev/null")

@@ -1760,6 +1760,13 @@ async fn exercise_agentless(sshd: &Sshd, connection: Connection) {
     assert_eq!(prefix.size, content.len() as u64);
     assert!(prefix.hash.is_none());
     assert!(prefix.truncated);
+    let past_end = workspace
+        .fs()
+        .read(&file, Some(aim_proto::harness::ByteRange { start: u64::MAX, len: 4 }), 4, false)
+        .await
+        .expect("out-of-range prefix read");
+    assert!(past_end.content.into_bytes().is_empty());
+    assert!(!past_end.truncated);
     let edit = ExactEdit { old: "before".to_owned(), new: "after".to_owned(), replace_all: false };
     timed(
         "edit",
