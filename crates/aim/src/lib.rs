@@ -16,5 +16,6 @@ pub mod context;
 pub mod harness;
 pub mod host;
 pub mod providers;
+pub mod remote;
 pub mod session;
 pub mod store;

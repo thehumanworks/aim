@@ -31,6 +31,8 @@ pub struct RunOptions {
     pub effort: Option<String>,
     /// Workspace directory.
     pub cwd: PathBuf,
+    /// SSH destination for a remote workspace.
+    pub ssh: Option<String>,
     /// Path of the `aimx` binary.
     pub aimx: Option<PathBuf>,
     /// Keep nothing on disk.
@@ -169,7 +171,11 @@ impl Human {
 /// # Errors
 /// A message for the user when setup fails (workspace, provider, store, session).
 pub async fn run(options: RunOptions, factory: ProviderFactory) -> Result<i32, String> {
-    let root = options.cwd.canonicalize().map_err(|e| format!("{}: {e}", options.cwd.display()))?;
+    let root = if options.ssh.is_some() {
+        options.cwd.clone()
+    } else {
+        options.cwd.canonicalize().map_err(|e| format!("{}: {e}", options.cwd.display()))?
+    };
     let (store, persistence): (Arc<dyn SessionStore>, Persistence) = if options.ephemeral {
         (Arc::new(MemoryStore::default()), Persistence::Ephemeral)
     } else {
@@ -182,7 +188,7 @@ pub async fn run(options: RunOptions, factory: ProviderFactory) -> Result<i32, S
 
     let spec = SessionSpec {
         workspace: root.to_string_lossy().into_owned(),
-        location: Location::Local,
+        location: options.ssh.as_ref().map_or(Location::Local, |destination| Location::Ssh { destination: destination.clone() }),
         provider: options.provider.clone(),
         model: options.model.clone(),
         effort: options.effort.clone(),
