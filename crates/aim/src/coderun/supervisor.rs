@@ -417,6 +417,7 @@ impl CellTicket {
         locked(&self.inner.bridges.cells).insert(self.cell_id.clone(), Arc::new(bridge));
         self.in_flight = true;
         let hard = remaining.saturating_add(Duration::from_millis(DEADLINE_MARGIN_MS));
+        let limit = request.output_limit_bytes;
         let result = tokio::time::timeout(hard, peer.call::<ExecuteCell>(request)).await;
         self.in_flight = false;
         match result {
@@ -425,7 +426,8 @@ impl CellTicket {
                 if peer.is_closed() {
                     Inner::kill_worker(&mut locked(&self.inner.state));
                 }
-                Err(error)
+                // Defense in depth: a failure is bounded like output even from a compromised worker.
+                Err(aim_coderun::runtime::bounded_error(error, limit))
             }
             Err(_) => {
                 Inner::kill_worker(&mut locked(&self.inner.state));

@@ -24,7 +24,7 @@ use rquickjs::{AsyncContext, AsyncRuntime, CaughtError, Ctx, Promise, Value as J
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::budget::{Charge, EventKind, MAX_EVENTS, MAX_STORE_BYTES, OutputBudget};
+use crate::budget::{Charge, EventKind, MAX_EVENTS, MAX_STORE_BYTES, OutputBudget, truncate_middle};
 use crate::protocol::{CallTool, CellOutput, Execute, ExecuteResult, Output, ToolCall};
 
 const BOOTSTRAP: &str = r"
@@ -133,8 +133,17 @@ pub struct QuickJsRuntime;
 
 impl CodeRuntime for QuickJsRuntime {
     fn execute(&self, request: Execute, parent: Peer) -> Pin<Box<dyn Future<Output = Result<ExecuteResult, ProtoError>> + Send>> {
-        Box::pin(run_cell(request, parent))
+        let limit = request.output_limit_bytes;
+        Box::pin(async move { run_cell(request, parent).await.map_err(|error| bounded_error(error, limit)) })
     }
+}
+
+/// A failure within the cell's output budget: a script can throw a message of any size, and the
+/// model sees it, so it is cut as output is (head and tail, UTF-8 safe, with a warning line).
+#[must_use]
+pub fn bounded_error(mut error: ProtoError, limit_bytes: usize) -> ProtoError {
+    error.message = truncate_middle(&error.message, limit_bytes);
+    error
 }
 
 struct Emitted {
