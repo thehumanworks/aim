@@ -821,6 +821,7 @@ fn with_media(media: &Arc<FakeMedia>) -> NativeServices {
             Box::pin(async move { Some(media) })
         })),
         decider: None,
+        tools: Vec::new(),
     }
 }
 

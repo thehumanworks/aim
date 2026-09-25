@@ -174,7 +174,14 @@ pub struct NativeServices {
     /// Automatic effort advice (Jev). Attached only to persistent sessions (ADR 0013), and heeded
     /// only while their effort is automatic.
     pub decider: Option<Arc<dyn Decider>>,
+    /// More tools for each session (conversation search, board, code mode, MCP servers, …). Each
+    /// factory decides for the session and may offer none; they are composed after the workspace's
+    /// and media tools (which keep their names) and before the agent's allowlist.
+    pub tools: Vec<ToolsFactory>,
 }
+
+/// Offers a session extra tools, or none (see [`NativeServices::tools`]).
+pub type ToolsFactory = Arc<dyn Fn(&SessionSpec) -> BoxFuture<Option<Arc<dyn ToolHost>>> + Send + Sync>;
 
 /// The native loop: a provider from `providers` and tools from a workspace `workspaces`
 /// connects, with aim's instructions, the session's resources (the project's through the
@@ -282,6 +289,15 @@ pub fn native_backends_with(
                 && let Some(media) = media().await
             {
                 tools = Arc::new(Dispatcher::with_policy(tools, media, spec.persistence == Persistence::Persistent));
+            }
+            let mut extra = Vec::new();
+            for factory in &services.tools {
+                if let Some(host) = factory(&spec).await {
+                    extra.push(host);
+                }
+            }
+            if !extra.is_empty() {
+                tools = Arc::new(crate::agent::tools::Compose::new(tools, extra));
             }
             let (tools, record) = match &agent {
                 Some((agent, policy)) => (narrowed(tools, agent, policy), Some(policy.record(&agent.meta.name))),

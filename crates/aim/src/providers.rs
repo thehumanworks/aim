@@ -109,7 +109,42 @@ pub fn services() -> crate::host::NativeServices {
     let decider = std::env::var_os("TYPESAFE_API_KEY")
         .is_some_and(|value| !value.is_empty())
         .then(|| Arc::new(crate::jev::JevDecider) as Arc<dyn crate::jev::Decider>);
-    crate::host::NativeServices { media: Some(media), decider }
+    crate::host::NativeServices { media: Some(media), decider, tools: vec![search_tools()] }
+}
+
+type SearchParts = (Arc<crate::search::SearchEngine>, Arc<crate::store::SqliteStore>);
+
+/// Conversation search tools (`search_sessions`, `read_session`, ADR 0035) over this user's session
+/// database, opened once per process on first use. Omitted when the index cannot be opened.
+fn search_tools() -> crate::host::ToolsFactory {
+    let opened: Arc<tokio::sync::OnceCell<Option<SearchParts>>> = Arc::new(tokio::sync::OnceCell::new());
+    Arc::new(move |spec: &aim_proto::daemon::SessionSpec| {
+        let opened = Arc::clone(&opened);
+        let persistence = spec.persistence;
+        Box::pin(async move {
+            let parts = opened
+                .get_or_init(|| async {
+                    let database = crate::cli::aim_home().join("aim.db");
+                    let engine = {
+                        let database = database.clone();
+                        tokio::task::spawn_blocking(move || crate::search::SearchEngine::open(&database)).await
+                    };
+                    if let (Ok(Ok(engine)), Ok(store)) = (engine, crate::store::SqliteStore::open(&database)) {
+                        Some((Arc::new(engine), Arc::new(store)))
+                    } else {
+                        tracing::debug!("conversation search is unavailable");
+                        None
+                    }
+                })
+                .await
+                .clone()?;
+            let reranker = std::env::var_os("TYPESAFE_API_KEY")
+                .is_some_and(|value| !value.is_empty())
+                .then(|| Arc::new(crate::search::rerank::JevReranker) as Arc<dyn crate::search::tools::Reranker>);
+            let host = crate::search::tools::SearchToolHost::new(parts.0, parts.1, persistence, reranker);
+            Some(Arc::new(host) as Arc<dyn crate::agent::ToolHost>)
+        })
+    })
 }
 
 /// Every backend this build can host: `acp:*` agents, else the native loop with [`build`]'s

@@ -33,3 +33,86 @@ pub trait ToolHost: Send + Sync {
         Box::pin(async { Err(ProtoError::new(ErrorCode::Unavailable, "workspace does not support binary writes")) })
     }
 }
+
+/// Several tool hosts as one: specs are concatenated in order, and a name offered by an earlier
+/// host shadows the same name later on (the workspace's tools always keep their names). Calls go
+/// to the host that offered the name; binary writes go to the first host (the workspace).
+pub struct Compose {
+    hosts: Vec<std::sync::Arc<dyn ToolHost>>,
+}
+
+impl Compose {
+    /// Composes `first` (the workspace, which keeps its names) with `rest`, in order.
+    #[must_use]
+    pub fn new(first: std::sync::Arc<dyn ToolHost>, rest: Vec<std::sync::Arc<dyn ToolHost>>) -> Self {
+        let mut hosts = vec![first];
+        hosts.extend(rest);
+        Self { hosts }
+    }
+
+    fn owner(&self, name: &str) -> Option<&std::sync::Arc<dyn ToolHost>> {
+        self.hosts.iter().find(|host| host.specs().iter().any(|spec| spec.name == name))
+    }
+}
+
+impl ToolHost for Compose {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut seen = std::collections::HashSet::new();
+        self.hosts.iter().flat_map(|host| host.specs()).filter(|spec| seen.insert(spec.name.clone())).collect()
+    }
+
+    fn call(&self, name: String, arguments: Value, key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
+        match self.owner(&name) {
+            Some(host) => host.call(name, arguments, key),
+            None => Box::pin(async move { Err(ProtoError::new(ErrorCode::NotFound, format!("no tool named `{name}`"))) }),
+        }
+    }
+
+    fn write_blob(&self, path: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        match self.hosts.first() {
+            Some(workspace) => workspace.write_blob(path, bytes, key),
+            None => Box::pin(async { Err(ProtoError::new(ErrorCode::Unavailable, "no workspace")) }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    struct Named(&'static [&'static str], &'static str);
+
+    impl ToolHost for Named {
+        fn specs(&self) -> Vec<ToolSpec> {
+            self.0
+                .iter()
+                .map(|name| ToolSpec {
+                    name: (*name).to_owned(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    input: aim_proto::tool::ToolInput::default(),
+                    annotations: aim_proto::tool::ToolAnnotations::default(),
+                })
+                .collect()
+        }
+
+        fn call(&self, _name: String, _arguments: Value, _key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
+            let from = self.1;
+            Box::pin(async move { Ok(ToolResult::text(from)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn earlier_hosts_keep_their_names_and_calls_route_to_the_owner() {
+        let composed =
+            Compose::new(Arc::new(Named(&["Read", "Bash"], "workspace")), vec![Arc::new(Named(&["Bash", "search_sessions"], "extra"))]);
+        let names: Vec<String> = composed.specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["Read", "Bash", "search_sessions"], "a later Bash does not shadow the workspace's");
+        let key = || IdempotencyKey::new("k".to_owned());
+        assert_eq!(composed.call("Bash".into(), Value::Null, key()).await.unwrap(), ToolResult::text("workspace"));
+        assert_eq!(composed.call("search_sessions".into(), Value::Null, key()).await.unwrap(), ToolResult::text("extra"));
+        assert!(composed.call("nope".into(), Value::Null, key()).await.is_err());
+    }
+}
