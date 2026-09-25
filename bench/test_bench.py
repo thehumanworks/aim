@@ -15,7 +15,7 @@ from pathlib import Path
 from live_tasks import TASKS, grade, prepare
 from compare import compare_wire
 from proxy import BenchServer, Handler, Recorder, SseUsage, append_only, has_generated_delta, render_order, request_shape, usage_fields
-from run import invocation, path_map, split_arm, summary, update_diagnostics
+from run import TRIAL_ROOT, invocation, isolated_env, path_map, split_arm, summary, temporary_workspace, update_diagnostics
 
 
 class RecorderTests(unittest.TestCase):
@@ -194,6 +194,13 @@ class LiveTaskTests(unittest.TestCase):
         self.assertEqual(diagnostic["failed_tools_by_name"], {"Bash": 1})
         self.assertEqual(diagnostic["turn_failure_class"], "max_requests")
         self.assertNotIn("secret-value", str(diagnostic))
+
+    def test_trial_paths_do_not_depend_on_the_callers_tmpdir(self):
+        with mock.patch.dict("run.BASE_ENV", {"PATH": "/bin", "TMPDIR": "/var/folders/xx/long-caller-temp/T/"}, clear=True):
+            env = isolated_env(Path("/h"))
+            with temporary_workspace() as root:
+                self.assertEqual(root.parent, TRIAL_ROOT)
+        self.assertEqual(env["TMPDIR"], str(TRIAL_ROOT), "harnesses name their temp files in model-visible text")
 
     def test_aim_arms_select_aim_code_mode(self):
         self.assertEqual(split_arm("aim_openrouter@only"), ("aim_openrouter", "only"))

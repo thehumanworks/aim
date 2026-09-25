@@ -38,12 +38,17 @@ MANIFEST = BENCH / "manifest.toml"
 PROXY = BENCH / "proxy.py"
 CODEX_AUTH = Path.home() / ".codex"
 BASE_ENV = os.environ.copy()
+# Every trial root lives under this fixed directory, which is also each harness's TMPDIR. Codex CLI,
+# pi and aim put the workspace path in model-visible text (pi also names its temp output file), so
+# the caller's TMPDIR (`/var/folders/…/T/` on macOS, `/tmp` in some sandboxes) used to change the
+# deterministic byte counts by its length (T4b: +44 bytes on every codex and pi row).
+TRIAL_ROOT = Path("/tmp")
 
 
 @contextmanager
 def temporary_workspace():
     """Wait briefly for a peer's just-exited helper to stop touching its isolated HOME."""
-    path = Path(tempfile.mkdtemp(prefix="aim-bench-"))
+    path = Path(tempfile.mkdtemp(prefix="aim-bench-", dir=TRIAL_ROOT))
     try:
         yield path
     finally:
@@ -206,8 +211,8 @@ class ProcessTreeRss:
 
 
 def isolated_env(home: Path) -> dict[str, str]:
-    env = {name: BASE_ENV[name] for name in ("PATH", "LANG", "LC_ALL", "TMPDIR", "USER") if name in BASE_ENV}
-    env.update(HOME=str(home), AIM_HOME=str(home / ".aim"), XDG_CONFIG_HOME=str(home / ".config"),
+    env = {name: BASE_ENV[name] for name in ("PATH", "LANG", "LC_ALL", "USER") if name in BASE_ENV}
+    env.update(HOME=str(home), TMPDIR=str(TRIAL_ROOT), AIM_HOME=str(home / ".aim"), XDG_CONFIG_HOME=str(home / ".config"),
                XDG_CACHE_HOME=str(home / ".cache"), XDG_DATA_HOME=str(home / ".local/share"),
                XDG_STATE_HOME=str(home / ".local/state"), TERM="xterm", PYTHONDONTWRITEBYTECODE="1")
     return env
