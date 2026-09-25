@@ -37,6 +37,11 @@ pub struct ForwardOptions {
     pub idle: Duration,
 }
 
+pub(super) struct VerifiedBinary {
+    pub(super) path: String,
+    pub(super) sha256: String,
+}
+
 struct TtyPrompter;
 
 impl Prompter for TtyPrompter {
@@ -138,7 +143,7 @@ pub(super) async fn connect_ssh(options: &ForwardOptions) -> Result<Connection, 
     Ok(connection)
 }
 
-pub(super) async fn remote_binary(connection: &Connection, options: &ForwardOptions) -> Result<String, String> {
+pub(super) async fn remote_binary(connection: &Connection, options: &ForwardOptions) -> Result<VerifiedBinary, String> {
     let probe = bootstrap::probe(connection).await.map_err(|err| format!("probe: {err:?}"))?;
     let target = probe.target.ok_or("unsupported SSH host")?;
     let path = options.artifact.clone().map_or_else(std::env::current_exe, Ok).map_err(|err| err.to_string())?;
@@ -156,7 +161,7 @@ pub(super) async fn remote_binary(connection: &Connection, options: &ForwardOpti
     };
     let binary = bootstrap::install(connection, &artifact, false).await.map_err(|err| format!("install: {err:?}"))?;
     connection.run(&format!("{} version >/dev/null", quote(&binary)), &[]).await.map_err(|err| err.to_string())?;
-    Ok(binary)
+    Ok(VerifiedBinary { path: binary, sha256: artifact.sha256 })
 }
 
 async fn serve_agentless(connection: Connection, options: &ForwardOptions) -> Result<(), String> {

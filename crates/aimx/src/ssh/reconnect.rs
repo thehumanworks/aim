@@ -10,7 +10,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::conn::Connection;
-use super::forward::{ForwardOptions, connect_ssh, remote_binary};
+use super::forward::{ForwardOptions, VerifiedBinary, connect_ssh, remote_binary};
 use super::quote;
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -27,9 +27,9 @@ struct Channel {
 }
 
 impl Channel {
-    fn open(connection: &Connection, binary: &str, options: &ForwardOptions) -> Result<Self, String> {
+    fn open(connection: &Connection, binary: &VerifiedBinary, options: &ForwardOptions) -> Result<Self, String> {
         let root = options.root.to_str().ok_or("remote root is not UTF-8")?;
-        let script = format!("exec {} proxy --root {} --idle-secs {}", quote(binary), quote(root), options.idle.as_secs());
+        let script = launch_script(binary, root, options.idle);
         let mut command = connection.command(&script, false);
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
         let mut child = command.spawn().map_err(|err| err.to_string())?;
@@ -42,6 +42,16 @@ impl Channel {
         drop(self.child.start_kill());
         drop(tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await);
     }
+}
+
+fn launch_script(binary: &VerifiedBinary, root: &str, idle: Duration) -> String {
+    let path = quote(&binary.path);
+    format!(
+        "if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < {path}) || exit; elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < {path}) || exit; else exit 127; fi; h=${{h%% *}}; [ \"$h\" = {} ] || exit 42; exec {path} proxy --root {} --idle-secs {}",
+        quote(&binary.sha256),
+        quote(root),
+        idle.as_secs()
+    )
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(reader: &mut BufReader<R>, frame: &mut Vec<u8>) -> Result<Option<Vec<u8>>, String> {
@@ -212,7 +222,7 @@ async fn reconnect(
 }
 
 /// Keep aim's one stdio stream alive while replacing dropped SSH channels.
-pub(super) async fn relay(options: &ForwardOptions, connection: Connection, binary: String) -> Result<(), String> {
+pub(super) async fn relay(options: &ForwardOptions, connection: Connection, binary: VerifiedBinary) -> Result<(), String> {
     let mut channel = Channel::open(&connection, &binary, options)?;
     let mut local_input = BufReader::new(tokio::io::stdin());
     let mut local_output = tokio::io::stdout();
@@ -293,9 +303,32 @@ pub(super) async fn relay(options: &ForwardOptions, connection: Connection, bina
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
     use tokio::io::{AsyncWriteExt as _, BufReader};
 
-    use super::{HEARTBEAT_ID, RESUME_ID, forbidden_client_id, read_frame, replayable, reserved_id};
+    use super::{HEARTBEAT_ID, RESUME_ID, forbidden_client_id, launch_script, read_frame, replayable, reserved_id};
+    use crate::ssh::forward::VerifiedBinary;
+
+    #[test]
+    fn tampered_resident_is_rejected_at_launch() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let executable = dir.path().join("resident");
+        let marker = dir.path().join("executed");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("original resident");
+        let digest = crate::ssh::bootstrap::local_sha256(&executable).expect("original digest");
+        std::fs::write(&executable, format!("#!/bin/sh\nprintf bad > {}\n", crate::ssh::quote(&marker.to_string_lossy())))
+            .expect("replace resident");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).expect("executable mode");
+        let binary = VerifiedBinary { path: executable.to_string_lossy().into_owned(), sha256: digest };
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(launch_script(&binary, "/", Duration::from_secs(1)))
+            .output()
+            .expect("launch script");
+        assert_eq!(output.status.code(), Some(42));
+        assert!(!marker.exists(), "a replaced resident binary executed");
+    }
 
     #[test]
     fn only_idempotent_requests_are_replayed() {
@@ -324,7 +357,7 @@ mod tests {
         writer.write_all(br#"{"id":1,"result":{}"#).await.expect("first fragment");
         tokio::select! {
             result = read_frame(&mut reader, &mut partial) => panic!("unexpected complete frame: {result:?}"),
-            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
         }
         writer.write_all(b"}\n").await.expect("second fragment");
         let frame = read_frame(&mut reader, &mut partial).await.expect("valid frame").expect("frame");
