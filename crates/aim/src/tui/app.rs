@@ -352,7 +352,7 @@ pub struct App {
     /// switched to), for the session being opened, in order.
     queued: Vec<Queued>,
     /// Whether the history file has been asked for.
-    history_requested: bool,
+    history_file: HistoryFile,
     /// The latest create or attach attempt; answers of older ones are ignored.
     attempt: u64,
     /// History from the file: shown only while a persistent session is attached.
@@ -367,6 +367,15 @@ pub struct App {
     outbox: Vec<Effect>,
     models: Vec<String>,
     efforts: Vec<String>,
+}
+
+/// The history file's state: read only once a persistent session needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryFile {
+    /// Not asked for.
+    Unread,
+    /// Asked for (its prompts arrive as [`Input::HistoryLoaded`]).
+    Requested,
 }
 
 /// Something typed for a session that is still being opened.
@@ -434,7 +443,7 @@ impl App {
             quitting: false,
             next_prompt: 1,
             queued: Vec::new(),
-            history_requested: false,
+            history_file: HistoryFile::Unread,
             attempt: 0,
             disk_history: Vec::new(),
             private_history: Vec::new(),
@@ -625,8 +634,8 @@ impl App {
     /// Offers the history that fits the attached session: the file's for a persistent session,
     /// this run's ephemeral prompts (memory only) for an ephemeral one.
     fn expose_history(&mut self, persistence: Persistence) {
-        if persistence == Persistence::Persistent && self.config.persist_history && !self.history_requested {
-            self.history_requested = true;
+        if persistence == Persistence::Persistent && self.config.persist_history && self.history_file == HistoryFile::Unread {
+            self.history_file = HistoryFile::Requested;
             self.outbox.push(Effect::LoadHistory);
         }
         let history = match persistence {
