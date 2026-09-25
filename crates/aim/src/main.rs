@@ -277,10 +277,12 @@ enum PluginAction {
         #[command(flatten)]
         project: PluginProject,
     },
-    /// Revoke grants for an installed plugin's current hash (or an explicit SHA-256 hash).
+    /// Revoke grants for a plugin's current hash (or an explicit SHA-256 hash).
     Untrust {
-        /// Installed plugin name or 64-character SHA-256 hex digest.
+        /// Installed/project plugin name or 64-character SHA-256 hex digest.
         name_or_hash: String,
+        #[command(flatten)]
+        project: PluginProject,
     },
 }
 
@@ -480,9 +482,15 @@ async fn plugin_command(home: &Path, action: PluginAction) -> Result<i32, String
             println!("trusted {name} at its current manifest and component hash");
             Ok(0)
         }
-        PluginAction::Untrust { name_or_hash } => {
+        PluginAction::Untrust { name_or_hash, project } => {
             let hash = if name_or_hash.len() == 64 && name_or_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 name_or_hash
+            } else if let Some(sources) = project_plugin_sources(&project).await? {
+                sources
+                    .into_iter()
+                    .find(|source| PluginManifest::parse(&source.manifest_text).is_ok_and(|manifest| manifest.name == name_or_hash))
+                    .ok_or_else(|| format!("project plugin `{name_or_hash}` was not found"))?
+                    .hash()
             } else {
                 installed_plugin(home, &name_or_hash)?.1.hash()
             };
@@ -532,7 +540,12 @@ mod plugin_tests {
         );
         let trusted = TrustStore::load(home.path()).unwrap();
         assert_eq!(trusted.grants(&hash).unwrap().iter().map(String::as_str).collect::<Vec<_>>(), ["kv"]);
-        assert_eq!(plugin_command(home.path(), PluginAction::Untrust { name_or_hash: "kv_counter".into() }).await.unwrap(), 0);
+        assert_eq!(
+            plugin_command(home.path(), PluginAction::Untrust { name_or_hash: "kv_counter".into(), project: PluginProject::default() })
+                .await
+                .unwrap(),
+            0
+        );
         assert!(TrustStore::load(home.path()).unwrap().grants(&hash).is_none());
     }
 }
