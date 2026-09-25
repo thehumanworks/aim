@@ -3,7 +3,7 @@ version = 1
 hardware = "macOS arm64, report host details in each result"
 topology = "local, loopback HTTP recording proxy, fresh git worktree per run"
 permissions = "workspace read/write/exec; no hosted search; no network tool"
-cache_state = "cold isolated HOME per run; operating-system and binary caches warm"
+cache_state = "fresh isolated HOME per trial; one recorded mock prewarm per harness before timed trials"
 token_estimate = "ceil(uncompressed request JSON bytes / 4); provider usage is separate"
 
 [wire]
@@ -13,6 +13,7 @@ repetitions = 2
 harnesses = ["aim_openrouter", "codex", "pi"]
 optional_harnesses = ["omp", "unreal"] # require pinned local artifacts supplied to run.py
 max_concurrency = 1
+prewarm_mock_runs = 1
 
 [[wire.case]]
 id = "W1"
@@ -44,6 +45,7 @@ steps = 20
 [live]
 repetitions = 2
 max_concurrency = 1
+prewarm_mock_runs = 1
 max_spend_usd = 1.50
 unpriced_transport_reserve_usd = 0.05
 max_subscription_runs = 12

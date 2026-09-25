@@ -1,0 +1,3916 @@
+{
+  "binary_sha256": {
+    "aim": "2dc737316b8c2c3208e94d0817f347d305efdda7a4427b2e5f56e273d019f76e",
+    "aimx": "ac4a1d6419ada39f61c9f88c612d61a187d5a9fbf5d5907d0b0416cdbd2323fa",
+    "bun": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5",
+    "codex": "8b93eddd656ee85e07785fed7b0c6f445491abfba80d52e278d0afd1fe680a4e",
+    "omp": "33cf63aab3a109b339049c17549767096fe174b772b491e3f4ccbb53035b84f4",
+    "pi": "0fcda879f854b95368a4c217782a78808f7fea61cf60cc1e6fbec4f5b5d700f9",
+    "python": "ab15cbe78b02b5fc939765827e0b1c2dc3668def22c6952f06a369bfbde01163",
+    "unreal": "ef2336bd0cf19638db6ca76b09e723df9c0294d5ed3414eee9bb42438849303e"
+  },
+  "budget_used_including_transport_reserve_usd": 0.0,
+  "finished_unix": 1790311903.646966,
+  "hardware": {
+    "machine": "arm64",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "python": "3.14.7"
+  },
+  "manifest_sha256": "ae24ffdd375561904fb6ff8f4b986bc310db55b6c9adba96dd9bec2134ba8238",
+  "prewarm": [
+    {
+      "auxiliary_requests": 2,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6447,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 19.44,
+      "first_request_tokens_estimate": 1612,
+      "first_request_tools": 9,
+      "first_token_ms": 0.12,
+      "harness": "aim_openrouter",
+      "http_exchanges": 3,
+      "ite": 1617.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 24.81,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": -1,
+      "request_json_bytes": [
+        6447
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          6447,
+          515
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 1612,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 21.79
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 38432,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 118.08,
+      "first_request_tokens_estimate": 9608,
+      "first_request_tools": 9,
+      "first_token_ms": 0.368,
+      "harness": "codex",
+      "http_exchanges": 1,
+      "ite": 9613.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 104.17,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": -1,
+      "request_json_bytes": [
+        38432
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          38432,
+          1732
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 9608,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 299.13
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6099,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 226.94,
+      "first_request_tokens_estimate": 1525,
+      "first_request_tools": 4,
+      "first_token_ms": 0.363,
+      "harness": "pi",
+      "http_exchanges": 1,
+      "ite": 1530.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 146.15,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": -1,
+      "request_json_bytes": [
+        6099
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          2378,
+          1732
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 1525,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 232.22
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 28430,
+      "first_request_instructions_chars": 10378,
+      "first_request_ms": 615.24,
+      "first_request_tokens_estimate": 7108,
+      "first_request_tools": 11,
+      "first_token_ms": 0.472,
+      "harness": "omp",
+      "http_exchanges": 1,
+      "ite": 7113.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 462.72,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": -1,
+      "request_json_bytes": [
+        28430
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          28430,
+          1732
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 7108,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 646.98
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 2854,
+      "first_request_instructions_chars": 1584,
+      "first_request_ms": 42.73,
+      "first_request_tokens_estimate": 714,
+      "first_request_tools": 2,
+      "first_token_ms": 0.417,
+      "harness": "unreal",
+      "http_exchanges": 1,
+      "ite": 719.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 15.7,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": -1,
+      "request_json_bytes": [
+        2854
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          2854,
+          1730
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 714,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 51.43
+    }
+  ],
+  "recorded_spend_usd": 0.0,
+  "runs": [
+    {
+      "auxiliary_requests": 2,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6447,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 20.16,
+      "first_request_tokens_estimate": 1612,
+      "first_request_tools": 9,
+      "first_token_ms": 0.135,
+      "harness": "aim_openrouter",
+      "http_exchanges": 3,
+      "ite": 1617.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 24.77,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        6447
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          6447,
+          515
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 1612,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 22.41
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 38432,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 113.95,
+      "first_request_tokens_estimate": 9608,
+      "first_request_tools": 9,
+      "first_token_ms": 0.371,
+      "harness": "codex",
+      "http_exchanges": 1,
+      "ite": 9613.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 103.78,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        38432
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          38432,
+          1732
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 9608,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 296.74
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6099,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 221.56,
+      "first_request_tokens_estimate": 1525,
+      "first_request_tools": 4,
+      "first_token_ms": 0.345,
+      "harness": "pi",
+      "http_exchanges": 1,
+      "ite": 1530.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 146.51,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        6099
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          2376,
+          1732
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 1525,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 227.11
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 28430,
+      "first_request_instructions_chars": 10378,
+      "first_request_ms": 589.17,
+      "first_request_tokens_estimate": 7108,
+      "first_request_tools": 11,
+      "first_token_ms": 0.451,
+      "harness": "omp",
+      "http_exchanges": 1,
+      "ite": 7113.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 450.17,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        28430
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          28430,
+          1732
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 7108,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 613.19
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 2854,
+      "first_request_instructions_chars": 1584,
+      "first_request_ms": 41.2,
+      "first_request_tokens_estimate": 714,
+      "first_request_tools": 2,
+      "first_token_ms": 0.319,
+      "harness": "unreal",
+      "http_exchanges": 1,
+      "ite": 719.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 15.58,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        2854
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          2854,
+          1730
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 714,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 49.77
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 38432,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 116.76,
+      "first_request_tokens_estimate": 9608,
+      "first_request_tools": 9,
+      "first_token_ms": 0.334,
+      "harness": "codex",
+      "http_exchanges": 1,
+      "ite": 9613.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 103.89,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        38432
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          38432,
+          1732
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 9608,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 272.09
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6099,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 208.9,
+      "first_request_tokens_estimate": 1525,
+      "first_request_tools": 4,
+      "first_token_ms": 0.35,
+      "harness": "pi",
+      "http_exchanges": 1,
+      "ite": 1530.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 147.1,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        6099
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          2375,
+          1732
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 1525,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 214.29
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 28430,
+      "first_request_instructions_chars": 10378,
+      "first_request_ms": 582.17,
+      "first_request_tokens_estimate": 7108,
+      "first_request_tools": 11,
+      "first_token_ms": 0.417,
+      "harness": "omp",
+      "http_exchanges": 1,
+      "ite": 7113.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 463.32,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        28430
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          28430,
+          1732
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 7108,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 623.41
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 2854,
+      "first_request_instructions_chars": 1584,
+      "first_request_ms": 59.71,
+      "first_request_tokens_estimate": 714,
+      "first_request_tools": 2,
+      "first_token_ms": 0.83,
+      "harness": "unreal",
+      "http_exchanges": 1,
+      "ite": 719.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 15.43,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        2854
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          2854,
+          1730
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 714,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 72.68
+    },
+    {
+      "auxiliary_requests": 2,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6447,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 46.26,
+      "first_request_tokens_estimate": 1612,
+      "first_request_tools": 9,
+      "first_token_ms": 0.175,
+      "harness": "aim_openrouter",
+      "http_exchanges": 3,
+      "ite": 1617.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 24.89,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        6447
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          6447,
+          515
+        ]
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 1612,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 52.01
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W2",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 38458,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 306.52,
+      "first_request_tokens_estimate": 9615,
+      "first_request_tools": 9,
+      "first_token_ms": 0.95,
+      "harness": "codex",
+      "http_exchanges": 2,
+      "ite": 31240.0,
+      "max_tool_output_chars": 40217,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 135.74,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        38458,
+        86460
+      ],
+      "request_lcp_bytes": [
+        27843
+      ],
+      "request_response_sizes": [
+        [
+          38458,
+          1480
+        ],
+        [
+          86460,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 31230,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 631.89
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W2",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6125,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 368.45,
+      "first_request_tokens_estimate": 1532,
+      "first_request_tools": 4,
+      "first_token_ms": 0.777,
+      "harness": "pi",
+      "http_exchanges": 2,
+      "ite": 6642.0,
+      "max_tool_output_chars": 12088,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 156.71,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        6125,
+        20397
+      ],
+      "request_lcp_bytes": [
+        2792
+      ],
+      "request_response_sizes": [
+        [
+          2387,
+          1532
+        ],
+        [
+          4614,
+          1732
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 6632,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 428.67
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W2",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 28456,
+      "first_request_instructions_chars": 10378,
+      "first_request_ms": 1074.75,
+      "first_request_tokens_estimate": 7114,
+      "first_request_tools": 11,
+      "first_token_ms": 1.042,
+      "harness": "omp",
+      "http_exchanges": 2,
+      "ite": 29488.0,
+      "max_tool_output_chars": 51369,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 513.29,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        28456,
+        89454
+      ],
+      "request_lcp_bytes": [
+        843
+      ],
+      "request_response_sizes": [
+        [
+          28456,
+          1528
+        ],
+        [
+          89454,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 29478,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 1479.01
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W2",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 2880,
+      "first_request_instructions_chars": 1584,
+      "first_request_ms": 59.82,
+      "first_request_tokens_estimate": 720,
+      "first_request_tools": 2,
+      "first_token_ms": 0.551,
+      "harness": "unreal",
+      "http_exchanges": 2,
+      "ite": 13442.0,
+      "max_tool_output_chars": 47792,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 20.97,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        2880,
+        50847
+      ],
+      "request_lcp_bytes": [
+        1737
+      ],
+      "request_response_sizes": [
+        [
+          2880,
+          1462
+        ],
+        [
+          50847,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 13432,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 202.31
+    },
+    {
+      "auxiliary_requests": 2,
+      "case": "W2",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6473,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 36.31,
+      "first_request_tokens_estimate": 1619,
+      "first_request_tools": 9,
+      "first_token_ms": 0.193,
+      "harness": "aim_openrouter",
+      "http_exchanges": 4,
+      "ite": 12269.0,
+      "max_tool_output_chars": 30146,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 25.79,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        6473,
+        42557
+      ],
+      "request_lcp_bytes": [
+        1714
+      ],
+      "request_response_sizes": [
+        [
+          6473,
+          637
+        ],
+        [
+          42557,
+          516
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 12259,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 83.51
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W2",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6125,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 281.23,
+      "first_request_tokens_estimate": 1532,
+      "first_request_tools": 4,
+      "first_token_ms": 0.431,
+      "harness": "pi",
+      "http_exchanges": 2,
+      "ite": 6642.0,
+      "max_tool_output_chars": 12088,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 156.63,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        6125,
+        20397
+      ],
+      "request_lcp_bytes": [
+        2792
+      ],
+      "request_response_sizes": [
+        [
+          2389,
+          1532
+        ],
+        [
+          4615,
+          1732
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 6632,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 329.46
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W2",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 28456,
+      "first_request_instructions_chars": 10378,
+      "first_request_ms": 790.01,
+      "first_request_tokens_estimate": 7114,
+      "first_request_tools": 11,
+      "first_token_ms": 0.912,
+      "harness": "omp",
+      "http_exchanges": 2,
+      "ite": 29488.0,
+      "max_tool_output_chars": 51369,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 538.02,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        28456,
+        89454
+      ],
+      "request_lcp_bytes": [
+        843
+      ],
+      "request_response_sizes": [
+        [
+          28456,
+          1528
+        ],
+        [
+          89454,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 29478,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 1179.1
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W2",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 2880,
+      "first_request_instructions_chars": 1584,
+      "first_request_ms": 75.65,
+      "first_request_tokens_estimate": 720,
+      "first_request_tools": 2,
+      "first_token_ms": 0.707,
+      "harness": "unreal",
+      "http_exchanges": 2,
+      "ite": 13442.0,
+      "max_tool_output_chars": 47792,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 21.4,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        2880,
+        50847
+      ],
+      "request_lcp_bytes": [
+        1737
+      ],
+      "request_response_sizes": [
+        [
+          2880,
+          1462
+        ],
+        [
+          50847,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 13432,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 213.01
+    },
+    {
+      "auxiliary_requests": 2,
+      "case": "W2",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6473,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 23.82,
+      "first_request_tokens_estimate": 1619,
+      "first_request_tools": 9,
+      "first_token_ms": 0.168,
+      "harness": "aim_openrouter",
+      "http_exchanges": 4,
+      "ite": 12269.0,
+      "max_tool_output_chars": 30146,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 25.82,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        6473,
+        42557
+      ],
+      "request_lcp_bytes": [
+        1714
+      ],
+      "request_response_sizes": [
+        [
+          6473,
+          637
+        ],
+        [
+          42557,
+          516
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 12259,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 52.78
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W2",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 38458,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 157.89,
+      "first_request_tokens_estimate": 9615,
+      "first_request_tools": 9,
+      "first_token_ms": 0.42,
+      "harness": "codex",
+      "http_exchanges": 2,
+      "ite": 31240.0,
+      "max_tool_output_chars": 40217,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 135.68,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        38458,
+        86460
+      ],
+      "request_lcp_bytes": [
+        27843
+      ],
+      "request_response_sizes": [
+        [
+          38458,
+          1480
+        ],
+        [
+          86460,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 31230,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 416.33
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W3",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6116,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 242.49,
+      "first_request_tokens_estimate": 1529,
+      "first_request_tools": 4,
+      "first_token_ms": 0.424,
+      "harness": "pi",
+      "http_exchanges": 2,
+      "ite": 14135.0,
+      "max_tool_output_chars": 42082,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 154.14,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        6116,
+        50381
+      ],
+      "request_lcp_bytes": [
+        2783
+      ],
+      "request_response_sizes": [
+        [
+          2388,
+          1528
+        ],
+        [
+          4705,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 14125,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 266.67
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W3",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 28447,
+      "first_request_instructions_chars": 10378,
+      "first_request_ms": 645.78,
+      "first_request_tokens_estimate": 7112,
+      "first_request_tools": 11,
+      "first_token_ms": 0.475,
+      "harness": "omp",
+      "http_exchanges": 2,
+      "ite": 27732.0,
+      "max_tool_output_chars": 51361,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 538.87,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        28447,
+        82437
+      ],
+      "request_lcp_bytes": [
+        834
+      ],
+      "request_response_sizes": [
+        [
+          28447,
+          1524
+        ],
+        [
+          82437,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 27722,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 951.11
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W3",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 2871,
+      "first_request_instructions_chars": 1584,
+      "first_request_ms": 64.12,
+      "first_request_tokens_estimate": 718,
+      "first_request_tools": 2,
+      "first_token_ms": 0.412,
+      "harness": "unreal",
+      "http_exchanges": 2,
+      "ite": 12025.0,
+      "max_tool_output_chars": 42141,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 19.51,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        2871,
+        45186
+      ],
+      "request_lcp_bytes": [
+        1728
+      ],
+      "request_response_sizes": [
+        [
+          2871,
+          1458
+        ],
+        [
+          45186,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 12015,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 149.2
+    },
+    {
+      "auxiliary_requests": 2,
+      "case": "W3",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6464,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 54.12,
+      "first_request_tokens_estimate": 1616,
+      "first_request_tools": 9,
+      "first_token_ms": 0.151,
+      "harness": "aim_openrouter",
+      "http_exchanges": 4,
+      "ite": 11190.0,
+      "max_tool_output_chars": 30145,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 25.49,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        6464,
+        38254
+      ],
+      "request_lcp_bytes": [
+        1705
+      ],
+      "request_response_sizes": [
+        [
+          6464,
+          636
+        ],
+        [
+          38254,
+          515
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 11180,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 94.16
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W3",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 38448,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 167.56,
+      "first_request_tokens_estimate": 9612,
+      "first_request_tools": 9,
+      "first_token_ms": 0.422,
+      "harness": "codex",
+      "http_exchanges": 2,
+      "ite": 29821.0,
+      "max_tool_output_chars": 40212,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 116.9,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        38448,
+        80794
+      ],
+      "request_lcp_bytes": [
+        27834
+      ],
+      "request_response_sizes": [
+        [
+          38448,
+          1476
+        ],
+        [
+          80794,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 29811,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 433.05
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W3",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 28447,
+      "first_request_instructions_chars": 10378,
+      "first_request_ms": 778.32,
+      "first_request_tokens_estimate": 7112,
+      "first_request_tools": 11,
+      "first_token_ms": 0.542,
+      "harness": "omp",
+      "http_exchanges": 2,
+      "ite": 27732.0,
+      "max_tool_output_chars": 51361,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 546.83,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        28447,
+        82437
+      ],
+      "request_lcp_bytes": [
+        834
+      ],
+      "request_response_sizes": [
+        [
+          28447,
+          1524
+        ],
+        [
+          82437,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 27722,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 1132.09
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W3",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 2871,
+      "first_request_instructions_chars": 1584,
+      "first_request_ms": 56.17,
+      "first_request_tokens_estimate": 718,
+      "first_request_tools": 2,
+      "first_token_ms": 0.406,
+      "harness": "unreal",
+      "http_exchanges": 2,
+      "ite": 12025.0,
+      "max_tool_output_chars": 42141,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 19.46,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        2871,
+        45186
+      ],
+      "request_lcp_bytes": [
+        1728
+      ],
+      "request_response_sizes": [
+        [
+          2871,
+          1458
+        ],
+        [
+          45186,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 12015,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 147.27
+    },
+    {
+      "auxiliary_requests": 2,
+      "case": "W3",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6464,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 21.09,
+      "first_request_tokens_estimate": 1616,
+      "first_request_tools": 9,
+      "first_token_ms": 0.184,
+      "harness": "aim_openrouter",
+      "http_exchanges": 4,
+      "ite": 11190.0,
+      "max_tool_output_chars": 30145,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 25.69,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        6464,
+        38254
+      ],
+      "request_lcp_bytes": [
+        1705
+      ],
+      "request_response_sizes": [
+        [
+          6464,
+          636
+        ],
+        [
+          38254,
+          515
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 11180,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 35.02
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W3",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 38448,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 139.63,
+      "first_request_tokens_estimate": 9612,
+      "first_request_tools": 9,
+      "first_token_ms": 0.444,
+      "harness": "codex",
+      "http_exchanges": 2,
+      "ite": 29821.0,
+      "max_tool_output_chars": 40212,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 118.26,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        38448,
+        80794
+      ],
+      "request_lcp_bytes": [
+        27834
+      ],
+      "request_response_sizes": [
+        [
+          38448,
+          1476
+        ],
+        [
+          80794,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 29811,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 366.7
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W3",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6116,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 237.97,
+      "first_request_tokens_estimate": 1529,
+      "first_request_tools": 4,
+      "first_token_ms": 0.496,
+      "harness": "pi",
+      "http_exchanges": 2,
+      "ite": 14135.0,
+      "max_tool_output_chars": 42082,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 153.99,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        6116,
+        50381
+      ],
+      "request_lcp_bytes": [
+        2783
+      ],
+      "request_response_sizes": [
+        [
+          2387,
+          1528
+        ],
+        [
+          4706,
+          1734
+        ]
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 14125,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 264.14
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W4",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 28470,
+      "first_request_instructions_chars": 10378,
+      "first_request_ms": 661.2,
+      "first_request_tokens_estimate": 7118,
+      "first_request_tools": 11,
+      "first_token_ms": 0.458,
+      "harness": "omp",
+      "http_exchanges": 21,
+      "ite": 175924.0,
+      "max_tool_output_chars": 720,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 505.18,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        28470,
+        28682,
+        28894,
+        29106,
+        29318,
+        29976,
+        30634,
+        31292,
+        31950,
+        32608,
+        33269,
+        33930,
+        34591,
+        35252,
+        35913,
+        36574,
+        37235,
+        37896,
+        38557,
+        39218,
+        39879
+      ],
+      "request_lcp_bytes": [
+        857,
+        1069,
+        1281,
+        1493,
+        1705,
+        2363,
+        3021,
+        3679,
+        4337,
+        4995,
+        5656,
+        6317,
+        6978,
+        7639,
+        8300,
+        8961,
+        9622,
+        10283,
+        10944,
+        11605
+      ],
+      "request_response_sizes": [
+        [
+          28470,
+          1496
+        ],
+        [
+          28682,
+          1496
+        ],
+        [
+          28894,
+          1496
+        ],
+        [
+          29106,
+          1496
+        ],
+        [
+          29318,
+          1496
+        ],
+        [
+          29976,
+          1496
+        ],
+        [
+          30634,
+          1496
+        ],
+        [
+          31292,
+          1496
+        ],
+        [
+          31950,
+          1496
+        ],
+        [
+          32608,
+          1506
+        ],
+        [
+          33269,
+          1506
+        ],
+        [
+          33930,
+          1506
+        ],
+        [
+          34591,
+          1506
+        ],
+        [
+          35252,
+          1506
+        ],
+        [
+          35913,
+          1506
+        ],
+        [
+          36574,
+          1506
+        ],
+        [
+          37235,
+          1506
+        ],
+        [
+          37896,
+          1506
+        ],
+        [
+          38557,
+          1506
+        ],
+        [
+          39218,
+          1506
+        ],
+        [
+          39879,
+          1741
+        ]
+      ],
+      "requests": 21,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 175819,
+        "output_tokens": 21,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 919.73
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W4",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 2894,
+      "first_request_instructions_chars": 1584,
+      "first_request_ms": 43.84,
+      "first_request_tokens_estimate": 724,
+      "first_request_tools": 2,
+      "first_token_ms": 0.347,
+      "harness": "unreal",
+      "http_exchanges": 21,
+      "ite": 26590.0,
+      "max_tool_output_chars": 940,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 21.33,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        2894,
+        3108,
+        3322,
+        3536,
+        3750,
+        3964,
+        4178,
+        4392,
+        4606,
+        4820,
+        5037,
+        5254,
+        5471,
+        5688,
+        5905,
+        6122,
+        6339,
+        6556,
+        6773,
+        6990,
+        7207
+      ],
+      "request_lcp_bytes": [
+        1751,
+        1965,
+        2179,
+        2393,
+        2607,
+        2821,
+        3035,
+        3249,
+        3463,
+        3677,
+        3894,
+        4111,
+        4328,
+        4545,
+        4762,
+        4979,
+        5196,
+        5413,
+        5630,
+        5847
+      ],
+      "request_response_sizes": [
+        [
+          2894,
+          1430
+        ],
+        [
+          3108,
+          1430
+        ],
+        [
+          3322,
+          1430
+        ],
+        [
+          3536,
+          1430
+        ],
+        [
+          3750,
+          1430
+        ],
+        [
+          3964,
+          1430
+        ],
+        [
+          4178,
+          1432
+        ],
+        [
+          4392,
+          1432
+        ],
+        [
+          4606,
+          1432
+        ],
+        [
+          4820,
+          1442
+        ],
+        [
+          5037,
+          1442
+        ],
+        [
+          5254,
+          1442
+        ],
+        [
+          5471,
+          1442
+        ],
+        [
+          5688,
+          1442
+        ],
+        [
+          5905,
+          1442
+        ],
+        [
+          6122,
+          1442
+        ],
+        [
+          6339,
+          1442
+        ],
+        [
+          6556,
+          1442
+        ],
+        [
+          6773,
+          1442
+        ],
+        [
+          6990,
+          1442
+        ],
+        [
+          7207,
+          1741
+        ]
+      ],
+      "requests": 21,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 26485,
+        "output_tokens": 21,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 1526.97
+    },
+    {
+      "auxiliary_requests": 2,
+      "case": "W4",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6487,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 22.05,
+      "first_request_tokens_estimate": 1622,
+      "first_request_tools": 9,
+      "first_token_ms": 0.144,
+      "harness": "aim_openrouter",
+      "http_exchanges": 23,
+      "ite": 45385.0,
+      "max_tool_output_chars": 220,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 25.61,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        6487,
+        6700,
+        6913,
+        7126,
+        7339,
+        7552,
+        7765,
+        7978,
+        8191,
+        8404,
+        8619,
+        8834,
+        9049,
+        9264,
+        9479,
+        9694,
+        9909,
+        10124,
+        10339,
+        10554,
+        10769
+      ],
+      "request_lcp_bytes": [
+        1728,
+        1941,
+        2154,
+        2367,
+        2580,
+        2793,
+        3006,
+        3219,
+        3432,
+        3645,
+        3860,
+        4075,
+        4290,
+        4505,
+        4720,
+        4935,
+        5150,
+        5365,
+        5580,
+        5795
+      ],
+      "request_response_sizes": [
+        [
+          6487,
+          629
+        ],
+        [
+          6700,
+          629
+        ],
+        [
+          6913,
+          629
+        ],
+        [
+          7126,
+          629
+        ],
+        [
+          7339,
+          629
+        ],
+        [
+          7552,
+          629
+        ],
+        [
+          7765,
+          629
+        ],
+        [
+          7978,
+          629
+        ],
+        [
+          8191,
+          629
+        ],
+        [
+          8404,
+          632
+        ],
+        [
+          8619,
+          632
+        ],
+        [
+          8834,
+          632
+        ],
+        [
+          9049,
+          632
+        ],
+        [
+          9264,
+          632
+        ],
+        [
+          9479,
+          632
+        ],
+        [
+          9694,
+          632
+        ],
+        [
+          9909,
+          632
+        ],
+        [
+          10124,
+          632
+        ],
+        [
+          10339,
+          632
+        ],
+        [
+          10554,
+          632
+        ],
+        [
+          10769,
+          517
+        ]
+      ],
+      "requests": 21,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 45280,
+        "output_tokens": 21,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 180.44
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W4",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 38472,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 132.43,
+      "first_request_tokens_estimate": 9618,
+      "first_request_tools": 9,
+      "first_token_ms": 0.376,
+      "harness": "codex",
+      "http_exchanges": 21,
+      "ite": 218766.0,
+      "max_tool_output_chars": 2040,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 113.52,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        38472,
+        38789,
+        39106,
+        39423,
+        39740,
+        40057,
+        40374,
+        40691,
+        41008,
+        41325,
+        41644,
+        41963,
+        42282,
+        42601,
+        42920,
+        43239,
+        43558,
+        43877,
+        44196,
+        44515,
+        44834
+      ],
+      "request_lcp_bytes": [
+        27857,
+        28174,
+        28491,
+        28808,
+        29125,
+        29442,
+        29759,
+        30076,
+        30393,
+        30710,
+        31029,
+        31348,
+        31667,
+        31986,
+        32305,
+        32624,
+        32943,
+        33262,
+        33581,
+        33900
+      ],
+      "request_response_sizes": [
+        [
+          38472,
+          1448
+        ],
+        [
+          38789,
+          1448
+        ],
+        [
+          39106,
+          1448
+        ],
+        [
+          39423,
+          1448
+        ],
+        [
+          39740,
+          1448
+        ],
+        [
+          40057,
+          1450
+        ],
+        [
+          40374,
+          1450
+        ],
+        [
+          40691,
+          1450
+        ],
+        [
+          41008,
+          1450
+        ],
+        [
+          41325,
+          1460
+        ],
+        [
+          41644,
+          1460
+        ],
+        [
+          41963,
+          1460
+        ],
+        [
+          42282,
+          1460
+        ],
+        [
+          42601,
+          1460
+        ],
+        [
+          42920,
+          1460
+        ],
+        [
+          43239,
+          1460
+        ],
+        [
+          43558,
+          1460
+        ],
+        [
+          43877,
+          1460
+        ],
+        [
+          44196,
+          1460
+        ],
+        [
+          44515,
+          1460
+        ],
+        [
+          44834,
+          1743
+        ]
+      ],
+      "requests": 21,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 218661,
+        "output_tokens": 21,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 1082.32
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W4",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6139,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 233.64,
+      "first_request_tokens_estimate": 1535,
+      "first_request_tools": 4,
+      "first_token_ms": 0.523,
+      "harness": "pi",
+      "http_exchanges": 21,
+      "ite": 42146.0,
+      "max_tool_output_chars": 220,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 168.67,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        6139,
+        6325,
+        6511,
+        6697,
+        6883,
+        7069,
+        7255,
+        7441,
+        7627,
+        7813,
+        8001,
+        8189,
+        8377,
+        8565,
+        8753,
+        8941,
+        9129,
+        9317,
+        9505,
+        9693,
+        9881
+      ],
+      "request_lcp_bytes": [
+        2806,
+        2992,
+        3178,
+        3364,
+        3550,
+        3736,
+        3922,
+        4108,
+        4294,
+        4480,
+        4668,
+        4856,
+        5044,
+        5232,
+        5420,
+        5608,
+        5796,
+        5984,
+        6172,
+        6360
+      ],
+      "request_response_sizes": [
+        [
+          2399,
+          1500
+        ],
+        [
+          2476,
+          1500
+        ],
+        [
+          2491,
+          1500
+        ],
+        [
+          2500,
+          1500
+        ],
+        [
+          2513,
+          1500
+        ],
+        [
+          2521,
+          1500
+        ],
+        [
+          2529,
+          1500
+        ],
+        [
+          2539,
+          1500
+        ],
+        [
+          2548,
+          1500
+        ],
+        [
+          2556,
+          1510
+        ],
+        [
+          2568,
+          1510
+        ],
+        [
+          2575,
+          1510
+        ],
+        [
+          2585,
+          1510
+        ],
+        [
+          2592,
+          1510
+        ],
+        [
+          2598,
+          1510
+        ],
+        [
+          2605,
+          1510
+        ],
+        [
+          2614,
+          1510
+        ],
+        [
+          2621,
+          1510
+        ],
+        [
+          2628,
+          1510
+        ],
+        [
+          2636,
+          1510
+        ],
+        [
+          2646,
+          1741
+        ]
+      ],
+      "requests": 21,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 42041,
+        "output_tokens": 21,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 351.59
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W4",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 2894,
+      "first_request_instructions_chars": 1584,
+      "first_request_ms": 57.04,
+      "first_request_tokens_estimate": 724,
+      "first_request_tools": 2,
+      "first_token_ms": 0.387,
+      "harness": "unreal",
+      "http_exchanges": 21,
+      "ite": 26590.0,
+      "max_tool_output_chars": 940,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 21.4,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        2894,
+        3108,
+        3322,
+        3536,
+        3750,
+        3964,
+        4178,
+        4392,
+        4606,
+        4820,
+        5037,
+        5254,
+        5471,
+        5688,
+        5905,
+        6122,
+        6339,
+        6556,
+        6773,
+        6990,
+        7207
+      ],
+      "request_lcp_bytes": [
+        1751,
+        1965,
+        2179,
+        2393,
+        2607,
+        2821,
+        3035,
+        3249,
+        3463,
+        3677,
+        3894,
+        4111,
+        4328,
+        4545,
+        4762,
+        4979,
+        5196,
+        5413,
+        5630,
+        5847
+      ],
+      "request_response_sizes": [
+        [
+          2894,
+          1430
+        ],
+        [
+          3108,
+          1430
+        ],
+        [
+          3322,
+          1430
+        ],
+        [
+          3536,
+          1430
+        ],
+        [
+          3750,
+          1430
+        ],
+        [
+          3964,
+          1430
+        ],
+        [
+          4178,
+          1432
+        ],
+        [
+          4392,
+          1432
+        ],
+        [
+          4606,
+          1432
+        ],
+        [
+          4820,
+          1442
+        ],
+        [
+          5037,
+          1442
+        ],
+        [
+          5254,
+          1442
+        ],
+        [
+          5471,
+          1442
+        ],
+        [
+          5688,
+          1442
+        ],
+        [
+          5905,
+          1442
+        ],
+        [
+          6122,
+          1442
+        ],
+        [
+          6339,
+          1442
+        ],
+        [
+          6556,
+          1442
+        ],
+        [
+          6773,
+          1442
+        ],
+        [
+          6990,
+          1442
+        ],
+        [
+          7207,
+          1741
+        ]
+      ],
+      "requests": 21,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 26485,
+        "output_tokens": 21,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 1591.87
+    },
+    {
+      "auxiliary_requests": 2,
+      "case": "W4",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6487,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 21.27,
+      "first_request_tokens_estimate": 1622,
+      "first_request_tools": 9,
+      "first_token_ms": 0.149,
+      "harness": "aim_openrouter",
+      "http_exchanges": 23,
+      "ite": 45385.0,
+      "max_tool_output_chars": 220,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 25.59,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        6487,
+        6700,
+        6913,
+        7126,
+        7339,
+        7552,
+        7765,
+        7978,
+        8191,
+        8404,
+        8619,
+        8834,
+        9049,
+        9264,
+        9479,
+        9694,
+        9909,
+        10124,
+        10339,
+        10554,
+        10769
+      ],
+      "request_lcp_bytes": [
+        1728,
+        1941,
+        2154,
+        2367,
+        2580,
+        2793,
+        3006,
+        3219,
+        3432,
+        3645,
+        3860,
+        4075,
+        4290,
+        4505,
+        4720,
+        4935,
+        5150,
+        5365,
+        5580,
+        5795
+      ],
+      "request_response_sizes": [
+        [
+          6487,
+          629
+        ],
+        [
+          6700,
+          629
+        ],
+        [
+          6913,
+          629
+        ],
+        [
+          7126,
+          629
+        ],
+        [
+          7339,
+          629
+        ],
+        [
+          7552,
+          629
+        ],
+        [
+          7765,
+          629
+        ],
+        [
+          7978,
+          629
+        ],
+        [
+          8191,
+          629
+        ],
+        [
+          8404,
+          632
+        ],
+        [
+          8619,
+          632
+        ],
+        [
+          8834,
+          632
+        ],
+        [
+          9049,
+          632
+        ],
+        [
+          9264,
+          632
+        ],
+        [
+          9479,
+          632
+        ],
+        [
+          9694,
+          632
+        ],
+        [
+          9909,
+          632
+        ],
+        [
+          10124,
+          632
+        ],
+        [
+          10339,
+          632
+        ],
+        [
+          10554,
+          632
+        ],
+        [
+          10769,
+          517
+        ]
+      ],
+      "requests": 21,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 45280,
+        "output_tokens": 21,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 160.06
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W4",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 38472,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 115.69,
+      "first_request_tokens_estimate": 9618,
+      "first_request_tools": 9,
+      "first_token_ms": 0.381,
+      "harness": "codex",
+      "http_exchanges": 21,
+      "ite": 218766.0,
+      "max_tool_output_chars": 2040,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 114.05,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        38472,
+        38789,
+        39106,
+        39423,
+        39740,
+        40057,
+        40374,
+        40691,
+        41008,
+        41325,
+        41644,
+        41963,
+        42282,
+        42601,
+        42920,
+        43239,
+        43558,
+        43877,
+        44196,
+        44515,
+        44834
+      ],
+      "request_lcp_bytes": [
+        27857,
+        28174,
+        28491,
+        28808,
+        29125,
+        29442,
+        29759,
+        30076,
+        30393,
+        30710,
+        31029,
+        31348,
+        31667,
+        31986,
+        32305,
+        32624,
+        32943,
+        33262,
+        33581,
+        33900
+      ],
+      "request_response_sizes": [
+        [
+          38472,
+          1448
+        ],
+        [
+          38789,
+          1448
+        ],
+        [
+          39106,
+          1448
+        ],
+        [
+          39423,
+          1448
+        ],
+        [
+          39740,
+          1448
+        ],
+        [
+          40057,
+          1450
+        ],
+        [
+          40374,
+          1450
+        ],
+        [
+          40691,
+          1450
+        ],
+        [
+          41008,
+          1450
+        ],
+        [
+          41325,
+          1460
+        ],
+        [
+          41644,
+          1460
+        ],
+        [
+          41963,
+          1460
+        ],
+        [
+          42282,
+          1460
+        ],
+        [
+          42601,
+          1460
+        ],
+        [
+          42920,
+          1460
+        ],
+        [
+          43239,
+          1460
+        ],
+        [
+          43558,
+          1460
+        ],
+        [
+          43877,
+          1460
+        ],
+        [
+          44196,
+          1460
+        ],
+        [
+          44515,
+          1460
+        ],
+        [
+          44834,
+          1743
+        ]
+      ],
+      "requests": 21,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 218661,
+        "output_tokens": 21,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 1084.06
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W4",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 6139,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 239.86,
+      "first_request_tokens_estimate": 1535,
+      "first_request_tools": 4,
+      "first_token_ms": 0.414,
+      "harness": "pi",
+      "http_exchanges": 21,
+      "ite": 42146.0,
+      "max_tool_output_chars": 220,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 169.05,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        6139,
+        6325,
+        6511,
+        6697,
+        6883,
+        7069,
+        7255,
+        7441,
+        7627,
+        7813,
+        8001,
+        8189,
+        8377,
+        8565,
+        8753,
+        8941,
+        9129,
+        9317,
+        9505,
+        9693,
+        9881
+      ],
+      "request_lcp_bytes": [
+        2806,
+        2992,
+        3178,
+        3364,
+        3550,
+        3736,
+        3922,
+        4108,
+        4294,
+        4480,
+        4668,
+        4856,
+        5044,
+        5232,
+        5420,
+        5608,
+        5796,
+        5984,
+        6172,
+        6360
+      ],
+      "request_response_sizes": [
+        [
+          2399,
+          1500
+        ],
+        [
+          2475,
+          1500
+        ],
+        [
+          2491,
+          1500
+        ],
+        [
+          2502,
+          1500
+        ],
+        [
+          2512,
+          1500
+        ],
+        [
+          2521,
+          1500
+        ],
+        [
+          2529,
+          1500
+        ],
+        [
+          2538,
+          1500
+        ],
+        [
+          2547,
+          1500
+        ],
+        [
+          2553,
+          1510
+        ],
+        [
+          2565,
+          1510
+        ],
+        [
+          2575,
+          1510
+        ],
+        [
+          2584,
+          1510
+        ],
+        [
+          2591,
+          1510
+        ],
+        [
+          2597,
+          1510
+        ],
+        [
+          2604,
+          1510
+        ],
+        [
+          2613,
+          1510
+        ],
+        [
+          2621,
+          1510
+        ],
+        [
+          2627,
+          1510
+        ],
+        [
+          2635,
+          1510
+        ],
+        [
+          2645,
+          1741
+        ]
+      ],
+      "requests": 21,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 42041,
+        "output_tokens": 21,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 363.2
+    },
+    {
+      "auxiliary_requests": 0,
+      "case": "W4",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 28470,
+      "first_request_instructions_chars": 10378,
+      "first_request_ms": 682.53,
+      "first_request_tokens_estimate": 7118,
+      "first_request_tools": 11,
+      "first_token_ms": 0.476,
+      "harness": "omp",
+      "http_exchanges": 21,
+      "ite": 175924.0,
+      "max_tool_output_chars": 720,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 508.22,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        28470,
+        28682,
+        28894,
+        29106,
+        29318,
+        29976,
+        30634,
+        31292,
+        31950,
+        32608,
+        33269,
+        33930,
+        34591,
+        35252,
+        35913,
+        36574,
+        37235,
+        37896,
+        38557,
+        39218,
+        39879
+      ],
+      "request_lcp_bytes": [
+        857,
+        1069,
+        1281,
+        1493,
+        1705,
+        2363,
+        3021,
+        3679,
+        4337,
+        4995,
+        5656,
+        6317,
+        6978,
+        7639,
+        8300,
+        8961,
+        9622,
+        10283,
+        10944,
+        11605
+      ],
+      "request_response_sizes": [
+        [
+          28470,
+          1496
+        ],
+        [
+          28682,
+          1496
+        ],
+        [
+          28894,
+          1496
+        ],
+        [
+          29106,
+          1496
+        ],
+        [
+          29318,
+          1496
+        ],
+        [
+          29976,
+          1496
+        ],
+        [
+          30634,
+          1496
+        ],
+        [
+          31292,
+          1496
+        ],
+        [
+          31950,
+          1496
+        ],
+        [
+          32608,
+          1506
+        ],
+        [
+          33269,
+          1506
+        ],
+        [
+          33930,
+          1506
+        ],
+        [
+          34591,
+          1506
+        ],
+        [
+          35252,
+          1506
+        ],
+        [
+          35913,
+          1506
+        ],
+        [
+          36574,
+          1506
+        ],
+        [
+          37235,
+          1506
+        ],
+        [
+          37896,
+          1506
+        ],
+        [
+          38557,
+          1506
+        ],
+        [
+          39218,
+          1506
+        ],
+        [
+          39879,
+          1741
+        ]
+      ],
+      "requests": 21,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 175819,
+        "output_tokens": 21,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 997.91
+    }
+  ],
+  "source_sha": "a8bc12c23dd83889530c571ff4f5c4042a1ce544",
+  "spend_cap_usd": null,
+  "started_unix": 1790311877.111076,
+  "summary": [
+    {
+      "harness": "aim_openrouter",
+      "ite_per_passed": 17615.25,
+      "p50_wall_ms": 68.15,
+      "pass_rate": 1.0,
+      "pass_rate_ci95": [
+        0.676,
+        1.0
+      ],
+      "passed": 8,
+      "runs": 8,
+      "usd_per_passed": 0.0
+    },
+    {
+      "harness": "codex",
+      "ite_per_passed": 72360.0,
+      "p50_wall_ms": 424.69,
+      "pass_rate": 1.0,
+      "pass_rate_ci95": [
+        0.676,
+        1.0
+      ],
+      "passed": 8,
+      "runs": 8,
+      "usd_per_passed": null
+    },
+    {
+      "harness": "pi",
+      "ite_per_passed": 16113.25,
+      "p50_wall_ms": 298.06,
+      "pass_rate": 1.0,
+      "pass_rate_ci95": [
+        0.676,
+        1.0
+      ],
+      "passed": 8,
+      "runs": 8,
+      "usd_per_passed": null
+    },
+    {
+      "harness": "omp",
+      "ite_per_passed": 60064.25,
+      "p50_wall_ms": 974.51,
+      "pass_rate": 1.0,
+      "pass_rate_ci95": [
+        0.676,
+        1.0
+      ],
+      "passed": 8,
+      "runs": 8,
+      "usd_per_passed": null
+    },
+    {
+      "harness": "unreal",
+      "ite_per_passed": 13194.0,
+      "p50_wall_ms": 175.75,
+      "pass_rate": 1.0,
+      "pass_rate_ci95": [
+        0.676,
+        1.0
+      ],
+      "passed": 8,
+      "runs": 8,
+      "usd_per_passed": null
+    }
+  ],
+  "tier": "wire"
+}

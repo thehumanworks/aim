@@ -318,6 +318,15 @@ def main() -> None:
         cases = [case for case in cases if case["id"] in selected]
         if len(cases) != len(selected):
             parser.error("an unknown case/task id was selected")
+    prewarm = []
+    warm_case = manifest["wire"]["case"][0]
+    for harness in harnesses:
+        for _ in range(tier.get("prewarm_mock_runs", 0)):
+            row = run_once(harness, warm_case, -1, paths, "wire", manifest["wire"]["model"], manifest["wire"]["effort"], 90)
+            prewarm.append(row)
+            if not row["passed"]:
+                raise RuntimeError(f"mock prewarm failed for {harness}")
+            print(json.dumps({"prewarm": harness, "first_request_ms": row["first_request_ms"]}), flush=True)
     runs = []
     reported_spend = 0.0
     budget_used = 0.0
@@ -356,7 +365,7 @@ def main() -> None:
         "started_unix": started, "finished_unix": time.time(), "binary_sha256": {name: executable_hash(path) for name, path in paths.items()},
         "spend_cap_usd": tier.get("max_spend_usd"), "recorded_spend_usd": round(reported_spend, 6),
         "budget_used_including_transport_reserve_usd": round(budget_used, 6),
-        "runs": runs, "summary": summary(runs, harnesses)}
+        "prewarm": prewarm, "runs": runs, "summary": summary(runs, harnesses)}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(f"wrote {args.out}", flush=True)

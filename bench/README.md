@@ -17,7 +17,9 @@ mise run bench:live  # manual, requires OPENROUTER_API_KEY and read-only Codex a
 The wire task needs no credentials. It runs aim, pinned Codex CLI and pinned pi with two
 repetitions of W1 (answer), W2 (589 KB shell output), W3 (5,000-line file via shell), and W4
 (20 serial tool steps). To include locally built oh-my-pi and Unreal Agent artifacts, pass their
-paths explicitly:
+paths explicitly. The W22 optional artifacts came from the read-only references at
+oh-my-pi `4a7b586821a4df0afcea657717247f6ec9db8f88` and Unreal Agent
+`1b9f778453f411c029b39b85102aaefb95e7e48d`; the result records executable hashes:
 
 ```sh
 python3 -B bench/run.py wire --out bench/history/all-peers.json \
@@ -37,6 +39,8 @@ checked by hash before/after each aim/Codex run. Never run `codex login` for thi
 
 The task driver resolves pinned executable paths before replacing `HOME`, so peers cannot
 silently use workstation-global `latest` shims. Each run gets a fresh HOME and workspace.
+One scripted mock prewarm per harness is retained separately in the result; timed trials use
+fresh HOMEs but warmed binary/OS caches.
 Temporary harness output is discarded. The recorder persists only request/response sizes,
 timings, request hashes, prefix lengths, and provider numeric usage. It does not persist raw
 body text or authentication headers.
@@ -50,7 +54,7 @@ manifest hash, hardware, and cohort summaries. `first_request_tokens_estimate` i
 ITE is predeclared as uncached input + 0.1 × cached input + 1.25 × cache writes + 5 × output.
 ITE and cost per passed task include failed runs in the numerator. Subscription calls have no
 reported USD cost and remain `null` in the cost comparison. `first_token_ms` measures the first
-text delta at the proxy; startup is process launch to the first provider request.
+text or tool-argument delta at the proxy; startup is process launch to the first model POST.
 
 These are paired harness measurements, not model-quality rankings. A headline win requires a
 non-inferior pass rate on the same model/upstream before comparing ITE per passed task. The
