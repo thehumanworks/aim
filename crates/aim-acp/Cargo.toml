@@ -1,0 +1,31 @@
+[package]
+name = "aim-acp"
+description = "ACP client for external agents (Claude Code via claude-agent-acp)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+# A one-tool stdio MCP server used by the live aim-tools conformance test (tests/live.rs).
+[[bin]]
+name = "aim-acp-echo-mcp"
+path = "tests/support/echo_mcp.rs"
+test = false
+doc = false
+
+[dependencies]
+agent-client-protocol = "2.2"
+aim-proto = { path = "../aim-proto" }
+futures = "0.3"
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time", "fs"] }
+
+[lints]
+workspace = true
