@@ -133,6 +133,17 @@ fn describe_exit(exit: ExitStatus, timeout_ms: u64) -> Option<String> {
     }
 }
 
+async fn release_cancelled(ctx: &ToolCtx, exec: &dyn Exec, proc: &ProcId) {
+    match exec.release(proc).await {
+        Ok(()) => {
+            ctx.procs.remove(proc);
+        }
+        Err(err) => {
+            tracing::debug!(%err, "releasing a cancelled command failed");
+        }
+    }
+}
+
 pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Result<Outcome<ToolResult>, ProtoError> {
     let args: BashArgs = match parse(arguments) {
         Ok(args) => args,
@@ -145,6 +156,9 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Result<Outcome<Tool
         Ok(exec) => exec,
         Err(err) => return Ok(Err(err)),
     };
+    if ctx.cancelled.is_cancelled() {
+        return Err(ProtoError::new(ErrorCode::Cancelled, "Bash request cancelled"));
+    }
     let slot = ctx.procs.reserve()?;
     let outcome: Outcome<ToolResult> = async {
         if args.run_in_background {
@@ -153,6 +167,10 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Result<Outcome<Tool
                 Err(err) => return model_error(err),
             };
             ctx.procs.insert(proc.clone(), ctx.workspace_id.clone(), slot);
+            if ctx.cancelled.is_cancelled() {
+                release_cancelled(ctx, exec, &proc).await;
+                return Err(ProtoError::new(ErrorCode::Cancelled, "Bash request cancelled"));
+            }
             return Ok(ToolResult::text(format!(
                 "Started in the background with id {proc}. Read its output with BashOutput; stop it with KillShell."
             )));
@@ -167,7 +185,13 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Result<Outcome<Tool
         let mut cursor = 0u64;
         let mut dropped = false;
         let exit = loop {
-            let read = exec.read(&proc, cursor, READ_BYTES, Duration::from_secs(5)).await?;
+            let read = tokio::select! {
+                read = exec.read(&proc, cursor, READ_BYTES, Duration::from_secs(5)) => read,
+                () = ctx.cancelled.cancelled() => {
+                    release_cancelled(ctx, exec, &proc).await;
+                    return Err(ProtoError::new(ErrorCode::Cancelled, "Bash request cancelled"));
+                }
+            }?;
             dropped |= read.dropped_before.is_some();
             for chunk in read.chunks {
                 cursor = chunk.seq;
