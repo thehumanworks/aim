@@ -476,7 +476,7 @@ impl Agent {
                 }
                 ToolResult::error(why)
             };
-            emit(events, AgentEvent::ToolFinished { call_id: call.call_id.clone(), name: call.name.clone(), result: result.clone() });
+            emit(events, AgentEvent::ToolFinished { call_id: call.call_id.clone(), name: call.name.clone(), result: result.clone(), parent: None });
             self.push(Item::ToolResult { call_id: call.call_id, result }, events);
         }
     }
@@ -544,7 +544,7 @@ impl Agent {
                                 if turn.apply(TurnEvent::CallComplete { id }).is_err() {
                                     return Ended::Failed(AgentError::Protocol(format!("tool call {call_id} arrived outside streaming")));
                                 }
-                                emit(ctx.events, AgentEvent::ToolStarted { call_id: call_id.clone(), name: name.clone(), arguments: arguments.clone() });
+                                emit(ctx.events, AgentEvent::ToolStarted { call_id: call_id.clone(), name: name.clone(), arguments: arguments.clone(), parent: None });
                                 response.running.push(self.start_call(specs, id, name, arguments));
                                 response.dispatched.push(Dispatched { id, call_id: call_id.clone(), name: name.clone() });
                             }

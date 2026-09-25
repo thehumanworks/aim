@@ -148,7 +148,7 @@ fn a_tool_call_starts_once_finishes_once_and_its_items_follow() {
     let started = updates.iter().filter(|u| matches!(u, SessionUpdate::ToolStarted { .. })).count();
     let finished: Vec<&SessionUpdate> = updates.iter().filter(|u| matches!(u, SessionUpdate::ToolFinished { .. })).collect();
     assert_eq!(started, 1);
-    assert_eq!(finished, [&SessionUpdate::ToolFinished { call_id: "t1".into(), name: "Read".into(), result: ToolResult::text("hello") }]);
+    assert_eq!(finished, [&SessionUpdate::ToolFinished { call_id: "t1".into(), name: "Read".into(), result: ToolResult::text("hello"), parent: None }]);
     let position = |wanted: &SessionUpdate| updates.iter().position(|u| u == wanted).unwrap();
     assert!(position(&SessionUpdate::ItemAdded { item: call }) < position(finished[0]));
     assert!(position(finished[0]) < position(&SessionUpdate::ItemAdded { item: result }));
@@ -171,7 +171,12 @@ fn a_call_starts_when_its_input_is_known_not_when_it_is_announced() {
     let (updates, _) = run(&mut bridge, vec![update(Update::ToolCall(announced))]);
     assert_eq!(
         updates,
-        [SessionUpdate::ToolStarted { call_id: "t1".into(), name: "mcp__aim__read".into(), arguments: r#"{"file_path":"a.txt"}"#.into() }]
+        [SessionUpdate::ToolStarted {
+            call_id: "t1".into(),
+            name: "mcp__aim__read".into(),
+            arguments: r#"{"file_path":"a.txt"}"#.into(),
+            parent: None
+        }]
     );
 }
 

@@ -157,6 +157,29 @@ pub enum EventBody {
         /// What replaced them.
         items: Vec<Item>,
     },
+    /// A tool call made by another call started: a code cell's nested call (ADR 0066). The
+    /// model's own calls are recorded as transcript items instead.
+    NestedToolStarted {
+        /// The `run_code`, `exec` or `wait` call whose cell made it.
+        parent: String,
+        /// Its id, unique in the session.
+        call_id: String,
+        /// Tool name.
+        name: String,
+        /// Raw arguments.
+        arguments: String,
+    },
+    /// A nested tool call finished (ADR 0066).
+    NestedToolFinished {
+        /// The `run_code`, `exec` or `wait` call whose cell made it.
+        parent: String,
+        /// Its id, as in [`EventBody::NestedToolStarted`].
+        call_id: String,
+        /// Tool name.
+        name: String,
+        /// Its result.
+        result: crate::tool::ToolResult,
+    },
     /// An event kind this build does not know; preserved verbatim.
     #[serde(untagged)]
     Unknown(Value),
