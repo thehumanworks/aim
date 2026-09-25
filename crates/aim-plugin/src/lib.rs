@@ -366,7 +366,11 @@ fn validate_registration(manifest: &PluginManifest, registration: &types::Regist
     for (declared, actual) in manifest.tools.iter().zip(&registration.tools) {
         let declared_schema: Value = serde_json::from_str(&declared.input_schema).map_err(|e| PluginError::Invalid(e.to_string()))?;
         let actual_schema: Value = serde_json::from_str(&actual.input_schema).map_err(|e| PluginError::Invalid(e.to_string()))?;
-        if declared.name != actual.name || declared_schema != actual_schema || declared.sensitive != actual.sensitive {
+        if declared.name != actual.name
+            || declared.description != actual.description
+            || declared_schema != actual_schema
+            || declared.sensitive != actual.sensitive
+        {
             return Err(PluginError::Invalid("guest tool registration differs from manifest".into()));
         }
     }

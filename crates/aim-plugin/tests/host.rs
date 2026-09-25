@@ -85,6 +85,18 @@ async fn kv_guest_persists_across_session_host_recreation() {
 }
 
 #[tokio::test]
+async fn changed_manifest_description_fails_guest_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut trust = TrustStore::load(dir.path()).unwrap();
+    let mut src = source("kv_counter", false);
+    src.manifest_text = src.manifest_text.replace("Increase a named durable counter", "Raise a named durable counter");
+    trust.grant(&src.hash(), ["tools.provide".into(), "kv".into()]).unwrap();
+    let host = PluginToolHost::load(&trust, vec![src], Arc::new(Delegate::default()), HashSet::new()).unwrap();
+    let error = host.call("plugin__kv_counter__increment".into(), json!({"key":"a"}), key()).await.unwrap_err();
+    assert!(error.message.contains("registration differs"));
+}
+
+#[tokio::test]
 async fn concurrent_session_calls_do_not_lose_kv_updates() {
     let dir = tempfile::tempdir().unwrap();
     let mut trust = TrustStore::load(dir.path()).unwrap();
