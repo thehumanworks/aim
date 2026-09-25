@@ -146,4 +146,9 @@ seen values (wrong across providers).
   gateway default, no codex model carried) whose `/model ` listed OpenRouter's catalog; on
   `acp:claude`, `/model ` listed `default`, `opus[1m]`, `claude-fable-5-1[1m]`, `sonnet`, `haiku` and
   `/effort ` `default … max`, and after `/model haiku` the adapter advertised no effort option, so
-  only `auto` was offered.
+  only `auto` was offered (before `auto_effort` existed).
+- Live, same day, after `auto_effort` and case folding: on `acp:claude`, `/effort ` listed
+  `default … max` without `auto`, `/effort Low` put `low` in force through ADR 0075's resolver, and
+  `/effort auto` was refused locally; on `codex` (an ephemeral session, so no Jev), `/effort ` listed
+  the ladder and `auto` described as "unpinned: kept until a model change, then the provider's
+  default", and `/effort High` put `high` in force.
