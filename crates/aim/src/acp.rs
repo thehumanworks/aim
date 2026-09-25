@@ -256,7 +256,13 @@ impl AcpBackend {
                         let read = remote
                             .client
                             .peer()
-                            .call::<FsRead>(FsReadParams { workspace: workspace.clone(), path: remote_path.clone(), range: None })
+                            .call::<FsRead>(FsReadParams {
+                                workspace: workspace.clone(),
+                                path: remote_path.clone(),
+                                range: None,
+                                hash: true,
+                                scope: None,
+                            })
                             .await
                             .map_err(|_| aim_acp::AcpError::InvalidState("SSH challenge file was not readable through aimx".into()))?;
                         Ok(read.content.into_bytes() == nonce.as_bytes())
@@ -270,6 +276,7 @@ impl AcpBackend {
                         path: remote_path,
                         recursive: false,
                         idempotency_key: IdempotencyKey::new(uuid::Uuid::new_v4().to_string()),
+                        scope: None,
                     })
                     .await;
                 remote.shutdown().await;

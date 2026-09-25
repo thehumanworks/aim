@@ -102,7 +102,10 @@ async fn typed_notifications_reach_each_subscriber_and_exec_read_catches_up() {
         assert!(matches!(subscription.recv().await, Some(HarnessNotification::WatchEvent(params)) if params == watched));
         assert!(matches!(subscription.recv().await, Some(HarnessNotification::Progress(_))));
     }
-    let recovered = client.read_output(ExecReadParams { proc: ProcId::new("p"), after_seq: 1, max_bytes: None, wait_ms: 0 }).await.unwrap();
+    let recovered = client
+        .read_output(ExecReadParams { proc: ProcId::new("p"), after_seq: 1, max_bytes: None, wait_ms: 0, scope: None })
+        .await
+        .unwrap();
     assert_eq!(recovered.chunks.iter().map(|chunk| chunk.seq).collect::<Vec<_>>(), [2, 3]);
     client.shutdown().await;
     server.close();
@@ -177,6 +180,7 @@ async fn live_harness_output_notifications() {
             stdin: false,
             timeout_ms: Some(5_000),
             idempotency_key: IdempotencyKey::new("live-harness-output"),
+            scope: None,
         })
         .await
         .unwrap();
@@ -196,7 +200,10 @@ async fn live_harness_output_notifications() {
             _ => {}
         }
     }
-    let replay = client.read_output(ExecReadParams { proc: spawned.proc, after_seq: 0, max_bytes: None, wait_ms: 1_000 }).await.unwrap();
+    let replay = client
+        .read_output(ExecReadParams { proc: spawned.proc, after_seq: 0, max_bytes: None, wait_ms: 1_000, scope: None })
+        .await
+        .unwrap();
     assert!(saw_output && saw_exit, "the live harness must push output and exit notifications");
     assert!(replay.chunks.into_iter().any(|chunk| chunk.data.into_bytes() == b"aim-smoke"), "exec.read reconciles the output");
     client.shutdown().await;

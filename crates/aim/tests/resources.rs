@@ -125,7 +125,12 @@ struct FakeHarness {
 }
 
 fn read_result(file: FileText) -> FsReadResult {
-    FsReadResult { content: Content::Utf8 { text: file.text }, size: file.size, hash: ContentHash(file.hash), truncated: file.truncated }
+    FsReadResult {
+        content: Content::Utf8 { text: file.text },
+        size: file.size,
+        hash: Some(ContentHash(file.hash)),
+        truncated: file.truncated,
+    }
 }
 
 /// A client peer connected to a fake harness serving `files`.

@@ -37,7 +37,7 @@ pub const READ_BATCH: usize = 32;
 pub struct FileText {
     /// The text (UTF-8), at most the requested bytes.
     pub text: String,
-    /// `sha256:<hex>`: of the whole file for harness reads, of the bytes read for local ones.
+    /// `sha256:<hex>`: of the whole file when supplied, otherwise of the bytes read.
     pub hash: String,
     /// The file's full size in bytes.
     pub size: u64,
@@ -128,6 +128,7 @@ impl Files for HarnessFiles {
                 limit: Some(limit),
                 page_token: None,
                 include_hidden: true,
+                scope: None,
             };
             match self.peer.call::<FsList>(params).await {
                 Ok(listed) => Ok(Some(listed.entries)),
@@ -138,14 +139,15 @@ impl Files for HarnessFiles {
     }
 
     fn read_many(&self, paths: Vec<String>, max_bytes: u64) -> FilesFuture<'_, Vec<Read>> {
-        // TODO(aimx prefix read): aimx reads and hashes a whole file to return its first
-        // `max_bytes` (the protocol promises a whole-file hash), so a huge project file still
-        // costs its full size on the workspace host. Ask for a prefix-only read (no whole-file
-        // hash) once aim-harness offers one (REV8-8; ADR 0038, "Open").
         Box::pin(async move {
             let batches = paths.chunks(READ_BATCH).map(|batch| {
-                let params =
-                    FsReadManyParams { workspace: self.workspace.clone(), paths: batch.to_vec(), max_bytes_per_file: Some(max_bytes) };
+                let params = FsReadManyParams {
+                    workspace: self.workspace.clone(),
+                    paths: batch.to_vec(),
+                    max_bytes_per_file: Some(max_bytes),
+                    prefix_only: true,
+                    scope: None,
+                };
                 let count = batch.len();
                 async move {
                     match self.peer.call::<FsReadMany>(params).await {
@@ -165,8 +167,13 @@ impl Files for HarnessFiles {
 
 fn read_of(entry: ReadManyEntry) -> Read {
     match entry {
-        ReadManyEntry::Ok { path, read } => match text_of(read.content, read.truncated, &path) {
-            Ok(text) => Read::Ok(FileText { text, hash: read.hash.0, size: read.size, truncated: read.truncated }),
+        ReadManyEntry::Ok { path, read } => match text_of(read.content.clone(), read.truncated, &path) {
+            Ok(text) => Read::Ok(FileText {
+                text,
+                hash: read.hash.map_or_else(|| sha256(&read.content.into_bytes()), |hash| hash.0),
+                size: read.size,
+                truncated: read.truncated,
+            }),
             Err(message) => Read::Failed(message),
         },
         ReadManyEntry::Error { code, .. } if code == ErrorCode::NotFound.name() => Read::Missing,
@@ -373,7 +380,7 @@ mod tests {
         FsReadResult {
             content: Content::from_bytes(data.to_vec()),
             size: 70_000,
-            hash: aim_proto::harness::ContentHash("sha256:x".into()),
+            hash: Some(aim_proto::harness::ContentHash("sha256:x".into())),
             truncated,
         }
     }
@@ -386,6 +393,10 @@ mod tests {
         // Invalid UTF-8 elsewhere, or in a whole file, is not text.
         assert!(matches!(read_of(entry(bytes(b"a\xFFb\xC3", true))), Read::Failed(m) if m.contains("not UTF-8")));
         assert!(matches!(read_of(entry(bytes(b"abc\xC3", false))), Read::Failed(_)));
+        let mut prefix = bytes(b"abc", true);
+        prefix.hash = None;
+        let Read::Ok(prefix) = read_of(entry(prefix)) else { panic!("prefix read") };
+        assert_eq!(prefix.hash, sha256(b"abc"));
     }
 
     #[test]
