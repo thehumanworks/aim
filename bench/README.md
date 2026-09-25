@@ -211,6 +211,13 @@ of its runs. Re-grading every kept cohort 1 report offline (27 primary scripting
 trials) changed no verdict (`results/t4b-cohort1-regrade.json`); `acp_claude` trials kept no
 reports, so their pass counts are the lenient graders'.
 
+A second external review (REV-T4b2) found that the exact graders still accepted a call listed
+twice and rejected right `todo_table` reports whose File column came last or whose paths were
+Markdown links. The fixes (`a921344`) came from that review, not from results; amendment 2 of the
+plan records them. Re-grading every kept report of both cohorts with the final graders changed no
+verdict (`results/t4b-regrade-final.json`: 27 cohort 2 and 39 cohort 1 trials), so the table below
+stands and no trial was rerun.
+
 Cohort 2 reran the primary protocol on `33d1205` (clean tree), three rotated repetitions:
 `results/t4b-code-mode-c2-openrouter-r{1,2,3}.json`. Besides the graders, its tree differs from
 cohort 1's in that the `off` arm no longer carries the "# Code mode" prompt section (`7afcf10`)

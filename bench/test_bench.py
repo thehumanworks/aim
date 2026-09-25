@@ -189,6 +189,18 @@ class LiveTaskTests(unittest.TestCase):
         self.assertFalse(graded("todo_table", "\n".join([*rows, rows[2]])), "a file listed twice")
         self.assertFalse(graded("todo_table", "| file | TODO | FIXME |\n" + "\n".join(f"{name}: {todo}, {fixme}" for name, (todo, fixme) in counts.items())),
                          "the counts must be in the table")
+        # REV-T4b2 B2: the file column is found by its header, and links are decoration.
+        last = ["| TODO | FIXME | File |", "|---|---|---|"] + [f"| {todo} | {fixme} | {name} |" for name, (todo, fixme) in counts.items()]
+        self.assertTrue(graded("todo_table", "\n".join(last)), "the file column last")
+        linked = "\n".join(rows).replace("| src/alpha.py |", "| [src/alpha.py](src/alpha.py) |").replace(
+            "| src/beta.py |", "| [beta.py](src/beta.py) |").replace("| src/zeta.rs |", "| [zeta](src/zeta.rs) |")
+        self.assertTrue(graded("todo_table", linked), linked)
+        self.assertTrue(graded("todo_table", "\n".join(rows).replace("| 5 |", "| **5** |").replace("| src/eta.go |", "| *src/eta.go* |")))
+        self.assertTrue(graded("todo_table", "\n".join([*rows, "| Total: 18 TODO, 10 FIXME |"])), "a short note row")
+        self.assertTrue(graded("todo_table", "\n".join(row.strip("|").strip() for row in rows)), "rows without outer pipes")
+        # REV-T4b2: a file listed twice under two spellings.
+        self.assertFalse(graded("todo_table", "\n".join([*rows, "| alpha.py | 3 | 1 |"])), "src/alpha.py and alpha.py")
+        self.assertFalse(graded("todo_table", "\n".join([*rows, "| [alpha.py](src/alpha.py) | 3 | 1 |"])))
 
         callers = [f"{path}:{line} {name}" for path, line, name in CALLS]
         self.assertTrue(graded("callers", "\n".join(callers)))
@@ -206,6 +218,12 @@ class LiveTaskTests(unittest.TestCase):
         self.assertFalse(graded("callers", "\n".join(callers).replace(" setup", " Server.setup")), "the wrong class")
         self.assertFalse(graded("callers", "\n".join(f"/tmp/x/work/{line}" for line in callers)), "paths relative to the root")
         self.assertFalse(graded("callers", "\n".join(callers).replace("app/cli.py:6", "cli.py:6")), "paths relative to the root")
+        # REV-T4b2 B1: a call listed twice, under the same or another accepted spelling.
+        self.assertFalse(graded("callers", "\n".join([*callers, callers[0]])), "the same call twice")
+        self.assertFalse(graded("callers", "\n".join([*callers, "app/worker.py:7 Worker.setup"])), "setup and Worker.setup")
+        self.assertFalse(graded("callers", "\n".join([*callers, "./app/cli.py:6 main"])), "app/ and ./app/")
+        self.assertTrue(graded("callers", "\n".join(f"- [{line.split()[0]}]({line.split()[0].split(':')[0]}#L{line.split(':')[1].split()[0]}) *{line.split()[1]}*"
+                                                    for line in callers)), "links and italics are decoration")
 
         index = [f"- {path}: {heading}" for path, heading in HEADINGS.items()]
         self.assertTrue(graded("doc_index", "\n".join(index)))
@@ -222,6 +240,13 @@ class LiveTaskTests(unittest.TestCase):
         self.assertFalse(graded("doc_index", swapped), "headings under each other's paths")
         self.assertFalse(graded("doc_index", "\n".join(index).replace(": Changelog", ": Changelog and more")), "the exact heading")
         self.assertFalse(graded("doc_index", "\n".join([*index, index[0]])), "a file listed twice")
+        self.assertFalse(graded("doc_index", "\n".join([*index, "- setup.md: Installing the tool"])), "docs/setup.md and setup.md")
+        self.assertFalse(graded("doc_index", "\n".join([*index, "- [setup](docs/setup.md): Installing the tool"])), "a linked second spelling")
+        self.assertTrue(graded("doc_index", "\n".join(f"- {path}: [{heading}]({path})" for path, heading in HEADINGS.items())), "a linked heading")
+        self.assertTrue(graded("doc_index", "\n".join(f"- [{path.rsplit('/', 1)[-1][:-3]}]({path}): _{heading}_" for path, heading in HEADINGS.items())),
+                        "a link whose text is no path, and an italic heading")
+        self.assertTrue(graded("doc_index", "\n".join(f"{number}. {line[2:]}" for number, line in enumerate(index, 1))), "a numbered list")
+        self.assertFalse(graded("doc_index", "\n".join([*index, "11. docs/setup.md: Installing the tool"])), "a numbered duplicate")
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp) / "work"
             prepare("doc_index", workspace)

@@ -276,7 +276,10 @@ Markdown files (`doc_index`). Hidden tests grade the reports as exact entries.
 reports (codex review REV-T4b B1). A dated amendment to the plan registered cohort 2 with
 exact-entry graders before any of its runs (`b31a152`, manifest `[code_mode] cohort = 2`), and
 the primary protocol ran again. Re-grading every kept cohort 1 report with the fixed graders
-changed no verdict (`bench/results/t4b-cohort1-regrade.json`). Cohort 2 decides.
+changed no verdict (`bench/results/t4b-cohort1-regrade.json`). Cohort 2 decides. A second review
+(REV-T4b2) fixed two more grader bugs (a call listed twice passed; a File column placed last or a
+linked path failed) in `a921344`. Re-grading every kept report of both cohorts with the final
+graders changed no verdict (`bench/results/t4b-regrade-final.json`), so the numbers below stand.
 
 **Primary cohort 2** (decides): `openai/gpt-4.1-mini` on OpenRouter, three repetitions of all nine
 tasks per arm, arm order rotated, on `33d1205`

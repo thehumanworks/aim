@@ -165,3 +165,31 @@ effect of code mode:
 **The decision** is recomputed with `bench/code_mode.py` from cohort 2's primary results alone, by
 the same rule and margins. Arms, tasks, prompts, metrics and margins are unchanged; the
 manifest's `[code_mode] cohort` names the cohort.
+
+## Amendment 2, 2026-09-25: final grader fixes, cohort 2 re-graded
+
+Written after cohort 2's results. The fixes came from the external codex re-check of T4b
+(REV-T4b2), not from the results, and no trial was rerun: every trajectory, request, token and
+cost stays the recorded one; only the grades are recomputed.
+
+**Why.** Two grader bugs survived amendment 1. `callers` collected entries in a set, so a right
+report that listed a call twice passed, including `app/worker.py:7 setup` next to
+`app/worker.py:7 Worker.setup` (B1). `todo_table` took the path from the first column and read a
+Markdown link literally, so right tables with the File column last or cells such as
+`[src/alpha.py](src/alpha.py)` failed, although links are decoration (B2).
+
+**The fix** (`a921344`), after sweeping all three graders for both classes:
+
+- Duplicates: each entry is keyed after normalising its spelling (`./`, the `src/` or `docs/`
+  prefix, a class-qualified method, a link), and a second entry for the same file or call site
+  fails.
+- Decoration: `todo_table` finds the file column by its header (else the one column without
+  counts) and accepts rows without outer pipes; a link stands for its text when that names a
+  file, else its target (paths), or for its text (a `callers` `path:line` label, a `doc_index`
+  heading); `doc_index` accepts any list marker.
+
+**Re-grade.** Every kept report was graded again with the final graders
+(`bench/results/t4b-regrade-final.json`, at `a921344`): 27 cohort 2 primary scripting trials (one
+wrote no report and fails under any grader) and 39 cohort 1 trials (27 primary, 12 codex). **No
+verdict changed**, so cohort 2's table and the rule's verdict (`off`) stand as published, and no
+cohort 3 is needed. `acp_claude` kept no reports; its pass counts remain cohort 1's.
