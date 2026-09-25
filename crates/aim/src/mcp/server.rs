@@ -26,6 +26,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long calls still running when the client closes its input may finish and reply before they
 /// are dropped (codex review B2): a client that closed its input has shut the server down.
 const EOF_GRACE: Duration = Duration::from_secs(2);
+/// Replies that may wait for the writer: far above the 32 concurrent calls, so only a client that
+/// stopped reading fills it.
+const REPLY_BACKLOG: usize = 256;
 /// A code tool's calls may run a cell to its longest deadline; this adds a margin for admission
 /// and the worker's start (ADR 0076).
 const CELL_CALL_TIMEOUT: Duration = Duration::from_millis(crate::coderun::MAX_TIMEOUT_MS + 30_000);
@@ -73,26 +76,53 @@ impl AimMcpServer {
     /// 60-second default deadline (a code tool's, 330 s). `notifications/cancelled` drops the
     /// corresponding call future. When the client closes its input, calls still running get two
     /// seconds to reply; then they are dropped and this returns, so a disconnected client never
-    /// keeps the server (or what its calls hold, such as a cell or a shell) alive.
+    /// keeps the server (or what its calls hold, such as a cell or a shell) alive. Replies are
+    /// written beside the reading, so a client that stops reading cannot stall the shutdown
+    /// either: what is still queued when the grace ends is dropped.
     ///
     /// # Errors
-    /// Returns an I/O error when the transport fails or an inbound frame exceeds 16 MiB.
-    pub async fn serve<R, W>(&self, reader: R, mut writer: W) -> io::Result<()>
+    /// Returns an I/O error when the transport fails, an inbound frame exceeds 16 MiB, or more
+    /// than 256 replies wait for a client that does not read them.
+    pub async fn serve<R, W>(&self, reader: R, writer: W) -> io::Result<()>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
+        let (replies, queued) = tokio::sync::mpsc::channel::<Value>(REPLY_BACKLOG);
+        let writing = write_replies(writer, queued);
+        tokio::pin!(writing);
+        let closing = tokio::select! {
+            // With the reader still running, the writer ends only on a transport error.
+            written = &mut writing => {
+                written?;
+                return Ok(());
+            }
+            read = self.read_requests(reader, replies) => read?,
+        };
+        // The client closed its input: queued replies may still go out, but never past its grace
+        // (codex re-check B2).
+        tokio::time::timeout_at(closing, writing).await.unwrap_or(Ok(()))
+    }
+
+    /// Reads and dispatches requests until the client closes its input and its calls end (or
+    /// their grace does); returns when the grace ends. Replies go to `replies`.
+    async fn read_requests<R: AsyncRead + Unpin>(
+        &self,
+        reader: R,
+        replies: tokio::sync::mpsc::Sender<Value>,
+    ) -> io::Result<tokio::time::Instant> {
         let mut reader = BufReader::new(reader);
         let mut frame = Vec::new();
         let mut pending = FuturesUnordered::<Pending>::new();
         let mut active = HashMap::<String, AbortHandle>::new();
         let connection_id = uuid::Uuid::new_v4().to_string();
-        let mut eof = false;
         let mut closing: Option<tokio::time::Instant> = None;
 
         loop {
-            if eof && pending.is_empty() {
-                return Ok(());
+            if let Some(at) = closing
+                && pending.is_empty()
+            {
+                return Ok(at);
             }
             let grace_over = async {
                 match closing {
@@ -106,11 +136,11 @@ impl AimMcpServer {
                     if let Some((key, reply)) = completion {
                         active.remove(&key);
                         if let Some(reply) = reply {
-                            write_reply(&mut writer, &reply).await?;
+                            queue_reply(&replies, reply)?;
                         }
                     }
                 }
-                incoming = read_frame(&mut reader, &mut frame), if !eof => {
+                incoming = read_frame(&mut reader, &mut frame), if closing.is_none() => {
                     if incoming?.is_some() {
                         let request = serde_json::from_slice::<Value>(&frame);
                         let reply = match request {
@@ -119,10 +149,9 @@ impl AimMcpServer {
                         };
                         frame.clear();
                         if let Some(reply) = reply {
-                            write_reply(&mut writer, &reply).await?;
+                            queue_reply(&replies, reply)?;
                         }
                     } else {
-                        eof = true;
                         closing = Some(tokio::time::Instant::now() + self.eof_grace);
                     }
                 }
@@ -131,7 +160,7 @@ impl AimMcpServer {
                     for handle in active.values() {
                         handle.abort();
                     }
-                    return Ok(());
+                    return Ok(closing.unwrap_or_else(tokio::time::Instant::now));
                 }
             }
         }
@@ -316,6 +345,19 @@ fn success(id: &Value, mut result: Value, modern: bool) -> Value {
 
 fn error(id: &Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+}
+
+/// Queues a reply for the writer; a full backlog means the client stopped reading.
+fn queue_reply(replies: &tokio::sync::mpsc::Sender<Value>, reply: Value) -> io::Result<()> {
+    replies.try_send(reply).map_err(|_| io::Error::other("MCP reply backlog is full: the client stopped reading"))
+}
+
+/// Writes queued replies in order until the reader is done and the queue is empty.
+async fn write_replies<W: AsyncWrite + Unpin>(mut writer: W, mut queued: tokio::sync::mpsc::Receiver<Value>) -> io::Result<()> {
+    while let Some(reply) = queued.recv().await {
+        write_reply(&mut writer, &reply).await?;
+    }
+    Ok(())
 }
 
 async fn write_reply<W: AsyncWrite + Unpin>(writer: &mut W, reply: &Value) -> io::Result<()> {

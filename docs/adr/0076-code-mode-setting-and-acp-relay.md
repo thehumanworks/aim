@@ -57,7 +57,9 @@ conservative choice:
 aim says so on stderr, once per process, where code mode is chosen from the environment: `aim`
 (the TUI), `aim run`, `aim mcp --stdio` and `aim daemon`. The message is `aim:
 AIM_CODE_MODE="onn" is not off, on or only (or 0, 1, false, true); code mode is off`. The log gets
-the same warning once.
+the same warning once. The warning never echoes arbitrary environment content: the value is shown
+only if it is at most 16 characters of `[A-Za-z0-9_-]`. Anything else is reported as "an
+unrecognized value", so a pasted secret or a terminal escape never reaches the screen.
 
 - **`off`:** no code tool and no program tools. Every direct tool is offered.
 - **`on`:** the code tool(s) and the program tools, beside a compact direct set. In native
@@ -145,9 +147,16 @@ and the model sees it. So:
 - the worker cuts a failure to the cell's output limit (40 KB for `run_code` and `run_program`,
   64 KB for an `exec` cell);
 - the parent cuts it again, as defense in depth against a compromised worker;
-- an `exec` or `wait` failure shares its response's budget with the output before it.
+- an `exec` or `wait` failure shares its response's budget with the output before it;
+- `save_program`, `run_program` and `list_programs` errors are cut to 40 KB, which covers
+  workspace text such as a refused project write;
+- a nested call's failure, recorded in its child `ToolFinished` event, is cut to 64 KB. Nested
+  successes are bounded by their tools, as top-level results are.
 
-All three use the output's truncation: head and tail, UTF-8 safe, after a warning line.
+All of these use the output's truncation: head and tail, UTF-8 safe, after a warning line. That
+truncation now never exceeds its budget: a budget too small for the notice gets a shorter one, cut
+to fit. An `exec`/`wait` response budget has a 100-byte floor (25 tokens), so
+`max_output_tokens: 0` still shows the full notice.
 
 ### 4. Claude gets code mode through aim's relay
 
@@ -209,6 +218,10 @@ once as `1e3` and once as `1e8`. So aim does not rely on it. `aimx mcp` sessions
 shut the server down (the MCP stdio lifecycle).
 - **The grace.** `AimMcpServer` gives calls still running two seconds to reply, so a piped
   one-shot call still gets its answer. Then it drops them and returns.
+- **Replies cannot stall it.** Replies go through a queue of 256 to a writer that runs beside the
+  reader, so a client that stops reading its output can neither block the reading nor the
+  shutdown. Replies still queued when the grace ends are dropped. A full queue means the client
+  has stopped reading, and it ends the connection with an error.
 - **The relay** then ends its cells and its workspace. `aim mcp` ends its cells.
 - **aimx gets time to clean up.** Closing a local harness used to kill aimx at once, which
   orphaned any shell it had started. aimx releases (kills) a closed connection's processes before
@@ -217,6 +230,13 @@ shut the server down (the MCP stdio lifecycle).
 - **Before the fix,** a disconnected Claude left the relay, aimx and a 600 s `Bash` running until
   the call's deadline. `aimx mcp` still drains its calls on end of input (its
   `end_of_input_drains_accepted_request_and_reply`).
+- **Residual, not fixed here: an aimx that does not exit in time.** If aimx has not exited two
+  seconds after its connection closed, it is killed, and any shell it started can outlive it:
+  `workspace/local/exec.rs` starts each shell in a process group of its own. aimx's
+  `serve --stdio` has no SIGTERM handler (only its network and unix listeners handle Ctrl-C), so
+  sending SIGTERM first would not help. The fix belongs in aimx: a SIGTERM handler that runs
+  `Server::shutdown`. It is left to aimx's owner rather than adding OS access outside aimx's
+  backends.
 
 ### 5. Benchmark arms
 
@@ -311,8 +331,13 @@ A mutation that drops the permission check fails verification.
   `a_huge_exception_is_bounded_like_output` (B1).
 - `coderun.rs`: `a_huge_script_error_stays_within_run_code_s_budget` and
   `a_huge_exec_error_stays_within_the_response_budget` (B1).
-- `mcp_server.rs`: `closing_the_input_ends_pending_calls_after_a_short_grace` and
-  `a_call_that_finishes_within_the_grace_still_replies` (B2).
+- `mcp_server.rs`: `closing_the_input_ends_pending_calls_after_a_short_grace`,
+  `a_call_that_finishes_within_the_grace_still_replies`, and
+  `a_client_that_stops_reading_cannot_stall_the_shutdown` (B2; it fails after 5 s on the previous
+  server).
+- `coderun.rs`: `a_zero_token_exec_response_still_fits_its_truncation_notice`,
+  `a_huge_nested_failure_is_recorded_within_the_cell_budget` and
+  `a_huge_project_write_failure_is_bounded` (B1, re-check).
 - `code_mode.rs`: `closing_the_relay_s_input_ends_a_pending_call_and_its_processes` (B2: the
   relay, its aimx and the shell are gone about 2 s after the client closes) and
   `an_invalid_code_mode_is_reported_on_stderr_once` (N1).

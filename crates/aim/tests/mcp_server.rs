@@ -167,6 +167,37 @@ async fn closing_the_input_ends_pending_calls_after_a_short_grace() {
     assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
 }
 
+/// Codex re-check B2: a client that closes its input and never reads its output cannot keep the
+/// server writing forever; what is still queued when the grace ends is dropped.
+#[tokio::test]
+async fn a_client_that_stops_reading_cannot_stall_the_shutdown() {
+    let host = Arc::new(FakeHost::default());
+    let server = AimMcpServer::new(host).with_eof_grace(Duration::from_millis(100));
+    // A tiny pipe: the first large reply fills it, and the client never drains it.
+    let (client, server_io) = tokio::io::duplex(256);
+    let (reader, writer) = tokio::io::split(server_io);
+    let task = tokio::spawn(async move { server.serve(reader, writer).await });
+    let (_client_read, mut client_write) = tokio::io::split(client);
+    // One deadline over the whole exchange: a server that stalls on its first reply also stops
+    // reading, and the client's own writes would then block.
+    let exchange = async move {
+        for id in 0..3 {
+            let request =
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"echo","arguments":{"value":"x".repeat(64 * 1024)}}});
+            let mut bytes = serde_json::to_vec(&request).expect("serialize request");
+            bytes.push(b'\n');
+            client_write.write_all(&bytes).await.expect("send request");
+        }
+        client_write.shutdown().await.expect("close the client's input");
+        task.await
+    };
+    tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("the server keeps reading and returns")
+        .expect("server task")
+        .expect("clean end");
+}
+
 #[tokio::test]
 async fn a_call_that_finishes_within_the_grace_still_replies() {
     let host = Arc::new(FakeHost::default());
