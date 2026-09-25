@@ -6,11 +6,12 @@
 use std::path::Path;
 use std::sync::mpsc;
 
+use aim_proto::daemon::SessionState;
 use aim_proto::event::{SessionEvent, SessionMeta};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use tokio::sync::oneshot;
 
-use super::{BoxFuture, MAX_FORK_DEPTH, SessionStore, StoreError, check_sequence};
+use super::{BoxFuture, MAX_FORK_DEPTH, SessionStore, StoreError, StoredSessionSummary, check_sequence};
 
 /// Schema version of the database itself (independent of the event schema).
 const DB_SCHEMA: i64 = 1;
@@ -22,6 +23,7 @@ enum Command {
     Append(String, Vec<SessionEvent>, Reply<()>),
     Load(String, Reply<(SessionMeta, Vec<SessionEvent>)>),
     List(u32, Reply<Vec<SessionMeta>>),
+    Summarize(u32, Reply<Vec<StoredSessionSummary>>),
 }
 
 /// The default session store.
@@ -225,6 +227,53 @@ fn list(conn: &Connection, limit: u32) -> Result<Vec<SessionMeta>, StoreError> {
     rows.map(|row| row.map_err(backend).and_then(|json| meta_of(&json))).collect()
 }
 
+fn summarize(conn: &Connection, limit: u32) -> Result<Vec<StoredSessionSummary>, StoreError> {
+    // Each lineage row exposes only the ancestor prefix visible to the child. Event seqs are
+    // unique across that effective log, so the greatest seq supplies its last timestamp.
+    let mut stmt = conn
+        .prepare_cached(
+            "WITH RECURSIVE lineage(root_id, ancestor_id, max_seq, depth) AS (
+                 SELECT id, id, 9223372036854775807, 0 FROM sessions
+                 UNION ALL
+                 SELECT lineage.root_id,
+                        json_extract(s.meta, '$.parent.session'),
+                        MIN(lineage.max_seq, json_extract(s.meta, '$.parent.seq')),
+                        lineage.depth + 1
+                   FROM lineage JOIN sessions s ON s.id = lineage.ancestor_id
+                  WHERE json_extract(s.meta, '$.parent.session') IS NOT NULL
+                    AND lineage.depth + 1 < ?1
+             ), visible AS (
+                 SELECT lineage.root_id, e.seq, e.turn, e.ts_ms,
+                        ROW_NUMBER() OVER (PARTITION BY lineage.root_id ORDER BY e.seq DESC) AS recent
+                   FROM lineage JOIN events e ON e.session_id = lineage.ancestor_id
+                    AND e.seq <= lineage.max_seq
+             ), aggregate AS (
+                 SELECT root_id, MAX(turn) AS turns,
+                        MAX(CASE WHEN recent = 1 THEN ts_ms END) AS last_event_ms
+                   FROM visible GROUP BY root_id
+             )
+             SELECT s.meta, COALESCE(a.turns, 0), COALESCE(a.last_event_ms, s.created_ms)
+               FROM sessions s LEFT JOIN aggregate a ON a.root_id = s.id
+              ORDER BY COALESCE(a.last_event_ms, s.created_ms) DESC, s.id ASC LIMIT ?2",
+        )
+        .map_err(backend)?;
+    let rows = stmt
+        .query_map(params![i64::try_from(MAX_FORK_DEPTH).map_err(backend)?, limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })
+        .map_err(backend)?;
+    rows.map(|row| {
+        let (json, turns, last_activity_ms) = row.map_err(backend)?;
+        Ok(StoredSessionSummary {
+            meta: meta_of(&json)?,
+            turns: u64::try_from(turns).map_err(backend)?,
+            last_activity_ms,
+            state: SessionState::Closed,
+        })
+    })
+    .collect()
+}
+
 fn serve(mut conn: Connection, rx: &mpsc::Receiver<Command>) {
     while let Ok(command) = rx.recv() {
         // A dropped reply only means the caller stopped waiting.
@@ -233,6 +282,7 @@ fn serve(mut conn: Connection, rx: &mpsc::Receiver<Command>) {
             Command::Append(session, events, reply) => drop(reply.send(append(&mut conn, &session, &events))),
             Command::Load(session, reply) => drop(reply.send(load(&conn, &session))),
             Command::List(limit, reply) => drop(reply.send(list(&conn, limit))),
+            Command::Summarize(limit, reply) => drop(reply.send(summarize(&conn, limit))),
         }
     }
 }
@@ -279,5 +329,9 @@ impl SessionStore for SqliteStore {
 
     fn list(&self, limit: u32) -> BoxFuture<Result<Vec<SessionMeta>, StoreError>> {
         self.ask(|reply| Command::List(limit, reply))
+    }
+
+    fn summarize(&self, limit: u32) -> BoxFuture<Result<Vec<StoredSessionSummary>, StoreError>> {
+        self.ask(|reply| Command::Summarize(limit, reply))
     }
 }

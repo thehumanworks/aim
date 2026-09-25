@@ -46,3 +46,4 @@ Rules (enforced by `mise run check`):
 | [0023](0023-rust-web-ui-leptos.md) | Build the web UI in Rust with Leptos and shared protocol types. |
 | [0024](0024-benchmark-manifest.md) | Define comparable benchmark tiers and a quality-first pass condition. |
 | [0025](0025-compaction-plan-invariants.md) | Cut transcripts without separating tool exchanges. |
+| [0026](0026-daemon-stream-lifecycle-and-stored-summaries.md) | Order daemon attachments, report stream termination, and summarize stored sessions. |

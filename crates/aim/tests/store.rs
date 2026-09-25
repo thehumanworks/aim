@@ -3,6 +3,7 @@
 
 use aim::store::{MemoryStore, SessionStore, SqliteStore, StoreError};
 use aim_proto::conversation::{Item, Part, StopReason};
+use aim_proto::daemon::SessionState;
 use aim_proto::event::{EVENT_SCHEMA, EventBody, ForkPoint, SessionEvent, SessionMeta};
 
 fn meta(id: &str, created_ms: i64) -> SessionMeta {
@@ -20,6 +21,39 @@ fn meta(id: &str, created_ms: i64) -> SessionMeta {
 
 fn event(seq: u64, body: EventBody) -> SessionEvent {
     SessionEvent { schema: EVENT_SCHEMA, seq, turn: 1, ts_ms: 7, body }
+}
+
+fn timed_event(seq: u64, turn: u64, ts_ms: i64) -> SessionEvent {
+    SessionEvent { schema: EVENT_SCHEMA, seq, turn, ts_ms, body: EventBody::TurnStarted }
+}
+
+async fn summary_contract(store: &dyn SessionStore) {
+    store.create(meta("empty", 10)).await.unwrap();
+    store.create(meta("parent", 20)).await.unwrap();
+    store.append("parent".into(), vec![timed_event(1, 1, 100), timed_event(2, 2, 200), timed_event(3, 3, 300)]).await.unwrap();
+
+    let mut child = meta("child", 250);
+    child.parent = Some(ForkPoint { session: "parent".into(), seq: 2 });
+    store.create(child).await.unwrap();
+    let mut grandchild = meta("grandchild", 260);
+    grandchild.parent = Some(ForkPoint { session: "child".into(), seq: 2 });
+    store.create(grandchild).await.unwrap();
+    // Activity follows the greatest visible seq, even if wall-clock timestamps regress.
+    store.append("child".into(), vec![timed_event(3, 3, 150)]).await.unwrap();
+
+    let summaries = store.summarize(10).await.unwrap();
+    let projection: Vec<_> = summaries.iter().map(|s| (s.meta.id.as_str(), s.turns, s.last_activity_ms, s.state)).collect();
+    assert_eq!(
+        projection,
+        [
+            ("parent", 3, 300, SessionState::Closed),
+            ("grandchild", 2, 200, SessionState::Closed),
+            ("child", 3, 150, SessionState::Closed),
+            ("empty", 0, 10, SessionState::Closed),
+        ]
+    );
+    assert_eq!(store.summarize(2).await.unwrap().len(), 2);
+    assert!(store.summarize(0).await.unwrap().is_empty());
 }
 
 async fn contract(store: &dyn SessionStore) {
@@ -91,6 +125,20 @@ async fn memory_store_obeys_the_contract() {
 #[tokio::test]
 async fn memory_store_materializes_nested_forks() {
     fork_contract(&MemoryStore::default()).await;
+}
+
+#[tokio::test]
+async fn memory_store_summarizes_many_sessions_and_forks() {
+    summary_contract(&MemoryStore::default()).await;
+}
+
+#[tokio::test]
+async fn sqlite_store_summarizes_many_sessions_and_forks() {
+    let dir = std::env::temp_dir().join(format!("aim-summary-test-{}", std::process::id()));
+    let _stale = std::fs::remove_dir_all(&dir);
+    let store = SqliteStore::open(&dir.join("aim.db")).unwrap();
+    summary_contract(&store).await;
+    let _cleanup = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

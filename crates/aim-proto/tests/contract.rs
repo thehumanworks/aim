@@ -5,7 +5,7 @@ use aim_proto::content::{Base64Bytes, Content};
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{self, ExactEdit, FsEditParams, Precondition};
 use aim_proto::ids::{IdempotencyKey, WorkspaceId};
-use aim_proto::rpc::{Envelope, ErrorObject, Message, Method, RequestId};
+use aim_proto::rpc::{Envelope, ErrorObject, Message, Method, Notification, RequestId};
 use serde_json::json;
 
 #[test]
@@ -168,6 +168,13 @@ fn every_daemon_method_has_a_json_schema_and_updates_are_tagged() {
         update: daemon::SessionUpdate::StateChanged { state: daemon::SessionState::Running },
     };
     assert_eq!(serde_json::to_value(&update).unwrap(), json!({"session": "s", "update": {"type": "state_changed", "state": "running"}}));
+    let detached = daemon::SessionDetachedParams { session: "s".into(), reason: daemon::DetachReason::Lagged };
+    assert_eq!(<daemon::SessionDetachedNotification as Notification>::NAME, "session.detached");
+    assert_eq!(serde_json::to_value(&detached).unwrap(), json!({"session": "s", "reason": "lagged"}));
+    assert_eq!(
+        serde_json::from_value::<daemon::SessionDetachedParams>(json!({"session": "s", "reason": "replaced"})).unwrap().reason,
+        daemon::DetachReason::Replaced
+    );
 }
 
 #[test]

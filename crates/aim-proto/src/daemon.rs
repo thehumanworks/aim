@@ -363,3 +363,30 @@ notification!(
     /// `session.update` — one update of an attached session, in order.
     SessionUpdateNotification = "session.update" (SessionUpdateParams)
 );
+
+/// Why a daemon stopped forwarding an attached session's updates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DetachReason {
+    /// The host's update broadcast overflowed; attach again for a fresh snapshot.
+    Lagged,
+    /// The session closed and no more updates will follow.
+    Closed,
+    /// Another attach on this connection replaced the previous forwarder.
+    Replaced,
+}
+
+/// `session.detached` notification parameters.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SessionDetachedParams {
+    /// Session whose update stream ended.
+    pub session: String,
+    /// Why the stream ended.
+    pub reason: DetachReason,
+}
+
+notification!(
+    /// `session.detached` — terminal notification for one attached update stream. A lagged stream
+    /// must be re-attached to recover a gap-free transcript.
+    SessionDetachedNotification = "session.detached" (SessionDetachedParams)
+);
