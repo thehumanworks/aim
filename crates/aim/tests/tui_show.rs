@@ -1,5 +1,6 @@
 //! Prints the TUI's screens at the stages of a scripted session, for eyeballing:
 //! `cargo test -p aim --test tui_show -- --ignored --nocapture`.
+#![expect(clippy::print_stdout, reason = "prints screens for a human to read")]
 
 mod tui_support;
 
