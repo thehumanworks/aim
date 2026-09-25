@@ -22,7 +22,8 @@ fn claimant_is_fenced_and_acceptance_is_separate() {
     assert_eq!(job.review(), ReviewState::Pending);
     assert!(!job.is_accepted());
     assert_eq!(job.transition(Event::Review { accepted: true, evidence_present: true }, 3), Err(LifecycleError::WrongState));
-    assert_eq!(job.transition(Event::ConfirmCleanup, 3), Ok(()));
+    assert_eq!(job.transition(Event::ConfirmCleanup { generation: 0, claim_id: 8 }, 3), Err(LifecycleError::StaleClaim));
+    assert_eq!(job.transition(Event::ConfirmCleanup { generation: 0, claim_id: 7 }, 3), Ok(()));
     assert_eq!(job.transition(Event::Review { accepted: true, evidence_present: false }, 3), Err(LifecycleError::MissingEvidence));
     assert_eq!(job.transition(Event::Review { accepted: true, evidence_present: true }, 3), Ok(()));
     assert!(job.is_accepted());
@@ -37,11 +38,13 @@ fn expiry_retains_capacity_until_cleanup_then_fences_old_generation() {
     assert_eq!(job.cleanup(), CleanupState::Pending);
     assert!(job.holds_capacity(9));
     assert_eq!(job.transition(Event::Retry, 10), Err(LifecycleError::CleanupPending));
-    assert_eq!(job.transition(Event::ConfirmCleanup, 11), Ok(()));
+    assert_eq!(job.transition(Event::ConfirmCleanup { generation: 0, claim_id: 2 }, 11), Err(LifecycleError::StaleClaim));
+    assert_eq!(job.transition(Event::ConfirmCleanup { generation: 0, claim_id: 1 }, 11), Ok(()));
     assert_eq!(job.transition(Event::Retry, 11), Ok(()));
     assert_eq!(job.generation(), 1);
     assert_eq!(claim(&mut job, 9, 2, 20, 12), Ok(()));
     assert_eq!(job.transition(Event::Start { generation: 0, claim_id: 1 }, 13), Err(LifecycleError::StaleClaim));
+    assert_eq!(job.transition(Event::ConfirmCleanup { generation: 0, claim_id: 1 }, 13), Err(LifecycleError::StaleClaim));
     assert_eq!(job.transition(Event::Start { generation: 1, claim_id: 2 }, 13), Ok(()));
 }
 
