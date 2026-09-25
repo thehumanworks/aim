@@ -1,21 +1,17 @@
 //! The local backend: this host's filesystem and processes.
 //!
 //! One of the three places in aimx allowed to touch the OS directly (with `ssh` and `server`).
-//! Paths arrive lexically confined (see [`crate::authz::confine`]); this backend additionally
-//! resolves symlinks on every existing ancestor (and on the final component for operations that
-//! follow it) and refuses any path whose real location leaves the workspace root. Blocking
+//! Paths arrive lexically confined (see [`crate::authz::confine`], the kernel's decision); this
+//! backend enforces it: every path is resolved by walking directory descriptors from one held on
+//! the root, without the kernel ever following a symlink ([`walk`]), and the operation acts on
+//! those descriptors, so a directory swapped for a symlink mid-request cannot redirect it. Blocking
 //! filesystem calls run on tokio's blocking pool.
-//!
-//! Known limit: resolution and the operation are separate system calls, so a concurrent process
-//! that swaps a directory for a symlink in between could still redirect one operation
-//! (`openat2(RESOLVE_BENEATH)`/`O_NOFOLLOW` walking would close this; ADR 0008 lists it as a shell
-//! assumption).
 
 mod exec;
 mod fs;
 mod search;
+mod walk;
 
-use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +23,7 @@ use tokio::sync::Semaphore;
 use self::exec::LocalExec;
 use self::fs::LocalFs;
 use self::search::LocalSearch;
+use self::walk::{Follow, Loc, Root, WalkError};
 use super::{Exec, Fs, Outcome, Search, Workspace};
 use crate::authz::ProtectedPaths;
 
@@ -81,7 +78,9 @@ impl LocalWorkspace {
     /// is not a directory.
     pub async fn open(root: &str, config: LocalConfig) -> Outcome<Self> {
         let canonical = canonical_root(root).await?;
-        let base = Arc::new(Base { root: PathBuf::from(&canonical), protected: config.protected });
+        let path = PathBuf::from(&canonical);
+        let root = blocking(move || Root::open(&path).map_err(|err| io_error(&err, &path.to_string_lossy()))).await?;
+        let base = Arc::new(Base { root, protected: config.protected });
         Ok(Self {
             caps: Caps { max_concurrency: config.max_concurrency, ..local_caps() },
             fs: LocalFs::new(Arc::clone(&base)),
@@ -151,99 +150,48 @@ impl Workspace for LocalWorkspace {
     }
 }
 
-/// What every part of the backend shares: the canonical root and the protected set.
+/// What every part of the backend shares: the root (held open) and the protected set.
 #[derive(Debug)]
 struct Base {
-    root: PathBuf,
+    root: Root,
     protected: Arc<ProtectedPaths>,
 }
 
-/// Whether to resolve a symlink in the final path component.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Follow {
-    /// Operate on the link's target (read, write, list, search).
-    Final,
-    /// Operate on the link itself (stat, remove, rename).
-    NoFinal,
-}
-
 impl Base {
-    /// Resolves a lexically confined path to its real location, refusing anything outside the
-    /// root. Missing trailing components are allowed (for creation); a dangling symlink on the way
-    /// is refused, since its target cannot be checked.
-    fn resolve(&self, path: &str, follow: Follow) -> Outcome<PathBuf> {
-        let lexical = Path::new(path);
-        if !lexical.starts_with(&self.root) {
-            return Err(outside(path));
-        }
-        if lexical == self.root {
-            return Ok(self.root.clone());
-        }
-        let (Some(parent), Some(name)) = (lexical.parent(), lexical.file_name()) else {
-            return Err(outside(path));
-        };
-        let real_parent = self.real_prefix(parent, path)?;
-        let candidate = real_parent.join(name);
-        if follow == Follow::Final
-            && let Ok(meta) = std::fs::symlink_metadata(&candidate)
-            && meta.file_type().is_symlink()
-        {
-            return match std::fs::canonicalize(&candidate) {
-                Ok(target) if target.starts_with(&self.root) => Ok(target),
-                Ok(_) => Err(outside(path)),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    Err(ProtoError::new(ErrorCode::Denied, format!("`{path}` is a dangling symlink")))
-                }
-                Err(err) => Err(io_error(&err, path)),
-            };
-        }
-        Ok(candidate)
+    /// Resolves a lexically confined path by walking descriptors from the root ([`walk`]):
+    /// symlinks inside the root are followed (the final one only with [`Follow::Final`]), anything
+    /// leading out of it or dangling is `denied`, and missing trailing components are allowed for
+    /// creation.
+    fn resolve(&self, path: &str, follow: Follow) -> Outcome<Loc> {
+        let rel = Path::new(path).strip_prefix(&self.root.path).map_err(|_| outside(path))?;
+        walk::walk(&self.root, rel, follow).map_err(|err| match err {
+            WalkError::Outside => outside(path),
+            WalkError::Dangling => ProtoError::new(ErrorCode::Denied, format!("`{path}` passes through a dangling symlink")),
+            WalkError::TooManyLinks => {
+                ProtoError::new(ErrorCode::Denied, format!("`{path}` passes through more than {} symlinks", walk::MAX_LINKS))
+            }
+            WalkError::NotADirectory(name) => {
+                ProtoError::new(ErrorCode::Conflict, format!("`{path}`: `{}` is not a directory", name.to_string_lossy()))
+            }
+            WalkError::Io(err) => io_error(&err, path),
+        })
     }
 
-    /// The real location of directory `dir`: its deepest existing ancestor canonicalised, plus
-    /// the missing components.
-    fn real_prefix(&self, dir: &Path, display: &str) -> Outcome<PathBuf> {
-        let mut existing = dir.to_path_buf();
-        let mut missing: Vec<OsString> = Vec::new();
-        loop {
-            match std::fs::canonicalize(&existing) {
-                Ok(real) => {
-                    if !real.starts_with(&self.root) {
-                        return Err(outside(display));
-                    }
-                    let mut out = real;
-                    for component in missing.iter().rev() {
-                        out.push(component);
-                    }
-                    return Ok(out);
-                }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    if std::fs::symlink_metadata(&existing).is_ok() {
-                        return Err(ProtoError::new(ErrorCode::Denied, format!("`{display}` passes through a dangling symlink")));
-                    }
-                    match (existing.file_name(), existing.parent()) {
-                        (Some(name), Some(parent)) => {
-                            missing.push(name.to_owned());
-                            existing = parent.to_path_buf();
-                        }
-                        _ => return Err(ProtoError::new(ErrorCode::NotFound, format!("`{display}` does not exist"))),
-                    }
-                }
-                Err(err) => return Err(io_error(&err, display)),
-            }
-        }
+    /// The real path a resolution arrived at.
+    fn real(&self, loc: &Loc) -> PathBuf {
+        loc.real_path(&self.root.path)
     }
 
     /// Refuses mutations whose real location is protected.
-    fn check_protected(&self, real: &Path, tree: bool) -> Outcome<()> {
-        let real = path_string(real)?;
+    fn check_protected(&self, loc: &Loc, tree: bool) -> Outcome<()> {
+        let real = path_string(&self.real(loc))?;
         let hit = if tree { self.protected.guards_tree(&real) } else { self.protected.guards(&real) };
         if hit { Err(ProtoError::new(ErrorCode::Denied, format!("`{real}` is a protected path"))) } else { Ok(()) }
     }
 
     /// `real` relative to the root, for results (`""` for the root).
     fn relative(&self, real: &Path) -> String {
-        real.strip_prefix(&self.root).map(|rel| rel.to_string_lossy().into_owned()).unwrap_or_default()
+        real.strip_prefix(&self.root.path).map(|rel| rel.to_string_lossy().into_owned()).unwrap_or_default()
     }
 }
 
@@ -258,6 +206,10 @@ fn path_string(path: &Path) -> Outcome<String> {
 
 /// Maps an I/O error on `path` to a protocol error.
 fn io_error(err: &io::Error, path: &str) -> ProtoError {
+    // `ELOOP` from an `O_NOFOLLOW` open: the entry became a symlink after it was resolved.
+    if err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+        return ProtoError::new(ErrorCode::Conflict, format!("`{path}` changed while it was opened (it is now a symlink); retry"));
+    }
     let code = match err.kind() {
         io::ErrorKind::NotFound => ErrorCode::NotFound,
         io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem => ErrorCode::Denied,

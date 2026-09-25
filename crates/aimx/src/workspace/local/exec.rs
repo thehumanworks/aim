@@ -15,23 +15,25 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read as _, Write as _};
-use std::path::PathBuf;
+use std::os::fd::OwnedFd;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use aim_proto::content::Content;
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{Command, ExecReadResult, ExitStatus, OutputChunk, OutputStream, PtySize, Signal};
 use aim_proto::ids::ProcId;
+use rustix::fs::{Mode, OFlags};
 use rustix::process::{WaitId, WaitIdOptions, WaitIdStatus};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::ChildStdin;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use super::{Base, Follow, blocking, io_error};
+use super::walk::{self, Follow};
+use super::{Base, blocking, io_error};
 use crate::id::random_hex;
 use crate::ring::OutputRing;
 use crate::workspace::{BoxFuture, Exec, Outcome, SpawnSpec};
@@ -43,12 +45,37 @@ const READ_BLOCK: usize = 32 * 1024;
 /// between inherits the pipe's write end — and the first process then never sees end of file on
 /// its stdin (observed in this crate's conformance suite under load). Spawning is short; this lock
 /// only orders spawns against each other.
+///
+/// It also orders the working-directory switch of [`in_dir`].
 static SPAWN: Mutex<()> = Mutex::new(());
 /// How long output readers may keep draining after the process exited.
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `spawn` (under the spawn lock) with this process's working directory switched to the
+/// held directory `dir` and restored afterwards, so a child inherits a directory the walk opened
+/// rather than one re-resolved by path: a swap after the walk cannot move a process out of the
+/// root (REV4-A finding 3). The standard library can only set a child's directory by path
+/// (`/dev/fd/N` is refused on macOS), and `fchdir` in a `pre_exec` hook would need `unsafe`.
+/// Every other path aimx uses is absolute, so the brief switch affects nothing else.
+fn in_dir<T>(dir: &OwnedFd, spawn: impl FnOnce() -> T) -> io::Result<T> {
+    static ORIGINAL: OnceLock<Option<OwnedFd>> = OnceLock::new();
+    let _spawning = lock(&SPAWN);
+    let original = ORIGINAL
+        .get_or_init(|| rustix::fs::openat(rustix::fs::CWD, ".", OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).ok());
+    rustix::process::fchdir(dir)?;
+    let spawned = spawn();
+    let restored = match original {
+        Some(original) => rustix::process::fchdir(original),
+        None => rustix::process::chdir("/"),
+    };
+    if let Err(err) = restored {
+        tracing::error!(%err, "could not restore the working directory after a spawn");
+    }
+    Ok(spawned)
 }
 
 /// This host's processes, for one workspace.
@@ -357,7 +384,7 @@ async fn supervise_pty(
     }
 }
 
-fn spawn_pipes(cwd: PathBuf, spec: &SpawnSpec<'_>, ring_bytes: usize) -> Outcome<Arc<Proc>> {
+fn spawn_pipes(cwd: &OwnedFd, spec: &SpawnSpec<'_>, ring_bytes: usize) -> Outcome<Arc<Proc>> {
     let (mut command, program) = match spec.command {
         Command::Argv { argv } => {
             let Some((program, args)) = argv.split_first() else {
@@ -374,17 +401,13 @@ fn spawn_pipes(cwd: PathBuf, spec: &SpawnSpec<'_>, ring_bytes: usize) -> Outcome
         }
     };
     command
-        .current_dir(cwd)
         .envs(spec.env)
         .stdin(if spec.stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    let spawned = {
-        let _spawning = lock(&SPAWN);
-        command.spawn()
-    };
+    let spawned = in_dir(cwd, || command.spawn()).map_err(|err| io_error(&err, spec.cwd))?;
     let mut child = spawned.map_err(|err| spawn_error(&err, &program))?;
     let pgid = child.id().and_then(|id| i32::try_from(id).ok());
     let input = child.stdin.take().map_or(Input::Closed, Input::Pipe);
@@ -401,7 +424,7 @@ fn spawn_pipes(cwd: PathBuf, spec: &SpawnSpec<'_>, ring_bytes: usize) -> Outcome
 }
 
 fn spawn_pty(
-    cwd: PathBuf,
+    cwd: &OwnedFd,
     spec: &SpawnSpec<'_>,
     size: PtySize,
     ring_bytes: usize,
@@ -421,15 +444,15 @@ fn spawn_pty(
             builder
         }
     };
-    builder.cwd(cwd);
+    // The child keeps the working directory it inherits from [`in_dir`].
+    builder.cwd(".");
     if !spec.env.contains_key("TERM") {
         builder.env("TERM", "xterm-256color");
     }
     for (key, value) in spec.env {
         builder.env(key, value);
     }
-    let (child, master, mut reader, writer) = {
-        let _spawning = lock(&SPAWN);
+    let spawned = in_dir(cwd, || -> Outcome<_> {
         let pair = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize { rows: size.rows, cols: size.cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|err| pty_error(&err))?;
@@ -444,8 +467,9 @@ fn spawn_pty(
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|err| pty_error(&err))?;
         let writer = pair.master.take_writer().map_err(|err| pty_error(&err))?;
-        (child, pair.master, reader, writer)
-    };
+        Ok((child, pair.master, reader, writer))
+    });
+    let (child, master, mut reader, writer) = spawned.map_err(|err| io_error(&err, spec.cwd))??;
     let pgid = child.process_id().and_then(|id| i32::try_from(id).ok());
     let proc = Arc::new(Proc::new(pgid, ring_bytes, Input::Pty(Arc::new(Mutex::new(writer))), Some(master)));
 
@@ -516,9 +540,19 @@ impl Exec for LocalExec {
             let base = Arc::clone(&self.base);
             let cwd_path = spec.cwd.to_owned();
             let cwd = blocking(move || {
-                let real = base.resolve(&cwd_path, Follow::Final)?;
-                let meta = std::fs::metadata(&real).map_err(|err| io_error(&err, &cwd_path))?;
-                if meta.is_dir() { Ok(real) } else { Err(ProtoError::new(ErrorCode::Conflict, format!("`{cwd_path}` is not a directory"))) }
+                let loc = base.resolve(&cwd_path, Follow::Final)?;
+                if let Some(dir) = loc.target_dir() {
+                    return dir.try_clone().map_err(|err| io_error(&err, &cwd_path));
+                }
+                let exists = match (loc.dir(), &loc.name) {
+                    (Ok(dir), Some(name)) if loc.missing.is_empty() => walk::stat_entry(dir, name).is_ok(),
+                    _ => false,
+                };
+                if exists {
+                    Err(ProtoError::new(ErrorCode::Conflict, format!("`{cwd_path}` is not a directory")))
+                } else {
+                    Err(ProtoError::new(ErrorCode::NotFound, format!("`{cwd_path}` does not exist")))
+                }
             })
             .await?;
             let proc = match spec.pty {
@@ -531,9 +565,9 @@ impl Exec for LocalExec {
                             })?)),
                             None => None,
                         };
-                    spawn_pty(cwd, &spec, size, self.ring_bytes, permit)?
+                    spawn_pty(&cwd, &spec, size, self.ring_bytes, permit)?
                 }
-                None => spawn_pipes(cwd, &spec, self.ring_bytes)?,
+                None => spawn_pipes(&cwd, &spec, self.ring_bytes)?,
             };
             let id = ProcId::new(format!("p{}", random_hex()));
             lock(&self.procs).insert(id.clone(), proc);

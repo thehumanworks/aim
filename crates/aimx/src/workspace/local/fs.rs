@@ -1,18 +1,24 @@
 //! Filesystem operations of the local backend.
 //!
-//! Writes and edits replace files atomically: the new bytes go to a temporary file in the same
-//! directory (created with the umask's default mode, or the replaced file's mode), which is
-//! `fsync`ed and then renamed over the target; `IfAbsent` and non-overwriting renames use an
-//! exclusive rename (`renameat2(RENAME_NOREPLACE)` / `renamex_np(RENAME_EXCL)`), so they are
-//! race-free. Mutations within one workspace are serialised so a read-modify-write (`edit`,
-//! `IfHash`) cannot lose a concurrent update made through aimx.
+//! Every operation acts on the descriptors a [`walk`](super::walk) of its path returned: files are
+//! opened, created, renamed and removed with `*at` calls relative to a held directory, never by
+//! path, so a directory swapped for a symlink after the walk cannot redirect them (REV4-A
+//! finding 3). Final entries are opened with `O_NOFOLLOW` (and `O_NONBLOCK`, so a FIFO cannot
+//! block a reader).
+//!
+//! Writes and edits replace files atomically: the new bytes go to a temporary file created in the
+//! same directory (with the umask's default mode, or the replaced file's mode), which is `fsync`ed
+//! and then renamed over the target; `IfAbsent` and non-overwriting renames use an exclusive
+//! rename (`renameat2(RENAME_NOREPLACE)` / `renamex_np(RENAME_EXCL)`), so they are race-free.
+//! Mutations within one workspace are serialised so a read-modify-write (`edit`, `IfHash`) cannot
+//! lose a concurrent update made through aimx.
 
-use std::fs::{self, File, OpenOptions, Permissions};
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::Path;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt as _;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::UNIX_EPOCH;
 
 use aim_proto::content::Content;
 use aim_proto::error::{ErrorCode, ProtoError};
@@ -20,17 +26,25 @@ use aim_proto::harness::{
     ByteRange, ContentHash, DirEntry, EditOutcome, EntryKind, ExactEdit, FsListResult, FsReadResult, Meta, Precondition, WriteOutcome,
 };
 use aim_proto::ids::IdempotencyKey;
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags, Stat};
+use rustix::io::Errno;
 use sha2::{Digest as _, Sha256};
 
-use super::{Base, Follow, blocking, io_error};
+use super::walk::{Follow, Loc, kind, open_dir, open_entry, stat_entry};
+use super::{Base, blocking, io_error};
 use crate::edit::apply_edits;
 use crate::id::{hex, random_hex};
 use crate::page::Page;
 use crate::workspace::{BoxFuture, CopyRequest, EditRequest, Fs, ListRequest, Outcome, WriteRequest};
 
 const BLOCK: usize = 64 * 1024;
-/// Deepest directory tree `copy` descends into.
-const MAX_COPY_DEPTH: usize = 256;
+/// Deepest directory tree `copy` and a recursive `remove` descend into (every level holds a
+/// descriptor open).
+const MAX_TREE_DEPTH: usize = 128;
+/// A new file's mode before the umask (0o666).
+const NEW_FILE: Mode = Mode::RUSR.union(Mode::WUSR).union(Mode::RGRP).union(Mode::WGRP).union(Mode::ROTH).union(Mode::WOTH);
+/// A new directory's mode before the umask (0o777).
+const NEW_DIR: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
 
 /// The local filesystem, confined to a root.
 #[derive(Debug)]
@@ -56,12 +70,11 @@ pub(super) fn hash_bytes(bytes: &[u8]) -> ContentHash {
     content_hash(hasher)
 }
 
-fn hash_file(path: &Path, display: &str) -> Outcome<ContentHash> {
-    let mut file = File::open(path).map_err(|err| io_error(&err, display))?;
+fn hash_file(file: &mut File) -> io::Result<ContentHash> {
     let mut hasher = Sha256::new();
     let mut block = vec![0u8; BLOCK];
     loop {
-        let n = file.read(&mut block).map_err(|err| io_error(&err, display))?;
+        let n = file.read(&mut block)?;
         if n == 0 {
             break;
         }
@@ -70,34 +83,122 @@ fn hash_file(path: &Path, display: &str) -> Outcome<ContentHash> {
     Ok(content_hash(hasher))
 }
 
-fn entry_kind(file_type: fs::FileType) -> EntryKind {
-    if file_type.is_symlink() {
-        EntryKind::Symlink
-    } else if file_type.is_dir() {
-        EntryKind::Dir
-    } else if file_type.is_file() {
-        EntryKind::File
-    } else {
-        EntryKind::Other
+fn entry_kind(file_type: FileType) -> EntryKind {
+    match file_type {
+        FileType::Symlink => EntryKind::Symlink,
+        FileType::Directory => EntryKind::Dir,
+        FileType::RegularFile => EntryKind::File,
+        _ => EntryKind::Other,
     }
+}
+
+/// A `Stat`'s size, in bytes.
+fn size_of(stat: &Stat) -> u64 {
+    u64::try_from(i128::from(stat.st_size)).unwrap_or(0)
+}
+
+/// A `Stat`'s modification time, in milliseconds since the Unix epoch.
+fn mtime_ms(stat: &Stat) -> Option<i64> {
+    let ms = i128::from(stat.st_mtime).checked_mul(1000)?.checked_add(i128::from(stat.st_mtime_nsec) / 1_000_000)?;
+    i64::try_from(ms).ok()
+}
+
+/// A `Stat`'s permission bits.
+fn mode_of(stat: &Stat) -> Mode {
+    Mode::from_raw_mode(stat.st_mode)
+}
+
+fn lock(mutex: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn not_found(path: &str) -> ProtoError {
+    ProtoError::new(ErrorCode::NotFound, format!("`{path}` does not exist"))
+}
+
+fn is_a_directory(path: &str) -> ProtoError {
+    ProtoError::new(ErrorCode::Conflict, format!("`{path}` is a directory"))
+}
+
+/// Maps an OS error on `path` to a protocol error.
+fn os_error(err: Errno, path: &str) -> ProtoError {
+    io_error(&io::Error::from(err), path)
+}
+
+fn errno_is(err: &io::Error, errno: Errno) -> bool {
+    err.raw_os_error() == Some(errno.raw_os_error())
+}
+
+/// The directory holding the target and the target's name, when the target's directory exists.
+fn entry<'a>(loc: &'a Loc, path: &str) -> Outcome<(&'a OwnedFd, &'a OsStr)> {
+    match &loc.name {
+        Some(name) if loc.missing.is_empty() => Ok((loc.dir().map_err(|err| io_error(&err, path))?, name.as_os_str())),
+        _ => Err(not_found(path)),
+    }
+}
+
+/// `lstat` of the target; `None` when it does not exist.
+fn existing(dir: &OwnedFd, name: &OsStr, path: &str) -> Outcome<Option<Stat>> {
+    match stat_entry(dir, name) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(err) if errno_is(&err, Errno::NOENT) => Ok(None),
+        Err(err) => Err(io_error(&err, path)),
+    }
+}
+
+/// Opens an existing regular file for reading.
+fn open_file(dir: &OwnedFd, name: &OsStr, path: &str) -> Outcome<File> {
+    let file = open_entry(dir, name, OFlags::RDONLY, Mode::empty()).map_err(|err| io_error(&err, path))?;
+    let meta = file.metadata().map_err(|err| io_error(&err, path))?;
+    if meta.is_dir() {
+        return Err(is_a_directory(path));
+    }
+    if !meta.is_file() {
+        return Err(ProtoError::new(ErrorCode::Conflict, format!("`{path}` is not a regular file")));
+    }
+    Ok(file)
+}
+
+/// Creates the target's missing directories; returns the directory that holds the target.
+fn make_dirs(loc: &Loc) -> io::Result<OwnedFd> {
+    let mut current = loc.dir()?.try_clone()?;
+    for name in &loc.missing {
+        match rustix::fs::mkdirat(&current, name, NEW_DIR) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(err) => return Err(err.into()),
+        }
+        // `O_NOFOLLOW`: a symlink planted here in the meantime is refused, not followed.
+        current = open_dir(&current, name)?;
+    }
+    Ok(current)
 }
 
 fn stat(base: &Base, path: &str, hash: bool) -> Outcome<Meta> {
-    let real = base.resolve(path, Follow::NoFinal)?;
-    let meta = fs::symlink_metadata(&real).map_err(|err| io_error(&err, path))?;
-    let kind = entry_kind(meta.file_type());
-    let mtime_ms = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).and_then(|d| i64::try_from(d.as_millis()).ok());
-    let hash = if hash && kind == EntryKind::File { Some(hash_file(&real, path)?) } else { None };
-    Ok(Meta { kind, size: meta.len(), mtime_ms, hash })
+    let loc = base.resolve(path, Follow::NoFinal)?;
+    let (stat, file) = if loc.name.is_some() {
+        let (dir, name) = entry(&loc, path)?;
+        let stat = existing(dir, name, path)?.ok_or_else(|| not_found(path))?;
+        (stat, Some((dir, name)))
+    } else {
+        (rustix::fs::fstat(loc.dir().map_err(|err| io_error(&err, path))?).map_err(|err| os_error(err, path))?, None)
+    };
+    let kind = entry_kind(kind(&stat));
+    let hash = match file {
+        Some((dir, name)) if hash && kind == EntryKind::File => {
+            Some(hash_file(&mut open_file(dir, name, path)?).map_err(|err| io_error(&err, path))?)
+        }
+        _ => None,
+    };
+    Ok(Meta { kind, size: size_of(&stat), mtime_ms: mtime_ms(&stat), hash })
 }
 
 fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64) -> Outcome<FsReadResult> {
-    let real = base.resolve(path, Follow::Final)?;
-    let mut file = File::open(&real).map_err(|err| io_error(&err, path))?;
-    let meta = file.metadata().map_err(|err| io_error(&err, path))?;
-    if meta.is_dir() {
-        return Err(ProtoError::new(ErrorCode::Conflict, format!("`{path}` is a directory")));
+    let loc = base.resolve(path, Follow::Final)?;
+    if loc.target_dir().is_some() {
+        return Err(is_a_directory(path));
     }
+    let (dir, name) = entry(&loc, path)?;
+    let mut file = open_file(dir, name, path)?;
     let (start, wanted) = range.map_or((0, u64::MAX), |r| (r.start, r.len));
     let end = start.saturating_add(wanted.min(max_bytes));
     let mut out = Vec::new();
@@ -127,7 +228,7 @@ fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64) -> Ou
     Ok(FsReadResult { content: Content::from_bytes(out), size, hash: content_hash(hasher), truncated })
 }
 
-fn check_precondition(real: &Path, exists: bool, precondition: &Precondition, display: &str) -> Outcome<()> {
+fn check_precondition(dir: &OwnedFd, name: &OsStr, exists: bool, precondition: &Precondition, display: &str) -> Outcome<()> {
     match precondition {
         Precondition::IfAbsent if exists => Err(ProtoError::new(ErrorCode::PreconditionFailed, format!("`{display}` already exists"))),
         Precondition::Any | Precondition::IfAbsent => Ok(()),
@@ -135,7 +236,7 @@ fn check_precondition(real: &Path, exists: bool, precondition: &Precondition, di
             Err(ProtoError::new(ErrorCode::PreconditionFailed, format!("`{display}` does not exist")))
         }
         Precondition::IfHash { hash } => {
-            let current = hash_file(real, display)?;
+            let current = hash_file(&mut open_file(dir, name, display)?).map_err(|err| io_error(&err, display))?;
             if current == *hash {
                 Ok(())
             } else {
@@ -146,40 +247,39 @@ fn check_precondition(real: &Path, exists: bool, precondition: &Precondition, di
     }
 }
 
-/// Renames `from` to `to` unless `to` exists (atomically).
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    rustix::fs::renameat_with(rustix::fs::CWD, from, rustix::fs::CWD, to, rustix::fs::RenameFlags::NOREPLACE).map_err(io::Error::from)
-}
-
-fn sync_dir(dir: &Path) {
-    if let Ok(handle) = File::open(dir)
-        && let Err(err) = handle.sync_all()
-    {
-        tracing::debug!(%err, dir = %dir.display(), "directory fsync failed");
+fn sync_dir(dir: &OwnedFd) {
+    if let Err(err) = rustix::fs::fsync(dir) {
+        tracing::debug!(%err, "directory fsync failed");
     }
 }
 
-/// Replaces (or, when `exclusive`, creates) `target` with `bytes` atomically.
-fn atomic_replace(target: &Path, bytes: &[u8], mode: Option<Permissions>, exclusive: bool, display: &str) -> Outcome<()> {
-    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
-        return Err(ProtoError::new(ErrorCode::InvalidParams, format!("`{display}` is not a file path")));
-    };
-    let tmp = dir.join(format!(".{}.aimx-{}.tmp", name.to_string_lossy(), random_hex()));
+fn rename_at(from_dir: &OwnedFd, from: &OsStr, to_dir: &OwnedFd, to: &OsStr, overwrite: bool) -> io::Result<()> {
+    let flags = if overwrite { RenameFlags::empty() } else { RenameFlags::NOREPLACE };
+    rustix::fs::renameat_with(from_dir, from, to_dir, to, flags).map_err(Into::into)
+}
+
+fn staging_name(name: &OsStr) -> OsString {
+    OsString::from(format!(".{}.aimx-{}.tmp", name.to_string_lossy(), random_hex()))
+}
+
+/// Replaces (or, when `exclusive`, creates) entry `name` of `dir` with `bytes` atomically.
+fn atomic_replace(dir: &OwnedFd, name: &OsStr, bytes: &[u8], mode: Option<Mode>, exclusive: bool, display: &str) -> Outcome<()> {
+    let tmp = staging_name(name);
     let written = (|| -> io::Result<()> {
-        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o666).open(&tmp)?;
+        let mut file = open_entry(dir, &tmp, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL, NEW_FILE)?;
         if let Some(mode) = mode {
-            file.set_permissions(mode)?;
+            rustix::fs::fchmod(&file, mode)?;
         }
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        if exclusive { rename_noreplace(&tmp, target) } else { fs::rename(&tmp, target) }
+        rename_at(dir, &tmp, dir, name, !exclusive)
     })();
     if let Err(err) = written {
-        if let Err(cleanup) = fs::remove_file(&tmp)
-            && cleanup.kind() != io::ErrorKind::NotFound
+        if let Err(cleanup) = rustix::fs::unlinkat(dir, &tmp, AtFlags::empty())
+            && cleanup != Errno::NOENT
         {
-            tracing::warn!(%cleanup, tmp = %tmp.display(), "could not remove a temporary file");
+            tracing::warn!(%cleanup, tmp = %tmp.to_string_lossy(), "could not remove a temporary file");
         }
         if exclusive && err.kind() == io::ErrorKind::AlreadyExists {
             return Err(ProtoError::new(ErrorCode::PreconditionFailed, format!("`{display}` already exists")));
@@ -190,19 +290,6 @@ fn atomic_replace(target: &Path, bytes: &[u8], mode: Option<Permissions>, exclus
     Ok(())
 }
 
-fn existing(real: &Path, display: &str) -> Outcome<Option<fs::Metadata>> {
-    match fs::metadata(real) {
-        Ok(meta) if meta.is_dir() => Err(ProtoError::new(ErrorCode::Conflict, format!("`{display}` is a directory"))),
-        Ok(meta) => Ok(Some(meta)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(io_error(&err, display)),
-    }
-}
-
-fn lock(mutex: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 fn write(
     base: &Base,
     mutations: &Mutex<()>,
@@ -211,27 +298,46 @@ fn write(
     precondition: &Precondition,
     create_dirs: bool,
 ) -> Outcome<WriteOutcome> {
-    let real = base.resolve(path, Follow::Final)?;
-    base.check_protected(&real, false)?;
+    let loc = base.resolve(path, Follow::Final)?;
+    base.check_protected(&loc, false)?;
+    let Some(name) = loc.name.as_deref().filter(|_| loc.opened.is_none()) else {
+        return Err(is_a_directory(path));
+    };
     let _serial = lock(mutations);
-    let current = existing(&real, path)?;
-    check_precondition(&real, current.is_some(), precondition, path)?;
-    if create_dirs && let Some(parent) = real.parent() {
-        fs::create_dir_all(parent).map_err(|err| io_error(&err, path))?;
+    let made;
+    let dir = if loc.missing.is_empty() {
+        loc.dir().map_err(|err| io_error(&err, path))?
+    } else {
+        check_precondition(loc.dir().map_err(|err| io_error(&err, path))?, name, false, precondition, path)?;
+        if !create_dirs {
+            return Err(ProtoError::new(ErrorCode::NotFound, format!("the directory of `{path}` does not exist")));
+        }
+        made = make_dirs(&loc).map_err(|err| io_error(&err, path))?;
+        &made
+    };
+    let current = existing(dir, name, path)?;
+    if current.as_ref().is_some_and(|stat| kind(stat) == FileType::Directory) {
+        return Err(is_a_directory(path));
     }
+    check_precondition(dir, name, current.is_some(), precondition, path)?;
     let exclusive = matches!(precondition, Precondition::IfAbsent);
-    atomic_replace(&real, bytes, current.as_ref().map(fs::Metadata::permissions), exclusive, path)?;
+    atomic_replace(dir, name, bytes, current.as_ref().map(mode_of), exclusive, path)?;
     Ok(WriteOutcome { hash: hash_bytes(bytes), size: bytes.len() as u64, created: current.is_none() })
 }
 
 fn edit(base: &Base, mutations: &Mutex<()>, path: &str, edits: &[ExactEdit], precondition: &Precondition) -> Outcome<EditOutcome> {
-    let real = base.resolve(path, Follow::Final)?;
-    base.check_protected(&real, false)?;
+    let loc = base.resolve(path, Follow::Final)?;
+    base.check_protected(&loc, false)?;
+    if loc.target_dir().is_some() {
+        return Err(is_a_directory(path));
+    }
+    let (dir, name) = entry(&loc, path)?;
     let _serial = lock(mutations);
-    let Some(meta) = existing(&real, path)? else {
-        return Err(ProtoError::new(ErrorCode::NotFound, format!("`{path}` does not exist")));
+    let Some(stat) = existing(dir, name, path)? else {
+        return Err(not_found(path));
     };
-    let before = fs::read(&real).map_err(|err| io_error(&err, path))?;
+    let mut before = Vec::new();
+    open_file(dir, name, path)?.read_to_end(&mut before).map_err(|err| io_error(&err, path))?;
     match precondition {
         Precondition::Any => {}
         Precondition::IfAbsent => return Err(ProtoError::new(ErrorCode::PreconditionFailed, format!("`{path}` already exists"))),
@@ -245,7 +351,7 @@ fn edit(base: &Base, mutations: &Mutex<()>, path: &str, edits: &[ExactEdit], pre
     }
     let applied = apply_edits(&before, edits)?;
     if applied.content != before {
-        atomic_replace(&real, &applied.content, Some(meta.permissions()), false, path)?;
+        atomic_replace(dir, name, &applied.content, Some(mode_of(&stat)), false, path)?;
     }
     Ok(EditOutcome {
         write: WriteOutcome { hash: hash_bytes(&applied.content), size: applied.content.len() as u64, created: false },
@@ -254,57 +360,120 @@ fn edit(base: &Base, mutations: &Mutex<()>, path: &str, edits: &[ExactEdit], pre
 }
 
 fn list(base: &Base, path: &str, limit: u32, page_token: Option<&str>, include_hidden: bool) -> Outcome<FsListResult> {
-    let real = base.resolve(path, Follow::Final)?;
-    let reader = fs::read_dir(&real).map_err(|err| io_error(&err, path))?;
+    let loc = base.resolve(path, Follow::Final)?;
+    let Some(dir) = loc.target_dir() else {
+        let (parent, name) = entry(&loc, path)?;
+        return match existing(parent, name, path)? {
+            Some(_) => Err(ProtoError::new(ErrorCode::Conflict, format!("`{path}` is not a directory"))),
+            None => Err(not_found(path)),
+        };
+    };
+    let reader = rustix::fs::Dir::read_from(dir).map_err(|err| os_error(err, path))?;
     // Only the page (plus one, to know whether more follow) is held, however large the directory.
     let mut page = Page::new(usize::try_from(limit).unwrap_or(usize::MAX), page_token);
     for entry in reader {
-        let entry = entry.map_err(|err| io_error(&err, path))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let entry = entry.map_err(|err| os_error(err, path))?;
+        let raw = OsStr::from_bytes(entry.file_name().to_bytes());
+        if raw == "." || raw == ".." {
+            continue;
+        }
+        let name = raw.to_string_lossy().into_owned();
         if (!include_hidden && name.starts_with('.')) || !page.wants(&name) {
             continue;
         }
-        page.offer(name, entry);
+        page.offer(name, (raw.to_owned(), entry.file_type()));
     }
     let selected = page.finish();
     let mut entries = Vec::with_capacity(selected.entries.len());
-    for (name, entry) in selected.entries {
-        let file_type = entry.file_type().map_err(|err| io_error(&err, path))?;
+    for (name, (raw, file_type)) in selected.entries {
+        let stat = stat_entry(dir, &raw).ok();
+        let file_type = match (file_type, &stat) {
+            (FileType::Unknown, Some(stat)) => kind(stat),
+            (file_type, _) => file_type,
+        };
         let kind = entry_kind(file_type);
-        let size = if kind == EntryKind::File { entry.metadata().map_or(0, |m| m.len()) } else { 0 };
+        let size = if kind == EntryKind::File { stat.as_ref().map_or(0, size_of) } else { 0 };
         entries.push(DirEntry { name, kind, size });
     }
     Ok(FsListResult { entries, next_page: selected.next_page })
 }
 
 fn mkdir(base: &Base, mutations: &Mutex<()>, path: &str) -> Outcome<()> {
-    let real = base.resolve(path, Follow::Final)?;
-    base.check_protected(&real, false)?;
+    let loc = base.resolve(path, Follow::Final)?;
+    if loc.target_dir().is_some() {
+        return Ok(());
+    }
+    base.check_protected(&loc, false)?;
+    let Some(name) = loc.name.as_deref() else { return Ok(()) };
     let _serial = lock(mutations);
-    match fs::create_dir_all(&real) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists || err.kind() == io::ErrorKind::NotADirectory => {
-            Err(ProtoError::new(ErrorCode::Conflict, format!("`{path}` exists and is not a directory")))
+    let exists = || ProtoError::new(ErrorCode::Conflict, format!("`{path}` exists and is not a directory"));
+    let dir = make_dirs(&loc).map_err(|err| if errno_is(&err, Errno::NOTDIR) { exists() } else { io_error(&err, path) })?;
+    match rustix::fs::mkdirat(&dir, name, NEW_DIR) {
+        Ok(()) => {
+            sync_dir(&dir);
+            Ok(())
         }
-        Err(err) => Err(io_error(&err, path)),
+        Err(Errno::EXIST) => match existing(&dir, name, path)? {
+            Some(stat) if kind(&stat) == FileType::Directory => Ok(()),
+            _ => Err(exists()),
+        },
+        Err(err) => Err(os_error(err, path)),
     }
 }
 
+/// Removes directory `name` of `parent` and everything below it, through descriptors (a symlink
+/// inside is removed, never followed).
+fn remove_tree(parent: &OwnedFd, name: &OsStr, depth: usize) -> io::Result<()> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(io::Error::other("directory tree too deep to remove"));
+    }
+    let dir = open_dir(parent, name)?;
+    // A directory changed while it was emptied is emptied again (a few passes at most).
+    for _ in 0..3 {
+        for entry in rustix::fs::Dir::read_from(&dir)? {
+            let entry = entry?;
+            let child = OsStr::from_bytes(entry.file_name().to_bytes());
+            if child == "." || child == ".." {
+                continue;
+            }
+            let file_type = match entry.file_type() {
+                FileType::Unknown => kind(&stat_entry(&dir, child)?),
+                file_type => file_type,
+            };
+            if file_type == FileType::Directory {
+                remove_tree(&dir, child, depth + 1)?;
+            } else {
+                match rustix::fs::unlinkat(&dir, child, AtFlags::empty()) {
+                    Ok(()) | Err(Errno::NOENT) => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+        match rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR) {
+            Err(Errno::NOTEMPTY) => {}
+            other => return other.map_err(Into::into),
+        }
+    }
+    Err(Errno::NOTEMPTY.into())
+}
+
 fn remove(base: &Base, mutations: &Mutex<()>, path: &str, recursive: bool) -> Outcome<()> {
-    let real = base.resolve(path, Follow::NoFinal)?;
-    if real == base.root {
+    let loc = base.resolve(path, Follow::NoFinal)?;
+    if loc.name.is_none() {
         return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be removed"));
     }
-    base.check_protected(&real, true)?;
+    base.check_protected(&loc, true)?;
+    let (dir, name) = entry(&loc, path)?;
     let _serial = lock(mutations);
-    let meta = fs::symlink_metadata(&real).map_err(|err| io_error(&err, path))?;
-    let removed =
-        if meta.is_dir() { if recursive { fs::remove_dir_all(&real) } else { fs::remove_dir(&real) } } else { fs::remove_file(&real) };
+    let stat = existing(dir, name, path)?.ok_or_else(|| not_found(path))?;
+    let removed: io::Result<()> = if kind(&stat) == FileType::Directory {
+        if recursive { remove_tree(dir, name, 0) } else { rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR).map_err(Into::into) }
+    } else {
+        rustix::fs::unlinkat(dir, name, AtFlags::empty()).map_err(Into::into)
+    };
     match removed {
         Ok(()) => {
-            if let Some(parent) = real.parent() {
-                sync_dir(parent);
-            }
+            sync_dir(dir);
             Ok(())
         }
         Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {
@@ -315,21 +484,21 @@ fn remove(base: &Base, mutations: &Mutex<()>, path: &str, recursive: bool) -> Ou
 }
 
 fn rename(base: &Base, mutations: &Mutex<()>, from: &str, to: &str, overwrite: bool) -> Outcome<()> {
-    let real_from = base.resolve(from, Follow::NoFinal)?;
-    let real_to = base.resolve(to, Follow::NoFinal)?;
-    if real_from == base.root || real_to == base.root {
+    let source = base.resolve(from, Follow::NoFinal)?;
+    let target = base.resolve(to, Follow::NoFinal)?;
+    if source.name.is_none() || target.name.is_none() {
         return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be moved or replaced"));
     }
-    base.check_protected(&real_from, true)?;
-    base.check_protected(&real_to, true)?;
+    base.check_protected(&source, true)?;
+    base.check_protected(&target, true)?;
+    let (from_dir, from_name) = entry(&source, from)?;
+    let (to_dir, to_name) = entry(&target, to)?;
     let _serial = lock(mutations);
-    fs::symlink_metadata(&real_from).map_err(|err| io_error(&err, from))?;
-    let moved = if overwrite { fs::rename(&real_from, &real_to) } else { rename_noreplace(&real_from, &real_to) };
-    match moved {
+    existing(from_dir, from_name, from)?.ok_or_else(|| not_found(from))?;
+    match rename_at(from_dir, from_name, to_dir, to_name, overwrite) {
         Ok(()) => {
-            for dir in [real_from.parent(), real_to.parent()].into_iter().flatten() {
-                sync_dir(dir);
-            }
+            sync_dir(from_dir);
+            sync_dir(to_dir);
             Ok(())
         }
         Err(err) if !overwrite && err.kind() == io::ErrorKind::AlreadyExists => {
@@ -339,77 +508,115 @@ fn rename(base: &Base, mutations: &Mutex<()>, from: &str, to: &str, overwrite: b
     }
 }
 
-/// Copies directory `from` into the new directory `to`; symlinks are copied as links (never
-/// followed), special files are skipped, and each directory keeps its mode.
-fn copy_tree(from: &Path, to: &Path, depth: usize) -> io::Result<()> {
-    if depth > MAX_COPY_DEPTH {
+/// Copies the open regular file `from` to the new entry `name` of `dir`, keeping its mode.
+fn copy_file(from: &mut File, dir: &OwnedFd, name: &OsStr) -> io::Result<File> {
+    let mode = mode_of(&rustix::fs::fstat(&*from)?);
+    let mut to = open_entry(dir, name, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL, Mode::RUSR.union(Mode::WUSR))?;
+    io::copy(from, &mut to)?;
+    rustix::fs::fchmod(&to, mode)?;
+    Ok(to)
+}
+
+/// Copies the open directory `from` into the new directory `name` of `parent`; symlinks are copied
+/// as links (never followed), special files are skipped, and each directory keeps its mode.
+fn copy_tree(from: &OwnedFd, parent: &OwnedFd, name: &OsStr, depth: usize) -> io::Result<()> {
+    if depth > MAX_TREE_DEPTH {
         return Err(io::Error::other("directory tree too deep to copy"));
     }
-    fs::create_dir(to)?;
-    for entry in fs::read_dir(from)? {
+    let mode = mode_of(&rustix::fs::fstat(from)?);
+    rustix::fs::mkdirat(parent, name, Mode::RWXU)?;
+    let to = open_dir(parent, name)?;
+    for entry in rustix::fs::Dir::read_from(from)? {
         let entry = entry?;
-        let file_type = entry.file_type()?;
-        let dest = to.join(entry.file_name());
-        if file_type.is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(entry.path())?, &dest)?;
-        } else if file_type.is_dir() {
-            copy_tree(&entry.path(), &dest, depth + 1)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), &dest)?;
+        let child = OsStr::from_bytes(entry.file_name().to_bytes());
+        if child == "." || child == ".." {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            FileType::Unknown => kind(&stat_entry(from, child)?),
+            file_type => file_type,
+        };
+        match file_type {
+            FileType::Symlink => {
+                let target = rustix::fs::readlinkat(from, child, Vec::new())?;
+                rustix::fs::symlinkat(target.as_c_str(), &to, child)?;
+            }
+            FileType::Directory => copy_tree(&open_dir(from, child)?, &to, child, depth + 1)?,
+            FileType::RegularFile => {
+                copy_file(&mut open_entry(from, child, OFlags::RDONLY, Mode::empty())?, &to, child)?;
+            }
+            _ => {}
         }
     }
-    fs::set_permissions(to, fs::metadata(from)?.permissions())
+    rustix::fs::fchmod(&to, mode).map_err(Into::into)
+}
+
+/// The identity of an open file.
+fn identity(fd: &OwnedFd) -> io::Result<(i128, i128)> {
+    let stat = rustix::fs::fstat(fd)?;
+    Ok((i128::from(stat.st_dev), i128::from(stat.st_ino)))
 }
 
 fn copy(base: &Base, mutations: &Mutex<()>, from: &str, to: &str, overwrite: bool, recursive: bool) -> Outcome<()> {
     let source = base.resolve(from, Follow::Final)?;
     let target = base.resolve(to, Follow::NoFinal)?;
-    if target == base.root {
+    if target.name.is_none() {
         return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be replaced"));
     }
     base.check_protected(&target, true)?;
+    let (dir, name) = entry(&target, to)?;
     let _serial = lock(mutations);
-    let meta = fs::metadata(&source).map_err(|err| io_error(&err, from))?;
-    if meta.is_dir() && !recursive {
-        return Err(ProtoError::new(ErrorCode::Conflict, format!("`{from}` is a directory; pass recursive")));
-    }
-    if meta.is_dir() && target.starts_with(&source) {
-        return Err(ProtoError::new(ErrorCode::Conflict, format!("cannot copy `{from}` into itself")));
-    }
-    let existing = match fs::symlink_metadata(&target) {
-        Ok(existing) => Some(existing),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-        Err(err) => return Err(io_error(&err, to)),
+    // The source: a directory held open by the walk, or a regular file opened now.
+    let mut file = None;
+    let tree = if let Some(tree) = source.target_dir() {
+        if !recursive {
+            return Err(ProtoError::new(ErrorCode::Conflict, format!("`{from}` is a directory; pass recursive")));
+        }
+        let inside = identity(tree).map_err(|err| io_error(&err, from))?;
+        for hop in &target.hops {
+            if identity(&hop.fd).map_err(|err| io_error(&err, to))? == inside {
+                return Err(ProtoError::new(ErrorCode::Conflict, format!("cannot copy `{from}` into itself")));
+            }
+        }
+        Some(tree)
+    } else {
+        let (from_dir, from_name) = entry(&source, from)?;
+        file = Some(open_file(from_dir, from_name, from)?);
+        None
     };
-    if let Some(existing) = &existing {
+    let current = existing(dir, name, to)?;
+    if let Some(current) = &current {
         if !overwrite {
             return Err(ProtoError::new(ErrorCode::Conflict, format!("`{to}` already exists; pass overwrite")));
         }
-        if existing.is_dir() {
+        if kind(current) == FileType::Directory {
             return Err(ProtoError::new(ErrorCode::Conflict, format!("`{to}` is a directory; remove it first")));
         }
     }
-    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
-        return Err(ProtoError::new(ErrorCode::InvalidParams, format!("`{to}` is not a valid destination")));
-    };
     // Build the copy beside the destination, then rename it into place.
-    let staging = dir.join(format!(".{}.aimx-{}.tmp", name.to_string_lossy(), random_hex()));
-    let placed = if meta.is_dir() {
-        copy_tree(&source, &staging, 0).and_then(|()| {
-            if existing.is_some() {
-                fs::remove_file(&target)?;
+    let staging = staging_name(name);
+    let placed = match (tree, file.as_mut()) {
+        (Some(tree), _) => copy_tree(tree, dir, &staging, 0).and_then(|()| {
+            if current.is_some() {
+                rustix::fs::unlinkat(dir, name, AtFlags::empty())?;
             }
-            fs::rename(&staging, &target)
-        })
-    } else {
-        fs::copy(&source, &staging).and_then(|_| File::open(&staging)?.sync_all()).and_then(|()| fs::rename(&staging, &target))
+            rename_at(dir, &staging, dir, name, true)
+        }),
+        (None, Some(file)) => {
+            copy_file(file, dir, &staging).and_then(|copied| copied.sync_all()).and_then(|()| rename_at(dir, &staging, dir, name, true))
+        }
+        (None, None) => Err(io::Error::other("nothing to copy")),
     };
     if let Err(err) = placed {
-        let cleanup = if meta.is_dir() { fs::remove_dir_all(&staging) } else { fs::remove_file(&staging) };
+        let cleanup = if tree.is_some() {
+            remove_tree(dir, &staging, 0)
+        } else {
+            rustix::fs::unlinkat(dir, &staging, AtFlags::empty()).map_err(Into::into)
+        };
         if let Err(cleanup) = cleanup
             && cleanup.kind() != io::ErrorKind::NotFound
         {
-            tracing::warn!(%cleanup, staging = %staging.display(), "could not remove a partial copy");
+            tracing::warn!(%cleanup, staging = %staging.to_string_lossy(), "could not remove a partial copy");
         }
         return Err(io_error(&err, to));
     }
