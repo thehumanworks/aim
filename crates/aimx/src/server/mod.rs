@@ -5,6 +5,7 @@
 //! request must be `initialize`; every later request is enforced against the connection's
 //! principal and the grant of the workspace it names.
 
+pub mod grpc;
 mod handlers;
 pub mod network;
 mod session;

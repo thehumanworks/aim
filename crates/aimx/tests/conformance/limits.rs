@@ -137,7 +137,7 @@ async fn sessions_are_capped_and_resuming_is_not_a_new_session() {
     let second = connect(&env.socket).await;
     let token = initialize(&second, None).await.resume_token;
     let third = connect(&env.socket).await;
-    let err = third.peer.call::<Initialize>(init_params(1, 1, None)).await.unwrap_err();
+    let err = third.peer.call::<Initialize>(init_params(&third, 1, 1, None)).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::LimitExceeded);
 
     // Resuming an existing session needs no new room.
@@ -151,7 +151,7 @@ async fn sessions_are_capped_and_resuming_is_not_a_new_session() {
     first.peer.close();
     drop(first);
     let fourth = connect(&env.socket).await;
-    eventually(|| fourth.peer.call::<Initialize>(init_params(1, 1, None))).await;
+    eventually(|| fourth.peer.call::<Initialize>(init_params(&fourth, 1, 1, None))).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

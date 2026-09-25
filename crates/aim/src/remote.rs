@@ -27,6 +27,7 @@ pub async fn connect_network(url: &str, root: &str) -> Result<HarnessClient, Pro
     match parsed.scheme() {
         "ws" | "wss" => HarnessClient::connect_ws(url, &token, root).await,
         "http" | "https" => HarnessClient::connect_http(url, &token, root).await,
+        "grpc" | "grpcs" => HarnessClient::connect_grpc(url, &token, root).await,
         _ => Err(ProtoError::new(ErrorCode::InvalidParams, "unsupported remote harness URL scheme")),
     }
 }

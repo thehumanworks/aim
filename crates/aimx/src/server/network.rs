@@ -81,6 +81,8 @@ pub enum NetworkProtocol {
     WebSocket,
     /// JSON-RPC POST and notification SSE.
     Http,
+    /// Opaque JSON-RPC frames in a bidirectional gRPC stream.
+    Grpc,
 }
 
 /// Security and admission settings for a network listener.
@@ -145,6 +147,9 @@ impl Server {
     /// Invalid listener security, TLS materials, bind or accept failure.
     pub async fn serve_network(&self, options: NetworkOptions, tokens: Arc<TokenStore>) -> io::Result<()> {
         options.validate()?;
+        if options.protocol == NetworkProtocol::Grpc {
+            return self.serve_grpc(options, tokens).await;
+        }
         let listener = TcpListener::bind(options.address).await?;
         self.serve_network_listener(listener, options, tokens).await
     }
@@ -207,6 +212,7 @@ impl Server {
         match options.protocol {
             NetworkProtocol::WebSocket => self.serve_websocket(stream, options, tokens).await,
             NetworkProtocol::Http => serve_http(stream, http).await,
+            NetworkProtocol::Grpc => Err(io::Error::new(io::ErrorKind::InvalidInput, "gRPC uses its HTTP/2 listener")),
         }
     }
 

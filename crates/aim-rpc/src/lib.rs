@@ -13,6 +13,7 @@
 //!
 //! Framing is NDJSON (one compact JSON message per line) with a maximum message size.
 mod framing;
+pub mod grpc;
 pub mod http;
 mod peer;
 mod router;

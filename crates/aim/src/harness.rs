@@ -482,6 +482,57 @@ impl HarnessClient {
         Self::connect_with_auth(reader, writer, root, Some(AuthProof::Bearer { token: token.to_owned() }), resume).await
     }
 
+    /// Connects to a remote harness over gRPC and opens `root`. Plain `grpc://` is permitted
+    /// only for a numeric loopback address.
+    ///
+    /// # Errors
+    /// Returns an error for an unsafe URL, failed transport connection or harness handshake.
+    pub async fn connect_grpc(url: &str, token: &str, root: &str) -> Result<Self, ProtoError> {
+        Self::connect_grpc_resume(url, token, root, None).await
+    }
+
+    /// Reattaches a gRPC harness session by its prior resume token. Process output must then be
+    /// reconciled with `exec.read {after_seq}`.
+    ///
+    /// # Errors
+    /// Returns an error for an unsafe URL, failed transport connection or harness handshake.
+    pub async fn connect_grpc_resume(url: &str, token: &str, root: &str, resume: Option<ResumeToken>) -> Result<Self, ProtoError> {
+        validate_network_url(url, "grpc", "grpcs")?;
+        let parsed = reqwest::Url::parse(url).map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "invalid harness URL"))?;
+        if !parsed.path().is_empty() && parsed.path() != "/" {
+            return Err(ProtoError::new(ErrorCode::InvalidParams, "gRPC harness URL must have no path"));
+        }
+        let secure = parsed.scheme() == "grpcs";
+        let endpoint_url =
+            if secure { parsed.as_str().replacen("grpcs://", "https://", 1) } else { parsed.as_str().replacen("grpc://", "http://", 1) };
+        let mut endpoint = tonic::transport::Endpoint::from_shared(endpoint_url)
+            .map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "invalid harness URL"))?
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .keep_alive_timeout(std::time::Duration::from_secs(10));
+        if secure {
+            ensure_tls_provider();
+            let mut tls = tonic::transport::ClientTlsConfig::new().with_native_roots();
+            if let Some(pem) = remote_ca_pem()? {
+                tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem));
+            }
+            endpoint =
+                endpoint.tls_config(tls).map_err(|_| ProtoError::new(ErrorCode::Unavailable, "remote TLS configuration unavailable"))?;
+        }
+        let channel = endpoint.connect().await.map_err(|_| ProtoError::new(ErrorCode::Unavailable, "gRPC connection failed"))?;
+        let stream = aim_rpc::grpc::client_duplex(channel, token, PeerConfig::default().max_message_bytes).await.map_err(|status| {
+            let code = match status.code() {
+                tonic::Code::Unauthenticated => ErrorCode::Unauthenticated,
+                tonic::Code::PermissionDenied => ErrorCode::Denied,
+                tonic::Code::InvalidArgument => ErrorCode::InvalidParams,
+                _ => ErrorCode::Unavailable,
+            };
+            ProtoError::new(code, "gRPC session failed")
+        })?;
+        let (reader, writer) = tokio::io::split(stream);
+        Self::connect_with_auth(reader, writer, root, Some(AuthProof::Bearer { token: token.to_owned() }), resume).await
+    }
+
     /// Connects to a remote harness using JSON-RPC POST requests and an SSE notification stream.
     /// Plain `http://` is accepted only on loopback.
     ///
@@ -688,10 +739,14 @@ mod tests {
         assert!(validate_network_url("ws://127.0.0.1:99", "ws", "wss").is_ok());
         assert!(validate_network_url("http://[::1]:99", "http", "https").is_ok());
         assert!(validate_network_url("wss://example.test/rpc", "ws", "wss").is_ok());
+        assert!(validate_network_url("grpc://127.0.0.1:99", "grpc", "grpcs").is_ok());
+        assert!(validate_network_url("grpcs://example.test", "grpc", "grpcs").is_ok());
         assert!(validate_network_url("https://example.test", "http", "https").is_ok());
         assert!(validate_network_url("ws://example.test/rpc", "ws", "wss").is_err());
         assert!(validate_network_url("http://example.test", "http", "https").is_err());
         assert!(validate_network_url("ws://localhost:99", "ws", "wss").is_err());
+        assert!(validate_network_url("grpc://localhost:99", "grpc", "grpcs").is_err());
+        assert!(validate_network_url("grpc://example.test", "grpc", "grpcs").is_err());
         assert!(validate_network_url("wss://name:placeholder@example.test/rpc", "ws", "wss").is_err());
         assert!(validate_network_url("https://example.test/?x=y", "http", "https").is_err());
     }
@@ -722,17 +777,25 @@ mod tests {
         let serving = tokio::spawn({
             let server = server.clone();
             let tokens = Arc::clone(&tokens);
-            async move { server.serve_network(options, tokens).await }
+            async move {
+                if protocol == NetworkProtocol::Grpc {
+                    server.serve_grpc(options, tokens).await
+                } else {
+                    server.serve_network(options, tokens).await
+                }
+            }
         });
         let url = match protocol {
             NetworkProtocol::WebSocket => format!("ws://{address}"),
             NetworkProtocol::Http => format!("http://{address}"),
+            NetworkProtocol::Grpc => format!("grpc://{address}"),
         };
         let mut connected = None;
         for _ in 0..20 {
             let attempt = match protocol {
                 NetworkProtocol::WebSocket => HarnessClient::connect_ws(&url, &token, &root).await,
                 NetworkProtocol::Http => HarnessClient::connect_http(&url, &token, &root).await,
+                NetworkProtocol::Grpc => HarnessClient::connect_grpc(&url, &token, &root).await,
             };
             if let Ok(client) = attempt {
                 connected = Some(client);
@@ -748,6 +811,7 @@ mod tests {
         let resumed = match protocol {
             NetworkProtocol::WebSocket => HarnessClient::connect_ws_resume(&url, &token, &root, Some(resume)).await,
             NetworkProtocol::Http => HarnessClient::connect_http_resume(&url, &token, &root, Some(resume)).await,
+            NetworkProtocol::Grpc => HarnessClient::connect_grpc_resume(&url, &token, &root, Some(resume)).await,
         }
         .expect("remote harness session did not resume");
         assert!(resumed.init().resumed);
@@ -766,5 +830,11 @@ mod tests {
     #[ignore = "uses a local network listener and a newly issued test bearer"]
     async fn live_remote_http_client() {
         live_client_over(NetworkProtocol::Http).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "uses a local gRPC listener and a newly issued test bearer"]
+    async fn live_remote_grpc_client() {
+        live_client_over(NetworkProtocol::Grpc).await;
     }
 }

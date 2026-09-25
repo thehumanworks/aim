@@ -3,7 +3,7 @@
 //! - `aimx serve --unix PATH [--root DIR]… [--read-only]` serves `aim-harness/1` on a unix socket
 //!   (many connections; peers must run as the same OS user).
 //! - `aimx serve --stdio …` serves one connection on stdin/stdout (what SSH bootstrap runs).
-//! - `aimx serve --ws ADDR | --http ADDR` serves authenticated network peers.
+//! - `aimx serve --ws ADDR | --http ADDR | --grpc ADDR` serves authenticated network peers.
 //! - `aimx token create --scope read|write` or `--root DIR --ops read,write` issues an owner token once.
 //! - `aimx version` prints the version and the protocol generations.
 //!
@@ -32,7 +32,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Serve aim-harness/1.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Manage bearer tokens for network harness clients.
     Token {
         #[command(subcommand)]
@@ -80,14 +80,17 @@ enum TokenScopeArg {
 #[expect(clippy::struct_excessive_bools, reason = "independent command-line switches are represented as booleans by clap")]
 struct ServeArgs {
     /// Listen on this unix socket.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["stdio", "resident", "resident_child", "ws", "http"], required_unless_present_any = ["stdio", "resident", "resident_child", "ws", "http"])]
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["stdio", "resident", "resident_child", "ws", "http", "grpc"], required_unless_present_any = ["stdio", "resident", "resident_child", "ws", "http", "grpc"])]
     unix: Option<PathBuf>,
     /// Listen for WebSocket clients on this address.
-    #[arg(long, value_name = "ADDR", conflicts_with_all = ["http", "stdio", "resident", "resident_child", "ssh"])]
+    #[arg(long, value_name = "ADDR", conflicts_with_all = ["http", "grpc", "stdio", "resident", "resident_child", "ssh"])]
     ws: Option<std::net::SocketAddr>,
     /// Listen for HTTP JSON-RPC and SSE clients on this address.
-    #[arg(long, value_name = "ADDR", conflicts_with_all = ["ws", "stdio", "resident", "resident_child", "ssh"])]
+    #[arg(long, value_name = "ADDR", conflicts_with_all = ["ws", "grpc", "stdio", "resident", "resident_child", "ssh"])]
     http: Option<std::net::SocketAddr>,
+    /// Listen for bidirectional gRPC harness sessions on this address.
+    #[arg(long, value_name = "ADDR", conflicts_with_all = ["ws", "http", "stdio", "resident", "resident_child", "ssh"])]
+    grpc: Option<std::net::SocketAddr>,
     /// Direct TLS server certificate (PEM).
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -227,8 +230,11 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     let config = ServerConfig::new(principal, protected);
     tracing::info!(principal = %config.principal.id, roots = ?config.principal.roots, read_only = config.principal.read_only, "starting aimx");
     let server = Server::new(config);
-    if let Some((address, protocol)) =
-        args.ws.map(|addr| (addr, NetworkProtocol::WebSocket)).or_else(|| args.http.map(|addr| (addr, NetworkProtocol::Http)))
+    if let Some((address, protocol)) = args
+        .ws
+        .map(|addr| (addr, NetworkProtocol::WebSocket))
+        .or_else(|| args.http.map(|addr| (addr, NetworkProtocol::Http)))
+        .or_else(|| args.grpc.map(|addr| (addr, NetworkProtocol::Grpc)))
     {
         let tls = args.tls_cert.zip(args.tls_key);
         let options = NetworkOptions {
@@ -241,7 +247,13 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         };
         let tokens = std::sync::Arc::new(TokenStore::under_home(std::path::Path::new(&home)));
         return tokio::select! {
-            outcome = server.serve_network(options, tokens) => outcome.map_err(|err| format!("network listener: {err}")),
+            outcome = async {
+                if protocol == NetworkProtocol::Grpc {
+                    server.serve_grpc(options, tokens).await
+                } else {
+                    server.serve_network(options, tokens).await
+                }
+            } => outcome.map_err(|err| format!("network listener: {err}")),
             _ = tokio::signal::ctrl_c() => {
                 server.shutdown().await;
                 Ok(())
@@ -371,7 +383,7 @@ async fn main() -> ExitCode {
         }
         Cmd::Serve(args) => {
             init_logging();
-            match serve(args).await {
+            match serve(*args).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     tracing::error!("{err}");

@@ -10,19 +10,19 @@ use crate::common::{connect, env, init_params, initialize, open};
 async fn initialize_negotiates_and_reports_limits() {
     let env = env().await;
     let client = connect(&env.socket).await;
-    let init = client.peer.call::<Initialize>(init_params(0, 7, None)).await.unwrap();
+    let init = client.peer.call::<Initialize>(init_params(&client, 0, 7, None)).await.unwrap();
     assert_eq!(init.generation, 1);
     assert_eq!(init.server.name, "aimx");
     assert!(!init.resumed);
     assert_eq!(init.resume_token.as_str().len(), 64);
-    assert!(init.principal.id.starts_with("local:"));
+    assert!(init.principal.id.starts_with(if client.is_network() { "token:" } else { "local:" }));
     assert!(!init.principal.read_only);
     assert_eq!(init.limits.resume_ttl_secs, 1800);
     assert_eq!(init.limits.output_ring_bytes, 8 * 1024 * 1024);
     // Even fully escaped (`\u0000` is six bytes per input byte) a read fits in one message.
     assert!(init.limits.max_read_bytes * 6 < init.limits.max_message_bytes);
 
-    let again = client.peer.call::<Initialize>(init_params(1, 1, None)).await.unwrap_err();
+    let again = client.peer.call::<Initialize>(init_params(&client, 1, 1, None)).await.unwrap_err();
     assert_eq!(again.code, ErrorCode::InvalidRequest);
 }
 
@@ -30,10 +30,10 @@ async fn initialize_negotiates_and_reports_limits() {
 async fn disjoint_generations_are_refused() {
     let env = env().await;
     let client = connect(&env.socket).await;
-    let err = client.peer.call::<Initialize>(init_params(2, 5, None)).await.unwrap_err();
+    let err = client.peer.call::<Initialize>(init_params(&client, 2, 5, None)).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::UnsupportedGeneration);
     assert_eq!(err.detail.unwrap()["server"]["max"], 1);
-    let err = client.peer.call::<Initialize>(init_params(3, 2, None)).await.unwrap_err();
+    let err = client.peer.call::<Initialize>(init_params(&client, 3, 2, None)).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidParams);
     // A refused handshake leaves the connection usable for a correct one.
     initialize(&client, None).await;
