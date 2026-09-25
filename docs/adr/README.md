@@ -55,5 +55,6 @@ Rules (enforced by `mise run check`):
 | [0032](0032-compaction-events-and-model-context.md) | Record compaction as events; rebuild the model's context from the log. |
 | [0033](0033-resource-catalog-and-activation.md) | Discover resources into one bounded catalog and activate skills in the user turn. |
 | [0034](0034-inline-tui-writer-history-and-completion-sources.md) | Paint the inline TUI with a relative block writer; keep scrollback terminal-owned. |
+| [0035](0035-conversation-search-projection.md) | Index persistent conversation events as redacted chunks. |
 | [0036](0036-log-failure-closes-and-config-replies.md) | A session stops at its first log-write failure; config changes answer their requester. |
 | [0037](0037-bounded-rpc-notification-backlog.md) | Bound ordered RPC notifications without blocking control frames. |

@@ -1,7 +1,8 @@
-//! The SQLite session store: one database file, one owning thread (the "DB actor").
+//! The SQLite session store: one database file, one writer thread (the "DB actor").
 //!
 //! All access goes through the actor thread, so appends are serialized and the `seq` check and
-//! the insert happen in one transaction. WAL keeps readers from blocking the writer.
+//! the insert happen in one transaction. A separate connection updates the search projection.
+//! WAL keeps readers from blocking the writer.
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -15,7 +16,7 @@ use tokio::sync::oneshot;
 use super::{BoxFuture, MAX_FORK_DEPTH, SessionStore, StoreError, StoredSessionSummary, check_sequence};
 
 /// Schema version of the database itself (independent of the event schema).
-const DB_SCHEMA: i64 = 1;
+const DB_SCHEMA: i64 = 2;
 
 type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 
@@ -67,12 +68,19 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     )
     .map_err(backend)?;
     let version: Option<i64> = conn.query_row("SELECT version FROM db_schema LIMIT 1", [], |r| r.get(0)).optional().map_err(backend)?;
+    if let Some(v) = version
+        && v > DB_SCHEMA
+    {
+        return Err(StoreError::Backend(format!("database schema {v} is newer than this build ({DB_SCHEMA})")));
+    }
+    crate::search::index::migrate(conn)?;
     match version {
         None => {
             conn.execute("INSERT INTO db_schema (version) VALUES (?1)", params![DB_SCHEMA]).map_err(backend)?;
         }
-        Some(v) if v > DB_SCHEMA => {
-            return Err(StoreError::Backend(format!("database schema {v} is newer than this build ({DB_SCHEMA})")));
+        Some(v) if v < DB_SCHEMA => {
+            crate::search::index::queue_existing(conn)?;
+            conn.execute("UPDATE db_schema SET version = ?1", params![DB_SCHEMA]).map_err(backend)?;
         }
         Some(_) => {}
     }
@@ -118,6 +126,15 @@ fn append(conn: &mut Connection, session: &str, events: &[SessionEvent]) -> Resu
             let turn = i64::try_from(event.turn).map_err(backend)?;
             insert.execute(params![session, seq, turn, event.ts_ms, event.schema, body]).map_err(backend)?;
         }
+    }
+    if let Some(last_event) = events.last() {
+        let max_seq = i64::try_from(last_event.seq).map_err(backend)?;
+        tx.execute(
+            "INSERT INTO search_pending (session_id, max_seq) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET max_seq = MAX(search_pending.max_seq, excluded.max_seq)",
+            params![session, max_seq],
+        )
+        .map_err(backend)?;
     }
     tx.commit().map_err(backend)
 }
@@ -275,12 +292,33 @@ fn summarize(conn: &Connection, limit: u32) -> Result<Vec<StoredSessionSummary>,
     .collect()
 }
 
-fn serve(mut conn: Connection, rx: &mpsc::Receiver<Command>) {
+fn index_pending(mut conn: Connection, rx: &mpsc::Receiver<()>) {
+    loop {
+        if let Err(err) = crate::search::index::drain_pending(&mut conn) {
+            tracing::warn!(%err, "conversation search indexing failed; pending sessions remain queued");
+        }
+        if rx.recv().is_err() {
+            break;
+        }
+    }
+}
+
+fn serve(mut conn: Connection, rx: &mpsc::Receiver<Command>, search_tx: &mpsc::SyncSender<()>) {
     while let Ok(command) = rx.recv() {
         // A dropped reply only means the caller stopped waiting.
         match command {
             Command::Create(meta, reply) => drop(reply.send(create(&conn, &meta))),
-            Command::Append(session, events, reply) => drop(reply.send(append(&mut conn, &session, &events))),
+            Command::Append(session, events, reply) => {
+                let changed = !events.is_empty();
+                let result = append(&mut conn, &session, &events);
+                if changed && result.is_ok() {
+                    // The durable queue row was committed with the events. A lost notification
+                    // delays indexing but cannot lose work; the indexer drains on the next open.
+                    // One queued wake-up is enough: the indexer reads the durable queue.
+                    let _wake = search_tx.try_send(());
+                }
+                drop(reply.send(result));
+            }
             Command::Load(session, reply) => drop(reply.send(load(&conn, &session))),
             Command::List(limit, reply) => drop(reply.send(list(&conn, limit))),
             Command::Summarize(limit, reply) => drop(reply.send(summarize(&conn, limit))),
@@ -300,9 +338,16 @@ impl SqliteStore {
         let conn = Connection::open(path).map_err(backend)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(backend)?;
         migrate(&conn)?;
+        let search_conn = Connection::open(path).map_err(backend)?;
+        search_conn.busy_timeout(Duration::from_secs(5)).map_err(backend)?;
         private_store_files(path)?;
+        let (search_tx, search_rx) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("aim-search-index".to_owned())
+            .spawn(move || index_pending(search_conn, &search_rx))
+            .map_err(backend)?;
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new().name("aim-db".to_owned()).spawn(move || serve(conn, &rx)).map_err(backend)?;
+        std::thread::Builder::new().name("aim-db".to_owned()).spawn(move || serve(conn, &rx, &search_tx)).map_err(backend)?;
         Ok(Self { tx })
     }
 
@@ -335,5 +380,48 @@ impl SessionStore for SqliteStore {
 
     fn summarize(&self, limit: u32) -> BoxFuture<Result<Vec<StoredSessionSummary>, StoreError>> {
         self.ask(|reply| Command::Summarize(limit, reply))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aim_proto::event::{EVENT_SCHEMA, EventBody};
+
+    use super::*;
+
+    #[test]
+    fn append_keeps_a_durable_high_water_mark_for_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aim.db");
+        let mut conn = Connection::open(&path).unwrap();
+        migrate(&conn).unwrap();
+        create(
+            &conn,
+            &SessionMeta {
+                id: "session".to_owned(),
+                created_ms: 1,
+                workspace: "/w".to_owned(),
+                location: "local".to_owned(),
+                provider: "test".to_owned(),
+                model: "test".to_owned(),
+                title: None,
+                parent: None,
+            },
+        )
+        .unwrap();
+        let event = |seq| SessionEvent { schema: EVENT_SCHEMA, seq, turn: 1, ts_ms: 1, body: EventBody::TurnStarted };
+        append(&mut conn, "session", &[event(1)]).unwrap();
+        append(&mut conn, "session", &[event(2), event(3)]).unwrap();
+        assert!(matches!(append(&mut conn, "session", &[event(5)]), Err(StoreError::Sequence { .. })));
+        append(&mut conn, "session", &[]).unwrap();
+        drop(conn);
+
+        let reopened = Connection::open(&path).unwrap();
+        let (count, max_seq): (i64, i64) = reopened
+            .query_row("SELECT COUNT(*), MAX(max_seq) FROM search_pending WHERE session_id = ?1", params!["session"], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((count, max_seq), (1, 3));
     }
 }
