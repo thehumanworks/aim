@@ -77,8 +77,11 @@ pub fn find_aimx(explicit: Option<&Path>) -> PathBuf {
 /// Today's date (UTC) as `YYYY-MM-DD`.
 #[must_use]
 pub fn today() -> String {
-    let days = session::now_ms().div_euclid(86_400_000);
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    date_from_days(session::now_ms().div_euclid(86_400_000))
+}
+
+// Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+fn date_from_days(days: i64) -> String {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -254,4 +257,23 @@ pub async fn run(options: RunOptions, factory: ProviderFactory) -> Result<i32, S
         Ok(_) => 0,
         Err(_) => 1,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::date_from_days;
+
+    #[test]
+    fn civil_dates_from_unix_days() {
+        for (days, expected) in [
+            (0, "1970-01-01"),
+            (11_016, "2000-02-29"),
+            (11_017, "2000-03-01"),
+            (10_956, "1999-12-31"),
+            (10_957, "2000-01-01"),
+            (2_932_896, "9999-12-31"),
+        ] {
+            assert_eq!(date_from_days(days), expected, "day {days}");
+        }
+    }
 }
