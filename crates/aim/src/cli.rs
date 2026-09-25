@@ -160,6 +160,7 @@ impl Human {
             | AgentEvent::StateChanged { .. }
             | AgentEvent::TurnStarted { .. }
             | AgentEvent::ConfigChanged { .. }
+            | AgentEvent::ConfigRejected { .. }
             | AgentEvent::ItemAdded { .. }
             | AgentEvent::SteerQueued
             | AgentEvent::SteerDelivered { .. }

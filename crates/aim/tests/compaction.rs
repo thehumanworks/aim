@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use aim::agent::compact::SUMMARY_HEADING;
 use aim::agent::tools::{BoxFuture, ToolHost};
-use aim::agent::{Agent, AgentConfig, AgentEvent};
+use aim::agent::{Agent, AgentConfig, AgentError, AgentEvent};
 use aim::host::model_items_of;
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, NativeItem, Part, StopReason, Usage};
@@ -378,6 +378,35 @@ async fn an_overflow_reported_by_the_stream_also_compacts_once_and_retries() {
     assert_eq!(provider.seen.lock().unwrap().len(), 3, "overflow, summary, retry");
 }
 
+#[tokio::test]
+async fn an_overflow_after_streamed_output_fails_the_turn_instead_of_retrying() {
+    // REV8-6: once text or reasoning of an attempt is visible, a transparent retry would show the
+    // retry's answer after output the transcript never keeps. The overflow fails the turn.
+    for delta in [
+        StreamEvent::TextDelta { item_id: "m".into(), delta: "partial".into() },
+        StreamEvent::ReasoningDelta { item_id: "r".into(), delta: "thinking".into() },
+    ] {
+        let streamed = Ok(vec![Ok(delta), Err(LlmError::new(LlmErrorKind::ContextOverflow, "context_length_exceeded"))]);
+        let provider = Scripted::new(vec![streamed, text("SUMMARY"), text("done")], None, false);
+        let mut agent = agent(Arc::clone(&provider), history(20));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = agent.run_turn(vec![Part::Text { text: "and now?".into() }], &tx, &CancellationToken::new()).await;
+        assert!(matches!(&outcome, Err(AgentError::Provider(e)) if e.kind == LlmErrorKind::ContextOverflow), "{outcome:?}");
+        let events = drain(&mut rx);
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Compacted { .. })), "no compaction and retry");
+        assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::TurnFailed { .. })).count(), 1);
+        let shown: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TextDelta { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!shown.contains("done"), "the retry's answer never follows the partial output: {shown:?}");
+        assert_eq!(provider.seen.lock().unwrap().len(), 1, "only the failed attempt");
+    }
+}
+
 /// A provider that can stall: its catalog never answers, or every stream after an initial
 /// overflow never ends.
 struct Stalling {
@@ -416,7 +445,7 @@ impl ModelProvider for Stalling {
     }
 }
 
-async fn cancelled_within_a_second(provider: Arc<Stalling>) -> (Result<StopReason, aim::agent::AgentError>, Vec<AgentEvent>) {
+async fn cancelled_within_a_second(provider: Arc<Stalling>) -> (Result<StopReason, AgentError>, Vec<AgentEvent>) {
     let mut agent = Agent::with_transcript(
         provider,
         Arc::new(NoTools),

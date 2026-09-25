@@ -4,6 +4,7 @@
 - Date: 2026-09-25
 - Baseline: 0014, 0021, 0022, 0031
 - Scope: how a session discovers, ranks and uses project and user resources (instructions, rules, skills, agent definitions, prompt templates, memory indexes): the `aim.agent/v1` fields, the `resources::Files` trait, precedence, budgets, mention injection and agent tool allowlists. Not MCP servers, hooks, plugins or workflows (their opt-in is ADR 0014's), not memory writes or retrieval, and not how UIs show the catalog.
+- Amended by: [0038](0038-session-authority-effort-source-and-config-outcomes.md)
 
 ## Context
 

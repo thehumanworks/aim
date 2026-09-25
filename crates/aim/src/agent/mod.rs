@@ -25,7 +25,7 @@ use aim_kernel::effort::{Input as EffortInput, next as next_effort};
 use aim_kernel::turn::{CallId, Event as TurnEvent, Phase, Turn};
 use aim_llm::{EventStream, LlmError, LlmErrorKind, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason};
-use aim_proto::event::DecisionRecord;
+use aim_proto::event::{DecisionRecord, EffortSource};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolInput, ToolResult, ToolSpec};
 use futures_util::StreamExt as _;
@@ -40,7 +40,7 @@ pub mod tools;
 #[cfg(test)]
 mod jev_tests;
 
-pub use backend::{Backend, BackendFuture};
+pub use backend::{Backend, BackendFuture, InForce};
 pub use tools::ToolHost;
 
 use crate::jev::{Advice, Bundle, Decider};
@@ -111,6 +111,8 @@ struct Response {
     dispatched: Vec<Dispatched>,
     finished: HashMap<CallId, ToolResult>,
     running: Running,
+    /// Text or reasoning of this response was shown: it cannot be retried transparently.
+    streamed: bool,
 }
 
 /// Advice and the catalog entry it was computed against.
@@ -144,6 +146,15 @@ enum Compaction {
     Compacted,
     /// The user cancelled while it ran; nothing changed.
     Cancelled,
+}
+
+/// Where automatic effort starts on `model`'s ladder: its default, else its lowest level. `None`
+/// when the catalog gives no usable ladder (2 to 10 levels).
+pub(crate) fn ladder_start(model: &aim_llm::ModelInfo) -> Option<String> {
+    if !(2..=10).contains(&model.efforts.len()) {
+        return None;
+    }
+    model.default_effort.clone().filter(|default| model.efforts.contains(default)).or_else(|| model.efforts.first().cloned())
 }
 
 /// What the agent knows about its model's context window.
@@ -212,17 +223,35 @@ impl Agent {
     }
 
     /// Enable bounded advice for a persistent session. The host never calls this for private or
-    /// ephemeral sessions.
+    /// ephemeral sessions. Advice applies only while the effort is automatic
+    /// ([`Agent::with_effort_source`]; by default it is automatic unless the configuration sets an
+    /// effort).
     #[must_use]
     pub fn with_decider(mut self, decider: Arc<dyn Decider>) -> Self {
         self.decider = Some(decider);
-        self.explicit_effort = false;
         self
     }
 
-    /// Mark a user-set effort as an override of external advice.
-    pub(crate) fn set_explicit_effort(&mut self) {
-        self.explicit_effort = true;
+    /// Who chooses the effort: the user (`Explicit`, advice is ignored) or aim (`Auto`).
+    #[must_use]
+    pub fn with_effort_source(mut self, source: EffortSource) -> Self {
+        self.set_effort_source(source);
+        self
+    }
+
+    /// Sets who chooses the effort from now on.
+    pub(crate) fn set_effort_source(&mut self, source: EffortSource) {
+        self.explicit_effort = source.is_explicit();
+    }
+
+    /// The model and effort in force, and who chooses the effort.
+    #[must_use]
+    pub fn in_force(&self) -> InForce {
+        InForce {
+            model: self.config.model.clone(),
+            effort: self.config.effort.clone(),
+            effort_source: if self.explicit_effort { EffortSource::Explicit } else { EffortSource::Auto },
+        }
     }
 
     fn recent_digest(&self, goal: &str) -> Option<String> {
@@ -323,7 +352,14 @@ impl Agent {
         } else {
             if let Some(effort) = ladder.get(output as usize) {
                 self.config.effort = Some(effort.clone());
-                emit(events, AgentEvent::ConfigChanged { model: self.config.model.clone(), effort: self.config.effort.clone() });
+                emit(
+                    events,
+                    AgentEvent::ConfigChanged {
+                        model: self.config.model.clone(),
+                        effort: self.config.effort.clone(),
+                        effort_source: EffortSource::Auto,
+                    },
+                );
             }
             self.decisions_since_change = 0;
         }
@@ -470,8 +506,14 @@ impl Agent {
                     None => break,
                     Some(Err(err)) => return Ended::Failed(AgentError::Provider(err)),
                     Some(Ok(event)) => match event {
-                        StreamEvent::TextDelta { delta, .. } => emit(ctx.events, AgentEvent::TextDelta { delta }),
-                        StreamEvent::ReasoningDelta { delta, .. } => emit(ctx.events, AgentEvent::ReasoningDelta { delta }),
+                        StreamEvent::TextDelta { delta, .. } => {
+                            response.streamed = true;
+                            emit(ctx.events, AgentEvent::TextDelta { delta });
+                        }
+                        StreamEvent::ReasoningDelta { delta, .. } => {
+                            response.streamed = true;
+                            emit(ctx.events, AgentEvent::ReasoningDelta { delta });
+                        }
                         StreamEvent::RateLimits { limits } => emit(ctx.events, AgentEvent::RateLimits { limits }),
                         StreamEvent::Completed { usage, stop: s, .. } => {
                             self.measured = Some((usage.input_tokens.saturating_add(usage.output_tokens), self.items.len()));
@@ -621,7 +663,8 @@ impl Agent {
             emit(events, AgentEvent::RequestStarted { index: requests });
             // A context overflow, reported when the request is made or as the stream's first
             // failure, is answered once: compact, then retry the same request. Only a response that
-            // produced nothing is retried, so no output or tool effect is replayed.
+            // produced nothing — no item, no tool call, no visible text or reasoning — is retried,
+            // so no output or tool effect is replayed or shown twice (REV8-6).
             let stop = loop {
                 let produced_before = self.items.len();
                 let attempt = {
@@ -639,7 +682,7 @@ impl Agent {
                     },
                     Err(err) => AgentError::Provider(err),
                 };
-                let untouched = response.dispatched.is_empty() && self.items.len() == produced_before;
+                let untouched = response.dispatched.is_empty() && !response.streamed && self.items.len() == produced_before;
                 match failure {
                     AgentError::Provider(err) if err.kind == LlmErrorKind::ContextOverflow && !overflow_retried && untouched => {
                         overflow_retried = true;

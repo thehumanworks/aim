@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Read as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
@@ -57,8 +58,9 @@ pub enum Read {
 
 /// A source of resource files: a directory tree addressed by relative paths.
 pub trait Files: Send + Sync {
-    /// Lists `dir`, hidden entries included, at most `limit` entries, sorted by name. `Ok(None)`
-    /// when the directory does not exist.
+    /// Lists `dir`, hidden entries included, at most `limit` entries, sorted by name. Which
+    /// entries a directory holding more than `limit` yields is up to the source: enumeration stops
+    /// at the limit. `Ok(None)` when the directory does not exist.
     ///
     /// # Errors
     /// Anything but absence (denied, not a directory, transport).
@@ -93,10 +95,27 @@ impl core::fmt::Debug for HarnessFiles {
     }
 }
 
-fn text_of(content: Content, path: &str) -> Result<String, String> {
+fn text_of(content: Content, truncated: bool, path: &str) -> Result<String, String> {
     match content {
         Content::Utf8 { text } => Ok(text),
-        Content::Base64 { .. } => Err(format!("{path} is not UTF-8 text")),
+        // A cut at the byte limit can split the last character, and aimx then sends the bytes as
+        // base64 (REV8-10): keep the text before it.
+        Content::Base64 { data } => utf8_prefix(data.0, truncated).ok_or_else(|| format!("{path} is not UTF-8 text")),
+    }
+}
+
+/// `bytes` as text. When they were `truncated` and only their last character is incomplete, the
+/// text before it; invalid UTF-8 anywhere else is not text.
+fn utf8_prefix(bytes: Vec<u8>, truncated: bool) -> Option<String> {
+    match String::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        Err(err) if truncated && err.utf8_error().error_len().is_none() => {
+            let valid = err.utf8_error().valid_up_to();
+            let mut bytes = err.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()
+        }
+        Err(_) => None,
     }
 }
 
@@ -119,6 +138,10 @@ impl Files for HarnessFiles {
     }
 
     fn read_many(&self, paths: Vec<String>, max_bytes: u64) -> FilesFuture<'_, Vec<Read>> {
+        // TODO(aimx prefix read): aimx reads and hashes a whole file to return its first
+        // `max_bytes` (the protocol promises a whole-file hash), so a huge project file still
+        // costs its full size on the workspace host. Ask for a prefix-only read (no whole-file
+        // hash) once aim-harness offers one (REV8-8; ADR 0038, "Open").
         Box::pin(async move {
             let batches = paths.chunks(READ_BATCH).map(|batch| {
                 let params =
@@ -142,7 +165,7 @@ impl Files for HarnessFiles {
 
 fn read_of(entry: ReadManyEntry) -> Read {
     match entry {
-        ReadManyEntry::Ok { path, read } => match text_of(read.content, &path) {
+        ReadManyEntry::Ok { path, read } => match text_of(read.content, read.truncated, &path) {
             Ok(text) => Read::Ok(FileText { text, hash: read.hash.0, size: read.size, truncated: read.truncated }),
             Err(message) => Read::Failed(message),
         },
@@ -197,8 +220,7 @@ fn list_local(dir: &Path, limit: u32) -> Result<Option<Vec<DirEntry>>, String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("{}: {err}", dir.display())),
     };
-    let mut entries = Vec::new();
-    for entry in reader {
+    let entries = reader.map(|entry| {
         let entry = entry.map_err(|err| format!("{}: {err}", dir.display()))?;
         let kind = match entry.file_type() {
             Ok(t) if t.is_symlink() => EntryKind::Symlink,
@@ -207,22 +229,38 @@ fn list_local(dir: &Path, limit: u32) -> Result<Option<Vec<DirEntry>>, String> {
             _ => EntryKind::Other,
         };
         let size = if kind == EntryKind::File { entry.metadata().map_or(0, |m| m.len()) } else { 0 };
-        entries.push(DirEntry { name: entry.file_name().to_string_lossy().into_owned(), kind, size });
-    }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    entries.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    Ok(Some(entries))
+        Ok(DirEntry { name: entry.file_name().to_string_lossy().into_owned(), kind, size })
+    });
+    first_entries(entries, limit).map(Some)
 }
 
+/// The first `limit` of `entries` in the order they come (a directory's own order), sorted by
+/// name. Enumeration stops at the limit, so a huge directory costs no more than `limit` entries
+/// (REV8-8).
+fn first_entries(entries: impl Iterator<Item = Result<DirEntry, String>>, limit: u32) -> Result<Vec<DirEntry>, String> {
+    let mut first = entries.take(usize::try_from(limit).unwrap_or(usize::MAX)).collect::<Result<Vec<_>, _>>()?;
+    first.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(first)
+}
+
+/// Reads at most `max_bytes` of the regular file at `path`. Anything else (a FIFO, a socket, a
+/// device) is refused without blocking: it is checked before opening, opened non-blocking, and
+/// checked again on the open descriptor (REV8-8).
 fn read_local(path: &Path, max_bytes: u64) -> Read {
-    let file = match std::fs::File::open(path) {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Read::Failed(format!("{} is not a regular file", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Read::Missing,
+        Err(err) => return Read::Failed(format!("{}: {err}", path.display())),
+    }
+    let file = match std::fs::OpenOptions::new().read(true).custom_flags(nix::libc::O_NONBLOCK).open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Read::Missing,
         Err(err) => return Read::Failed(format!("{}: {err}", path.display())),
     };
     let size = match file.metadata() {
         Ok(meta) if meta.is_file() => meta.len(),
-        Ok(_) => return Read::Failed(format!("{} is not a file", path.display())),
+        Ok(_) => return Read::Failed(format!("{} is not a regular file", path.display())),
         Err(err) => return Read::Failed(format!("{}: {err}", path.display())),
     };
     let mut bytes = Vec::new();
@@ -231,18 +269,10 @@ fn read_local(path: &Path, max_bytes: u64) -> Read {
     }
     let truncated = u64::try_from(bytes.len()).unwrap_or(u64::MAX) < size;
     let hash = sha256(&bytes);
-    // A cut may split a character: keep the valid prefix.
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(err) if truncated => {
-            let valid = err.utf8_error().valid_up_to();
-            let mut bytes = err.into_bytes();
-            bytes.truncate(valid);
-            String::from_utf8(bytes).unwrap_or_default()
-        }
-        Err(_) => return Read::Failed(format!("{} is not UTF-8 text", path.display())),
-    };
-    Read::Ok(FileText { text, hash, size, truncated })
+    match utf8_prefix(bytes, truncated) {
+        Some(text) => Read::Ok(FileText { text, hash, size, truncated }),
+        None => Read::Failed(format!("{} is not UTF-8 text", path.display())),
+    }
 }
 
 impl Files for LocalFiles {
@@ -324,11 +354,79 @@ impl Files for MemoryFiles {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use aim_proto::harness::FsReadResult;
+
     use super::*;
 
     #[test]
     fn hashes_like_aimx() {
         assert_eq!(sha256(b""), "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    fn entry(read: FsReadResult) -> ReadManyEntry {
+        ReadManyEntry::Ok { path: "AGENTS.md".into(), read }
+    }
+
+    fn bytes(data: &[u8], truncated: bool) -> FsReadResult {
+        FsReadResult {
+            content: Content::from_bytes(data.to_vec()),
+            size: 70_000,
+            hash: aim_proto::harness::ContentHash("sha256:x".into()),
+            truncated,
+        }
+    }
+
+    #[test]
+    fn harness_reads_keep_the_text_before_a_split_character() {
+        // aimx cut `é` (C3 A9) after its first byte, so it sent the bytes as base64 (REV8-10).
+        let Read::Ok(file) = read_of(entry(bytes(b"abc\xC3", true))) else { panic!("a valid prefix") };
+        assert_eq!((file.text.as_str(), file.truncated), ("abc", true));
+        // Invalid UTF-8 elsewhere, or in a whole file, is not text.
+        assert!(matches!(read_of(entry(bytes(b"a\xFFb\xC3", true))), Read::Failed(m) if m.contains("not UTF-8")));
+        assert!(matches!(read_of(entry(bytes(b"abc\xC3", false))), Read::Failed(_)));
+    }
+
+    #[test]
+    fn listing_stops_at_its_limit() {
+        // An endless directory: enumeration must stop at the limit rather than collect it all.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut n = 0_u64;
+            let endless = std::iter::from_fn(|| {
+                n = n.wrapping_add(1);
+                Some(Ok(DirEntry { name: format!("e{:06}", u64::MAX - n), kind: EntryKind::File, size: 0 }))
+            });
+            let _sent = tx.send(first_entries(endless, 3));
+        });
+        let listed = rx.recv_timeout(Duration::from_secs(5)).expect("bounded").unwrap();
+        assert_eq!(listed.len(), 3);
+        assert!(listed.windows(2).all(|w| w[0].name < w[1].name), "sorted");
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("MEMORY.md");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let files = LocalFiles::new(dir.path());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let reads = runtime.block_on(files.read_many(vec!["MEMORY.md".into()], 1024));
+            // Dropping the runtime waits for its blocking reads: it must not hang either.
+            drop(runtime);
+            let _sent = tx.send(reads);
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(3));
+        if outcome.is_err() {
+            // Release the blocked reader so the test process can exit, then fail.
+            drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+        }
+        let reads = outcome.expect("a FIFO never blocks a read (REV8-8)");
+        reader.join().unwrap();
+        assert!(matches!(reads.as_slice(), [Read::Failed(message)] if message.contains("not a regular file")), "{reads:?}");
     }
 
     #[tokio::test]

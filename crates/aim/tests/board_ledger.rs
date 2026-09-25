@@ -128,6 +128,7 @@ async fn board_and_session_actors_share_one_wal_file() {
             model: "model".into(),
             title: None,
             parent: None,
+            agent: None,
         })
         .await
         .unwrap();

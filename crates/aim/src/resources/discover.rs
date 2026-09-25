@@ -4,7 +4,8 @@
 //! files (the `AGENTS.md` walk, `.agents/instructions.md`, `MEMORY.md`) are read; then the files
 //! the listings name are read in batches (one more round trip for Claude's namespaced command
 //! directories). Every scope is bounded by [`Bounds`] — files, bytes per file, bytes in total,
-//! entries per directory, and time — and whatever a bound stops is reported.
+//! entries per directory, and time — and whatever a bound stops is reported. The file and byte
+//! bounds are one admission budget, checked before each read ([`Admission`], ADR 0038).
 //!
 //! | Directory (project) | Kind | Source |
 //! | --- | --- | --- |
@@ -15,6 +16,8 @@
 //! | `.omp/skills/<n>/SKILL.md` | skill | oh-my-pi |
 //!
 //! User resources are `~/.aim/{skills/<n>/SKILL.md, agents/*.md, prompts/*.md, memory/MEMORY.md}`.
+
+use std::collections::HashMap;
 
 use aim_proto::harness::EntryKind;
 
@@ -80,6 +83,78 @@ struct Planned {
     source: Source,
 }
 
+/// A scope's admission budget (ADR 0038, REV8-9). Every file requested counts against
+/// [`Bounds::max_files`], fixed files first. A read is requested only when each file in it may
+/// return [`Bounds::max_file_bytes`] within the bytes left; afterwards the bytes it returned are
+/// charged (a `CLAUDE.md` that loses to `AGENTS.md` too), a failed read its whole cap, a missing
+/// file nothing.
+#[derive(Debug)]
+struct Admission {
+    files_left: usize,
+    bytes_left: u64,
+    cap: u64,
+}
+
+impl Admission {
+    const fn new(bounds: &Bounds) -> Self {
+        Self { files_left: bounds.max_files, bytes_left: bounds.max_total_bytes, cap: bounds.max_file_bytes }
+    }
+
+    /// How many of `wanted` files (at most `batch`) the next read may name; reserves their bytes.
+    fn admit(&mut self, wanted: usize, batch: usize) -> usize {
+        let by_bytes = self.bytes_left.checked_div(self.cap).map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
+        let admitted = wanted.min(batch).min(self.files_left).min(by_bytes);
+        self.files_left = self.files_left.saturating_sub(admitted);
+        self.bytes_left = self.bytes_left.saturating_sub(self.cap.saturating_mul(u64::try_from(admitted).unwrap_or(u64::MAX)));
+        admitted
+    }
+
+    /// Settles one admitted file's reservation once it was read.
+    fn settle(&mut self, read: &Read) {
+        let used = match read {
+            Read::Ok(file) => u64::try_from(file.text.len()).unwrap_or(u64::MAX).min(self.cap),
+            Read::Missing => 0,
+            Read::Failed(_) => self.cap,
+        };
+        self.bytes_left = self.bytes_left.saturating_add(self.cap.saturating_sub(used));
+    }
+
+    /// Why the next file is not read.
+    fn refusal(&self, bounds: &Bounds) -> String {
+        if self.files_left == 0 {
+            format!("not read: more than {} resource files", bounds.max_files)
+        } else {
+            format!("not read: the {}-byte budget for resources is spent", bounds.max_total_bytes)
+        }
+    }
+
+    /// Admits a prefix of `fixed` (they are in priority order), reporting the rest.
+    fn admit_fixed(&mut self, mut fixed: Vec<String>, bounds: &Bounds, files: &dyn Files, scope: Scope, found: &mut Found) -> Vec<String> {
+        let admitted = self.admit(fixed.len(), usize::MAX);
+        let refused = fixed.split_off(admitted);
+        if !refused.is_empty() {
+            let why = self.refusal(bounds);
+            found.diagnostics.extend(refused.iter().map(|path| Diagnostic {
+                problem: Problem::Limit,
+                path: files.display(path),
+                scope,
+                message: why.clone(),
+            }));
+        }
+        fixed
+    }
+}
+
+/// Reads the admitted `paths` (none: no request at all), settling their reservations; each path
+/// with its outcome.
+async fn read_admitted(files: &dyn Files, paths: Vec<String>, bounds: &Bounds) -> Vec<(String, Read)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let reads = files.read_many(paths.clone(), bounds.max_file_bytes).await;
+    paths.into_iter().zip(reads).collect()
+}
+
 /// Discovers a session's resources: the project's through `project` (the session's harness, so
 /// under `--ssh` the remote project), the user's from [`ResourceConfig::user_home`], concurrently
 /// and each within [`Bounds::timeout`]. `cwd` is the session's directory relative to the
@@ -128,17 +203,21 @@ pub async fn discover_project(files: &dyn Files, location: &str, cwd: &str, boun
         vec![String::new()]
     });
     let mut fixed: Vec<String> = dirs.iter().flat_map(|d| [join(d, "AGENTS.md"), join(d, "CLAUDE.md")]).collect();
-    fixed.push(".agents/instructions.md".to_owned());
-    fixed.push(".agents/memory/MEMORY.md".to_owned());
-    let (planned, reads) = tokio::join!(
-        plan(files, &PROJECT_DIRS, Scope::Project, bounds, &mut found.diagnostics),
-        files.read_many(fixed.clone(), bounds.max_file_bytes)
-    );
-    let mut spent: u64 = 0;
-    let mut reads = fixed.into_iter().zip(reads);
-    for _dir in &dirs {
-        let (Some((agents_path, agents)), Some((claude_path, claude))) = (reads.next(), reads.next()) else { break };
-        let chosen = match (agents, claude) {
+    fixed.push(INSTRUCTIONS.to_owned());
+    fixed.push(PROJECT_MEMORY.to_owned());
+    let mut admission = Admission::new(bounds);
+    let fixed = admission.admit_fixed(fixed, bounds, files, Scope::Project, &mut found);
+    let (planned, reads) =
+        tokio::join!(plan(files, &PROJECT_DIRS, Scope::Project, bounds, &mut found.diagnostics), read_admitted(files, fixed, bounds));
+    for (_, read) in &reads {
+        admission.settle(read);
+    }
+    // A file not admitted was reported; here it is as good as missing.
+    let mut reads: HashMap<String, Read> = reads.into_iter().collect();
+    let mut take = |path: &str| reads.remove(path).unwrap_or(Read::Missing);
+    for dir in &dirs {
+        let (agents_path, claude_path) = (join(dir, "AGENTS.md"), join(dir, "CLAUDE.md"));
+        let chosen = match (take(&agents_path), take(&claude_path)) {
             (Read::Ok(agents), Read::Ok(claude)) => {
                 if agents.hash != claude.hash {
                     let origin = origin(files, Scope::Project, Source::Claude, location, &claude_path);
@@ -163,51 +242,51 @@ pub async fn discover_project(files: &dyn Files, location: &str, cwd: &str, boun
             }
         };
         if let Some((path, source, file)) = chosen {
-            spent = spent.saturating_add(file.text.len() as u64);
             let origin = origin(files, Scope::Project, source, location, &path);
             found.instructions.push(instructions::instruction_file(&file, &origin, &mut found.diagnostics));
         }
     }
-    if let Some((path, read)) = reads.next() {
-        match read {
-            Read::Ok(file) => {
-                spent = spent.saturating_add(file.text.len() as u64);
-                let origin = origin(files, Scope::Project, Source::Native, location, &path);
-                found.instructions.push(instructions::instruction_file(&file, &origin, &mut found.diagnostics));
-            }
-            other => unreadable(files, Scope::Project, &path, other, &mut found.diagnostics),
+    match take(INSTRUCTIONS) {
+        Read::Ok(file) => {
+            let origin = origin(files, Scope::Project, Source::Native, location, INSTRUCTIONS);
+            found.instructions.push(instructions::instruction_file(&file, &origin, &mut found.diagnostics));
         }
+        other => unreadable(files, Scope::Project, INSTRUCTIONS, other, &mut found.diagnostics),
     }
-    if let Some((path, read)) = reads.next() {
-        match read {
-            Read::Ok(file) => {
-                found.memory.push(instructions::memory_index(&file, &origin(files, Scope::Project, Source::Native, location, &path)));
-            }
-            other => unreadable(files, Scope::Project, &path, other, &mut found.diagnostics),
+    match take(PROJECT_MEMORY) {
+        Read::Ok(file) => {
+            found.memory.push(instructions::memory_index(&file, &origin(files, Scope::Project, Source::Native, location, PROJECT_MEMORY)));
         }
+        other => unreadable(files, Scope::Project, PROJECT_MEMORY, other, &mut found.diagnostics),
     }
-    read_planned(files, planned, Scope::Project, location, bounds, spent, &mut found).await;
+    read_planned(files, planned, Scope::Project, location, bounds, &mut admission, &mut found).await;
     found
 }
+
+/// The project's always-on aim instructions.
+const INSTRUCTIONS: &str = ".agents/instructions.md";
+/// The project's memory index.
+const PROJECT_MEMORY: &str = ".agents/memory/MEMORY.md";
+/// The user's memory index (under `~/.aim`).
+const USER_MEMORY: &str = "memory/MEMORY.md";
 
 /// Discovers the user's resources (`~/.aim`) through `files`.
 pub async fn discover_user(files: &dyn Files, bounds: &Bounds) -> Found {
     let mut found = Found::default();
-    let memory_path = "memory/MEMORY.md".to_owned();
-    let (planned, reads) = tokio::join!(
-        plan(files, &USER_DIRS, Scope::User, bounds, &mut found.diagnostics),
-        files.read_many(vec![memory_path.clone()], bounds.max_file_bytes)
-    );
-    let mut spent: u64 = 0;
-    match reads.into_iter().next() {
-        Some(Read::Ok(file)) => {
-            spent = file.text.len() as u64;
-            found.memory.push(instructions::memory_index(&file, &origin(files, Scope::User, Source::Native, "local", &memory_path)));
+    let mut admission = Admission::new(bounds);
+    let fixed = admission.admit_fixed(vec![USER_MEMORY.to_owned()], bounds, files, Scope::User, &mut found);
+    let (planned, reads) =
+        tokio::join!(plan(files, &USER_DIRS, Scope::User, bounds, &mut found.diagnostics), read_admitted(files, fixed, bounds));
+    for (path, read) in reads {
+        admission.settle(&read);
+        match read {
+            Read::Ok(file) => {
+                found.memory.push(instructions::memory_index(&file, &origin(files, Scope::User, Source::Native, "local", &path)));
+            }
+            other => unreadable(files, Scope::User, &path, other, &mut found.diagnostics),
         }
-        Some(other) => unreadable(files, Scope::User, &memory_path, other, &mut found.diagnostics),
-        None => {}
     }
-    read_planned(files, planned, Scope::User, "local", bounds, spent, &mut found).await;
+    read_planned(files, planned, Scope::User, "local", bounds, &mut admission, &mut found).await;
     found
 }
 
@@ -304,46 +383,36 @@ async fn plan(files: &dyn Files, specs: &[DirSpec], scope: Scope, bounds: &Bound
     planned
 }
 
-/// Reads the planned files in batches within the scope's file and byte budgets, and parses them.
+/// Reads the planned files in batches the scope's admission budget allows, and parses them.
 async fn read_planned(
     files: &dyn Files,
-    mut planned: Vec<Planned>,
+    planned: Vec<Planned>,
     scope: Scope,
     location: &str,
     bounds: &Bounds,
-    mut spent: u64,
+    admission: &mut Admission,
     found: &mut Found,
 ) {
-    if planned.len() > bounds.max_files {
-        for skipped in planned.drain(bounds.max_files..) {
-            found.diagnostics.push(Diagnostic {
+    let mut rest = planned.as_slice();
+    while !rest.is_empty() {
+        let admitted = admission.admit(rest.len(), READ_BATCH);
+        let Some((batch, later)) = rest.split_at_checked(admitted).filter(|_| admitted > 0) else {
+            let why = admission.refusal(bounds);
+            found.diagnostics.extend(rest.iter().map(|skipped| Diagnostic {
                 problem: Problem::Limit,
                 path: files.display(&skipped.path),
                 scope,
-                message: format!("not read: more than {} resource files", bounds.max_files),
-            });
-        }
-    }
-    for batch in planned.chunks(READ_BATCH) {
-        if spent >= bounds.max_total_bytes {
-            for skipped in batch {
-                found.diagnostics.push(Diagnostic {
-                    problem: Problem::Limit,
-                    path: files.display(&skipped.path),
-                    scope,
-                    message: format!("not read: the {}-byte budget for resources is spent", bounds.max_total_bytes),
-                });
-            }
-            continue;
-        }
+                message: why.clone(),
+            }));
+            return;
+        };
+        rest = later;
         let reads = files.read_many(batch.iter().map(|p| p.path.clone()).collect(), bounds.max_file_bytes).await;
         for (item, read) in batch.iter().zip(reads) {
+            admission.settle(&read);
             let origin = origin(files, scope, item.source, location, &item.path);
             match read {
-                Read::Ok(file) => {
-                    spent = spent.saturating_add(file.text.len() as u64);
-                    parse(item, &file, &origin, found);
-                }
+                Read::Ok(file) => parse(item, &file, &origin, found),
                 Read::Missing if item.kind == Kind::Skill => {
                     found.diagnostics.push(origin.diagnostic(Problem::Invalid, "a skill directory without SKILL.md; skipped"));
                 }

@@ -36,7 +36,7 @@ use serde_json::{Value, json};
 use super::complete::{Candidate, Request, Source, Sources};
 use super::{Options, TuiArgs};
 use crate::agent::ToolHost;
-use crate::host::{BoxFuture, Connected, HostConfig, SessionHost, WorkspaceFactory, native_backends};
+use crate::host::{BoxFuture, Connected, HostConfig, NativeServices, SessionHost, WorkspaceFactory, native_backends_with};
 use crate::store::{MemoryStore, SessionStore};
 
 /// One step of a scripted model response.
@@ -249,6 +249,7 @@ async fn seed(store: &MemoryStore, spec: &SessionSpec, items: usize) -> Result<S
         model: "scripted-model".into(),
         title: Some("seeded".into()),
         parent: None,
+        agent: None,
     };
     store.create(meta).await.map_err(|e| e.to_string())?;
     let events: Vec<SessionEvent> = (0..items)
@@ -292,7 +293,14 @@ pub async fn run(path: &Path, args: &TuiArgs) -> Result<i32, String> {
         Arc::new(move |_name, _model| Ok((Arc::clone(&provider) as Arc<dyn ModelProvider>, "scripted-model".to_owned())));
     let host = SessionHost::new(HostConfig {
         store: store as Arc<dyn SessionStore>,
-        backends: native_backends(providers, workspaces(), args.max_requests),
+        // A scripted session gets no machine services (no credentials, no Jev).
+        backends: native_backends_with(
+            providers,
+            workspaces(),
+            args.max_requests,
+            crate::resources::ResourceConfig::user(crate::cli::aim_home()),
+            NativeServices::default(),
+        ),
         update_capacity: 4096,
     });
     if script.seed_ephemeral {

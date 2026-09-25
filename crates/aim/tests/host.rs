@@ -9,25 +9,36 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture, ToolHost};
-use aim::host::{Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends_with};
+use aim::agent::{AgentError, Backend, BackendFuture, InForce};
+use aim::host::{
+    BackendFactory, BackendRequest, Built, Connected, HostConfig, NativeServices, SessionClient, SessionHost, UpdateStream,
+    WorkspaceFactory, native_backends_with,
+};
+use aim::jev::{Advice, Bundle, Decider, DecisionFuture};
+use aim::media::MediaService;
 use aim::resources::{MemoryFiles, ResourceConfig};
 use aim::store::{MemoryStore, SessionStore, StoreError, StoredSessionSummary};
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, StreamEvent};
+use aim_llm_codex::media::{Image, SearchAnswer};
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
 use aim_proto::daemon::{
     Location, Persistence, PromptOutcome, SessionConfigParams, SessionListParams, SessionSpec, SessionState, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::event::{SessionEvent, SessionMeta};
+use aim_proto::event::{EffortSource, EventBody, SessionEvent, SessionMeta};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolAnnotations, ToolResult, ToolSpec};
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio_util::sync::CancellationToken;
 
 struct Scripted {
     responses: Mutex<VecDeque<Vec<Result<StreamEvent, LlmError>>>>,
     seen: Mutex<Vec<Request>>,
     models: Vec<ModelInfo>,
+    /// Once set, the catalog never answers (a stalled provider).
+    stall_catalog: AtomicBool,
 }
 
 impl ModelProvider for Scripted {
@@ -36,6 +47,9 @@ impl ModelProvider for Scripted {
     }
 
     fn catalog(&self) -> LlmFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
+        if self.stall_catalog.load(Ordering::SeqCst) {
+            return Box::pin(std::future::pending());
+        }
         let models = self.models.clone();
         Box::pin(async move { Ok(models) })
     }
@@ -116,7 +130,18 @@ fn fixture_full(
     script: Vec<Vec<Result<StreamEvent, LlmError>>>,
     models: Vec<ModelInfo>,
 ) -> Fixture {
-    let provider = Arc::new(Scripted { responses: Mutex::new(script.into()), seen: Mutex::default(), models });
+    fixture_services(backing, store, script, models, NativeServices::default())
+}
+
+fn fixture_services(
+    backing: Arc<dyn SessionStore>,
+    store: Arc<MemoryStore>,
+    script: Vec<Vec<Result<StreamEvent, LlmError>>>,
+    models: Vec<ModelInfo>,
+    services: NativeServices,
+) -> Fixture {
+    let provider =
+        Arc::new(Scripted { responses: Mutex::new(script.into()), seen: Mutex::default(), models, stall_catalog: AtomicBool::new(false) });
     let connects = Arc::new(AtomicUsize::new(0));
     let shutdowns = Arc::new(AtomicUsize::new(0));
     let (c, s) = (Arc::clone(&connects), Arc::clone(&shutdowns));
@@ -149,6 +174,7 @@ fn fixture_full(
             workspaces,
             8,
             ResourceConfig::default(),
+            services,
         ),
         update_capacity: 256,
     });
@@ -265,7 +291,10 @@ async fn set_config_applies_when_idle_and_after_a_running_turn() {
     let params = |model: &str| SessionConfigParams { session: id.clone(), model: Some(model.into()), effort: Some("high".into()) };
     f.host.set_config(params("m2")).await.unwrap();
     let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
-    assert_eq!(got.last(), Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("high".into()) }));
+    assert_eq!(
+        got.last(),
+        Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("high".into()), effort_source: EffortSource::Explicit })
+    );
     f.host.prompt(id.clone(), user("go")).await.unwrap();
     until(&mut updates, |u| matches!(u, SessionUpdate::ToolStarted { .. })).await;
     f.host.set_config(params("m3")).await.unwrap();
@@ -368,7 +397,11 @@ async fn config_changes_during_a_turn_merge_field_by_field() {
     f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m2".into()), effort: None }).await.unwrap();
     f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("high".into()) }).await.unwrap();
     let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
-    assert_eq!(got.last(), Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("high".into()) }), "neither change lost");
+    assert_eq!(
+        got.last(),
+        Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("high".into()), effort_source: EffortSource::Explicit }),
+        "neither change lost"
+    );
     f.host.prompt(id, user("next")).await.unwrap();
     until(&mut updates, is_idle).await;
     let last = f.provider.seen.lock().unwrap().last().cloned().unwrap();
@@ -475,9 +508,458 @@ async fn shutdown_waits_for_a_starting_session_and_refuses_new_ones() {
     let starting = tokio::spawn(async move { host.create(spec(Persistence::Ephemeral)).await });
     tokio::time::sleep(Duration::from_millis(5)).await;
     f.host.shutdown().await.unwrap();
-    let started = starting.await.unwrap().unwrap();
-    assert!(f.host.prompt(started.meta.id, user("hi")).await.is_err(), "no session outlives shutdown");
+    // The start in flight saw the shutdown and tore itself down instead of going live (ADR 0038).
+    let started = starting.await.unwrap();
+    assert_eq!(started.map_err(|e| e.code).err(), Some(ErrorCode::Unavailable), "no session outlives shutdown");
+    assert!(f.host.list(SessionListParams::default()).await.unwrap().is_empty());
     let late = f.host.create(spec(Persistence::Ephemeral)).await.map_err(|e| e.code);
     assert_eq!(late.err(), Some(ErrorCode::Unavailable));
     assert_eq!(f.shutdowns.load(Ordering::SeqCst), 1, "its workspace was shut down");
+}
+
+// ------------------------------------------------------------------------------------------------
+// ADR 0038: config outcomes, effort source, injected services, bounded shutdown
+// ------------------------------------------------------------------------------------------------
+
+fn ladder_model() -> ModelInfo {
+    ModelInfo {
+        id: "m1".into(),
+        display_name: "m1".into(),
+        context_window: Some(100_000),
+        efforts: vec!["low".into(), "medium".into(), "high".into()],
+        default_effort: None,
+        tiers: Vec::new(),
+        tools: true,
+        images: false,
+        hidden: false,
+        native: None,
+    }
+}
+
+/// Always advises the top of the ladder, at once; counts its calls.
+#[derive(Default)]
+struct Counting {
+    calls: AtomicUsize,
+}
+
+impl Decider for Counting {
+    fn decide(&self, _bundle: Bundle) -> DecisionFuture {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Some(Advice {
+                raw_score: 1.0,
+                raw_confidence: 1.0,
+                raw_probabilities: vec![0.0, 0.0, 1.0],
+                raw_noul: [0.0; 3],
+                proposed_bp: 10_000,
+                noul_bp: [0; 3],
+                latency_ms: 1,
+                input_tokens: None,
+                cost_micro_usd: None,
+            })
+        })
+    }
+}
+
+fn advised(counting: &Arc<Counting>) -> NativeServices {
+    NativeServices { media: None, decider: Some(Arc::clone(counting) as Arc<dyn Decider>) }
+}
+
+/// Runs one prompt to idle; returns its updates.
+async fn turn(f: &Fixture, updates: &mut UpdateStream, id: &str, prompt: &str) -> Vec<SessionUpdate> {
+    f.host.prompt(id.to_owned(), user(prompt)).await.unwrap();
+    until(updates, is_idle).await
+}
+
+fn config_changes(got: &[SessionUpdate]) -> Vec<(Option<String>, EffortSource)> {
+    got.iter()
+        .filter_map(|u| match u {
+            SessionUpdate::ConfigChanged { effort, effort_source, .. } => Some((effort.clone(), *effort_source)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn automatic_effort_survives_a_restart_and_explicit_effort_can_return_to_auto() {
+    let store = Arc::new(MemoryStore::default());
+    let counting = Arc::new(Counting::default());
+    let first = fixture_services(
+        Arc::clone(&store) as Arc<dyn SessionStore>,
+        Arc::clone(&store),
+        vec![slow_call("a", 100), text("one")],
+        vec![ladder_model()],
+        advised(&counting),
+    );
+    let id = first.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (_, mut updates) = first.host.attach(id.clone()).await.unwrap();
+    let got = turn(&first, &mut updates, &id, "go").await;
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 1);
+    assert!(got.iter().any(|u| matches!(u, SessionUpdate::Decision { .. })));
+    first.host.close(id.clone()).await.unwrap();
+    first.host.shutdown().await.unwrap();
+
+    // A restarted daemon: the session resumes automatic, and Jev keeps advising it (REV8-14,
+    // REV9-M1).
+    let script = vec![slow_call("b", 100), text("two"), slow_call("c", 100), text("three"), slow_call("d", 100), text("four")];
+    let second =
+        fixture_services(Arc::clone(&store) as Arc<dyn SessionStore>, Arc::clone(&store), script, vec![ladder_model()], advised(&counting));
+    let (_, mut updates) = second.host.attach(id.clone()).await.unwrap();
+    let got = turn(&second, &mut updates, &id, "more").await;
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 2, "the decider was attached again");
+    assert!(got.iter().any(|u| matches!(u, SessionUpdate::Decision { .. })));
+    assert_eq!(second.provider.seen.lock().unwrap()[0].effort.as_deref(), Some("medium"), "the recorded level is the start");
+
+    // An explicit effort stops the advice; `auto` hands the effort back.
+    second.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("low".into()) }).await.unwrap();
+    let got = turn(&second, &mut updates, &id, "explicit").await;
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 2, "explicit effort is not advised");
+    assert_eq!(config_changes(&got), [(Some("low".to_owned()), EffortSource::Explicit)]);
+    second.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("auto".into()) }).await.unwrap();
+    let got = turn(&second, &mut updates, &id, "auto again").await;
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 3, "advice resumes");
+    assert_eq!(config_changes(&got).first(), Some(&(Some("low".to_owned()), EffortSource::Auto)), "from the level in force");
+    let (_, events) = store.load(id).await.unwrap();
+    let last = events.iter().rev().find_map(|e| match &e.body {
+        EventBody::ConfigChanged { effort_source, .. } => Some(*effort_source),
+        _ => None,
+    });
+    assert_eq!(last, Some(EffortSource::Auto), "the log keeps the source");
+}
+
+#[tokio::test]
+async fn a_private_session_never_calls_the_decider() {
+    for (persistence, expected) in [(Persistence::Ephemeral, 0), (Persistence::Persistent, 1)] {
+        let counting = Arc::new(Counting::default());
+        let memory = Arc::new(MemoryStore::default());
+        let f = fixture_services(
+            Arc::clone(&memory) as Arc<dyn SessionStore>,
+            memory,
+            vec![slow_call("a", 100), text("done")],
+            vec![ladder_model()],
+            advised(&counting),
+        );
+        let id = f.host.create(spec(persistence)).await.unwrap().meta.id;
+        let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+        turn(&f, &mut updates, &id, "go").await;
+        assert_eq!(counting.calls.load(Ordering::SeqCst), expected, "{persistence:?} (ADR 0013)");
+    }
+}
+
+/// Media that is always available; counts its calls.
+#[derive(Default)]
+struct FakeMedia {
+    calls: AtomicUsize,
+}
+
+impl MediaService for FakeMedia {
+    fn search_enabled(&self) -> bool {
+        true
+    }
+
+    fn image_enabled(&self) -> bool {
+        true
+    }
+
+    fn web_search(&self, _query: String) -> BoxFuture<Result<SearchAnswer, LlmError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(SearchAnswer { text: "found".into(), citations: Vec::new(), queries: Vec::new() }) })
+    }
+
+    fn generate_image(&self, _prompt: String, _size: Option<String>, _quality: Option<String>) -> BoxFuture<Result<Image, LlmError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(LlmError::new(LlmErrorKind::Unavailable, "no images in tests")) })
+    }
+}
+
+#[tokio::test]
+async fn without_media_services_only_workspace_tools_are_offered() {
+    let f = fixture(vec![text("plain")]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    turn(&f, &mut updates, &id, "hi").await;
+    let offered: Vec<String> = f.provider.seen.lock().unwrap()[0].tools.iter().map(|t| t.name.clone()).collect();
+    assert_eq!(offered, ["echo"], "no credential-local tools unless injected (REV9-M4)");
+
+    let media = Arc::new(FakeMedia::default());
+    let held = Arc::clone(&media);
+    let services = NativeServices {
+        media: Some(Arc::new(move || {
+            let media = Arc::clone(&held) as Arc<dyn MediaService>;
+            Box::pin(async move { Some(media) })
+        })),
+        decider: None,
+    };
+    let memory = Arc::new(MemoryStore::default());
+    let search = vec![
+        Ok(StreamEvent::ItemDone {
+            item: Item::ToolCall {
+                call_id: "s".into(),
+                name: "web_search".into(),
+                arguments: json!({"query": "q"}).to_string(),
+                native: None,
+            },
+        }),
+        completed(StopReason::ToolUse),
+    ];
+    let script = vec![text("with media"), search, text("done")];
+    let f = fixture_services(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, script, Vec::new(), services);
+    let offered = |f: &Fixture, request: usize| -> Vec<String> {
+        f.provider.seen.lock().unwrap()[request].tools.iter().map(|t| t.name.clone()).collect()
+    };
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    turn(&f, &mut updates, &id, "hi").await;
+    assert_eq!(offered(&f, 0), ["echo", "web_search", "generate_image"]);
+    // A private session sends nothing to media services until it opts in, and cannot yet (ADR 0042).
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    turn(&f, &mut updates, &id, "search").await;
+    assert_eq!(offered(&f, 1), ["echo"]);
+    assert_eq!(media.calls.load(Ordering::SeqCst), 0, "a direct call does not reach the service");
+}
+
+fn two_efforts() -> ModelInfo {
+    ModelInfo { efforts: vec!["low".into(), "high".into()], ..ladder_model() }
+}
+
+#[tokio::test]
+async fn a_deferred_config_refusal_reaches_the_stream() {
+    let memory = Arc::new(MemoryStore::default());
+    let f =
+        fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, vec![slow_call("a", 100), text("done")], vec![two_efforts()]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    f.host.prompt(id.clone(), user("go")).await.unwrap();
+    until(&mut updates, |u| matches!(u, SessionUpdate::ToolStarted { .. })).await;
+    // Accepted while the turn runs; refused when it ends (REV8-4).
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("ultra".into()) }).await.unwrap();
+    let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigRejected { .. })).await;
+    let Some(SessionUpdate::ConfigRejected { model, effort, message }) = got.last() else { panic!("{got:?}") };
+    assert_eq!((model, effort.as_deref()), (&None, Some("ultra")));
+    assert!(message.contains("ultra"), "{message}");
+    assert!(!got.iter().any(|u| matches!(u, SessionUpdate::ConfigChanged { .. })), "nothing changed");
+}
+
+/// A backend that applies model and effort in two steps and refuses every effort after changing
+/// the model, like an ACP agent whose effort options depend on the model.
+struct TwoStep {
+    in_force: InForce,
+}
+
+impl Backend for TwoStep {
+    fn run_turn<'a>(
+        &'a mut self,
+        input: Vec<Part>,
+        events: &'a UnboundedSender<SessionUpdate>,
+        _cancel: &'a CancellationToken,
+        _steer: &'a mut UnboundedReceiver<Vec<Part>>,
+    ) -> BackendFuture<'a, Result<StopReason, AgentError>> {
+        Box::pin(async move {
+            let _unwatched = events.send(SessionUpdate::ItemAdded { item: Item::User { parts: input } });
+            let _unwatched = events.send(SessionUpdate::TurnEnded { stop: StopReason::EndTurn });
+            Ok(StopReason::EndTurn)
+        })
+    }
+
+    fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<InForce, String>> {
+        Box::pin(async move {
+            if let Some(model) = model {
+                self.in_force.model = model;
+            }
+            match effort {
+                Some(effort) => Err(format!("effort `{effort}` is not offered by `{}`", self.in_force.model)),
+                None => Ok(self.in_force.clone()),
+            }
+        })
+    }
+}
+
+/// A host whose sessions run `TwoStep`, built once `gate` opens (open from the start when
+/// `None`); counts backend-session shutdowns.
+fn two_step_host(store: Arc<dyn SessionStore>, gate: Option<Arc<tokio::sync::Semaphore>>) -> (SessionHost, Arc<AtomicUsize>) {
+    let shutdowns = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&shutdowns);
+    let backends: BackendFactory = Arc::new(move |request: BackendRequest| {
+        let (gate, counted) = (gate.clone(), Arc::clone(&counted));
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                let _open = gate.acquire().await;
+            }
+            let in_force = InForce { model: "A".into(), effort: None, effort_source: EffortSource::Explicit };
+            let shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send> = Box::new(move || {
+                Box::pin(async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                })
+            });
+            Ok(Built {
+                backend: Box::new(TwoStep { in_force }),
+                model: "A".into(),
+                root: request.spec.workspace.clone(),
+                location: "local".into(),
+                agent: None,
+                shutdown,
+            })
+        })
+    });
+    (SessionHost::new(HostConfig { store, backends, update_capacity: 256 }), shutdowns)
+}
+
+#[tokio::test]
+async fn a_partial_config_change_is_reconciled_and_announced() {
+    let store = Arc::new(MemoryStore::default());
+    let (host, _) = two_step_host(Arc::clone(&store) as Arc<dyn SessionStore>, None);
+    let id = host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (_, mut updates) = host.attach(id.clone()).await.unwrap();
+    // The model step applies, the effort step fails: the host announces what is in force, then
+    // reports the refusal (REV8-3).
+    let refused = host
+        .set_config(SessionConfigParams { session: id.clone(), model: Some("B".into()), effort: Some("high".into()) })
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(refused.code, ErrorCode::InvalidParams);
+    let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
+    assert!(matches!(got.last(), Some(SessionUpdate::ConfigChanged { model, .. }) if model == "B"), "{got:?}");
+    let (_, events) = store.load(id).await.unwrap();
+    let recorded = events.iter().rev().find_map(|e| match &e.body {
+        EventBody::ConfigChanged { model, .. } => Some(model.clone()),
+        _ => None,
+    });
+    assert_eq!(recorded.as_deref(), Some("B"), "a resume replays the configuration really in force");
+}
+
+#[tokio::test]
+async fn an_idle_config_change_the_log_cannot_keep_is_an_error() {
+    let memory = Arc::new(MemoryStore::default());
+    let failing = Arc::new(Failing { inner: Arc::clone(&memory), fail: AtomicBool::new(false) });
+    let f = fixture_full(Arc::clone(&failing) as Arc<dyn SessionStore>, memory, Vec::new(), Vec::new());
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (_, updates) = f.host.attach(id.clone()).await.unwrap();
+    failing.fail.store(true, Ordering::SeqCst);
+    // REV8-5: the change is not durable, so it is not acknowledged; storage is not "invalid".
+    let failed = f.host.set_config(SessionConfigParams { session: id, model: Some("m2".into()), effort: None }).await.err().unwrap();
+    assert_eq!(failed.code, ErrorCode::Internal, "{failed:?}");
+    assert!(failed.message.starts_with("store:"), "{}", failed.message);
+    let rest: Vec<SessionUpdate> = tokio::time::timeout(Duration::from_secs(5), updates.collect()).await.unwrap();
+    assert!(!rest.iter().any(|u| matches!(u, SessionUpdate::ConfigChanged { .. })), "{rest:?}");
+    assert_eq!(rest.last(), Some(&SessionUpdate::StateChanged { state: SessionState::Closed }));
+}
+
+#[tokio::test]
+async fn a_pending_config_is_cancelled_when_the_session_closes() {
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, vec![slow_call("a", 200)], vec![two_efforts()]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let (_, updates) = f.host.attach(id.clone()).await.unwrap();
+    let mut updates = updates;
+    f.host.prompt(id.clone(), user("go")).await.unwrap();
+    until(&mut updates, |u| matches!(u, SessionUpdate::ToolStarted { .. })).await;
+    // Applying the change would now wait on a provider that never answers (REV8-17).
+    f.provider.stall_catalog.store(true, Ordering::SeqCst);
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("high".into()) }).await.unwrap();
+    f.host.close(id).await.unwrap();
+    let rest: Vec<SessionUpdate> =
+        tokio::time::timeout(Duration::from_secs(5), updates.collect()).await.expect("the session closed promptly");
+    assert!(
+        rest.iter().any(|u| matches!(u, SessionUpdate::ConfigRejected { message, .. } if message.starts_with("cancelled"))),
+        "{rest:?}"
+    );
+    assert_eq!(rest.last(), Some(&SessionUpdate::StateChanged { state: SessionState::Closed }));
+}
+
+#[tokio::test]
+async fn shutdown_is_bounded_while_a_backend_is_still_starting() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (host, shutdowns) = two_step_host(Arc::new(MemoryStore::default()), Some(Arc::clone(&gate)));
+    let starting = tokio::spawn({
+        let host = host.clone();
+        async move { host.create(spec(Persistence::Ephemeral)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // REV8-7: the backend never finishes starting, yet shutdown returns within its deadline.
+    let began = std::time::Instant::now();
+    let stopped = tokio::time::timeout(Duration::from_secs(2), host.shutdown_within(Duration::from_millis(200))).await.expect("bounded");
+    assert_eq!(stopped.map_err(|e| e.code), Err(ErrorCode::Timeout));
+    assert!(began.elapsed() < Duration::from_secs(1));
+    // When the start finally completes, it tears itself down instead of going live.
+    gate.add_permits(1);
+    let started = tokio::time::timeout(Duration::from_secs(2), starting).await.unwrap().unwrap();
+    assert_eq!(started.map_err(|e| e.code).err(), Some(ErrorCode::Unavailable));
+    assert_eq!(shutdowns.load(Ordering::SeqCst), 1, "its workspace was shut down");
+    assert!(host.list(SessionListParams::default()).await.unwrap().is_empty(), "no session went live");
+    assert_eq!(host.create(spec(Persistence::Ephemeral)).await.map_err(|e| e.code).err(), Some(ErrorCode::Unavailable));
+}
+
+#[tokio::test]
+async fn a_log_from_before_adr_0038_resumes_as_it_did() {
+    // Such a log records no effort source: an unset effort was automatic, a set one explicit.
+    for (effort, advice) in [(None, 1), (Some("high"), 0)] {
+        let store = Arc::new(MemoryStore::default());
+        let meta = SessionMeta {
+            id: "old".into(),
+            created_ms: 1,
+            workspace: "/w".into(),
+            location: "local".into(),
+            provider: "scripted".into(),
+            model: "m1".into(),
+            title: None,
+            parent: None,
+            agent: None,
+        };
+        store.create(meta).await.unwrap();
+        let body: EventBody = serde_json::from_value(json!({"kind": "config_changed", "model": "m1", "effort": effort})).unwrap();
+        store.append("old".into(), vec![SessionEvent { schema: 1, seq: 1, turn: 0, ts_ms: 1, body }]).await.unwrap();
+        let counting = Arc::new(Counting::default());
+        let f = fixture_services(
+            Arc::clone(&store) as Arc<dyn SessionStore>,
+            store,
+            vec![slow_call("a", 100), text("done")],
+            vec![ladder_model()],
+            advised(&counting),
+        );
+        let (_, mut updates) = f.host.attach("old".into()).await.unwrap();
+        turn(&f, &mut updates, "old", "go").await;
+        assert_eq!(counting.calls.load(Ordering::SeqCst), advice, "recorded effort {effort:?}");
+        // What the resume put in force is recorded when it differs from the log's last record.
+        let (_, events) = f.store.load("old".into()).await.unwrap();
+        let configs: Vec<(Option<String>, EffortSource)> = events
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::ConfigChanged { effort, effort_source, .. } => Some((effort.clone(), *effort_source)),
+                _ => None,
+            })
+            .collect();
+        match effort {
+            None => assert_eq!(configs.get(1), Some(&(Some("low".to_owned()), EffortSource::Auto)), "{configs:?}"),
+            Some(_) => assert_eq!(configs.len(), 1, "nothing changed: {configs:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_automatic_session_switching_models_starts_from_the_new_ladder() {
+    // REV9-m1: the switch left the effort unset while decisions recorded a ladder index.
+    let counting = Arc::new(Counting::default());
+    let m2 = ModelInfo { id: "m2".into(), display_name: "m2".into(), default_effort: Some("medium".into()), ..ladder_model() };
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_services(
+        Arc::clone(&memory) as Arc<dyn SessionStore>,
+        memory,
+        vec![text("one"), text("two")],
+        vec![ladder_model(), m2],
+        advised(&counting),
+    );
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    turn(&f, &mut updates, &id, "one").await;
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m2".into()), effort: None }).await.unwrap();
+    let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
+    assert_eq!(
+        got.last(),
+        Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("medium".into()), effort_source: EffortSource::Auto })
+    );
+    turn(&f, &mut updates, &id, "two").await;
+    let efforts: Vec<Option<String>> = f.provider.seen.lock().unwrap().iter().map(|r| r.effort.clone()).collect();
+    assert_eq!(efforts, [Some("low".to_owned()), Some("medium".to_owned())], "each model's ladder start");
 }

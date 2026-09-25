@@ -16,6 +16,7 @@ fn meta(id: &str, created_ms: i64) -> SessionMeta {
         model: "gpt-6-sol".into(),
         title: None,
         parent: None,
+        agent: None,
     }
 }
 

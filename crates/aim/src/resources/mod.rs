@@ -243,7 +243,7 @@ pub struct Diagnostic {
 /// Bounds on discovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bounds {
-    /// Most files read per scope.
+    /// Most files requested per scope, fixed files included whether they exist or not (ADR 0038).
     pub max_files: usize,
     /// Most bytes read of one file (the rest is reported truncated).
     pub max_file_bytes: u64,

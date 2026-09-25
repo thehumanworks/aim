@@ -58,4 +58,5 @@ Rules (enforced by `mise run check`):
 | [0035](0035-conversation-search-projection.md) | Index persistent conversation events as redacted chunks. |
 | [0036](0036-log-failure-closes-and-config-replies.md) | A session stops at its first log-write failure; config changes answer their requester. |
 | [0037](0037-bounded-rpc-notification-backlog.md) | Bound ordered RPC notifications without blocking control frames. |
+| [0038](0038-session-authority-effort-source-and-config-outcomes.md) | Record a session's agent and effort source; report every config outcome. |
 | [0042](0042-bound-media-services-and-private-opt-in.md) | Bound media output and require private-session opt-in. |

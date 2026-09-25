@@ -123,6 +123,7 @@ fn host(deltas: usize, delay: Duration) -> (Arc<dyn SessionClient>, Arc<Scripted
             workspaces,
             4,
             aim::resources::ResourceConfig::default(),
+            aim::host::NativeServices::default(),
         ),
         update_capacity: 4096,
     }));

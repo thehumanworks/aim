@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use aim_proto::conversation::Usage;
 use aim_proto::daemon::Location;
-use aim_proto::event::SessionMeta;
+use aim_proto::event::{EffortSource, SessionMeta};
 use aim_proto::tool::ToolResult;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -37,6 +37,7 @@ fn summary(id: &str, state: SessionState) -> SessionSummary {
             model: "m1".into(),
             title: None,
             parent: None,
+            agent: None,
         },
         state,
         persistence: Persistence::Ephemeral,
@@ -282,7 +283,10 @@ fn commands_set_the_config_and_are_remembered() {
     let effects = app.handle(press(KeyCode::Enter));
     assert!(effects.contains(&Effect::SaveHistory("/model gpt-x".into())));
     assert!(effects.contains(&Effect::SetConfig(SessionConfigParams { session: "s1".into(), model: Some("gpt-x".into()), effort: None })));
-    update(&mut app, SessionUpdate::ConfigChanged { model: "gpt-x".into(), effort: Some("high".into()) });
+    update(
+        &mut app,
+        SessionUpdate::ConfigChanged { model: "gpt-x".into(), effort: Some("high".into()), effort_source: EffortSource::Explicit },
+    );
     let session = app.session.as_ref().unwrap();
     assert_eq!((session.model.as_str(), session.effort.as_deref()), ("gpt-x", Some("high")));
     typed(&mut app, "/dictate");

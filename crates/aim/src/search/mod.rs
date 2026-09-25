@@ -325,6 +325,7 @@ mod tests {
             model: "test".to_owned(),
             title: None,
             parent: None,
+            agent: None,
         }
     }
 

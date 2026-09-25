@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::Catalog;
 use super::mentions::{expand_mentions, mentions};
-use crate::agent::{AgentError, AgentEvent, Backend, BackendFuture};
+use crate::agent::{AgentError, AgentEvent, Backend, BackendFuture, InForce};
 
 /// `inner`, with skill mentions expanded from `catalog`.
 pub struct WithSkills {
@@ -53,7 +53,7 @@ impl Backend for WithSkills {
         self.inner.run_turn(input, events, cancel, steer)
     }
 
-    fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<(String, Option<String>), String>> {
+    fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<InForce, String>> {
         self.inner.set_config(model, effort)
     }
 

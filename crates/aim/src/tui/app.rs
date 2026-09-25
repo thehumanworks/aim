@@ -741,7 +741,7 @@ impl App {
                 t.reasoning = t.reasoning.saturating_add(usage.reasoning_tokens);
             }
             SessionUpdate::RateLimits { limits } => self.limits = Some(limits),
-            SessionUpdate::ConfigChanged { model, effort } => {
+            SessionUpdate::ConfigChanged { model, effort, .. } => {
                 self.remember_config(&model, effort.as_deref());
                 if let Some(session) = &mut self.session {
                     session.model.clone_from(&model);
@@ -749,6 +749,9 @@ impl App {
                 }
                 let effort = effort.map(|e| format!(" · effort {e}")).unwrap_or_default();
                 self.notice(Level::Info, format!("model {model}{effort}"));
+            }
+            SessionUpdate::ConfigRejected { message, .. } => {
+                self.notice(Level::Error, format!("configuration not changed: {message}"));
             }
             SessionUpdate::Compacted { method, tokens_before, tokens_after, .. } => {
                 // The model's context was folded; the transcript shown keeps every item.

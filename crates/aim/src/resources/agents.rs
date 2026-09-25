@@ -14,6 +14,8 @@
 
 use std::collections::BTreeSet;
 
+use aim_proto::event::SessionAgent;
+
 use super::files::FileText;
 use super::skills::report_unsupported;
 use super::yaml::{self, Fields, Split, Value};
@@ -53,6 +55,34 @@ impl ToolPolicy {
     #[must_use]
     pub fn is_unrestricted(&self) -> bool {
         self.allow.is_none() && self.deny.is_empty()
+    }
+
+    /// What both policies permit: allowlists intersect and denylists unite, so the result never
+    /// permits a tool either refuses (a resumed session's ceiling, ADR 0038).
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> Self {
+        let allow = match (&self.allow, &other.allow) {
+            (None, None) => None,
+            (Some(only), None) | (None, Some(only)) => Some(only.clone()),
+            (Some(a), Some(b)) => Some(a.intersection(b).cloned().collect()),
+        };
+        Self { allow, deny: self.deny.union(&other.deny).cloned().collect() }
+    }
+
+    /// This policy as recorded for agent `name` in the session's metadata (ADR 0038).
+    #[must_use]
+    pub fn record(&self, name: &str) -> SessionAgent {
+        SessionAgent {
+            name: name.to_owned(),
+            allow: self.allow.as_ref().map(|allow| allow.iter().cloned().collect()),
+            deny: self.deny.iter().cloned().collect(),
+        }
+    }
+
+    /// The policy a session recorded.
+    #[must_use]
+    pub fn recorded(record: &SessionAgent) -> Self {
+        Self { allow: record.allow.as_ref().map(|allow| allow.iter().cloned().collect()), deny: record.deny.iter().cloned().collect() }
     }
 }
 
@@ -360,6 +390,27 @@ mod tests {
 
     fn origin(source: Source) -> Origin {
         Origin { scope: Scope::Project, source, location: "local".into(), path: "x".into() }
+    }
+
+    #[test]
+    fn intersected_policies_permit_exactly_what_both_permit() {
+        let set = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<BTreeSet<String>>();
+        let policies = [
+            ToolPolicy::default(),
+            ToolPolicy { allow: Some(set(&["Read"])), deny: BTreeSet::new() },
+            ToolPolicy { allow: Some(set(&["Read", "Write"])), deny: set(&["Bash"]) },
+            ToolPolicy { allow: None, deny: set(&["Write"]) },
+            ToolPolicy { allow: Some(BTreeSet::new()), deny: BTreeSet::new() },
+        ];
+        for a in &policies {
+            for b in &policies {
+                let both = a.intersect(b);
+                for tool in ["Read", "Write", "Bash", "web_search"] {
+                    assert_eq!(both.permits(tool), a.permits(tool) && b.permits(tool), "{a:?} ∩ {b:?} on {tool}");
+                }
+                assert_eq!(ToolPolicy::recorded(&both.record("x")), both, "the record round-trips");
+            }
+        }
     }
 
     fn file(text: &str) -> FileText {
