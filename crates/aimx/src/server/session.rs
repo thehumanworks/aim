@@ -63,12 +63,18 @@ impl Session {
     /// Attaches the session to a connection; returns the peer it was attached to before (which the
     /// caller closes: a resumed session belongs to one connection at a time).
     pub(crate) fn attach(&self, conn: u64, peer: Peer) -> Option<Peer> {
-        *lock(&self.detached_at) = None;
+        let mut detached_at = lock(&self.detached_at);
+        *detached_at = None;
         self.attached.send_replace(Some(Attachment { conn, peer })).filter(|old| old.conn != conn).map(|old| old.peer)
     }
 
     /// Detaches connection `conn` (if it is still the attached one) and starts the resume clock.
     pub(crate) fn detach(&self, conn: u64) {
+        self.detach_after_clear(conn, || {});
+    }
+
+    fn detach_after_clear(&self, conn: u64, after_clear: impl FnOnce()) {
+        let mut detached_at = lock(&self.detached_at);
         let detached = self.attached.send_if_modified(|current| {
             if current.as_ref().is_some_and(|a| a.conn == conn) {
                 *current = None;
@@ -78,7 +84,8 @@ impl Session {
             }
         });
         if detached {
-            *lock(&self.detached_at) = Some(Instant::now());
+            after_clear();
+            *detached_at = Some(Instant::now());
         }
     }
 
@@ -201,6 +208,23 @@ impl State {
         sessions.get(token).filter(|s| s.principal.id == principal.id && !s.expired(self.config.resume_ttl)).cloned()
     }
 
+    /// Checks the resume window and attaches while holding the session-map lock. The reaper holds
+    /// that same lock through expiry selection and removal, so it cannot remove a session between
+    /// a successful resume lookup and the replacement attachment.
+    #[expect(dead_code, reason = "the handlers.rs owner switches initialize to this atomic API during integration")]
+    pub(crate) fn resume_and_attach(
+        &self,
+        token: &str,
+        principal: &Principal,
+        conn: u64,
+        peer: Peer,
+    ) -> Option<(Arc<Session>, Option<Peer>)> {
+        let sessions = lock(&self.sessions);
+        let session = sessions.get(token).filter(|s| s.principal.id == principal.id && !s.expired(self.config.resume_ttl))?;
+        let previous = session.attach(conn, peer);
+        Some((Arc::clone(session), previous))
+    }
+
     /// Starts a new session.
     ///
     /// # Errors
@@ -219,5 +243,58 @@ impl State {
         }
         sessions.insert(token, Arc::clone(&session));
         Ok(session)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+    use std::sync::mpsc;
+
+    use aim_rpc::{NoHandler, PeerConfig};
+    use tokio::sync::Semaphore;
+
+    use super::*;
+
+    fn peer() -> Peer {
+        Peer::spawn(tokio::io::empty(), tokio::io::sink(), NoHandler, PeerConfig::default())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replacement_attach_outlives_old_detach() {
+        let principal = Arc::new(Principal { id: "test".into(), roots: Vec::new(), read_only: false });
+        let procs = ProcTable::new(1, Arc::new(Semaphore::new(1)));
+        let session = Arc::new(Session::new("token".into(), principal, procs, 1));
+        session.attach(1, peer());
+
+        let cleared = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let old = Arc::clone(&session);
+        let old_cleared = Arc::clone(&cleared);
+        let old_release = Arc::clone(&release);
+        let old_detach = std::thread::spawn(move || {
+            old.detach_after_clear(1, || {
+                old_cleared.wait();
+                old_release.wait();
+            });
+        });
+        cleared.wait();
+
+        let (attached_tx, attached_rx) = mpsc::channel();
+        let replacement = Arc::clone(&session);
+        let new_peer = peer();
+        let new_attach = std::thread::spawn(move || {
+            replacement.attach(2, new_peer);
+            attached_tx.send(()).unwrap();
+        });
+        // Before the fix, replacement attachment can finish before the old detach writes its
+        // timestamp. After the fix it waits for the same lifecycle lock.
+        let _ = attached_rx.recv_timeout(Duration::from_secs(1));
+        release.wait();
+        old_detach.join().unwrap();
+        new_attach.join().unwrap();
+
+        assert_eq!(session.attached.borrow().as_ref().map(|a| a.conn), Some(2));
+        assert!(!session.expired(Duration::ZERO), "an attached session must never expire");
     }
 }
