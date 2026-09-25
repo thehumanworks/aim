@@ -358,7 +358,7 @@ pub async fn run(client: Arc<dyn SessionClient>, options: Options) -> Result<i32
     }
     drop(modes);
     if let (Some(session), true) = (&app.session, matches!(app.session.as_ref().map(|s| s.persistence), Some(Persistence::Persistent))) {
-        let _ignored = write_out(&format!("aim: session {} · resume with `aim --session {}`\r\n", session.id, session.id));
+        let _ignored = write_out(&format!("resume: aim --session {}\r\n", session.id));
     }
     finished.map_err(|e| format!("terminal: {e}"))?;
     result

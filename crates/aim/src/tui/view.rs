@@ -134,7 +134,8 @@ pub fn status(app: &App, width: usize) -> Line<'static> {
 
 fn live_rows(app: &App, width: usize, budget: usize) -> Vec<Row> {
     let theme = &app.theme;
-    let opts = RenderOpts { width, hyperlinks: false };
+    // Same link rendering as the finished entry, so rows do not jump when it lands.
+    let opts = RenderOpts { width, hyperlinks: app.config.hyperlinks };
     let mut rows = Vec::new();
     if !app.live_reasoning.trim().is_empty() {
         rows.extend(markdown::render(&app.live_reasoning, theme, opts, theme.reasoning));
@@ -168,17 +169,20 @@ fn tool_rows(app: &App, width: usize) -> Vec<Row> {
 fn chip_rows(app: &App, width: usize) -> Vec<Row> {
     let theme = &app.theme;
     let mut rows = Vec::new();
-    for steer in app.steers.iter().take(CHIP_ROWS) {
+    // A prompt sent while idle is a chip only if it turns out to be steering.
+    let running = app.running();
+    let chips: Vec<_> = app.steers.iter().filter(|s| running || s.state != SteerState::Sending).collect();
+    for steer in chips.iter().take(CHIP_ROWS) {
         let (mark, style) = match steer.state {
-            SteerState::Sending(_) => ("… sending ", theme.muted),
+            SteerState::Sending => ("… sending ", theme.muted),
             SteerState::Queued => ("⧗ queued ", theme.chip_queued),
             SteerState::Delivered => ("✓ delivered ", theme.chip_delivered),
         };
         let text = markdown::one_line(&steer.text, width.saturating_sub(mark.len() + 2).max(4));
         rows.push(Row::new(vec![Run::new(mark, style), Run::new(text, theme.muted)]));
     }
-    if app.steers.len() > CHIP_ROWS {
-        rows.push(Row::plain(format!("  +{} more", app.steers.len() - CHIP_ROWS), theme.muted));
+    if chips.len() > CHIP_ROWS {
+        rows.push(Row::plain(format!("  +{} more", chips.len() - CHIP_ROWS), theme.muted));
     }
     rows
 }
@@ -208,7 +212,8 @@ fn popup_rows(app: &App, width: usize) -> Vec<Row> {
     rows
 }
 
-/// Builds the pinned block for `width` columns and at most `max_rows` rows.
+/// Builds the pinned block for `width` columns and at most `max_rows` rows (at least two: the
+/// composer and the status line always show). The inline writer relies on this bound.
 pub fn block(app: &App, width: u16, max_rows: u16) -> Block {
     let w = usize::from(width).max(8);
     let max = usize::from(max_rows).max(2);
@@ -221,19 +226,18 @@ pub fn block(app: &App, width: u16, max_rows: u16) -> Block {
     } else {
         composer
     };
-    // Keep the cursor's row inside the visible composer rows.
-    let first = cursor_row.saturating_sub(COMPOSER_ROWS - 1).min(composer.len().saturating_sub(1));
-    let composer: Vec<Row> = composer.into_iter().skip(first).take(COMPOSER_ROWS).collect();
-    let popup = popup_rows(app, w);
-    let chips = chip_rows(app, w);
-    let tools = tool_rows(app, w);
-    let fixed = 2 + composer.len();
-    let mut room = max.saturating_sub(fixed);
-    let popup: Vec<Row> = popup.into_iter().take(room).collect();
+    // The status line, then the composer (keeping the cursor's row visible), then the rule.
+    let visible = composer.len().min(COMPOSER_ROWS).min(max - 1).max(1);
+    let first = cursor_row.saturating_sub(visible - 1).min(composer.len().saturating_sub(visible));
+    let composer: Vec<Row> = composer.into_iter().skip(first).take(visible).collect();
+    let mut room = max - 1 - composer.len();
+    let rule = room > 0;
+    room = room.saturating_sub(usize::from(rule));
+    let popup: Vec<Row> = popup_rows(app, w).into_iter().take(room).collect();
     room = room.saturating_sub(popup.len());
-    let chips: Vec<Row> = chips.into_iter().take(room).collect();
+    let chips: Vec<Row> = chip_rows(app, w).into_iter().take(room).collect();
     room = room.saturating_sub(chips.len());
-    let tools: Vec<Row> = tools.into_iter().take(room).collect();
+    let tools: Vec<Row> = tool_rows(app, w).into_iter().take(room).collect();
     room = room.saturating_sub(tools.len());
     let live_budget = room.min(usize::from(app.size.1 / 2).max(3));
     let live = live_rows(app, w, live_budget);
@@ -242,7 +246,9 @@ pub fn block(app: &App, width: u16, max_rows: u16) -> Block {
     rows.extend(lines(&live));
     rows.extend(lines(&tools));
     rows.extend(lines(&chips));
-    rows.push(Line::styled("─".repeat(w), theme.muted));
+    if rule {
+        rows.push(Line::styled("─".repeat(w), theme.muted));
+    }
     let composer_top = rows.len();
     rows.extend(lines(&composer));
     rows.extend(lines(&popup));
@@ -400,6 +406,213 @@ pub fn wants_alternate_screen(app: &App) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::{AppConfig, Input};
+    use crate::tui::complete::{Candidate, Completed, Kind};
+    use crate::tui::theme::Theme;
+    use aim_proto::conversation::{Item, Part};
+    use aim_proto::daemon::{Location, PromptOutcome, SessionSpec, SessionUpdate};
+    use aim_proto::event::SessionMeta;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn summary(id: &str, workspace: &str, state: SessionState, turns: u64) -> SessionSummary {
+        SessionSummary {
+            meta: SessionMeta {
+                id: id.into(),
+                created_ms: 0,
+                workspace: workspace.into(),
+                location: "local".into(),
+                provider: "codex".into(),
+                model: "gpt-6-sol".into(),
+                title: None,
+                parent: None,
+            },
+            state,
+            persistence: Persistence::Persistent,
+            last_activity_ms: 0,
+            turns,
+        }
+    }
+
+    fn app() -> App {
+        let spec = SessionSpec {
+            workspace: "/home/me/aim".into(),
+            location: Location::Local,
+            provider: "codex".into(),
+            model: None,
+            effort: Some("low".into()),
+            agent: None,
+            persistence: Persistence::Persistent,
+        };
+        let mut app = App::new(Theme::plain(), AppConfig { spec, hyperlinks: false, home: Some("/home/me".into()) }, Vec::new(), false);
+        app.handle(Input::Resize(50, 30));
+        app.start(None);
+        app.handle(Input::Attached {
+            summary: summary("s1", "/home/me/aim", SessionState::Idle, 0),
+            transcript: Vec::new(),
+            resync: false,
+        });
+        app
+    }
+
+    fn up(app: &mut App, update: SessionUpdate) {
+        app.handle(Input::Update { session: "s1".into(), update });
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.handle(Input::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn text_rows(buf: &Buffer) -> Vec<String> {
+        let area = buf.area;
+        (area.top()..area.bottom())
+            .map(|y| {
+                let mut row = String::new();
+                let mut skip = 0;
+                for x in area.left()..area.right() {
+                    let symbol = buf.cell((x, y)).map_or(" ", |c| c.symbol());
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    skip = unicode_width::UnicodeWidthStr::width(symbol).saturating_sub(1);
+                    row.push_str(symbol);
+                }
+                row.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    fn draw(width: u16, height: u16, paint: impl FnOnce(Rect, &mut Buffer)) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| paint(frame.area(), frame.buffer_mut())).unwrap();
+        text_rows(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn the_pinned_block_stacks_partial_tools_chips_composer_popup_and_status() {
+        let mut app = app();
+        up(&mut app, SessionUpdate::StateChanged { state: SessionState::Running });
+        up(&mut app, SessionUpdate::ItemAdded { item: Item::User { parts: vec![Part::Text { text: "go".into() }] } });
+        up(
+            &mut app,
+            SessionUpdate::ItemAdded {
+                item: Item::ToolCall {
+                    call_id: "c".into(),
+                    name: "exec".into(),
+                    arguments: r#"{"cmd":"cargo test"}"#.into(),
+                    native: None,
+                },
+            },
+        );
+        up(&mut app, SessionUpdate::TextDelta { delta: "Working on **it**".into() });
+        for c in "steer me".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        app.handle(Input::PromptDone { id: 1, result: Ok(PromptOutcome::Steered) });
+        for c in "@sr".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let candidates = vec![
+            Candidate { label: "src/".into(), insert: "@src/".into(), detail: String::new(), kind: Kind::Dir },
+            Candidate { label: "src/main.rs".into(), insert: "@src/main.rs ".into(), detail: String::new(), kind: Kind::File },
+        ];
+        app.handle(Input::Completed(Completed { generation: app.generation(), candidates }));
+        let block = block(&app, 49, 29);
+        let height = u16::try_from(block.rows.len()).unwrap();
+        let rows = draw(49, height, |area, buf| draw_rows(&block.rows, area, buf));
+        assert_eq!(
+            rows,
+            [
+                "Working on it",
+                "⏺ exec cargo test",
+                "  ⎿ running…",
+                "⧗ queued steer me",
+                "─────────────────────────────────────────────────",
+                "› @sr",
+                "  src/",
+                "  src/main.rs",
+                "running 0s · request 1 · gpt-6-sol · low · ~/aim",
+            ]
+        );
+        assert_eq!(block.cursor, Some((5, 5)), "after `› @sr`, on the composer row");
+    }
+
+    #[test]
+    fn the_block_never_exceeds_its_rows() {
+        for max in [2_u16, 3, 5, 8, 12] {
+            let mut app = app();
+            up(&mut app, SessionUpdate::StateChanged { state: SessionState::Running });
+            up(&mut app, SessionUpdate::TextDelta { delta: "line\n\n".repeat(40) });
+            for n in 0..5 {
+                up(
+                    &mut app,
+                    SessionUpdate::ItemAdded {
+                        item: Item::ToolCall { call_id: format!("c{n}"), name: "exec".into(), arguments: "{}".into(), native: None },
+                    },
+                );
+                for c in format!("steer {n}").chars() {
+                    key(&mut app, KeyCode::Char(c));
+                }
+                key(&mut app, KeyCode::Enter);
+            }
+            for _ in 0..20 {
+                app.handle(Input::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)));
+            }
+            let block = block(&app, 40, max);
+            assert!(block.rows.len() <= usize::from(max), "max {max}: {} rows", block.rows.len());
+            let cursor_row = usize::from(block.cursor.unwrap().1);
+            assert!(cursor_row < block.rows.len(), "the cursor is inside the block");
+        }
+    }
+
+    #[test]
+    fn fullscreen_scrolls_the_same_rows_and_says_how_far() {
+        let mut app = app();
+        app.layout = Layout::Fullscreen;
+        for n in 0..30 {
+            up(&mut app, SessionUpdate::ItemAdded { item: Item::User { parts: vec![Part::Text { text: format!("prompt {n}") }] } });
+        }
+        let mut cache = RowCache::default();
+        let rows = draw(50, 12, |area, buf| {
+            let (_, limit) = fullscreen(&app, &mut cache, area, buf);
+            assert_eq!(limit, 60 - 9, "30 entries of two rows; 12 rows less a 3-row block");
+        });
+        assert_eq!(rows[1], "› prompt 26");
+        assert_eq!(rows[7], "› prompt 29");
+        assert_eq!(rows[9], "─".repeat(49));
+        app.scroll.offset = 10;
+        app.scroll.limit = 51;
+        let rows = draw(50, 12, |area, buf| {
+            fullscreen(&app, &mut cache, area, buf);
+        });
+        assert_eq!(rows[0], " ↑ 10 rows below · pgdn/ctrl+end to follow");
+        assert!(rows.iter().any(|r| r == "› prompt 24"), "{rows:?}");
+    }
+
+    #[test]
+    fn the_picker_lists_filters_and_marks_the_current_session() {
+        let mut app = app();
+        app.picker = Some(crate::tui::app::Picker {
+            filter: "else".into(),
+            sessions: Some(vec![
+                summary("s1", "/home/me/aim", SessionState::Idle, 3),
+                summary("s2", "/srv/elsewhere", SessionState::Closed, 12),
+            ]),
+            error: None,
+            selected: 0,
+        });
+        let rows = draw(90, 6, |area, buf| picker(&app, 60_000, area, buf));
+        assert_eq!(rows[0], " sessions · type to filter · ↑↓ select · enter attach · esc back");
+        assert_eq!(rows[1], " filter: else");
+        assert_eq!(rows[3], "    1m  stored    12 turns  s2  codex/gpt-6-sol  /srv/elsewhere");
+        assert_eq!(rows.get(4).map(String::as_str), Some(""), "only the match is listed");
+        app.picker.as_mut().unwrap().filter.clear();
+        let rows = draw(90, 6, |area, buf| picker(&app, 60_000, area, buf));
+        assert!(rows[3].starts_with("●"), "the attached session is marked: {rows:?}");
+    }
 
     #[test]
     fn counts_and_paths_are_short() {

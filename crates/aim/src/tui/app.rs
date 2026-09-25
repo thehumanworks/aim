@@ -125,20 +125,24 @@ pub struct SessionView {
     pub persistence: Persistence,
 }
 
-/// Where a steering chip is.
+/// Where a sent prompt is, from the UI's point of view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SteerState {
-    /// Sent; the session has not answered (the prompt's id).
-    Sending(u64),
+    /// Sent; the session has not answered yet.
+    Sending,
     /// Accepted as steering; waits for the next model request.
     Queued,
     /// Went out with a request.
     Delivered,
 }
 
-/// Input typed while a turn ran.
+/// A sent prompt until its fate is known: it started a turn (and disappears), or it became
+/// steering (a chip until the turn ends). Keyed by the prompt's id, so the session's answer and
+/// its updates may arrive in any order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Steer {
+    /// The prompt's id.
+    pub id: u64,
     /// The text.
     pub text: String,
     /// Where it is.
@@ -253,13 +257,6 @@ pub struct AppConfig {
     pub home: Option<String>,
 }
 
-/// A prompt waiting for its answer.
-#[derive(Clone, Debug)]
-struct Pending {
-    id: u64,
-    text: String,
-}
-
 /// The whole UI state.
 #[derive(Debug)]
 pub struct App {
@@ -305,7 +302,6 @@ pub struct App {
     quit_armed: bool,
     quitting: bool,
     next_prompt: u64,
-    pending: Vec<Pending>,
     queued_first: Option<String>,
     models: Vec<String>,
     efforts: Vec<String>,
@@ -348,7 +344,6 @@ impl App {
             quit_armed: false,
             quitting: false,
             next_prompt: 1,
-            pending: Vec::new(),
             queued_first: None,
             models,
             efforts,
@@ -372,6 +367,12 @@ impl App {
     /// Whether a turn is running.
     pub fn running(&self) -> bool {
         self.session.as_ref().is_some_and(|s| matches!(s.state, SessionState::Running | SessionState::RequiresAction))
+    }
+
+    /// The current input generation (bumped by every keystroke).
+    #[cfg(test)]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Entry rendering options at `width`.
@@ -596,7 +597,8 @@ impl App {
                 self.flush_live();
                 self.transcript.settle();
                 self.steers.retain(|s| s.state != SteerState::Delivered);
-                // Anything the session accepted but never answered for goes back to the composer.
+                // Steering the session accepted but neither delivered nor returned goes back to the
+                // composer (the host always does one or the other; this keeps the text if not).
                 let orphans: Vec<String> = self.steers.iter().filter(|s| s.state == SteerState::Queued).map(|s| s.text.clone()).collect();
                 if !orphans.is_empty() {
                     self.steers.retain(|s| s.state != SteerState::Queued);
@@ -659,32 +661,30 @@ impl App {
         }
     }
 
+    /// The session answered prompt `id`. Its chip may already be delivered (`SteerDelivered`
+    /// came first) or gone (`SteersReturned` came first); either way the later answer changes
+    /// nothing, so no text is shown or refilled twice.
     fn on_prompt_done(&mut self, id: u64, result: Result<PromptOutcome, String>) {
-        let pending = self.pending.iter().position(|p| p.id == id).map(|i| self.pending.remove(i));
-        let chip = self.steers.iter().position(|s| s.state == SteerState::Sending(id));
+        let Some(index) = self.steers.iter().position(|s| s.id == id) else {
+            if let Err(error) = result {
+                self.notice(Level::Error, format!("not sent: {error}"));
+            }
+            return;
+        };
         match result {
-            Ok(PromptOutcome::Steered) => match (chip, pending) {
-                (Some(index), _) => {
-                    if let Some(steer) = self.steers.get_mut(index) {
-                        steer.state = SteerState::Queued;
-                    }
-                }
-                // The session was busy although this UI thought it idle (another client's turn).
-                (None, Some(p)) => self.steers.push(Steer { text: p.text, state: SteerState::Queued }),
-                (None, None) => {}
-            },
-            Ok(PromptOutcome::Started { .. }) => {
-                if let Some(index) = chip {
-                    self.steers.remove(index);
+            Ok(PromptOutcome::Steered) => {
+                if let Some(steer) = self.steers.get_mut(index)
+                    && steer.state == SteerState::Sending
+                {
+                    steer.state = SteerState::Queued;
                 }
             }
+            Ok(PromptOutcome::Started { .. }) => {
+                self.steers.remove(index);
+            }
             Err(error) => {
-                if let Some(index) = chip {
-                    self.steers.remove(index);
-                }
-                if let Some(p) = pending {
-                    self.refill(&[p.text]);
-                }
+                let steer = self.steers.remove(index);
+                self.refill(&[steer.text]);
                 self.notice(Level::Error, format!("not sent: {error}"));
             }
         }
@@ -730,10 +730,7 @@ impl App {
         let id = self.next_prompt;
         self.next_prompt = self.next_prompt.saturating_add(1);
         let effect = Effect::Prompt { id, session, parts: text_parts(text.clone()) };
-        if self.running() {
-            self.steers.push(Steer { text: text.clone(), state: SteerState::Sending(id) });
-        }
-        self.pending.push(Pending { id, text });
+        self.steers.push(Steer { id, text, state: SteerState::Sending });
         vec![effect]
     }
 
