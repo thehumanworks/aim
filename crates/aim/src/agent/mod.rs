@@ -52,7 +52,8 @@ pub struct AgentConfig {
 }
 
 /// What happens during a turn, for UIs and logs.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// A model request started (1-based within the turn).
     RequestStarted {
