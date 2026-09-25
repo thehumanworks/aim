@@ -7,12 +7,46 @@ use aim_proto::conversation::{Item, NativeItem, Part, StopReason, Usage};
 use aim_proto::tool::{ToolContent, ToolInput, ToolResult, ToolSpec};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use serde::ser::SerializeMap as _;
+use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
 use crate::errors;
 
 /// The provider id stamped on every native item and required to replay one.
 pub(crate) const PROVIDER: &str = "codex";
+
+/// Serialize stable request fields before the growing input array (ADR 0056).
+pub(crate) struct OrderedResponses<'a>(pub &'a Value);
+
+impl Serialize for OrderedResponses<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Some(fields) = self.0.as_object() else {
+            return self.0.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for (key, value) in fields.iter().filter(|(key, _)| key.as_str() != "input") {
+            map.serialize_entry(key, value)?;
+        }
+        if let Some(input) = fields.get("input") {
+            map.serialize_entry("input", input)?;
+        }
+        map.end()
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+
+    #[test]
+    fn growing_input_is_last_on_the_wire() {
+        let body = json!({"input": [{"role":"user"}], "tools": [{"name":"read"}], "instructions": "stable"});
+        let encoded = serde_json::to_string(&OrderedResponses(&body)).unwrap();
+        assert!(encoded.find("\"tools\"") < encoded.find("\"input\""));
+        assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), body);
+    }
+}
 
 fn protocol(message: &str) -> LlmError {
     LlmError::new(LlmErrorKind::Protocol, message)

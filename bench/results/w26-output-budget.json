@@ -1,0 +1,763 @@
+{
+  "aim_sha256": "93ec116bfdb87f9c39613c065b1cd2a4d7eb803c119d9c400fce46a991f3f19e",
+  "model": "openai/gpt-4.1-mini",
+  "prompt": "First call the direct Bash tool once with command `seq 1 100000` and inspect its output. Do not use run_code for this command. Then fix sum_even in calc.py and run the tests.",
+  "runs": [
+    {
+      "append_only_steps": 4,
+      "auxiliary_requests": 1,
+      "bash_model_end_bytes": 15000,
+      "case": "even_sum",
+      "client_disconnects_with_usage": 0,
+      "effort": null,
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 5987,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 28.27,
+      "first_request_tokens_estimate": 1497,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 499,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 223,
+          "name": "LS"
+        },
+        {
+          "bytes": 470,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 630,
+          "name": "run_code"
+        },
+        {
+          "bytes": 425,
+          "name": "save_program"
+        },
+        {
+          "bytes": 318,
+          "name": "run_program"
+        },
+        {
+          "bytes": 194,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 10,
+      "first_request_tools_json_bytes": 4035,
+      "first_token_ms": 878.01,
+      "harness": "aim_openrouter",
+      "harness_peak_rss_mb": 50.56,
+      "helpers_peak_rss_mb": 18.4,
+      "http_exchanges": 6,
+      "ite": 24932.2,
+      "max_tool_output_chars": 30409,
+      "missing_success_cost": false,
+      "model": "openai/gpt-4.1-mini",
+      "passed": true,
+      "peak_rss_mb": 63.96,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {
+        "file_path,limit,offset": 1
+      },
+      "read_failure_classes": {},
+      "repetition": 0,
+      "request_json_bytes": [
+        5987,
+        42191,
+        42563,
+        43071,
+        43481
+      ],
+      "request_lcp_bytes": [
+        5985,
+        42189,
+        42561,
+        43069
+      ],
+      "request_response_sizes": [
+        [
+          5987,
+          8737
+        ],
+        [
+          42191,
+          6748
+        ],
+        [
+          42563,
+          23349
+        ],
+        [
+          43071,
+          9077
+        ],
+        [
+          43481,
+          8737
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0004588,
+          "input_tokens": 1023,
+          "output_tokens": 31,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0069496,
+          "input_tokens": 17278,
+          "output_tokens": 24,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17152,
+          "cost_usd": 0.0019052,
+          "input_tokens": 17331,
+          "output_tokens": 74,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17280,
+          "cost_usd": 0.001834,
+          "input_tokens": 17417,
+          "output_tokens": 32,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17280,
+          "cost_usd": 0.0018516,
+          "input_tokens": 17469,
+          "output_tokens": 30,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 5,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "stable_head_ratio_median": 1.0,
+      "stable_head_ratios": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "timed_out": false,
+      "tool_calls_by_name": {
+        "Bash": 2,
+        "Edit": 1,
+        "Read": 1
+      },
+      "tool_output_recovery_hint": true,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 51712,
+        "cost_usd": 0.0129992,
+        "input_tokens": 70518,
+        "output_tokens": 191,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 6568.55
+    },
+    {
+      "append_only_steps": 4,
+      "auxiliary_requests": 1,
+      "bash_model_end_bytes": 5500,
+      "case": "even_sum",
+      "client_disconnects_with_usage": 0,
+      "effort": null,
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 5987,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 31.09,
+      "first_request_tokens_estimate": 1497,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 499,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 223,
+          "name": "LS"
+        },
+        {
+          "bytes": 470,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 630,
+          "name": "run_code"
+        },
+        {
+          "bytes": 425,
+          "name": "save_program"
+        },
+        {
+          "bytes": 318,
+          "name": "run_program"
+        },
+        {
+          "bytes": 194,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 10,
+      "first_request_tools_json_bytes": 4035,
+      "first_token_ms": 844.08,
+      "harness": "aim_openrouter",
+      "harness_peak_rss_mb": 51.09,
+      "helpers_peak_rss_mb": 18.42,
+      "http_exchanges": 6,
+      "ite": 11176.0,
+      "max_tool_output_chars": 11411,
+      "missing_success_cost": false,
+      "model": "openai/gpt-4.1-mini",
+      "passed": true,
+      "peak_rss_mb": 63.49,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {
+        "file_path,limit,offset": 1
+      },
+      "read_failure_classes": {},
+      "repetition": 0,
+      "request_json_bytes": [
+        5987,
+        19708,
+        20080,
+        20532,
+        20941
+      ],
+      "request_lcp_bytes": [
+        5985,
+        19706,
+        20078,
+        20530
+      ],
+      "request_response_sizes": [
+        [
+          5987,
+          8734
+        ],
+        [
+          19708,
+          6746
+        ],
+        [
+          20080,
+          18038
+        ],
+        [
+          20532,
+          9075
+        ],
+        [
+          20941,
+          11223
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0004596,
+          "input_tokens": 1025,
+          "output_tokens": 31,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0027696,
+          "input_tokens": 6828,
+          "output_tokens": 24,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6784,
+          "cost_usd": 0.00081,
+          "input_tokens": 6881,
+          "output_tokens": 58,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6784,
+          "cost_usd": 0.0007964,
+          "input_tokens": 6951,
+          "output_tokens": 32,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6912,
+          "cost_usd": 0.00079,
+          "input_tokens": 7003,
+          "output_tokens": 39,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 5,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "stable_head_ratio_median": 1.0,
+      "stable_head_ratios": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "timed_out": false,
+      "tool_calls_by_name": {
+        "Bash": 2,
+        "Edit": 1,
+        "Read": 1
+      },
+      "tool_output_recovery_hint": true,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 20480,
+        "cost_usd": 0.0056256,
+        "input_tokens": 28688,
+        "output_tokens": 184,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 7049.72
+    },
+    {
+      "append_only_steps": 4,
+      "auxiliary_requests": 1,
+      "bash_model_end_bytes": 5500,
+      "case": "even_sum",
+      "client_disconnects_with_usage": 0,
+      "effort": null,
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 5987,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 49.56,
+      "first_request_tokens_estimate": 1497,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 499,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 223,
+          "name": "LS"
+        },
+        {
+          "bytes": 470,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 630,
+          "name": "run_code"
+        },
+        {
+          "bytes": 425,
+          "name": "save_program"
+        },
+        {
+          "bytes": 318,
+          "name": "run_program"
+        },
+        {
+          "bytes": 194,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 10,
+      "first_request_tools_json_bytes": 4035,
+      "first_token_ms": 789.611,
+      "harness": "aim_openrouter",
+      "harness_peak_rss_mb": 51.49,
+      "helpers_peak_rss_mb": 18.28,
+      "http_exchanges": 6,
+      "ite": 11330.0,
+      "max_tool_output_chars": 11411,
+      "missing_success_cost": false,
+      "model": "openai/gpt-4.1-mini",
+      "passed": true,
+      "peak_rss_mb": 67.35,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {
+        "file_path,limit,offset": 1
+      },
+      "read_failure_classes": {},
+      "repetition": 1,
+      "request_json_bytes": [
+        5987,
+        19709,
+        20081,
+        20589,
+        20998
+      ],
+      "request_lcp_bytes": [
+        5985,
+        19707,
+        20079,
+        20587
+      ],
+      "request_response_sizes": [
+        [
+          5987,
+          8737
+        ],
+        [
+          19709,
+          6745
+        ],
+        [
+          20081,
+          23344
+        ],
+        [
+          20589,
+          9075
+        ],
+        [
+          20998,
+          12043
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0004592,
+          "input_tokens": 1024,
+          "output_tokens": 31,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0027724,
+          "input_tokens": 6835,
+          "output_tokens": 24,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6784,
+          "cost_usd": 0.0008384,
+          "input_tokens": 6888,
+          "output_tokens": 74,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6784,
+          "cost_usd": 0.0008056,
+          "input_tokens": 6974,
+          "output_tokens": 32,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6912,
+          "cost_usd": 0.000804,
+          "input_tokens": 7026,
+          "output_tokens": 42,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 5,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "stable_head_ratio_median": 1.0,
+      "stable_head_ratios": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "timed_out": false,
+      "tool_calls_by_name": {
+        "Bash": 2,
+        "Edit": 1,
+        "Read": 1
+      },
+      "tool_output_recovery_hint": true,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 20480,
+        "cost_usd": 0.0056796,
+        "input_tokens": 28747,
+        "output_tokens": 203,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 8062.88
+    },
+    {
+      "append_only_steps": 4,
+      "auxiliary_requests": 1,
+      "bash_model_end_bytes": 15000,
+      "case": "even_sum",
+      "client_disconnects_with_usage": 0,
+      "effort": null,
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 5987,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 61.46,
+      "first_request_tokens_estimate": 1497,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 499,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 223,
+          "name": "LS"
+        },
+        {
+          "bytes": 470,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 630,
+          "name": "run_code"
+        },
+        {
+          "bytes": 425,
+          "name": "save_program"
+        },
+        {
+          "bytes": 318,
+          "name": "run_program"
+        },
+        {
+          "bytes": 194,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 10,
+      "first_request_tools_json_bytes": 4035,
+      "first_token_ms": 1181.017,
+      "harness": "aim_openrouter",
+      "harness_peak_rss_mb": 51.89,
+      "helpers_peak_rss_mb": 18.43,
+      "http_exchanges": 6,
+      "ite": 24899.2,
+      "max_tool_output_chars": 30409,
+      "missing_success_cost": false,
+      "model": "openai/gpt-4.1-mini",
+      "passed": true,
+      "peak_rss_mb": 63.9,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {
+        "file_path,limit,offset": 1
+      },
+      "read_failure_classes": {},
+      "repetition": 1,
+      "request_json_bytes": [
+        5987,
+        42191,
+        42563,
+        43071,
+        43481
+      ],
+      "request_lcp_bytes": [
+        5985,
+        42189,
+        42561,
+        43069
+      ],
+      "request_response_sizes": [
+        [
+          5987,
+          8737
+        ],
+        [
+          42191,
+          6748
+        ],
+        [
+          42563,
+          23349
+        ],
+        [
+          43071,
+          9079
+        ],
+        [
+          43481,
+          9294
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0004592,
+          "input_tokens": 1024,
+          "output_tokens": 31,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0069452,
+          "input_tokens": 17267,
+          "output_tokens": 24,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17152,
+          "cost_usd": 0.0019008,
+          "input_tokens": 17320,
+          "output_tokens": 74,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17280,
+          "cost_usd": 0.0018296,
+          "input_tokens": 17406,
+          "output_tokens": 32,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17280,
+          "cost_usd": 0.0018504,
+          "input_tokens": 17458,
+          "output_tokens": 32,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 5,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "stable_head_ratio_median": 1.0,
+      "stable_head_ratios": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "timed_out": false,
+      "tool_calls_by_name": {
+        "Bash": 2,
+        "Edit": 1,
+        "Read": 1
+      },
+      "tool_output_recovery_hint": true,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 51712,
+        "cost_usd": 0.0129852,
+        "input_tokens": 70475,
+        "output_tokens": 193,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 7143.9
+    }
+  ]
+}

@@ -140,6 +140,51 @@ pub struct CodeToolHost {
     guard: Arc<HostGuard>,
 }
 
+/// Keep common file/shell and composed service actions directly visible in code mode. Less common
+/// built-in file/search actions remain available inside cells with the complete admitted set.
+pub(crate) struct DirectCodeTools(pub Arc<dyn ToolHost>);
+
+impl ToolHost for DirectCodeTools {
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.0
+            .specs()
+            .into_iter()
+            .filter(|spec| !matches!(spec.name.as_str(), "Glob" | "Grep" | "KillShell" | "search_sessions" | "read_session"))
+            .map(|mut spec| {
+                if spec.name == "Read" {
+                    spec.description =
+                        "Read numbered file lines. offset starts at 1; limit defaults to 2000. Images return as images.".into();
+                } else if spec.name == "Bash" {
+                    spec.description = "Run a Bash command in the workspace. Long output keeps both ends and a readable handle.".into();
+                } else if spec.name == "LS" {
+                    spec.description = "List a workspace directory.".into();
+                }
+                spec
+            })
+            .collect()
+    }
+
+    fn call(&self, name: String, arguments: Value, key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
+        self.0.call(name, arguments, key)
+    }
+
+    fn reserve_blob(&self, path: String, key: IdempotencyKey) -> BoxFuture<Result<String, ProtoError>> {
+        self.0.reserve_blob(path, key)
+    }
+
+    fn finalize_blob(&self, reservation: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        self.0.finalize_blob(reservation, bytes, key)
+    }
+
+    fn cancel_blob(&self, reservation: String, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        self.0.cancel_blob(reservation, key)
+    }
+
+    fn write_blob(&self, path: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        self.0.write_blob(path, bytes, key)
+    }
+}
+
 impl CodeToolHost {
     /// Bind the session dispatcher, worker path, catalog mode, and stable session id.
     #[must_use]
@@ -393,7 +438,7 @@ impl ToolHost for CodeToolHost {
             CodeMode::RunCode => vec![spec(
                 "run_code",
                 &format!(
-                    "Run JavaScript or TypeScript statements in an isolated async cell. Execute code at top level; do not only define a function. Use await tools.NAME(args) for admitted tools. Each call returns a ToolResult object with content; text is in result.content[0].text. Emit the answer with text(value).\n{index}"
+                    "Run JavaScript/TypeScript in an isolated async cell. Execute statements at top level, not only a function definition. Call await tools.NAME(args); each returns a ToolResult with text in result.content[0].text. Emit results with text(value).\n{index}"
                 ),
                 ToolInput::Json,
                 json!({"type":"object","properties":{"code":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":300_000}},"required":["code"]}),
@@ -402,7 +447,7 @@ impl ToolHost for CodeToolHost {
                 spec(
                     "exec",
                     &format!(
-                        "Run raw JavaScript in an isolated async cell. Use tools.NAME(args), ALL_TOOLS, describe(name), search(query), text(value), notify(value), store(key,value), load(key), yield_control(). Nested calls return ToolResult objects with text in result.content[0].text. Optional first line: // @exec: {{\"yield_time_ms\":10000,\"max_output_tokens\":1000}}. A running cell returns its ID for wait.\n{index}"
+                        "Run raw JavaScript in an isolated async cell. Use await tools.NAME(args), text(value), store/load, notify and yield_control(). Nested text is result.content[0].text. Optional // @exec: {{\"yield_time_ms\":10000,\"max_output_tokens\":1000}}; use wait for running cells.\n{index}"
                     ),
                     ToolInput::Freeform { syntax: None, definition: None },
                     Value::Null,

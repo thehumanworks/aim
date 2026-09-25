@@ -115,6 +115,32 @@ async fn live_codex_text_turn() -> Result<(), LlmError> {
     Ok(())
 }
 
+/// Ten real model steps with one stable session and cache key; prints numeric usage only.
+#[tokio::test]
+#[ignore = "live: ten ChatGPT subscription requests for the W26 cache probe"]
+async fn live_codex_cache_ten_steps() -> Result<(), LlmError> {
+    let provider = CodexProvider::new()?;
+    let mut request = request("Reply OK to step 1.");
+    request.model = "gpt-6-sol".into();
+    request.instructions = format!("Reply OK to each step. {}", "Keep this instruction prefix stable. ".repeat(180));
+    request.cache_key = Some("aim:w26:cache-probe".into());
+    let mut totals = (0_u64, 0_u64);
+    for step in 1..=10 {
+        if step > 1 {
+            request.items.push(Item::User { parts: vec![Part::Text { text: format!("Reply OK to step {step}.") }] });
+        }
+        request.turn_id = Some(format!("turn-{step}"));
+        let result = run(&provider, request.clone()).await?;
+        let usage = result.usage();
+        totals.0 = totals.0.saturating_add(usage.input_tokens);
+        totals.1 = totals.1.saturating_add(usage.cached_input_tokens);
+        eprintln!("cache step={step} input={} cached={}", usage.input_tokens, usage.cached_input_tokens);
+        request.items.extend(result.items());
+    }
+    eprintln!("cache ten steps input={} cached={}", totals.0, totals.1);
+    Ok(())
+}
+
 /// Tool call → replay with `function_call_output` → final text, within one turn (the
 /// follow-up echoes the turn's `x-codex-turn-state`).
 #[tokio::test]

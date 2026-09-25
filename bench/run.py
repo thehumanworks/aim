@@ -10,20 +10,24 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import Counter
 import hashlib
 import json
 import math
 import os
 import platform
 import re
+import shutil
 import signal
 import socket
 import subprocess
 import statistics
 import sys
 import tempfile
+import threading
 import time
 import tomllib
+from contextlib import contextmanager
 from pathlib import Path
 
 from live_tasks import grade, prepare
@@ -34,6 +38,23 @@ MANIFEST = BENCH / "manifest.toml"
 PROXY = BENCH / "proxy.py"
 CODEX_AUTH = Path.home() / ".codex"
 BASE_ENV = os.environ.copy()
+
+
+@contextmanager
+def temporary_workspace():
+    """Wait briefly for a peer's just-exited helper to stop touching its isolated HOME."""
+    path = Path(tempfile.mkdtemp(prefix="aim-bench-"))
+    try:
+        yield path
+    finally:
+        for attempt in range(10):
+            try:
+                shutil.rmtree(path)
+                break
+            except OSError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
 
 
 def pinned(name: str) -> Path:
@@ -92,6 +113,98 @@ def peak_rss(stderr: str) -> float | None:
     return None
 
 
+def update_diagnostics(stdout: bytes) -> dict:
+    """Keep only tool names and failure classes, never model text or tool arguments."""
+    calls: Counter[str] = Counter()
+    failed_tools: Counter[str] = Counter()
+    patterns: Counter[str] = Counter()
+    read_failures: Counter[str] = Counter()
+    read_argument_keys: Counter[str] = Counter()
+    terminal = None
+    for line in stdout.decode(errors="replace").splitlines():
+        try:
+            update = json.loads(line)
+        except ValueError:
+            continue
+        kind = update.get("type")
+        name = update.get("name")
+        if kind == "tool_started" and isinstance(name, str):
+            calls[name] += 1
+            if name == "Read":
+                try:
+                    arguments = json.loads(update.get("arguments") or "{}")
+                    if isinstance(arguments, dict):
+                        keys = tuple(sorted(key if key in {"file_path", "offset", "limit"} else "other"
+                                            for key in arguments))
+                        read_argument_keys[",".join(keys)] += 1
+                except (TypeError, ValueError):
+                    read_argument_keys["invalid_json"] += 1
+        elif kind == "tool_finished" and isinstance(name, str):
+            result = update.get("result") or {}
+            if result.get("is_error"):
+                failed_tools[name] += 1
+            content = result.get("content") or []
+            text = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))[:2048]
+            if name == "Read" and result.get("is_error"):
+                failure = ("past_end" if "is past the end" in text else
+                           "missing_file" if "No such file" in text or "not found" in text or "does not exist" in text else
+                           "invalid_arguments" if "arguments" in text or "file_path" in text else
+                           "directory" if "is a directory" in text else
+                           "denied" if "denied" in text or "outside" in text else "other")
+                read_failures[failure] += 1
+            for marker in ("SyntaxError", "ReferenceError", "TypeError", "unknown tool", "not found",
+                           "is not a function", "Script running", "Traceback", "AssertionError"):
+                if marker in text:
+                    patterns[marker] += 1
+        elif kind == "turn_failed":
+            message = str(update.get("message", ""))
+            terminal = "max_requests" if "too many" in message or "exceeded" in message else "provider" if "provider" in message else "other"
+    return {"tool_calls_by_name": dict(calls), "failed_tools_by_name": dict(failed_tools),
+            "tool_result_pattern_counts": dict(patterns), "read_failure_classes": dict(read_failures),
+            "read_argument_keys": dict(read_argument_keys), "turn_failure_class": terminal}
+
+
+class ProcessTreeRss:
+    """Sample the isolated process group so aimx counts alongside aim."""
+
+    def __init__(self, pgid: int):
+        self.pgid = pgid
+        self.stop = threading.Event()
+        self.peak_bytes = 0
+        self.helper_peak_bytes = 0
+        self.thread = threading.Thread(target=self.sample, daemon=True)
+        self.thread.start()
+
+    def sample(self) -> None:
+        while not self.stop.is_set():
+            try:
+                rows = subprocess.run(["ps", "-axo", "pgid=,rss=,comm="], capture_output=True, text=True,
+                                      timeout=2, check=True).stdout.splitlines()
+            except (OSError, subprocess.SubprocessError):
+                break
+            total = helpers = 0
+            for row in rows:
+                fields = row.split(maxsplit=2)
+                if len(fields) != 3 or fields[0] != str(self.pgid):
+                    continue
+                try:
+                    size = int(fields[1]) * 1024
+                except ValueError:
+                    continue
+                total += size
+                if Path(fields[2]).name in {"aimx", "aim-coderun"}:
+                    helpers += size
+            self.peak_bytes = max(self.peak_bytes, total)
+            self.helper_peak_bytes = max(self.helper_peak_bytes, helpers)
+            self.stop.wait(0.01)
+
+    def finish(self) -> tuple[float | None, float | None]:
+        self.stop.set()
+        self.thread.join(timeout=3)
+        return (round(self.peak_bytes / 1_000_000, 2) if self.peak_bytes else None,
+                round(self.helper_peak_bytes / 1_000_000, 2) if self.helper_peak_bytes else None)
+
+
 def isolated_env(home: Path) -> dict[str, str]:
     env = {name: BASE_ENV[name] for name in ("PATH", "LANG", "LC_ALL", "TMPDIR", "USER") if name in BASE_ENV}
     env.update(HOME=str(home), AIM_HOME=str(home / ".aim"), XDG_CONFIG_HOME=str(home / ".config"),
@@ -105,7 +218,9 @@ def invocation(harness: str, paths: dict[str, Path], home: Path, url: str, model
     env = isolated_env(home)
     env["PATH"] = str(paths["python"].parent) + os.pathsep + env.get("PATH", "")
     if harness.startswith("aim_"):
-        env["AIM_CODERUN"] = str(paths["aim_coderun"])
+        env["AIM_CODERUN"] = str(home / "missing-worker") if BASE_ENV.get("AIM_BENCH_CODE_MODE") == "off" else str(paths["aim_coderun"])
+        if "AIM_BASH_MODEL_END_BYTES" in BASE_ENV:
+            env["AIM_BASH_MODEL_END_BYTES"] = BASE_ENV["AIM_BASH_MODEL_END_BYTES"]
     if harness == "aim_openrouter":
         env["AIM_OPENROUTER_BASE_URL"] = url + "/v1"
         env["OPENROUTER_API_KEY"] = "fixture" if mode == "mock" else BASE_ENV["OPENROUTER_API_KEY"]
@@ -162,9 +277,16 @@ def invocation(harness: str, paths: dict[str, Path], home: Path, url: str, model
 
 
 def path_map(args: argparse.Namespace) -> dict[str, Path]:
-    paths = {"aim": ROOT / "target/debug/aim", "aimx": ROOT / "target/debug/aimx",
-             "aim_coderun": ROOT / "target/debug/aim-coderun", "codex": pinned("codex"),
+    metadata = subprocess.run(["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"],
+                              cwd=ROOT, capture_output=True, text=True, check=True)
+    debug = Path(json.loads(metadata.stdout)["target_directory"]) / "debug"
+    paths = {"aim": debug / "aim", "aimx": debug / "aimx",
+             "aim_coderun": debug / "aim-coderun", "codex": pinned("codex"),
              "pi": pinned("pi"), "python": pinned("python")}
+    for name in ("aim", "aimx", "aim_coderun"):
+        override = getattr(args, f"{name}_bin", None)
+        if override is not None:
+            paths[name] = override.resolve()
     if args.omp:
         paths["omp"] = args.omp.resolve()
         paths["bun"] = pinned("bun")
@@ -174,11 +296,11 @@ def path_map(args: argparse.Namespace) -> dict[str, Path]:
 
 
 def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], mode: str, model: str,
-             effort: str | None, timeout: int) -> dict:
+             effort: str | None, timeout: int, spend_cap_usd: float | None = None,
+             request_reserve_usd: float = 0.0) -> dict:
     borrowed_auth = CODEX_AUTH / "auth.json"
     auth_before = executable_hash(borrowed_auth) if harness == "aim_codex" and borrowed_auth.exists() else None
-    with tempfile.TemporaryDirectory(prefix="aim-bench-") as temp:
-        root = Path(temp)
+    with temporary_workspace() as root:
         home, workspace = root / "home", root / "work"
         home.mkdir()
         if mode == "live":
@@ -194,22 +316,28 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
         incoming = "/backend-api/codex" if harness == "aim_codex" else "/v1"
         upstream_base = "/backend-api/codex" if harness == "aim_codex" else "/api/v1"
         recorder = root / "requests.jsonl"
+        pgid_file = root / "harness-pgid"
         proxy_command = [sys.executable, "-B", str(PROXY), "--port", str(port), "--out", str(recorder),
                          "--mode", "mock" if mode == "wire" else "live", "--model", model,
                          "--scenario", case.get("scenario", "reply"), "--steps", str(case.get("steps", 0)),
                          "--command", case.get("command", "true"), "--harness", harness, "--upstream-host", upstream,
-                         "--incoming-base", incoming, "--upstream-base", upstream_base]
+                         "--incoming-base", incoming, "--upstream-base", upstream_base,
+                         "--pgid-file", str(pgid_file)]
+        if spend_cap_usd is not None:
+            proxy_command.extend(["--spend-cap-usd", str(spend_cap_usd), "--request-reserve-usd", str(request_reserve_usd)])
         with (root / "proxy.stderr").open("wb") as proxy_stderr:
             proxy = subprocess.Popen(proxy_command, stdout=subprocess.DEVNULL, stderr=proxy_stderr)
             try:
                 wait_port(port, proxy)
                 env, command = invocation(harness, paths, home, url, model, case["prompt"], "mock" if mode == "wire" else "live",
                                           effort, workspace)
-                start_ns = time.time_ns()
+                start_ns = time.monotonic_ns()
                 started = time.monotonic()
                 process = subprocess.Popen(time_command(command), cwd=workspace, env=env,
                                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                            start_new_session=True)
+                pgid_file.write_text(str(process.pid))
+                rss = ProcessTreeRss(process.pid)
                 timed_out = False
                 try:
                     stdout, stderr = process.communicate(timeout=timeout)
@@ -218,6 +346,7 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
                     os.killpg(process.pid, signal.SIGKILL)
                     stdout, stderr = process.communicate()
                 wall_ms = round((time.monotonic() - started) * 1000, 2)
+                tree_rss_mb, helpers_rss_mb = rss.finish()
             finally:
                 proxy.terminate()
                 try:
@@ -227,6 +356,9 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
                     proxy.wait()
         all_rows = [json.loads(line) for line in recorder.read_text().splitlines()] if recorder.exists() else []
         rows = [row for row in all_rows if row.get("kind") == "model"]
+        append_only_steps = sum(row.get("append_only_with_previous") is True for row in rows[1:])
+        stable_head_ratios = [row["stable_head_bytes_with_previous"] / row["stable_head_previous_bytes"]
+                              for row in rows[1:] if row.get("stable_head_previous_bytes")]
         usage = {field: sum(row.get("usage", {}).get(field, 0) for row in rows) for field in
                  ("input_tokens", "cached_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "cost_usd")}
         transport_errors = [row for row in rows if row.get("status") != 200]
@@ -239,27 +371,42 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
             usage["cost_usd"] = None
         ite = None if not usage_complete else round(usage["input_tokens"] - usage["cached_tokens"] - usage["cache_write_tokens"]
                + 0.1 * usage["cached_tokens"] + 1.25 * usage["cache_write_tokens"] + 5 * usage["output_tokens"], 2)
+        harness_rss_mb = peak_rss(stderr.decode(errors="replace"))
+        peak_tree_mb = max((value for value in (tree_rss_mb, harness_rss_mb, *(row.get("process_group_rss_mb") for row in rows))
+                            if value is not None), default=None)
+        helpers_rss_mb = max((value for value in (helpers_rss_mb, *(row.get("helpers_rss_mb") for row in rows))
+                              if value is not None), default=None)
         result = {"harness": harness, "case": case["id"], "repetition": repetition, "model": model,
                   "effort": effort, "exit_code": process.returncode, "timed_out": timed_out, "wall_ms": wall_ms,
-                  "peak_rss_mb": peak_rss(stderr.decode(errors="replace")), "requests": len(rows),
+                  "peak_rss_mb": peak_tree_mb, "harness_peak_rss_mb": harness_rss_mb,
+                  "helpers_peak_rss_mb": helpers_rss_mb, "requests": len(rows),
                   "auxiliary_requests": len(all_rows) - len(rows), "http_exchanges": len(all_rows),
-                  "first_request_ms": round((rows[0]["arrival_wall_ns"] - start_ns) / 1e6, 2) if rows else None,
+                  "first_request_ms": round((rows[0]["arrival_monotonic_ns"] - start_ns) / 1e6, 2) if rows else None,
                   "first_request_bytes": rows[0]["request_json_bytes"] if rows else None,
                   "first_request_tokens_estimate": rows[0]["request_tokens_estimate"] if rows else None,
                   "first_request_tools": rows[0]["tools_count"] if rows else None,
+                  "first_request_tools_json_bytes": rows[0]["tools_json_bytes"] if rows else None,
+                  "first_request_tool_schema_bytes": rows[0]["tool_schema_bytes"] if rows else [],
                   "first_request_instructions_chars": rows[0]["instructions_chars"] if rows else None,
                   "first_token_ms": rows[0].get("first_token_ms") if rows else None,
                   "request_lcp_bytes": [row["lcp_bytes_with_previous"] for row in rows[1:]],
+                  "append_only_steps": append_only_steps,
+                  "stable_head_ratios": stable_head_ratios,
+                  "stable_head_ratio_median": statistics.median(stable_head_ratios) if stable_head_ratios else None,
                   "request_json_bytes": [row["request_json_bytes"] for row in rows],
                   "max_tool_output_chars": max((row["tool_output_chars"] for row in rows), default=0),
                   "tool_output_recovery_hint": any(row["tool_output_has_recovery_hint"] for row in rows),
                   "provider_usage_complete": usage_complete, "usage": usage,
+                  "request_usage": [row.get("usage", {}) for row in rows],
                   "provider_cost_complete": cost_complete,
                   "missing_success_cost": missing_success_cost,
                   "transport_errors": len(transport_errors),
+                  "client_disconnects_with_usage": sum(row.get("client_disconnected") is True and bool(row.get("usage")) for row in rows),
+                  "proxy_spend_cap_hit": any(row.get("spend_cap_hit") is True for row in rows),
                   "proxy_error_types": [row.get("proxy_error_type") for row in transport_errors],
                   "ite": ite, "request_response_sizes": [[row["request_wire_bytes"], row["response_bytes"]] for row in rows],
                   "response_statuses": [row["status"] for row in rows]}
+        result.update(update_diagnostics(stdout))
         if harness == "aim_codex":
             result["borrowed_codex_auth_unchanged"] = auth_before is not None and executable_hash(borrowed_auth) == auth_before
         if mode == "live":
@@ -303,7 +450,15 @@ def main() -> None:
     parser.add_argument("--cases", help="comma-separated case/task ids for diagnosis")
     parser.add_argument("--omp", type=Path, help="local pinned oh-my-pi artifact")
     parser.add_argument("--unreal", type=Path, help="local pinned unreal-agent artifact")
+    parser.add_argument("--aim-bin", type=Path, help="measured aim executable (e.g. the baseline build)")
+    parser.add_argument("--aimx-bin", type=Path, help="measured aimx executable")
+    parser.add_argument("--aim-coderun-bin", type=Path, help="measured code worker executable")
+    parser.add_argument("--source-sha", help="source commit of an explicitly supplied baseline binary")
+    parser.add_argument("--no-gate", action="store_true", help="record a diagnostic or immutable baseline without comparison")
     args = parser.parse_args()
+    if args.source_sha and (not re.fullmatch(r"[0-9a-f]{40}", args.source_sha)
+                            or any(getattr(args, f"{name}_bin") is None for name in ("aim", "aimx", "aim_coderun"))):
+        parser.error("--source-sha needs a 40-character hash and all three aim executable overrides")
     with MANIFEST.open("rb") as stream:
         manifest = tomllib.load(stream)
     tier = manifest[args.tier]
@@ -342,7 +497,8 @@ def main() -> None:
         for repetition in range(repetitions):
             rotated = harnesses[(case_index + repetition) % len(harnesses):] + harnesses[:(case_index + repetition) % len(harnesses)]
             for harness in rotated:
-                if args.tier == "live" and budget_used >= tier["max_spend_usd"]:
+                reserve = tier.get("max_request_spend_usd", 0.0) if args.tier == "live" and harness != "aim_codex" else 0.0
+                if args.tier == "live" and harness != "aim_codex" and budget_used + reserve > tier["max_spend_usd"]:
                     break
                 if harness == "aim_codex" and args.tier == "live":
                     if subscription_runs >= tier["max_subscription_runs"]:
@@ -350,7 +506,9 @@ def main() -> None:
                     subscription_runs += 1
                 model = tier["model"] if args.tier == "wire" else tier["codex_model"] if harness == "aim_codex" else tier["openrouter_model"]
                 effort = tier["effort"] if args.tier == "wire" else tier["codex_effort"] if harness == "aim_codex" else None
-                row = run_once(harness, case, repetition, paths, args.tier, model, effort, tier.get("timeout_seconds", 90))
+                remaining = tier["max_spend_usd"] - budget_used if args.tier == "live" and harness != "aim_codex" else None
+                row = run_once(harness, case, repetition, paths, args.tier, model, effort, tier.get("timeout_seconds", 90),
+                               spend_cap_usd=remaining, request_reserve_usd=reserve)
                 runs.append(row)
                 if args.tier == "live" and harness != "aim_codex":
                     if row["missing_success_cost"]:
@@ -361,11 +519,11 @@ def main() -> None:
                 print(json.dumps({"harness": harness, "case": case["id"], "rep": repetition,
                                   "passed": row["passed"], "exit": row["exit_code"], "requests": row["requests"],
                                   "ite": row["ite"], "cost_usd": row["usage"]["cost_usd"]}), flush=True)
-            if args.tier == "live" and budget_used >= tier["max_spend_usd"]:
+            if args.tier == "live" and budget_used + tier.get("max_request_spend_usd", 0.0) > tier["max_spend_usd"]:
                 break
-        if args.tier == "live" and budget_used >= tier["max_spend_usd"]:
+        if args.tier == "live" and budget_used + tier.get("max_request_spend_usd", 0.0) > tier["max_spend_usd"]:
             break
-    result = {"tier": args.tier, "manifest_sha256": executable_hash(MANIFEST), "source_sha": subprocess.run(
+    result = {"tier": args.tier, "manifest_sha256": executable_hash(MANIFEST), "source_sha": args.source_sha or subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip(),
         "hardware": {"platform": platform.platform(), "machine": platform.machine(), "python": platform.python_version()},
         "started_unix": started, "finished_unix": time.time(), "binary_sha256": {name: executable_hash(path) for name, path in paths.items()},
@@ -375,6 +533,15 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(f"wrote {args.out}", flush=True)
+    if args.tier == "wire" and not args.no_gate:
+        from compare import compare_wire
+        baseline = json.loads((BENCH / "results/w26-main-baseline.json").read_text())
+        errors = compare_wire(result, baseline, manifest)
+        if errors:
+            for error in errors:
+                print(f"wire regression: {error}", file=sys.stderr)
+            raise SystemExit(1)
+        print("wire gate passed", flush=True)
 
 
 if __name__ == "__main__":

@@ -129,19 +129,14 @@ impl MediaClient {
 
     /// Whether usable ChatGPT credentials can currently be acquired without exposing them.
     pub async fn has_credentials(&self) -> bool {
-        if self.provider.auth.credentials().await.is_err() {
-            return false;
-        }
-        if self.config.search_model.is_none() && self.config.search_from_catalog && self.resolve_search_model().await.is_err() {
-            log_search_catalog_unavailable();
-        }
-        true
+        self.provider.auth.credentials().await.is_ok()
     }
 
     /// Whether standalone web search is configured.
     #[must_use]
     pub fn search_enabled(&self) -> bool {
         self.config.search_model.as_ref().is_some_and(|model| !model.trim().is_empty())
+            || self.config.search_from_catalog
             || self.resolved_search_model.read().is_ok_and(|selected| selected.is_some())
     }
 
@@ -356,11 +351,6 @@ fn log_unknown_search_item() {
     if std::env::var_os("AIM_CODEX_MEDIA_DEBUG").is_some() {
         eprintln!("Codex web search ignored an unknown output item");
     }
-}
-
-#[expect(clippy::print_stderr, reason = "diagnostic contains only static text and no catalog or credential data")]
-fn log_search_catalog_unavailable() {
-    eprintln!("Codex web search unavailable: catalog did not yield a usable model");
 }
 
 fn timeout(capability: &str) -> LlmError {

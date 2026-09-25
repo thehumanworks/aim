@@ -51,8 +51,20 @@ def grade(task_id: str, workspace: Path) -> bool:
     """Run the task's independent tests, without trusting a harness's own summary."""
     with tempfile.TemporaryDirectory(prefix="aim-hidden-grader-") as temporary:
         hidden = Path(temporary)
+        home = hidden / "home"
+        home.mkdir()
+        for name in TASKS[task_id]:
+            if name == "test_task.py":
+                continue
+            source = workspace / name
+            if source.is_symlink() or not source.is_file() or source.stat().st_size > 1_000_000:
+                return False
+            (hidden / name).write_bytes(source.read_bytes())
         (hidden / "test_task.py").write_text(TASKS[task_id]["test_task.py"], encoding="utf-8")
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(workspace))
-        result = subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-s", str(hidden), "-q"],
-                                cwd=hidden, env=env, capture_output=True, timeout=30)
+        env = {"HOME": str(home), "TMPDIR": str(home), "PYTHONDONTWRITEBYTECODE": "1", "LANG": "C.UTF-8"}
+        try:
+            result = subprocess.run([sys.executable, "-I", "-B", "-m", "unittest", "discover", "-s", str(hidden), "-q"],
+                                    cwd=hidden, env=env, capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
         return result.returncode == 0

@@ -72,6 +72,7 @@ Rules (enforced by `mise run check`):
 | [0053](0053-network-token-call-scope-ceilings.md) | Bind network bearer scopes to harness sessions. |
 | [0054](0054-reserve-image-destination-before-generation.md) | Reserve image destinations before paid generation. |
 | [0055](0055-board-attempt-identity-and-worker-boundary.md) | Bind cleanup to an attempt and narrow worker authority. |
+| [0056](0056-startup-catalog-and-model-output-budget.md) | Reuse startup capabilities and bound model-visible shell output. |
 | [0063](0063-compose-native-mcp-and-board-tools.md) | Compose trusted MCP and durable board tools, with a private last-known MCP catalog. |
 | [0064](0064-ui-surfaces-envelope-events-and-agent-tools.md) | Carry agent UI surfaces as validated, logged A2UI-shaped messages. |
 | [0065](0065-locked-digests-resolve-names-by-module.md) | LOCKED digests resolve kernel names by module. |

@@ -1,0 +1,105 @@
+{
+  "cohorts": [
+    {
+      "artifact": "bench/results/w26-before-live.json",
+      "name": "task-start paired baseline",
+      "provider_reported_usd": 0.075642,
+      "unpriced_transport_reserve_usd": 0.05
+    },
+    {
+      "artifact": "bench/results/w26-after-live.json",
+      "name": "intermediate paired candidate",
+      "provider_reported_usd": 0.077746,
+      "unpriced_transport_reserve_usd": 0.1
+    },
+    {
+      "artifact": null,
+      "local_diagnostic_name": "w26-slug-diagnostic.json",
+      "name": "slug diagnosis",
+      "provider_reported_usd": 0.006714,
+      "unpriced_transport_reserve_usd": 0.0
+    },
+    {
+      "artifact": null,
+      "local_diagnostic_name": "w26-slug-diagnostic2.json",
+      "name": "slug diagnosis",
+      "provider_reported_usd": 0.007147,
+      "unpriced_transport_reserve_usd": 0.0
+    },
+    {
+      "artifact": null,
+      "local_diagnostic_name": "w26-slug-diagnostic3.json",
+      "name": "slug diagnosis",
+      "provider_reported_usd": 0.003032,
+      "unpriced_transport_reserve_usd": 0.0
+    },
+    {
+      "artifact": null,
+      "local_diagnostic_name": "w26-slug-diagnostic4.json",
+      "name": "slug diagnosis",
+      "provider_reported_usd": 0.006066,
+      "unpriced_transport_reserve_usd": 0.0
+    },
+    {
+      "artifact": null,
+      "local_diagnostic_name": "w26-pre-rebase-live-openrouter.json",
+      "name": "pre-rebase paired candidate",
+      "provider_reported_usd": 0.225086,
+      "unpriced_transport_reserve_usd": 0.0
+    },
+    {
+      "artifact": "bench/results/w26-final-live-openrouter.json",
+      "name": "final rebased paired candidate",
+      "provider_reported_usd": 0.0921,
+      "unpriced_transport_reserve_usd": 0.0
+    },
+    {
+      "artifact": null,
+      "name": "superseded first two-repetition candidate (console transcript)",
+      "provider_reported_usd": 0.241877,
+      "unpriced_transport_reserve_usd": 0
+    },
+    {
+      "artifact": null,
+      "name": "prior output-budget paired probe (console transcript)",
+      "provider_reported_usd": 0.0373592,
+      "unpriced_transport_reserve_usd": 0
+    },
+    {
+      "artifact": "bench/results/w26-output-budget.json",
+      "name": "final output-budget paired probe",
+      "provider_reported_usd": 0.0372896,
+      "unpriced_transport_reserve_usd": 0
+    },
+    {
+      "artifact": "bench/results/w26-exploratory-cache-openrouter.json",
+      "name": "exploratory OpenRouter cache task",
+      "provider_reported_usd": 0.0030704,
+      "unpriced_transport_reserve_usd": 0
+    },
+    {
+      "artifact": "bench/results/w26-openrouter-cache.json",
+      "name": "OpenRouter ten-step cache before",
+      "provider_reported_usd": 0.00318,
+      "unpriced_transport_reserve_usd": 0
+    },
+    {
+      "artifact": "bench/results/w26-openrouter-cache.json",
+      "name": "OpenRouter ten-step cache after",
+      "provider_reported_usd": 0.00318,
+      "unpriced_transport_reserve_usd": 0
+    }
+  ],
+  "conservative_total_usd": 0.9824192,
+  "note": "Two superseded probe totals were transcribed from completed console summaries before their artifact paths were overwritten; all other costs come from the named numeric artifacts.",
+  "provider_reported_usd": 0.8194892,
+  "task_cap_usd": 1.0,
+  "unpriced_transport_reserve_usd": 0.15,
+  "unproxied_sonnet5_smoke": {
+    "basis": "All input priced at OpenRouter Sonnet 5 1h cache-write rate ($4/M), output at $10/M; actual billing may be lower.",
+    "cost_upper_bound_usd": 0.01293,
+    "input_tokens": 2720,
+    "output_tokens": 205,
+    "pricing_source": "https://openrouter.ai/anthropic/claude-sonnet-5"
+  }
+}

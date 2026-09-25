@@ -15,6 +15,10 @@ harnesses = ["aim_openrouter", "codex", "pi"]
 optional_harnesses = ["omp", "unreal"] # require pinned local artifacts supplied to run.py
 max_concurrency = 1
 prewarm_mock_runs = 1
+aim_w1_max_bytes = 6000
+aim_w2_max_tool_output_chars = 12088
+aim_expected_tools = 10
+aim_max_auxiliary_requests = 1
 
 [[wire.case]]
 id = "W1"
@@ -47,7 +51,8 @@ steps = 20
 repetitions = 2
 max_concurrency = 1
 prewarm_mock_runs = 1
-max_spend_usd = 1.50
+max_spend_usd = 1.00
+max_request_spend_usd = 0.60 # reserved at the proxy before each OpenRouter request; reviewed model/context bound
 unpriced_transport_reserve_usd = 0.05
 max_subscription_runs = 12
 pass_noninferiority_delta_pp = 8
