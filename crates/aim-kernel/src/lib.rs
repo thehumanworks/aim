@@ -34,6 +34,7 @@ pub mod dedup;
 pub mod discovery;
 pub mod effort;
 pub mod job;
+pub mod model_match;
 pub mod negotiate;
 pub mod path;
 pub mod policy;
