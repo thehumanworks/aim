@@ -19,6 +19,8 @@ not say. It is itself a target of aim's self-improvement loop: keep it short and
 - `mise run smoke` — live smoke tests (`#[ignore]` tests named `live_*`) against real services with
   the maintainer's credentials. They are **required** evidence for every integration (ADR 0022);
   mocks and fixtures are additional, never a substitute. Never print a token, key or secret.
+- `mise run build` / `tui` / `web:run` / `web:token` — release build (stops a stale daemon),
+  the TUI, and the web UI served by a foreground daemon. Use these rather than ad-hoc commands.
 
 ## Rules that are easy to get wrong
 
