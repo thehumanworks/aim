@@ -51,7 +51,7 @@ The codex review REV8 (`scratchpad/reviews/REV8.md`) and Claude's review REV9 (`
 - `providers::services()` wires production:
   - codex media tools when codex credentials exist;
   - `JevDecider` when `TYPESAFE_API_KEY` is set.
-- A decider is attached only to persistent sessions (0013). The skill budget uses the context window of the model the session will actually run, so an agent that selects another model is budgeted for that model (REV8-15).
+- A decider is attached only to persistent sessions (0013). Media tools are composed with `Dispatcher::with_policy`, allowed for persistent sessions only. Private and ephemeral sessions have no per-session opt-in yet, so they get none (0042). The skill budget uses the context window of the model the session will actually run, so an agent that selects another model is budgeted for that model (REV8-15).
 
 **Discovery admits before it reads** (amends 0033's bounds). Every file requested counts against `max_files`: the fixed files, then the listed ones. Before a batch is sent, it is sized to the budget left:
 - at most `READ_BATCH` files;
