@@ -26,7 +26,7 @@ client still builds.
 | T2 | `/clear` clears the chat and starts fresh | done | Merged with T1 (transcript, inline rows, row cache, screen + scrollback best effort, new session) | With T1 | with T1 |
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | done | Merged incl. REV-T4a and REV-T4a-b fixes (`e569a5e`) | Residual in ADR 0076: aimx needs a SIGTERM handler (orphan shells if it ignores close) | `agent/claude/code-mode` · `../aim-wt/code-mode` |
-| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | review | Merged (`ad49be0`, merge `02d987e`): wire gate passes; pre-registered benchmark chose default `off`; follow-up running (code-mode prompt section only when code tools are offered); codex REV-T4b running | Merge follow-up; close | `agent/claude/code-mode-bench` |
+| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | review | Merged (`f286d31`): exact graders, cohort 2 rerun (rule: off), default On per maintainer, wire baseline at the default | Codex re-check of the grader fix + default flip | `agent/claude/code-mode-bench` |
 | T4c | Per-session code mode: client-side `AIM_CODE_MODE` / `--code-mode` carried in the session spec, kept on resume and `/new`, shown in the status line; ACP relay follows it | in progress | T4a's worker (context kept), on `agent/claude/code-mode` | Merge; codex review | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | done | Merged incl. REV-T5 fixes (`c4a1b35`); codex re-check: MERGE | Follow-up (not in this batch): adapter resets mode/effort on model switch | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
@@ -168,3 +168,8 @@ client still builds.
   status-line indicator (T4c); (2) make code mode the DEFAULT (`on`), overriding the benchmark
   rule's `off` — T4b's worker flips DEFAULT_MODE, re-records the wire baseline and records the
   override in ADR 0076 next to the (rerun) numbers.
+- 2026-09-25 — T4b final merged: graders exact (false passes now fail; cohort 1 kept reports
+  re-grade unchanged); cohort 2 (gpt-4.1-mini, 3×9, rotated arms): off 23/27, on 24/27, only 16/27;
+  scripting requests off 5.56 / on 7.33; rule verdict `off`. Shipped DEFAULT_MODE = On (maintainer).
+  Wire at default: W1 7,745 B, 14 tools; bound 7,793. OpenRouter total $0.94 of $3; no new
+  codex/Claude runs; auth.json unchanged. Branch Verus 360 verified.
