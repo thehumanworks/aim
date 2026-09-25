@@ -2,6 +2,16 @@
 
 lockfile_version = 2
 
+[[tools.bun]]
+version = "1.4.2"
+backend = "core:bun"
+specifiers = ["1.4.2"]
+
+[[tools.codex]]
+version = "0.158.0-alpha.10"
+backend = "aqua:openai/codex"
+specifiers = ["0.158.0-alpha.10"]
+
 [[tools."github:verus-lang/verus"]]
 version = "0.2026.09.20.aef82ed"
 backend = "github:verus-lang/verus"
@@ -94,6 +104,16 @@ url = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-win-x64.zip"
 version = "0.81.2"
 backend = "npm:@agentclientprotocol/claude-agent-acp"
 specifiers = ["0.81.2"]
+
+[[tools.pi]]
+version = "0.87.1"
+backend = "aqua:earendil-works/pi"
+specifiers = ["0.87.1"]
+
+[[tools.python]]
+version = "3.14.7"
+backend = "core:python"
+specifiers = ["3.14.7"]
 
 [[tools.rust]]
 version = "1.98.1"
