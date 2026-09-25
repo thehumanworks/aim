@@ -244,7 +244,7 @@ pub struct ClaimParams {
 }
 
 /// One-time claim receipt. Store `claim_token` privately; snapshots and events never repeat it.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClaimResult {
     /// Committed job.
     pub job: JobSnapshot,
@@ -259,7 +259,7 @@ method!(
 );
 
 /// Fenced attempt heartbeat; stale tokens and non-increasing sequences fail.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HeartbeatParams {
     /// Target job.
     pub job_id: String,
@@ -280,7 +280,7 @@ method!(
 );
 
 /// Send a bounded typed message under an active attempt.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MessageParams {
     /// Target job.
     pub job_id: String,
@@ -314,7 +314,7 @@ method!(
 );
 
 /// Complete an attempt with immutable artifact content.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CompleteParams {
     /// Target job.
     pub job_id: String,
@@ -333,7 +333,7 @@ method!(
 );
 
 /// Fail an attempt; cleanup can remain uncertain.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FailParams {
     /// Target job.
     pub job_id: String,
@@ -407,6 +407,20 @@ method!(
     /// `board.review` — record acceptance or rejection separately from execution.
     BoardReview = "board.review" (ReviewParams) -> JobSnapshot
 );
+
+// Protocol structs carry a bearer claim token. Even accidental Debug logging must redact it.
+macro_rules! redacted_claim_debug {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            impl core::fmt::Debug for $name {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.debug_struct(stringify!($name)).field("claim_token", &"***").finish()
+                }
+            }
+        )+
+    };
+}
+redacted_claim_debug!(ClaimResult, HeartbeatParams, MessageParams, CompleteParams, FailParams);
 
 /// Reconciliation read for a run after a durable event sequence.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]

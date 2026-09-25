@@ -20,7 +20,8 @@ Add typed `board.*` request/result markers and a `board.event` notification to `
 without changing existing session methods or generation 1. `board.post` can create a run namespace
 or add a job to one. The job contract includes a deliverable, acceptance criteria, explicit
 accepted dependencies, retry budget and optional workspace. A claim returns a fenced attempt and
-one-time claim token; ordinary snapshots, events and messages never repeat that secret. Attempt
+one-time claim token; ordinary snapshots, events and messages never repeat that secret. Token-bearing wire structs
+also redact it in their Rust `Debug` output. Attempt
 mutations present the attempt ID and token, while job-level mutations use observed job versions.
 Execution state and review state remain separate. Job snapshots include content-hashed artifact
 summaries so a reviewer can name exact evidence IDs without receiving the raw bytes.
