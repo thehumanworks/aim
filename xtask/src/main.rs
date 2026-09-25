@@ -1,6 +1,7 @@
 //! `cargo xtask`: repository invariants that the quality gate enforces.
 //!
-//! - `cargo xtask check` — ADR hygiene, kernel API rules, LOCKED decision digests.
+//! - `cargo xtask check` — ADR hygiene, kernel API rules, LOCKED decision digests, the
+//!   execution layer's OS-access boundary.
 //! - `cargo xtask locked --update` — re-record LOCKED digests after a maintainer-approved change.
 //!
 //! These checks turn promises in docs/architecture.md into mechanics: a `LOCKED` spec in
@@ -11,6 +12,7 @@
 mod adr;
 mod kernel;
 mod locked;
+mod osaccess;
 mod source;
 
 use std::path::{Path, PathBuf};
@@ -37,6 +39,7 @@ fn main() -> ExitCode {
             let mut findings = adr::check(&root);
             findings.extend(kernel::check(&root));
             findings.extend(locked::check(&root));
+            findings.extend(osaccess::check(&root));
             report(&findings)
         }
         ["locked", "--update"] => report(&locked::update(&root)),

@@ -29,8 +29,11 @@ not say. It is itself a target of aim's self-improvement loop: keep it short and
 - **LOCKED is protected.** A spec marked `LOCKED(ADR-NNNN)` and `crates/aim-kernel/LOCKED.toml`
   must not be edited by agents. Changing a locked decision needs the maintainer and a superseding
   ADR. You may change proofs and implementations freely as long as `mise run verify` stays green.
-- **OS access only in `aimx::workspace::local`.** Tools and everything else reach files and
-  processes through the `Workspace` trait so every call can be shadowed over SSH.
+- **OS access only in aimx's backends.** Under `crates/aimx/src`, only `workspace/local`, `ssh`
+  and `server` (and the binary entry point) may use `std::fs`/`std::process`/`tokio::fs`/
+  `tokio::process` — `cargo xtask check` enforces it. Tools reach files and processes through the
+  `Workspace` trait so every call can be shadowed over SSH. In the agent layer, project resources
+  (`AGENTS.md`, `.agents/`) are read through the workspace too.
 - **Lint exceptions** use `#[expect(lint, reason = "…")]`, never `#[allow]` (ADR 0004).
 - **Contracts change with their ADR.** A change to a protocol type in `aim-proto`, a public trait,
   a persisted format, a policy default or a verified invariant lands together with a new or

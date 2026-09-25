@@ -1,7 +1,7 @@
 # Workspace-wide clippy configuration (docs/adr/0004).
-# Execution-layer tool crates add their own clippy.toml with `disallowed-methods` for std::fs /
-# std::process / tokio::fs / tokio::process: only aim-workspace-local may touch the OS directly,
-# so every tool call goes through the Workspace trait and can be shadowed over SSH.
+# OS access in the execution layer (std::fs / std::process / tokio::fs / tokio::process) is confined
+# to aimx's backends and server plumbing by `cargo xtask check` (a module-level rule clippy cannot
+# express), so every tool call goes through the Workspace trait and can be shadowed over SSH.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true

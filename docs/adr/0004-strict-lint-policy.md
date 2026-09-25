@@ -38,9 +38,15 @@ lint no longer fires. Forbid `unsafe_code`; a platform-specific exception requir
 documented policy change rather than a broad local suppression (`Cargo.toml`,
 `[workspace.lints.rust]` and `[workspace.lints.clippy]`). Warn on `missing_docs`.
 
-Tool crates must configure `disallowed-methods`/`disallowed-types` for OS filesystem and process
-access outside `aimx::workspace::local`. This makes `Workspace` the only path to local or SSH
-effects (`docs/architecture.md`, §§9, 13; `docs/research/infra.md`, Implications A2).
+OS filesystem and process access in the execution layer is confined to its backends
+(`aimx::workspace::local`, `aimx::ssh`) and server plumbing (`aimx::server`, the binary entry
+point). `cargo xtask check` rejects `std::fs`, `std::process`, `tokio::fs` and `tokio::process`
+anywhere else under `crates/aimx/src`. This makes `Workspace` the only path to local or SSH effects
+(`docs/architecture.md`, §§9, 13; `docs/research/infra.md`, Implications A2).
+
+*Amended 2026-09-25, same day, before any dependent code:* the first version named clippy's
+`disallowed-methods`, but that configuration is crate-wide and cannot express a module boundary
+inside `aimx`; the xtask path rule replaces it.
 
 ## Consequences
 

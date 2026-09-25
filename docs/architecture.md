@@ -145,7 +145,9 @@ Method families (typed in `aim-proto::harness`):
   `exec.read {proc, after_seq, max_bytes, wait_ms}`; `exec.write_stdin | resize | signal | wait`.
 - `search.grep | glob` (streamed, bounded), `watch.start | stop` (+ `watch.event`).
 - `tools.list | tools.call` — the high-level tool surface (what MCP projects).
-- `session.resume {token, last_seq per stream}` — reconnect after SSH/WS drops.
+- Resume: a reconnecting client sends `initialize {resume: token}` within the session's TTL to
+  re-attach its processes and streams, then catches each stream up by pulling
+  `exec.read {after_seq}` — there is no separate resume method.
 - `$/cancel`, `$/progress`.
 
 **Mutation safety.** Every mutating request (`fs.write | edit | remove | rename | copy | mkdir`,
@@ -536,9 +538,11 @@ compensation are declared per step. Workflows compile onto the same job ledger a
 - **What stays local**: inference, credentials, sessions, memory, plugins, local-only MCP servers.
   The remote never sees a provider key. Remote `AGENTS.md` is loaded and labelled as remote
   (tny ADR 0040); the model's preamble states the workspace is remote.
-- **Enforcement**: inside `aimx`, only the `workspace::local` module may touch `std::fs` /
-  `std::process` (clippy `disallowed-methods` everywhere else), so a tool cannot accidentally run
-  locally — pi's SSH example greps locally; this is the failure it prevents. Plus the live
+- **Enforcement**: inside `aimx`, only the backends (`workspace::local`, `ssh`) and the server
+  plumbing (`server`, the binary entry point) may touch `std::fs` / `std::process` /
+  `tokio::fs` / `tokio::process`; `cargo xtask check` rejects them anywhere else under
+  `crates/aimx/src` (clippy's `disallowed-methods` is crate-wide and cannot express a module
+  boundary), so a tool cannot accidentally run locally — pi's SSH example greps locally; this is the failure it prevents. Plus the live
   "remote changed, local untouched" conformance suite ([§6.3](#63-the-dispatcher)).
 
 ---
@@ -679,8 +683,8 @@ races, disconnects), adversarial sandbox tests, and live smoke tests.
   against the kernel model, fixture-based contract tests, PTY screen tests for the TUI, and
   **live smoke tests** for every provider and service (required).
 - **Static rules**: strict clippy (workspace lints, `-D warnings`), `unsafe_code = forbid`
-  (narrow, documented exceptions only in platform code), `disallowed-methods` for OS access outside
-  `aimx::workspace::local`.
+  (narrow, documented exceptions only in platform code), and an xtask path rule confining OS
+  access in the execution layer to its backends and server plumbing ([§9](#9-ssh-shadowing)).
 
 ---
 

@@ -37,8 +37,9 @@ resume (research/infra.md, TL;DR, lines 13–35).
   Read remote `AGENTS.md` and `.agents/` through `Workspace`, label their origin remote,
   and state the remote workspace in the model preamble. No provider key crosses SSH.
 - Every workspace tool, including MCP, hooks, plugins, programs and code mode, must route
-  through the session's `Workspace`/aimx target. Only `aimx::workspace::local` may call
-  `std::fs` or `std::process`; Clippy `disallowed-methods` guards this boundary.
+  through the session's `Workspace`/aimx target. Only the backends (`aimx::workspace::local`,
+  `aimx::ssh`) and server plumbing may call `std::fs` or `std::process`; the `cargo xtask check`
+  path rule guards this boundary (amended 2026-09-25; see ADR 0004).
 
 ## Consequences
 
@@ -51,5 +52,5 @@ with visibly weaker guarantees; the caller must handle capability differences.
 - M1b live `remote_changed_local_untouched` conformance runs each tool source under SSH.
 - M1b fault tests cover reconnect within/after TTL, replay bounds, tampered manifest,
   local and remote hash mismatch, failed execution, and agentless capability reporting.
-- M1b Clippy gate uses `disallowed-methods` to reject OS access outside
-  `aimx::workspace::local`.
+- `cargo xtask check` rejects OS access under `crates/aimx/src` outside the backends and
+  server plumbing (in force from M1a).
