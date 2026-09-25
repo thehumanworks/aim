@@ -31,6 +31,7 @@ struct Sshd {
     dir: TempDir,
     child: Child,
     config: PathBuf,
+    sandbox: PathBuf,
 }
 
 pub(super) fn aimx_binary() -> PathBuf {
@@ -59,8 +60,11 @@ fn spawn_forward(sshd: &Sshd, root: &Path, bootstrap: &str) -> (Peer, tokio::pro
     let local_home = sshd.dir.path().join("local_home");
     std::fs::create_dir_all(&local_home).expect("local home");
     let local_root = sshd.local_root(&root.file_name().expect("workspace name").to_string_lossy());
-    let mut command = tokio::process::Command::new(aimx_binary());
+    let mut command = tokio::process::Command::new("sandbox-exec");
     command
+        .arg("-f")
+        .arg(&sshd.sandbox)
+        .arg(aimx_binary())
         .args(["serve", "--stdio", "--ssh", "aim-test", "--root"])
         .arg(root)
         .args(["--ssh-config"])
@@ -115,10 +119,11 @@ async fn tool(peer: &Peer, workspace: &WorkspaceId, name: &str, arguments: serde
     result
 }
 
-async fn exercise_tools(peer: &Peer, workspace: &WorkspaceId, remote: &Path, local: &Path) {
+async fn exercise_tools(sshd: &Sshd, peer: &Peer, workspace: &WorkspaceId, remote: &Path, local: &Path) {
     std::fs::write(local.join("tool.txt"), "local").expect("local fixture");
     tool(peer, workspace, "Write", serde_json::json!({"file_path":"tool.txt","content":"alpha\n"}), "tool-write").await;
     assert_eq!(std::fs::read_to_string(remote.join("tool.txt")).expect("remote write"), "alpha\n");
+    sshd.assert_local_denied(&remote.join("tool.txt"));
     assert!(tool_text(&tool(peer, workspace, "Read", serde_json::json!({"file_path":"tool.txt"}), "tool-read").await).contains("alpha"));
     tool(peer, workspace, "Edit", serde_json::json!({"file_path":"tool.txt","old_string":"alpha","new_string":"beta"}), "tool-edit").await;
     assert!(tool_text(&tool(peer, workspace, "LS", serde_json::json!({"path":"."}), "tool-ls").await).contains("tool.txt"));
@@ -130,6 +135,7 @@ async fn exercise_tools(peer: &Peer, workspace: &WorkspaceId, remote: &Path, loc
     let bash = tool(peer, workspace, "Bash", serde_json::json!({"command":"printf shell > command.txt; cat tool.txt"}), "tool-bash").await;
     assert!(tool_text(&bash).contains("beta"));
     assert_eq!(std::fs::read_to_string(remote.join("command.txt")).expect("remote bash"), "shell");
+    sshd.assert_local_denied(&remote.join("command.txt"));
     let background =
         tool(peer, workspace, "Bash", serde_json::json!({"command":"printf started; sleep 30","run_in_background":true}), "tool-bg").await;
     let id = tool_text(&background).split("id ").nth(1).and_then(|text| text.split('.').next()).expect("background id");
@@ -168,6 +174,10 @@ impl Sshd {
     }
 
     fn start_with(native_search: bool, daemon_config: &str, client_config: &str) -> Self {
+        Self::start_with_path(native_search, daemon_config, client_config, None)
+    }
+
+    fn start_with_path(native_search: bool, daemon_config: &str, client_config: &str, remote_path: Option<&str>) -> Self {
         let dir = tempfile::Builder::new().prefix("aimssh").tempdir_in("/private/tmp").expect("tempdir");
         let host = dir.path().join("host");
         let client = dir.path().join("client");
@@ -184,6 +194,16 @@ impl Sshd {
         let sshd_config = dir.path().join("sshd_config");
         let remote_home = dir.path().join("remote_home");
         std::fs::create_dir(&remote_home).expect("remote home");
+        let sandbox = dir.path().join("local_sandbox.sb");
+        std::fs::write(
+            &sandbox,
+            format!(
+                "(version 1)\n(allow default)\n(deny file-read* file-write* (subpath \"{}\"))\n(deny file-read* file-write* (subpath \"{}\"))\n",
+                dir.path().join("remote_tree").display(),
+                remote_home.display()
+            ),
+        )
+        .expect("local sandbox profile");
         let rg_path = if native_search {
             let output = Command::new("mise").args(["which", "rg"]).output().expect("mise which rg");
             assert!(output.status.success(), "ripgrep must be installed through mise");
@@ -192,7 +212,7 @@ impl Sshd {
         } else {
             String::new()
         };
-        let path = format!("{rg_path}:/usr/bin:/bin:/usr/sbin:/sbin");
+        let path = remote_path.map_or_else(|| format!("{rg_path}:/usr/bin:/bin:/usr/sbin:/sbin"), str::to_owned);
         std::fs::write(&sshd_config, format!("Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nPidFile {}\nSetEnv HOME={} PATH={path}\n{daemon_config}", host.display(), dir.path().join("authorized_keys").display(), dir.path().join("sshd.pid").display(), remote_home.display())).expect("sshd config");
         let pubkey = std::fs::read_to_string(host.with_extension("pub")).expect("host public key");
         std::fs::write(dir.path().join("known_hosts"), format!("[127.0.0.1]:{port} {pubkey}")).expect("known_hosts");
@@ -206,7 +226,21 @@ impl Sshd {
             .stderr(Stdio::null())
             .spawn()
             .expect("sshd");
-        Self { dir, child, config }
+        Self { dir, child, config, sandbox }
+    }
+
+    fn assert_local_denied(&self, remote_file: &Path) {
+        assert!(remote_file.is_file(), "remote fixture must exist before isolation check");
+        let output = Command::new("sandbox-exec")
+            .arg("-f")
+            .arg(&self.sandbox)
+            .arg(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "ssh::live_tests::live_ssh_sandbox_denies_local_std_fs_at_remote_path", "--ignored"])
+            .env("AIM_SSH_SANDBOX_PROBE", remote_file)
+            .output()
+            .expect("probe local sandbox");
+        assert!(output.status.success(), "local Rust std::fs could access the remote filesystem path");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "local sandbox probe did not execute");
     }
 
     fn options(&self) -> SshOptions {
@@ -277,11 +311,70 @@ async fn run_to_exit(workspace: &AgentlessWorkspace, root: &Path, command: &Remo
     panic!("process did not exit");
 }
 
+async fn wait_for_sleep_pid(marker: &Path) -> String {
+    for _ in 0..40 {
+        if let Ok(pid) = std::fs::read_to_string(marker)
+            && !pid.is_empty()
+        {
+            return pid;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("remote sleep pid marker was not written");
+}
+
+fn running_sleep(pid: &str) -> bool {
+    let output = Command::new("ps").args(["-p", pid, "-o", "comm="]).output().expect("inspect sleep process");
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim().ends_with("sleep")
+}
+
+async fn wait_for_sleep_exit(pid: &str) -> bool {
+    for _ in 0..40 {
+        if !running_sleep(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+fn stop_sleep_if_running(pid: &str) {
+    if running_sleep(pid) {
+        drop(Command::new("kill").args(["-KILL", pid]).status());
+    }
+}
+
 async fn timed<T>(name: &str, operation: impl Future<Output = T>) -> T {
     let started = Instant::now();
     let result = operation.await;
     eprintln!("{name}_ms={}", started.elapsed().as_millis());
     result
+}
+
+#[test]
+#[ignore = "probes the local sandbox created by its parent live test"]
+fn live_ssh_sandbox_denies_local_std_fs_at_remote_path() {
+    let Some(path) = std::env::var_os("AIM_SSH_SANDBOX_PROBE") else {
+        return;
+    };
+    assert!(std::fs::read(&path).is_err(), "sandboxed local std::fs read reached the remote path");
+    assert!(std::fs::write(&path, b"local overwrite").is_err(), "sandboxed local std::fs write reached the remote path");
+}
+
+#[tokio::test]
+#[ignore = "starts a private sshd and contrasts local sandbox with remote SSH access"]
+async fn live_ssh_local_sandbox_and_remote_have_distinct_file_access() {
+    let sshd = Sshd::start(false);
+    let root = sshd.remote_root("sandbox_probe");
+    let file = root.join("sentinel.txt");
+    std::fs::write(&file, "remote v1").expect("remote fixture");
+    sshd.assert_local_denied(&file);
+    let connection = sshd.connect().await;
+    let script =
+        format!("cat -- {}; printf 'remote v2' > {}", super::quote(&file.to_string_lossy()), super::quote(&file.to_string_lossy()));
+    assert_eq!(connection.run(&script, &[]).await.expect("remote read and write"), b"remote v1");
+    assert_eq!(std::fs::read_to_string(&file).expect("remote changed"), "remote v2");
+    sshd.assert_local_denied(&file);
 }
 
 #[tokio::test]
@@ -661,6 +754,254 @@ async fn live_ssh_nonreading_stdin_cannot_block_process_timeout() {
 
 #[tokio::test]
 #[ignore = "starts a private user-space sshd"]
+async fn live_ssh_timeout_kills_remote_pipeline_children() {
+    let sshd = Sshd::start(false);
+    let root = sshd.remote_root("timeout_group");
+    let marker = root.join("sleep.pid");
+    let workspace = open_agentless(&sshd, &root).await;
+    let command = RemoteCommand::Shell {
+        script: format!("sleep 30 & child=$!; printf '%s' \"$child\" > {}; wait \"$child\"", super::quote(&marker.to_string_lossy())),
+    };
+    let env = std::collections::BTreeMap::new();
+    let proc = workspace
+        .exec()
+        .expect("exec")
+        .spawn(SpawnSpec {
+            command: &command,
+            cwd: &root.to_string_lossy(),
+            env: &env,
+            pty: None,
+            stdin: false,
+            timeout: Some(Duration::from_millis(500)),
+            key: &key(),
+        })
+        .await
+        .expect("spawn pipeline");
+    let pid = wait_for_sleep_pid(&marker).await;
+    let mut timed_out = false;
+    for _ in 0..20 {
+        let result = workspace.exec().expect("exec").read(&proc, 0, 100, Duration::from_millis(200)).await.expect("read timeout");
+        if matches!(result.exit, Some(aim_proto::harness::ExitStatus::TimedOut)) {
+            timed_out = true;
+            break;
+        }
+    }
+    workspace.exec().expect("exec").release(&proc).await.expect("release timed out pipeline");
+    let child_gone = wait_for_sleep_exit(&pid).await;
+    stop_sleep_if_running(&pid);
+    assert!(timed_out, "pipeline timeout was not reported");
+    assert!(child_gone, "pipeline child survived the timeout and release");
+}
+
+#[tokio::test]
+#[ignore = "starts a private user-space sshd"]
+async fn live_ssh_dropping_workspace_stops_remote_processes() {
+    let sshd = Sshd::start(false);
+    let root = sshd.remote_root("drop_group");
+    let marker = root.join("sleep.pid");
+    let workspace = open_agentless(&sshd, &root).await;
+    let command = RemoteCommand::Shell {
+        script: format!("sleep 30 & child=$!; printf '%s' \"$child\" > {}; wait \"$child\"", super::quote(&marker.to_string_lossy())),
+    };
+    let env = std::collections::BTreeMap::new();
+    let _proc = workspace
+        .exec()
+        .expect("exec")
+        .spawn(SpawnSpec {
+            command: &command,
+            cwd: &root.to_string_lossy(),
+            env: &env,
+            pty: None,
+            stdin: false,
+            timeout: None,
+            key: &key(),
+        })
+        .await
+        .expect("spawn process");
+    let pid = wait_for_sleep_pid(&marker).await;
+    assert!(running_sleep(&pid), "fixture child did not start");
+    drop(workspace);
+    let child_gone = wait_for_sleep_exit(&pid).await;
+    stop_sleep_if_running(&pid);
+    assert!(child_gone, "remote process survived workspace drop");
+}
+
+#[tokio::test]
+#[ignore = "benchmarks a private user-space sshd on localhost"]
+async fn live_ssh_large_read_and_listing_have_bounded_localhost_latency() {
+    let sshd = Sshd::start(false);
+    let root = sshd.remote_root("roundtrips");
+    let large = root.join("large.bin");
+    std::fs::write(&large, vec![b'x'; 4 << 20]).expect("large fixture");
+    let directory = root.join("many");
+    std::fs::create_dir(&directory).expect("listing fixture");
+    for index in 0..100 {
+        std::fs::write(directory.join(format!("file-{index:03}.txt")), b"x").expect("listing child");
+    }
+    let workspace = open_agentless(&sshd, &root).await;
+    let started = Instant::now();
+    let read = workspace.fs().read(&large.to_string_lossy(), None, 4 << 20).await.expect("large read");
+    let read_duration = started.elapsed();
+    assert_eq!(read.content.len(), 4 << 20);
+    let started = Instant::now();
+    let listing = workspace
+        .fs()
+        .list(ListRequest { path: &directory.to_string_lossy(), limit: 100, page_token: None, include_hidden: false })
+        .await
+        .expect("100-entry listing");
+    let list_duration = started.elapsed();
+    assert_eq!(listing.entries.len(), 100);
+    eprintln!("ssh_read_4m_ms={} ssh_list_100_ms={}", read_duration.as_millis(), list_duration.as_millis());
+    assert!(read_duration < Duration::from_secs(2), "4 MiB SSH read took {read_duration:?}");
+    assert!(list_duration < Duration::from_secs(2), "100-entry SSH listing took {list_duration:?}");
+}
+
+#[tokio::test]
+#[ignore = "starts a private user-space sshd with shasum-only PATH"]
+async fn live_ssh_hashes_filenames_with_backslashes_via_stdin() {
+    let sshd = Sshd::start_with_path(false, "", "", Some("/usr/bin:/bin:/usr/sbin"));
+    let connection = sshd.connect().await;
+    assert!(connection.run("command -v sha256sum", &[]).await.is_err(), "fixture must exclude sha256sum");
+    assert!(connection.run("command -v shasum", &[]).await.is_ok(), "fixture needs shasum");
+    let root = sshd.remote_root("hash_filename");
+    let workspace = AgentlessWorkspace::open(connection, &root.to_string_lossy()).await.expect("open");
+    let path = root.join("a\\b.txt").to_string_lossy().into_owned();
+    workspace
+        .fs()
+        .write(WriteRequest {
+            path: &path,
+            content: &Content::Utf8 { text: "before".to_owned() },
+            precondition: &Precondition::IfAbsent,
+            create_dirs: false,
+            key: &key(),
+        })
+        .await
+        .expect("write unusual filename");
+    let read = workspace.fs().read(&path, None, 100).await.expect("read unusual filename");
+    assert_eq!(read.content.into_bytes(), b"before");
+    let edit = [ExactEdit { old: "before".to_owned(), new: "after".to_owned(), replace_all: false }];
+    workspace
+        .fs()
+        .edit(EditRequest { path: &path, edits: &edit, precondition: &Precondition::Any, key: &key() })
+        .await
+        .expect("edit unusual filename");
+    assert_eq!(std::fs::read_to_string(path).expect("edited filename"), "after");
+}
+
+#[tokio::test]
+#[ignore = "starts a private user-space sshd"]
+async fn live_ssh_root_aliases_cannot_be_removed_or_renamed() {
+    let sshd = Sshd::start(false);
+    let remove_root = sshd.remote_root("protected_remove");
+    std::fs::write(remove_root.join("sentinel"), "keep").expect("root sentinel");
+    let remove_workspace = open_agentless(&sshd, &remove_root).await;
+    assert_eq!(
+        remove_workspace.fs().remove(&format!("{}/", remove_root.display()), true, &key()).await.expect_err("remove root alias").code,
+        ErrorCode::Denied
+    );
+    assert_eq!(std::fs::read_to_string(remove_root.join("sentinel")).expect("root preserved"), "keep");
+
+    let rename_root = sshd.remote_root("protected_rename");
+    let rename_workspace = open_agentless(&sshd, &rename_root).await;
+    let destination = rename_root.join("moved").to_string_lossy().into_owned();
+    assert_eq!(
+        rename_workspace
+            .fs()
+            .rename(&format!("{}/", rename_root.display()), &destination, false, &key())
+            .await
+            .expect_err("rename root alias")
+            .code,
+        ErrorCode::Denied
+    );
+    assert!(rename_root.is_dir());
+}
+
+#[tokio::test]
+#[ignore = "starts a private user-space sshd"]
+async fn live_ssh_pty_respects_requested_rows_and_columns() {
+    let sshd = Sshd::start(false);
+    let root = sshd.remote_root("pty_size");
+    let workspace = open_agentless(&sshd, &root).await;
+    let command = RemoteCommand::Argv { argv: vec!["stty".to_owned(), "size".to_owned()] };
+    let env = std::collections::BTreeMap::new();
+    let proc = workspace
+        .exec()
+        .expect("exec")
+        .spawn(SpawnSpec {
+            command: &command,
+            cwd: &root.to_string_lossy(),
+            env: &env,
+            pty: Some(aim_proto::harness::PtySize { rows: 24, cols: 80 }),
+            stdin: false,
+            timeout: None,
+            key: &key(),
+        })
+        .await
+        .expect("spawn pty");
+    let mut output = Vec::new();
+    let mut cursor = 0;
+    for _ in 0..20 {
+        let read = workspace.exec().expect("exec").read(&proc, cursor, 100, Duration::from_millis(200)).await.expect("read pty size");
+        for chunk in read.chunks {
+            cursor = chunk.seq;
+            output.extend(chunk.data.into_bytes());
+        }
+        if read.exit.is_some() {
+            break;
+        }
+    }
+    workspace.exec().expect("exec").release(&proc).await.expect("release pty");
+    assert_eq!(String::from_utf8_lossy(&output).trim(), "24 80");
+}
+
+#[tokio::test]
+#[ignore = "starts a private user-space sshd"]
+async fn live_ssh_listing_follows_confined_directory_symlink() {
+    let sshd = Sshd::start(false);
+    let root = sshd.remote_root("list_symlink");
+    let directory = root.join("directory");
+    std::fs::create_dir(&directory).expect("directory fixture");
+    std::fs::write(directory.join("a.txt"), b"a").expect("first file");
+    std::fs::write(directory.join("b.txt"), b"b").expect("second file");
+    let link = root.join("link");
+    std::os::unix::fs::symlink("directory", &link).expect("directory link");
+    let workspace = open_agentless(&sshd, &root).await;
+    let listing = workspace
+        .fs()
+        .list(ListRequest { path: &link.to_string_lossy(), limit: 10, page_token: None, include_hidden: false })
+        .await
+        .expect("list in-root symlink");
+    assert_eq!(listing.entries.len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "starts a private user-space sshd"]
+async fn live_ssh_pagination_after_removed_token_does_not_repeat_entries() {
+    let sshd = Sshd::start(false);
+    let root = sshd.remote_root("list_pages");
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(root.join(name), b"x").expect("page fixture");
+    }
+    let workspace = open_agentless(&sshd, &root).await;
+    let first = workspace
+        .fs()
+        .list(ListRequest { path: &root.to_string_lossy(), limit: 2, page_token: None, include_hidden: false })
+        .await
+        .expect("first page");
+    assert_eq!(first.entries.first().expect("first entry").name, "a.txt");
+    assert_eq!(first.entries.get(1).expect("second entry").name, "b.txt");
+    let token = first.next_page.expect("page token");
+    std::fs::remove_file(root.join("b.txt")).expect("remove token entry");
+    let second = workspace
+        .fs()
+        .list(ListRequest { path: &root.to_string_lossy(), limit: 1, page_token: Some(&token), include_hidden: false })
+        .await
+        .expect("page after removal");
+    assert_eq!(second.entries.first().expect("next entry").name, "c.txt");
+}
+
+#[tokio::test]
+#[ignore = "starts a private user-space sshd"]
 async fn live_ssh_master_bootstrap_and_agentless() {
     let sshd = Sshd::start(false);
     let connected = Instant::now();
@@ -730,6 +1071,7 @@ async fn live_ssh_native_search() {
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches.first().expect("match").before, vec!["first"]);
     assert_eq!(result.matches.first().expect("match").after, vec!["last"]);
+    sshd.assert_local_denied(&root.join("sample.txt"));
     assert_eq!(std::fs::read_to_string(local.join("sample.txt")).expect("local sentinel"), "local sentinel\n");
 }
 
@@ -762,8 +1104,9 @@ async fn live_ssh_resident_resume_two_proxies_and_idle_exit() {
     .await
     .expect("resident write");
     assert_eq!(std::fs::read_to_string(&path).expect("remote file"), "remote");
+    sshd.assert_local_denied(&root.join("different.txt"));
     assert_eq!(std::fs::read_to_string(local.join("different.txt")).expect("local file"), "local");
-    exercise_tools(&peer, &workspace.id, &root, &local).await;
+    exercise_tools(&sshd, &peer, &workspace.id, &root, &local).await;
     resume_two_proxies(&sshd, &root, peer, child, init, workspace.id).await;
 }
 
@@ -879,8 +1222,9 @@ async fn live_ssh_agentless_stdio_fallback() {
     .expect("agentless write");
     let read = peer.call::<FsRead>(FsReadParams { workspace: workspace.id.clone(), path, range: None }).await.expect("agentless read");
     assert_eq!(read.content.into_bytes(), b"remote-only");
+    sshd.assert_local_denied(&root.join("fallback.txt"));
     assert_eq!(std::fs::read_to_string(local.join("fallback.txt")).expect("local sentinel"), "local sentinel");
-    exercise_tools(&peer, &workspace.id, &root, &local).await;
+    exercise_tools(&sshd, &peer, &workspace.id, &root, &local).await;
     peer.close();
     child.kill().await.expect("stop fallback");
 }
@@ -950,7 +1294,10 @@ async fn live_ssh_aim_run_openrouter_edits_and_executes_remote_file() {
     let local = sshd.local_root("provider_workspace");
     std::fs::write(local.join("probe.sh"), "local sentinel\n").expect("local sentinel");
     let started = Instant::now();
-    let output = Command::new(aim_binary())
+    let output = Command::new("sandbox-exec")
+        .arg("-f")
+        .arg(&sshd.sandbox)
+        .arg(aim_binary())
         .arg("run")
         .args(["--ssh", "aim-test", "-p", "openrouter", "--model", "openai/gpt-4.1-mini", "--ephemeral", "--max-requests", "6", "--aimx"])
         .arg(aimx_binary())
@@ -964,6 +1311,7 @@ async fn live_ssh_aim_run_openrouter_edits_and_executes_remote_file() {
     eprintln!("aim_ssh_openrouter_turn_ms={}", started.elapsed().as_millis());
     assert!(output.status.success(), "aim run status: {}", output.status);
     assert_eq!(std::fs::read_to_string(remote.join("probe.sh")).expect("remote script"), "#!/bin/sh\nprintf ssh-ok\n");
+    sshd.assert_local_denied(&remote.join("probe.sh"));
     assert_eq!(std::fs::read_to_string(local.join("probe.sh")).expect("local sentinel"), "local sentinel\n");
     assert!(String::from_utf8_lossy(&output.stdout).contains("ssh-ok"), "agent should report execution output");
 }
