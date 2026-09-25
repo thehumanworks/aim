@@ -65,9 +65,16 @@ pub async fn connect_or_spawn_executable(home: &Path, exe: &Path) -> Result<Daem
     while start.elapsed() < Duration::from_secs(5) {
         if let Ok(client) = DaemonClient::connect(&socket).await {
             if let Some(mut child) = pending.0.take() {
-                let _reaper = std::thread::Builder::new().name("aim-daemon-reaper".into()).spawn(move || {
-                    let _status = child.wait();
-                });
+                if client.initialize_result().pid == child.id() {
+                    let _reaper = std::thread::Builder::new().name("aim-daemon-reaper".into()).spawn(move || {
+                        let _status = child.wait();
+                    });
+                } else {
+                    // This candidate lost the race. It may still be migrating and could
+                    // otherwise bind after the winner stops, resurrecting a test daemon.
+                    drop(child.kill());
+                    drop(child.wait());
+                }
             }
             return Ok(client);
         }

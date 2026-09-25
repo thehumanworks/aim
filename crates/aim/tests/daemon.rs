@@ -641,6 +641,57 @@ async fn cancelled_auto_spawn_reaps_its_child() {
     );
 }
 
+#[tokio::test]
+async fn losing_auto_spawn_reaps_before_the_winner_stops() {
+    let dir = private_tempdir();
+    let binary = Path::new(env!("CARGO_BIN_EXE_aim"));
+    let _daemon = DetachedDaemonGuard { home: dir.path(), binary };
+    std::os::unix::fs::symlink(binary, dir.path().join("real-aim")).unwrap();
+    let script = dir.path().join("gated-daemon");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nif mkdir \"$AIM_HOME/first\" 2>/dev/null; then\n  echo \"$$\" > \"$AIM_HOME/slow.pid\"\n  while [ ! -e \"$AIM_HOME/release\" ]; do /bin/sleep 0.02; done\nfi\nexec \"$AIM_HOME/real-aim\" daemon\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = dir.path().to_path_buf();
+    let script_first = script.clone();
+    let first = tokio::spawn(async move { spawn::connect_or_spawn_executable(&home, &script_first).await });
+    let slow_pid_file = dir.path().join("slow.pid");
+    let mut slow_started = false;
+    for _ in 0..250 {
+        if slow_pid_file.exists() {
+            slow_started = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if !slow_started {
+        first.abort();
+        drop(first.await);
+        panic!("gated daemon never started");
+    }
+    let second = spawn::connect_or_spawn_executable(dir.path(), &script).await.unwrap();
+    let first = first.await.unwrap().unwrap();
+    assert_eq!(first.initialize_result().pid, second.initialize_result().pid);
+    let slow_pid = std::fs::read_to_string(slow_pid_file).unwrap();
+    let alive = std::process::Command::new("kill")
+        .args(["-0", slow_pid.trim()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    if alive {
+        let _killed = std::process::Command::new("kill").args(["-TERM", slow_pid.trim()]).status();
+    }
+    assert!(!alive, "losing auto-spawn child could start after the winner stops");
+    let stopped = std::process::Command::new(binary).args(["daemon", "stop"]).env("AIM_HOME", dir.path()).status().unwrap();
+    assert!(stopped.success());
+    first.disconnect();
+    second.disconnect();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a real codex provider and aimx credentials"]
 async fn live_daemon_codex_turn() {
