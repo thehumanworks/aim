@@ -853,7 +853,10 @@ impl App {
                 }
                 self.transcript.push_item(&item);
             }
-            SessionUpdate::ToolStarted { .. } | SessionUpdate::ToolFinished { .. } | SessionUpdate::SteerQueued => {}
+            SessionUpdate::ToolStarted { .. }
+            | SessionUpdate::ToolFinished { .. }
+            | SessionUpdate::SteerQueued
+            | SessionUpdate::Options { .. } => {}
             SessionUpdate::Ui { message } => self.on_ui(&message.message),
             // Which chips went out is told by the user items that follow, not by position: the
             // oldest chip may be a turn's first prompt whose answer is merely late.
@@ -879,7 +882,6 @@ impl App {
             SessionUpdate::ConfigRejected { message, .. } => {
                 self.notice(Level::Error, format!("configuration not changed: {message}"));
             }
-            SessionUpdate::Options { .. } => {}
             SessionUpdate::Compacted { method, tokens_before, tokens_after, .. } => {
                 // The model's context was folded; the transcript shown keeps every item.
                 let (before, after) = (super::view::short_count(tokens_before), super::view::short_count(tokens_after));

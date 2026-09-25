@@ -165,6 +165,34 @@ pub fn current_config(options: &[ConfigOption]) -> (String, Option<String>) {
     (find("model").unwrap_or_default(), find("thought_level").or_else(|| find("effort")))
 }
 
+/// What an agent advertises for its model and effort, as session options (ADR 0074): the values
+/// of the option with category `model` (else id `model`) and `thought_level` (else id `effort`).
+/// `None` when it advertises neither as a select.
+#[must_use]
+pub fn advertised_options(options: &[ConfigOption]) -> Option<aim_proto::daemon::SessionOptions> {
+    let values = |category: &str, id: &str| {
+        let option = options.iter().find(|o| o.category.as_deref() == Some(category) || o.id == id)?;
+        match &option.kind {
+            aim_acp::ConfigKind::Select { values, .. } => Some(
+                values
+                    .iter()
+                    .map(|v| aim_proto::daemon::ChoiceValue {
+                        value: v.value.clone(),
+                        name: (!v.name.is_empty() && v.name != v.value).then(|| v.name.clone()),
+                        description: v.description.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        }
+    };
+    let (models, efforts) = (values("model", "model"), values("thought_level", "effort"));
+    if models.is_none() && efforts.is_none() {
+        return None;
+    }
+    Some(aim_proto::daemon::SessionOptions { models: models.unwrap_or_default(), efforts: efforts.unwrap_or_default() })
+}
+
 fn emit(events: &UnboundedSender<AgentEvent>, update: SessionUpdate) {
     // A closed receiver only means nobody is watching.
     let _unwatched = events.send(update);
@@ -455,6 +483,12 @@ impl Backend for AcpBackend {
         false
     }
 
+    fn options(&self) -> BackendFuture<'static, Option<aim_proto::daemon::SessionOptions>> {
+        // Fresh after every `set_config`: the agent answers each with its options (ADR 0074).
+        let options = advertised_options(self.session.config_options());
+        Box::pin(async move { options })
+    }
+
     fn shutdown(self: Box<Self>) -> BackendFuture<'static, ()> {
         let Self { client, session, scratch } = *self;
         Box::pin(async move {
@@ -648,6 +682,40 @@ mod tests {
         let refused = backend.set_config(Some("gpt-6".into()), None).await.unwrap_err();
         assert!(refused.contains("`opus[1m]` (Opus 5.5)") && refused.contains("`a` (A)"), "{refused}");
         assert_eq!(backend.set_config(None, None).await.unwrap().model, "opus[1m]");
+    }
+
+    fn values(choices: &[aim_proto::daemon::ChoiceValue]) -> Vec<&str> {
+        choices.iter().map(|c| c.value.as_str()).collect()
+    }
+
+    /// ADR 0074: the options follow the agent's answers, so the effort ladder changes with the model.
+    #[tokio::test]
+    async fn advertised_options_follow_the_agents_answers() {
+        let mut backend = scripted_agent().await;
+        let options = backend.options().await.unwrap();
+        assert_eq!(values(&options.models), ["a", "b", "opus[1m]"]);
+        assert_eq!(options.models[0].name.as_deref(), Some("A"));
+        assert_eq!(values(&options.efforts), ["low", "high"]);
+        backend.set_config(Some("b".into()), None).await.unwrap();
+        assert_eq!(values(&backend.options().await.unwrap().efforts), ["low"]);
+    }
+
+    /// ADR 0074: what claude-agent-acp 0.81.2 advertised in a recorded session (the fixture's
+    /// `session/new` answer) becomes the session's options, descriptions included.
+    #[test]
+    fn claude_agent_acp_models_and_efforts_become_options() {
+        let fixture = include_str!("../../aim-acp/tests/fixtures/aim_tools_turn.jsonl");
+        let answer = fixture
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|frame| frame["msg"]["result"].get("configOptions").cloned())
+            .unwrap();
+        let options = super::advertised_options(&aim_acp::parse_config_options(Some(&answer))).unwrap();
+        assert_eq!(values(&options.models), ["default", "opus[1m]", "claude-fable-5-1[1m]", "sonnet", "haiku"]);
+        assert_eq!(options.models[0].description.as_deref(), Some("Opus (1M context)"));
+        assert_eq!(options.models[1].name.as_deref(), Some("Opus 5.5"));
+        assert_eq!(values(&options.efforts), ["default", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(super::advertised_options(&[]), None, "an agent without model or effort options offers none");
     }
 
     #[test]

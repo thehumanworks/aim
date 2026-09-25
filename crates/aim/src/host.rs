@@ -25,7 +25,7 @@ use aim_llm_codex::media::{MediaClient, MediaConfig};
 use aim_proto::conversation::{Item, Part};
 use aim_proto::daemon::{
     Location, MediaTranscribeParams, MediaTranscribeResult, Persistence, PromptOutcome, SessionAttachResult, SessionConfigParams,
-    SessionListParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
+    SessionListParams, SessionOptions, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::event::{EffortSource, EventBody, SessionAgent, SessionEvent, SessionMeta};
@@ -33,7 +33,7 @@ use futures_core::Stream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AgentConfig, Backend, InForce, ToolHost};
+use crate::agent::{Agent, AgentConfig, Backend, BackendFuture, InForce, ToolHost};
 use crate::context;
 use crate::harness::HarnessClient;
 use crate::jev::Decider;
@@ -344,8 +344,8 @@ pub fn native_backends_with(
                 parallel_tool_calls: true,
                 max_requests,
             };
-            let mut native =
-                Agent::with_transcript(provider, tools, config, transcript).with_initial_window(window).with_effort_source(effort_source);
+            let native = Agent::with_transcript(provider, tools, config, transcript).with_catalog(models);
+            let mut native = native.with_initial_window(window).with_effort_source(effort_source);
             if let Some(decider) = decider {
                 native = native.with_decider(decider);
             }
@@ -544,6 +544,32 @@ struct Live {
     /// The session's UI surfaces (ADR 0064): published under the transcript lock, reached by the
     /// `ui_*` tools through the outlet each turn runs in.
     ui: Arc<crate::ui::SessionUi>,
+    /// What the session can switch to (ADR 0074): the latest options, published under the
+    /// transcript lock so `attach` sees them in its snapshot or on its stream.
+    options: Mutex<Option<SessionOptions>>,
+}
+
+impl Live {
+    /// A session's shared state, idle with nothing sent yet, and its control channel's receiver.
+    fn new(
+        summary: SessionSummary,
+        transcript: Vec<Item>,
+        capacity: usize,
+        ui: Arc<crate::ui::SessionUi>,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<Control>) {
+        let (updates, _) = broadcast::channel(capacity.max(16));
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let live = Self {
+            summary: Mutex::new(summary),
+            transcript: Mutex::new(transcript),
+            updates,
+            control,
+            close_requested: CancellationToken::new(),
+            ui,
+            options: Mutex::new(None),
+        };
+        (Arc::new(live), control_rx)
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -704,18 +730,9 @@ impl SessionHost {
             last_activity_ms: session::now_ms(),
             turns: recorder.turns(),
         };
-        let (updates, _) = broadcast::channel(self.config.update_capacity.max(16));
-        let (control, control_rx) = mpsc::unbounded_channel();
-        let live = Arc::new(Live {
-            summary: Mutex::new(summary.clone()),
-            transcript: Mutex::new(transcript),
-            updates,
-            control,
-            close_requested: CancellationToken::new(),
-            ui,
-        });
+        let (live, control_rx) = Live::new(summary.clone(), transcript, self.config.update_capacity, ui);
         lock(&self.sessions).insert(meta.id.clone(), Arc::clone(&live));
-        let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location, announced };
+        let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location, announced, options: None };
         let sessions = Arc::clone(&self.sessions);
         let id = meta.id.clone();
         tokio::spawn(async move {
@@ -809,6 +826,8 @@ struct Actor {
     /// The configuration last announced (`ConfigChanged`), to tell whether a refused change left
     /// something changed (ADR 0038).
     announced: Option<InForce>,
+    /// The options lookup in flight (ADR 0074); a newer configuration aborts it.
+    options: Option<tokio::task::JoinHandle<()>>,
 }
 
 fn set_state(live: &Live, state: SessionState) {
@@ -857,6 +876,20 @@ async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<Strin
     let _unwatched = live.updates.send(update);
 }
 
+/// Publishes what a session's backend says it can switch to (ADR 0074), unless nothing changed.
+/// Under the transcript lock, like items and surfaces: `attach` sees it in its snapshot or on its
+/// stream. It is not recorded.
+async fn publish_options(live: Arc<Live>, lookup: BackendFuture<'static, Option<SessionOptions>>) {
+    let Some(options) = lookup.await else { return };
+    let _ordered = lock(&live.transcript);
+    let mut current = lock(&live.options);
+    if current.as_ref() == Some(&options) {
+        return;
+    }
+    *current = Some(options.clone());
+    let _unwatched = live.updates.send(SessionUpdate::Options { options });
+}
+
 fn in_force_of(update: &SessionUpdate) -> Option<InForce> {
     match update {
         SessionUpdate::ConfigChanged { model, effort, effort_source } => {
@@ -868,6 +901,8 @@ fn in_force_of(update: &SessionUpdate) -> Option<InForce> {
 
 impl Actor {
     async fn run(mut self, mut control: mpsc::UnboundedReceiver<Control>) {
+        // Never on the create path: the options arrive when the backend knows them (ADR 0074).
+        self.refresh_options();
         let mut pending_config: Option<(Option<String>, Option<String>)> = None;
         while let Some(message) = control.recv().await {
             match message {
@@ -897,8 +932,20 @@ impl Actor {
                 break;
             }
         }
+        if let Some(lookup) = self.options.take() {
+            lookup.abort();
+        }
         set_state(&self.live, SessionState::Closed);
         self.backend.shutdown().await;
+    }
+
+    /// Asks the backend again what the session can switch to (the model, or an agent's options,
+    /// changed), dropping a lookup for an older configuration.
+    fn refresh_options(&mut self) {
+        if let Some(lookup) = self.options.take() {
+            lookup.abort();
+        }
+        self.options = Some(tokio::spawn(publish_options(Arc::clone(&self.live), self.backend.options())));
     }
 
     /// Applies a change accepted during the turn that just ended and reports its outcome:
@@ -961,6 +1008,7 @@ impl Actor {
             return Err(why.clone());
         }
         self.announced = Some(in_force);
+        self.refresh_options();
         Ok(())
     }
 
@@ -971,7 +1019,7 @@ impl Actor {
         control: &mut mpsc::UnboundedReceiver<Control>,
         pending_config: &mut Option<(Option<String>, Option<String>)>,
     ) -> bool {
-        let Self { live, backend, recorder, broken, root, location, announced } = self;
+        let Self { live, backend, recorder, broken, root, location, announced, .. } = self;
         if let Err(e) = recorder.begin_turn().await {
             // Nothing ran: report the failure as this turn's only terminal event and close.
             let why = format!("store: the session log could not be written ({e}); the session is closed");
@@ -1192,7 +1240,7 @@ impl SessionClient for SessionHost {
                 summary: lock(&live.summary).clone(),
                 transcript: transcript.clone(),
                 surfaces: live.ui.snapshot(),
-                options: None,
+                options: lock(&live.options).clone(),
             };
             drop(transcript);
             Ok((result, updates_of(rx)))

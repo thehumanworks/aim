@@ -1160,3 +1160,91 @@ async fn extra_tool_factories_receive_the_connected_root_for_resume_stability() 
     assert_eq!(observed.lock().unwrap().as_slice(), ["/canonical/workspace"]);
     f.host.close(id).await.unwrap();
 }
+
+// ------------------------------------------------------------------------------------------------
+// ADR 0074: what a session can switch to
+// ------------------------------------------------------------------------------------------------
+
+fn options_of(update: &SessionUpdate) -> Option<&aim_proto::daemon::SessionOptions> {
+    match update {
+        SessionUpdate::Options { options } => Some(options),
+        _ => None,
+    }
+}
+
+fn values(choices: &[aim_proto::daemon::ChoiceValue]) -> Vec<&str> {
+    choices.iter().map(|c| c.value.as_str()).collect()
+}
+
+/// Options are published off the create path, replayed to every later attach, and re-sent with the
+/// new model's ladder when the model changes; hidden models are left out.
+#[tokio::test]
+async fn options_are_published_replayed_on_attach_and_follow_the_model() {
+    let m2 = ModelInfo {
+        id: "m2".into(),
+        display_name: "Model Two".into(),
+        efforts: vec!["minimal".into(), "high".into()],
+        default_effort: Some("high".into()),
+        context_window: Some(1_000_000),
+        ..ladder_model()
+    };
+    let hidden = ModelInfo { id: "internal".into(), hidden: true, ..ladder_model() };
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, Vec::new(), vec![ladder_model(), m2, hidden]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let (first, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    // Either the snapshot has them or they follow on the stream, never both.
+    let options = match first.options {
+        Some(options) => options,
+        None => until(&mut updates, |u| options_of(u).is_some()).await.last().and_then(options_of).cloned().unwrap(),
+    };
+    assert_eq!(values(&options.models), ["m1", "m2"], "hidden models are left out");
+    assert_eq!(options.models[1].name.as_deref(), Some("Model Two"));
+    assert_eq!(options.models[1].description.as_deref(), Some("1M context"));
+    assert_eq!(options.models[0].name, None, "a display name equal to the id adds nothing");
+    assert_eq!(values(&options.efforts), ["low", "medium", "high"], "the ladder of the model in force");
+
+    // A client attaching later gets them in its snapshot.
+    let (late, _late_updates) = f.host.attach(id.clone()).await.unwrap();
+    assert_eq!(late.options.as_ref(), Some(&options));
+
+    // Switching models re-sends the options with that model's ladder.
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m2".into()), effort: None }).await.unwrap();
+    let got = until(&mut updates, |u| options_of(u).is_some()).await;
+    let switched = got.last().and_then(options_of).unwrap();
+    assert_eq!(values(&switched.efforts), ["minimal", "high"]);
+    assert_eq!(switched.efforts[1].description.as_deref(), Some("default"));
+    assert_eq!(values(&switched.models), ["m1", "m2"]);
+    let (again, _) = f.host.attach(id.clone()).await.unwrap();
+    assert_eq!(again.options.as_ref(), Some(switched), "the latest options are replayed");
+
+    // An effort change keeps the model: nothing new is sent.
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("minimal".into()) }).await.unwrap();
+    let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
+    assert!(got.iter().all(|u| options_of(u).is_none()), "{got:?}");
+    f.host.close(id).await.unwrap();
+    let rest = until(&mut updates, |u| matches!(u, SessionUpdate::StateChanged { state: SessionState::Closed })).await;
+    assert!(rest.iter().all(|u| options_of(u).is_none()), "unchanged options are not sent again: {rest:?}");
+}
+
+/// A provider whose catalog is empty (or that never answers) sends no options, and a session
+/// whose catalog stalls still starts and runs turns.
+#[tokio::test]
+async fn a_session_without_a_catalog_sends_no_options_and_is_not_held_up() {
+    let f = fixture(vec![text("hello")]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let (first, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    assert_eq!(first.options, None);
+    f.host.prompt(id.clone(), user("hi")).await.unwrap();
+    let got = until(&mut updates, is_idle).await;
+    assert!(got.iter().all(|u| options_of(u).is_none()), "{got:?}");
+
+    let stalled = fixture(vec![text("hello")]);
+    stalled.provider.stall_catalog.store(true, Ordering::SeqCst);
+    let id =
+        tokio::time::timeout(Duration::from_secs(10), stalled.host.create(spec(Persistence::Ephemeral))).await.unwrap().unwrap().meta.id;
+    let (first, mut updates) = tokio::time::timeout(Duration::from_secs(1), stalled.host.attach(id.clone())).await.unwrap().unwrap();
+    assert_eq!(first.options, None, "no options yet, and attach did not wait for them");
+    stalled.host.prompt(id, user("hi")).await.unwrap();
+    until(&mut updates, is_idle).await;
+}
