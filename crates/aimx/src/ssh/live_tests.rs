@@ -725,9 +725,11 @@ async fn live_ssh_native_search_truncates_large_results() {
 async fn live_ssh_nonreading_stdin_cannot_block_process_timeout() {
     let sshd = Sshd::start(false);
     let root = sshd.remote_root("stdin_timeout");
+    let marker = root.join("sleep.pid");
     let workspace = open_agentless(&sshd, &root).await;
     let env = std::collections::BTreeMap::new();
-    let command = RemoteCommand::Argv { argv: vec!["sleep".to_owned(), "30".to_owned()] };
+    let command =
+        RemoteCommand::Shell { script: format!("printf '%s' \"$$\" > {}; exec sleep 30", super::quote(&marker.to_string_lossy())) };
     let proc = workspace
         .exec()
         .expect("exec")
@@ -742,14 +744,18 @@ async fn live_ssh_nonreading_stdin_cannot_block_process_timeout() {
         })
         .await
         .expect("spawn nonreader");
+    let pid = wait_for_sleep_pid(&marker).await;
     let write =
         tokio::time::timeout(Duration::from_secs(5), workspace.exec().expect("exec").write_stdin(&proc, &vec![b'x'; 8 << 20], false)).await;
     let read =
         tokio::time::timeout(Duration::from_secs(3), workspace.exec().expect("exec").read(&proc, 0, 100, Duration::from_millis(100))).await;
     let released = tokio::time::timeout(Duration::from_secs(3), workspace.exec().expect("exec").release(&proc)).await;
+    let process_gone = wait_for_sleep_exit(&pid).await;
+    stop_sleep_if_running(&pid);
     assert!(write.is_ok(), "write_stdin stayed blocked after process timeout");
     assert!(read.is_ok_and(|result| result.is_ok_and(|value| value.exit.is_some())), "process timeout did not become readable");
     assert!(released.is_ok_and(|result| result.is_ok()), "release stayed blocked after process timeout");
+    assert!(process_gone, "nonreading remote process survived the timeout");
 }
 
 #[tokio::test]
@@ -998,6 +1004,93 @@ async fn live_ssh_pagination_after_removed_token_does_not_repeat_entries() {
         .await
         .expect("page after removal");
     assert_eq!(second.entries.first().expect("next entry").name, "c.txt");
+}
+
+#[tokio::test]
+#[ignore = "starts a private user-space sshd"]
+async fn live_ssh_output_ring_reports_only_unseen_evictions() {
+    let sshd = Sshd::start(false);
+    let root = sshd.remote_root("ring");
+    let workspace = open_agentless(&sshd, &root).await;
+    let command = RemoteCommand::Shell { script: "head -c 16777216 /dev/zero".to_owned() };
+    let env = std::collections::BTreeMap::new();
+    let proc = workspace
+        .exec()
+        .expect("exec")
+        .spawn(SpawnSpec {
+            command: &command,
+            cwd: &root.to_string_lossy(),
+            env: &env,
+            pty: None,
+            stdin: false,
+            timeout: None,
+            key: &key(),
+        })
+        .await
+        .expect("spawn output producer");
+    for _ in 0..20 {
+        if workspace.exec().expect("exec").read(&proc, u64::MAX, 1, Duration::from_millis(100)).await.expect("wait producer").exit.is_some()
+        {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let first = workspace.exec().expect("exec").read(&proc, 0, 9 << 20, Duration::ZERO).await.expect("read retained ring");
+    let first_seq = first.chunks.first().expect("retained output").seq;
+    let last_seq = first.chunks.last().expect("last output").seq;
+    assert!(first_seq > 1, "fixture did not evict output from its ring");
+    assert_eq!(first.dropped_before, Some(first_seq), "dropped_before must identify the first retained sequence");
+    let caught_up = workspace.exec().expect("exec").read(&proc, last_seq, 100, Duration::ZERO).await.expect("read caught-up cursor");
+    workspace.exec().expect("exec").release(&proc).await.expect("release output producer");
+    assert_eq!(caught_up.dropped_before, None, "caught-up reader must not report past eviction");
+}
+
+#[tokio::test]
+#[ignore = "starts a private user-space sshd"]
+async fn live_ssh_short_process_read_does_not_wait_for_full_poll_timeout() {
+    let sshd = Sshd::start(false);
+    let root = sshd.remote_root("read_wakeup");
+    let workspace = open_agentless(&sshd, &root).await;
+    let command = RemoteCommand::Argv { argv: vec!["printf".to_owned(), "x".to_owned()] };
+    let env = std::collections::BTreeMap::new();
+    for trial in 0..40 {
+        let proc = workspace
+            .exec()
+            .expect("exec")
+            .spawn(SpawnSpec {
+                command: &command,
+                cwd: &root.to_string_lossy(),
+                env: &env,
+                pty: None,
+                stdin: false,
+                timeout: None,
+                key: &key(),
+            })
+            .await
+            .expect("spawn short process");
+        let mut cursor = 0;
+        let mut finished = false;
+        for _ in 0..4 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                workspace.exec().expect("exec").read(&proc, cursor, 100, Duration::from_secs(5)),
+            )
+            .await;
+            let Ok(Ok(read)) = result else {
+                workspace.exec().expect("exec").release(&proc).await.expect("release stalled read");
+                panic!("trial {trial}: read waited after short process completed");
+            };
+            if let Some(last) = read.chunks.last() {
+                cursor = last.seq;
+            }
+            if read.exit.is_some() {
+                finished = true;
+                break;
+            }
+        }
+        workspace.exec().expect("exec").release(&proc).await.expect("release short process");
+        assert!(finished, "trial {trial}: process exit was not reported promptly");
+    }
 }
 
 #[tokio::test]
