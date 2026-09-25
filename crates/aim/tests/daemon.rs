@@ -78,7 +78,7 @@ fn host(deltas: usize, delay: Duration) -> (Arc<dyn SessionClient>, Arc<Scripted
         let shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send> = Box::new(|| Box::pin(async {}));
         Box::pin(async move { Ok(Connected { tools: Arc::new(NoTools), root, location: "local".into(), project: None, shutdown }) })
     });
-    let host: Arc<dyn SessionClient> = Arc::new(SessionHost::new(HostConfig {
+    let host = Arc::new(SessionHost::new(HostConfig {
         store: Arc::new(MemoryStore::default()),
         providers: Arc::new(move |_, _| Ok((Arc::clone(&cloned) as Arc<dyn ModelProvider>, "m".into()))),
         workspaces,
@@ -194,6 +194,21 @@ async fn attach_prompt_and_two_clients_receive_ordered_updates() {
 }
 
 #[tokio::test]
+async fn reattach_on_one_connection_replaces_forwarder() {
+    let (dir, _, _, task) = started(4, Duration::from_millis(1)).await;
+    let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
+    let session = client.create(spec()).await.unwrap().meta.id;
+    let (_, mut old) = client.attach(session.clone()).await.unwrap();
+    let (_, mut current) = client.attach(session.clone()).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(1), old.next()).await.unwrap().is_none());
+    drop(old);
+    client.prompt(session, input()).await.unwrap();
+    let updates = until_idle(&mut current).await;
+    assert!(updates.iter().any(|u| matches!(u, SessionUpdate::TurnEnded { .. })));
+    task.abort();
+}
+
+#[tokio::test]
 async fn attach_during_stream_is_gap_free_and_reconnect_sees_transcript() {
     let (dir, _, _, task) = started(200, Duration::from_millis(1)).await;
     let socket = socket_path(dir.path());
@@ -220,10 +235,11 @@ async fn duplicate_key_runs_one_turn_and_second_daemon_cannot_bind() {
     let (dir, host, provider, task) = started(100, Duration::from_millis(1)).await;
     let socket = socket_path(dir.path());
     let client = DaemonClient::connect(&socket).await.unwrap();
+    let other = DaemonClient::connect(&socket).await.unwrap();
     let session = client.create(spec()).await.unwrap().meta.id;
     let key = IdempotencyKey::new("same-key");
     let (a, b) =
-        tokio::join!(client.prompt_with_key(session.clone(), input(), key.clone()), client.prompt_with_key(session.clone(), input(), key),);
+        tokio::join!(client.prompt_with_key(session.clone(), input(), key.clone()), other.prompt_with_key(session.clone(), input(), key),);
     assert_eq!(a.unwrap(), b.unwrap());
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     let conflict = server::serve(dir.path(), &socket, None, host).await.unwrap_err();
@@ -361,17 +377,18 @@ async fn live_daemon_codex_turn() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let socket = socket_path(dir.path());
-    let host: Arc<dyn SessionClient> = Arc::new(SessionHost::new(HostConfig {
+    let host = Arc::new(SessionHost::new(HostConfig {
         store: Arc::new(MemoryStore::default()),
         providers: Arc::new(aim::providers::build),
-        workspaces: aimx_workspaces(aim::cli::find_aimx(None)),
+        workspaces: aimx_workspaces(Path::new(env!("CARGO_BIN_EXE_aim")).with_file_name("aimx")),
         max_requests: 4,
         update_capacity: 1024,
     }));
     let task = tokio::spawn({
         let home = dir.path().to_path_buf();
         let socket = socket.clone();
-        async move { server::serve(&home, &socket, None, host).await }
+        let host = Arc::clone(&host) as Arc<dyn SessionClient>;
+        async move { server::serve(&home, &socket, Some(Duration::from_millis(200)), host).await }
     });
     wait_socket(&socket).await;
     let client = DaemonClient::connect(&socket).await.unwrap();
@@ -380,11 +397,16 @@ async fn live_daemon_codex_turn() {
     session_spec.provider = "codex".into();
     let session = client.create(session_spec).await.unwrap().meta.id;
     let (_, mut updates) = client.attach(session.clone()).await.unwrap();
+    let started = std::time::Instant::now();
     assert_eq!(
         client.prompt(session, vec![Part::Text { text: "Reply with one short greeting.".into() }]).await.unwrap(),
         PromptOutcome::Started { turn: 1 }
     );
     let collected = tokio::time::timeout(Duration::from_secs(240), until_idle(&mut updates)).await.unwrap();
     assert!(collected.iter().any(|u| matches!(u, SessionUpdate::TurnEnded { .. })));
-    task.abort();
+    assert!(collected.iter().any(|u| matches!(u, SessionUpdate::ItemAdded { item: Item::Assistant { .. } })));
+    eprintln!("live_daemon_codex_turn_ms={}", started.elapsed().as_millis());
+    client.disconnect();
+    tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+    host.shutdown().await.unwrap();
 }

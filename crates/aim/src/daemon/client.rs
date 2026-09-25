@@ -28,7 +28,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-type Subscribers = Arc<Mutex<HashMap<String, (u64, mpsc::UnboundedSender<SessionUpdate>)>>>;
+type Subscribers = Arc<Mutex<HashMap<String, (u64, mpsc::Sender<SessionUpdate>)>>>;
 
 struct UpdateHandler(Subscribers);
 
@@ -42,9 +42,13 @@ impl Handler for UpdateHandler {
         Box::pin(async move {
             if method == "session.update"
                 && let Ok(SessionUpdateParams { session, update }) = serde_json::from_value(params)
-                && let Some((_, sender)) = lock(&subscribers).get(&session)
             {
-                let _ignored = sender.send(update);
+                let mut attached = lock(&subscribers);
+                if attached.get(&session).is_some_and(|(_, sender)| sender.try_send(update).is_err()) {
+                    // A lagging UI must reattach for a fresh snapshot. Never hold up the
+                    // ordered RPC notification reader or grow a queue without bound.
+                    attached.remove(&session);
+                }
             }
         })
     }
@@ -125,7 +129,7 @@ struct AttachedUpdates {
     serial: u64,
     subscribers: Subscribers,
     peer: Peer,
-    receiver: mpsc::UnboundedReceiver<SessionUpdate>,
+    receiver: mpsc::Receiver<SessionUpdate>,
 }
 
 impl Stream for AttachedUpdates {
@@ -167,7 +171,7 @@ impl SessionClient for DaemonClient {
         let serial = self.serial.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Box::pin(async move {
             let snapshot = peer.call::<SessionAttach>(SessionRef { session: session.clone() }).await?;
-            let (sender, receiver) = mpsc::unbounded_channel();
+            let (sender, receiver) = mpsc::channel(1024);
             lock(&subscribers).insert(session.clone(), (serial, sender));
             // The server holds updates until this notification, which is sent only after the
             // attach response has been received and the local stream is registered.

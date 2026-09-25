@@ -125,12 +125,14 @@ async fn main_async(args: Args) -> Result<i32, String> {
             match action {
                 Some(DaemonAction::Status) => {
                     let client = DaemonClient::connect(&socket).await.map_err(|e| e.to_string())?;
-                    let sessions = client.list(SessionListParams::default()).await.map_err(|e| e.to_string())?;
+                    let sessions =
+                        client.list(SessionListParams { limit: Some(u32::MAX), workspace: None }).await.map_err(|e| e.to_string())?;
+                    let live = sessions.iter().filter(|s| s.state != aim_proto::daemon::SessionState::Closed).count();
                     println!(
                         "generation={} pid={} sessions={}",
                         client.initialize_result().generation,
                         client.initialize_result().pid,
-                        sessions.len()
+                        live
                     );
                     Ok(0)
                 }

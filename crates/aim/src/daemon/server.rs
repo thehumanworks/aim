@@ -301,7 +301,7 @@ pub async fn serve(home: &Path, socket: &Path, idle_exit: Option<Duration>, host
             _ = tick.tick(), if idle_exit.is_some() => {
                 let sessions = host.list(aim_proto::daemon::SessionListParams { limit: Some(u32::MAX), workspace: None }).await?;
                 let busy = connections.load(Ordering::Acquire) != 0
-                    || sessions.iter().any(|s| s.state == aim_proto::daemon::SessionState::Running);
+                    || sessions.iter().any(|s| matches!(s.state, aim_proto::daemon::SessionState::Running | aim_proto::daemon::SessionState::RequiresAction));
                 if busy {
                     idle_since = Instant::now();
                 } else if idle_exit.is_some_and(|limit| idle_since.elapsed() >= limit) {
