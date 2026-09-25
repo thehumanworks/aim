@@ -21,6 +21,8 @@ mod idempotency;
 #[cfg(test)]
 mod limits;
 #[cfg(test)]
+mod mcp;
+#[cfg(test)]
 mod races;
 #[cfg(test)]
 mod reservation;
