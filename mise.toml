@@ -7,6 +7,11 @@
 
 [tools]
 rust = { version = "1.98.1", components = "rustfmt,clippy", targets = "wasm32-unknown-unknown" }
+# Claude Code over ACP (docs/adr/0012): the adapter is pinned exactly and gated by aim's live
+# capability probe at every bump. Node runs it (`#!/usr/bin/env node`). These must stay under
+# `[tools]` — below a `[tools."…"]` table they would silently become that tool's options.
+node = "26.8.1"
+"npm:@agentclientprotocol/claude-agent-acp" = "0.81.2"
 
 # Verus tags look like `release/0.2026.09.20.aef82ed`; `version_prefix` strips `release/`.
 # The archive also carries z3/rust_verify/…; only the two entry points go on PATH.
@@ -14,11 +19,6 @@ rust = { version = "1.98.1", components = "rustfmt,clippy", targets = "wasm32-un
 version = "0.2026.09.20.aef82ed"
 version_prefix = "release/"
 filter_bins = ["verus", "cargo-verus"]
-
-# Claude Code over ACP (docs/adr/0012): the adapter is pinned exactly and gated by aim's live
-# capability probe at every bump. Node runs it (`#!/usr/bin/env node`).
-node = "26.8.1"
-"npm:@agentclientprotocol/claude-agent-acp" = "0.81.2"
 
 # rustfmt does not format inside `verus! {}`; verusfmt does (kernel only).
 [tools."github:verus-lang/verusfmt"]
