@@ -267,6 +267,34 @@ async fn sqlite_store_obeys_the_contract_and_survives_reopening() {
     let _cleanup = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn concurrent_cold_store_opens_share_one_schema_upgrade() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = home.path().join("aim.db");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                SqliteStore::open(&path)
+            })
+        })
+        .collect();
+    barrier.wait();
+    for worker in workers {
+        let opened = worker.join().unwrap();
+        assert!(opened.is_ok(), "concurrent startup failed to migrate the shared database: {opened:?}");
+    }
+    let conn = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(conn.query_row("SELECT version FROM db_schema", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+}
+
 #[tokio::test]
 async fn sqlite_store_materializes_nested_forks() {
     let dir = std::env::temp_dir().join(format!("aim-fork-test-{}", std::process::id()));

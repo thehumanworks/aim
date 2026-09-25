@@ -163,6 +163,18 @@ fn private_tempdir() -> TempDir {
     dir
 }
 
+/// Stops an auto-spawned daemon if a later assertion fails. Each test has a private home.
+struct DetachedDaemonGuard<'a> {
+    home: &'a Path,
+    binary: &'a Path,
+}
+
+impl Drop for DetachedDaemonGuard<'_> {
+    fn drop(&mut self) {
+        drop(std::process::Command::new(self.binary).args(["daemon", "stop"]).env("AIM_HOME", self.home).output());
+    }
+}
+
 async fn started(
     deltas: usize,
     delay: Duration,
@@ -555,6 +567,7 @@ async fn stale_socket_is_recovered() {
 async fn binary_auto_spawn_status_stop_leaves_no_socket() {
     let dir = private_tempdir();
     let binary = env!("CARGO_BIN_EXE_aim");
+    let _daemon = DetachedDaemonGuard { home: dir.path(), binary: Path::new(binary) };
     let client = spawn::connect_or_spawn_executable(dir.path(), Path::new(binary)).await.unwrap();
     let socket = socket_path(dir.path());
     let status = std::process::Command::new(binary).args(["daemon", "status"]).env("AIM_HOME", dir.path()).output().unwrap();
@@ -592,11 +605,87 @@ async fn binary_auto_spawn_status_stop_leaves_no_socket() {
 async fn concurrent_auto_spawn_gets_one_process() {
     let dir = private_tempdir();
     let binary = Path::new(env!("CARGO_BIN_EXE_aim"));
+    let _daemon = DetachedDaemonGuard { home: dir.path(), binary };
     let (first, second) =
         tokio::join!(spawn::connect_or_spawn_executable(dir.path(), binary), spawn::connect_or_spawn_executable(dir.path(), binary),);
     let first = first.unwrap();
     let second = second.unwrap();
     assert_eq!(first.initialize_result().pid, second.initialize_result().pid);
+    let stopped = std::process::Command::new(binary).args(["daemon", "stop"]).env("AIM_HOME", dir.path()).status().unwrap();
+    assert!(stopped.success());
+    first.disconnect();
+    second.disconnect();
+}
+
+#[tokio::test]
+async fn cancelled_auto_spawn_reaps_its_child() {
+    let dir = private_tempdir();
+    let script = dir.path().join("slow-daemon");
+    std::fs::write(&script, "#!/bin/sh\nprintf '%s' \"$$\" > \"$AIM_HOME/child.pid\"\nexec /bin/sleep 30\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = dir.path().to_path_buf();
+    let task = tokio::spawn(async move { spawn::connect_or_spawn_executable(&home, &script).await });
+    let pid_file = dir.path().join("child.pid");
+    for _ in 0..250 {
+        if pid_file.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    task.abort();
+    drop(task.await);
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    assert!(
+        !std::process::Command::new("kill").args(["-0", pid.trim()]).status().unwrap().success(),
+        "cancelled auto-spawn left its child running"
+    );
+}
+
+#[tokio::test]
+async fn losing_auto_spawn_reaps_before_the_winner_stops() {
+    let dir = private_tempdir();
+    let binary = Path::new(env!("CARGO_BIN_EXE_aim"));
+    let _daemon = DetachedDaemonGuard { home: dir.path(), binary };
+    std::os::unix::fs::symlink(binary, dir.path().join("real-aim")).unwrap();
+    let script = dir.path().join("gated-daemon");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nif mkdir \"$AIM_HOME/first\" 2>/dev/null; then\n  echo \"$$\" > \"$AIM_HOME/slow.pid\"\n  while [ ! -e \"$AIM_HOME/release\" ]; do /bin/sleep 0.02; done\nfi\nexec \"$AIM_HOME/real-aim\" daemon\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = dir.path().to_path_buf();
+    let script_first = script.clone();
+    let first = tokio::spawn(async move { spawn::connect_or_spawn_executable(&home, &script_first).await });
+    let slow_pid_file = dir.path().join("slow.pid");
+    let mut slow_started = false;
+    for _ in 0..250 {
+        if slow_pid_file.exists() {
+            slow_started = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if !slow_started {
+        first.abort();
+        drop(first.await);
+        panic!("gated daemon never started");
+    }
+    let second = spawn::connect_or_spawn_executable(dir.path(), &script).await.unwrap();
+    let first = first.await.unwrap().unwrap();
+    assert_eq!(first.initialize_result().pid, second.initialize_result().pid);
+    let slow_pid = std::fs::read_to_string(slow_pid_file).unwrap();
+    let alive = std::process::Command::new("kill")
+        .args(["-0", slow_pid.trim()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    if alive {
+        let _killed = std::process::Command::new("kill").args(["-TERM", slow_pid.trim()]).status();
+    }
+    assert!(!alive, "losing auto-spawn child could start after the winner stops");
     let stopped = std::process::Command::new(binary).args(["daemon", "stop"]).env("AIM_HOME", dir.path()).status().unwrap();
     assert!(stopped.success());
     first.disconnect();

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -16,6 +17,38 @@ use aim_proto::event::{SessionEvent, SessionMeta};
 mod sqlite;
 
 pub use sqlite::SqliteStore;
+
+/// Serializes schema setup across daemon candidates before either acquires the daemon lock.
+/// SQLite's journal-mode PRAGMA can return BUSY immediately on a new shared file even with a
+/// connection busy timeout, so the session and board stores use the same advisory lock.
+pub(crate) fn schema_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".schema.lock");
+    let lock_path = Path::new(&name);
+    match std::fs::symlink_metadata(lock_path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "schema lock is not a regular file"));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.lock()?;
+    Ok(file)
+}
 
 /// A boxed, sendable, owned future.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;

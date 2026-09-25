@@ -5,10 +5,12 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aim::board::{Board, integration::IntegrationState};
+use aim::daemon::{client::DaemonClient, socket_path};
 use aim::host::{BoxFuture, SessionClient, UpdateStream};
 use aim::workers::{Integrator, Runner, RunnerOptions};
 use aim_proto::board::{FailureCleanup, JobSnapshot, JobSpec, PostParams, ReviewParams, WorkPolicy};
@@ -20,6 +22,33 @@ use aim_proto::daemon::{
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::event::SessionMeta;
 use tempfile::TempDir;
+
+/// The live test owns its daemon, including when an assertion or provider call fails.
+struct ChildGuard(Child);
+
+impl ChildGuard {
+    fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return status.success();
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            drop(self.0.kill());
+            drop(self.0.wait());
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Script {
@@ -425,12 +454,33 @@ async fn live_board_worker_codex_end_to_end() {
         .unwrap()
         .job;
     let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("aim");
+    let mut daemon = ChildGuard(
+        std::process::Command::new(&binary)
+            .arg("daemon")
+            .env("AIM_HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let startup = Instant::now();
+    loop {
+        if let Ok(client) = DaemonClient::connect(&socket_path(&home)).await {
+            client.disconnect();
+            break;
+        }
+        assert!(daemon.0.try_wait().unwrap().is_none(), "live test daemon exited before becoming ready");
+        assert!(startup.elapsed() < Duration::from_secs(30), "live test daemon did not become ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let began = Instant::now();
     let output = tokio::process::Command::new(&binary)
         .env("AIM_HOME", &home)
         .args(["board", "work", "--provider", "codex", "--effort", "low", "--once", "--timeout-seconds", "180", "--aimx"])
         .arg(aimx())
         .arg("--json")
+        .kill_on_drop(true)
         .output()
         .await
         .unwrap();
@@ -451,4 +501,5 @@ async fn live_board_worker_codex_end_to_end() {
     );
     let stopped = tokio::process::Command::new(binary).env("AIM_HOME", &home).args(["daemon", "stop"]).output().await.unwrap();
     assert!(stopped.status.success(), "{}", String::from_utf8_lossy(&stopped.stderr));
+    assert!(daemon.wait_for_exit(Duration::from_secs(10)), "live test daemon did not exit cleanly");
 }
