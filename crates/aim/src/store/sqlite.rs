@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use aim_proto::daemon::SessionState;
 use aim_proto::event::{SessionEvent, SessionMeta};
@@ -297,6 +298,7 @@ impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         private_store_files(path)?;
         let conn = Connection::open(path).map_err(backend)?;
+        conn.busy_timeout(Duration::from_secs(5)).map_err(backend)?;
         migrate(&conn)?;
         private_store_files(path)?;
         let (tx, rx) = mpsc::channel();
