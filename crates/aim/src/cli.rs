@@ -166,7 +166,9 @@ impl Human {
             | AgentEvent::ItemAdded { .. }
             | AgentEvent::SteerQueued
             | AgentEvent::SteerDelivered { .. }
-            | AgentEvent::RateLimits { .. } => Ok(()),
+            | AgentEvent::RateLimits { .. }
+            // Surfaces are for interactive clients; headless output shows the tool call.
+            | AgentEvent::Ui { .. } => Ok(()),
             AgentEvent::Decision { decision } => {
                 writeln!(err, "· effort: {} → {} (Jev {} ms)", decision.current, decision.output, decision.latency_ms)
             }

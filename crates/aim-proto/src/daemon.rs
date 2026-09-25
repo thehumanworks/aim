@@ -255,6 +255,12 @@ pub enum SessionUpdate {
         /// Estimated context tokens after.
         tokens_after: u64,
     },
+    /// A UI surface message (ADR 0064), after the session validated it. Clients fold it into
+    /// their surfaces ([`crate::ui::model::Surfaces`]); it is recorded in the session log.
+    Ui {
+        /// The message.
+        message: crate::ui::UiEnvelope,
+    },
     /// The turn is over.
     TurnEnded {
         /// Why.
@@ -310,6 +316,10 @@ pub struct SessionAttachResult {
     pub summary: SessionSummary,
     /// The transcript so far (finished items, in order).
     pub transcript: Vec<Item>,
+    /// The session's UI surfaces as of the same instant (ADR 0064), in creation order; each
+    /// records where in the transcript it was created.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surfaces: Vec<crate::ui::model::Surface>,
 }
 
 method!(
@@ -328,6 +338,10 @@ pub struct SessionAttachPagedResult {
     pub total_bytes: u64,
     /// First bounded chunk of the serialized transcript.
     pub first_chunk: Base64Bytes,
+    /// The session's UI surfaces at the snapshot boundary (ADR 0064). Bounded by the session's UI
+    /// limits, so they travel whole in this reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surfaces: Vec<crate::ui::model::Surface>,
 }
 
 method!(

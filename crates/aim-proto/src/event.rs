@@ -157,6 +157,12 @@ pub enum EventBody {
         /// What replaced them.
         items: Vec<Item>,
     },
+    /// A UI surface message (ADR 0064): recorded as validated, so resume, attach and replay
+    /// rebuild the session's surfaces by folding these in order.
+    Ui {
+        /// The message.
+        message: crate::ui::UiEnvelope,
+    },
     /// An event kind this build does not know; preserved verbatim.
     #[serde(untagged)]
     Unknown(Value),

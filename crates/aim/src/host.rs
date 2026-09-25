@@ -1161,7 +1161,7 @@ impl SessionClient for SessionHost {
             let live = host.live_or_resume(&session).await?;
             let transcript = lock(&live.transcript);
             let rx = live.updates.subscribe();
-            let result = SessionAttachResult { summary: lock(&live.summary).clone(), transcript: transcript.clone() };
+            let result = SessionAttachResult { summary: lock(&live.summary).clone(), transcript: transcript.clone(), surfaces: Vec::new() };
             drop(transcript);
             Ok((result, updates_of(rx)))
         })

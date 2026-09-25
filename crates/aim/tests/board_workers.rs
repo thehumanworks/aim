@@ -115,7 +115,7 @@ impl SessionClient for Scripted {
             let updates: UpdateStream = Box::pin(async_stream::stream! {
                 while let Ok(update) = receiver.recv().await { yield update; }
             });
-            Ok((SessionAttachResult { summary, transcript: vec![] }, updates))
+            Ok((SessionAttachResult { summary, transcript: vec![], surfaces: vec![] }, updates))
         })
     }
     fn prompt(&self, id: String, parts: Vec<Part>) -> BoxFuture<Result<PromptOutcome, ProtoError>> {

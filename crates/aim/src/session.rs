@@ -115,6 +115,7 @@ impl Recorder {
                 EventBody::ConfigChanged { model: model.clone(), effort: effort.clone(), effort_source: *effort_source }
             }
             AgentEvent::Compacted { replaced, items, .. } => EventBody::Compacted { replaced: *replaced, items: items.clone() },
+            AgentEvent::Ui { message } => EventBody::Ui { message: message.clone() },
             AgentEvent::StateChanged { .. }
             | AgentEvent::TurnStarted { .. }
             | AgentEvent::RequestStarted { .. }

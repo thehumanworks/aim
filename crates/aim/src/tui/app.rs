@@ -816,6 +816,7 @@ impl App {
                 // One per request: shown in the status line, not the transcript.
                 self.jev_effort = decision.ladder.get(usize::try_from(decision.output).unwrap_or(usize::MAX)).cloned();
             }
+            SessionUpdate::Ui { .. } => {}
             SessionUpdate::TurnEnded { stop } => self.on_turn_ended(&stop),
             SessionUpdate::TurnFailed { message } => {
                 self.flush_live();
