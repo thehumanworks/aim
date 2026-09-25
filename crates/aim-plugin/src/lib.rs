@@ -276,52 +276,56 @@ impl PluginToolHost {
         let allowed = Arc::clone(&self.allowed_tools);
         let metadata = Arc::clone(&self.metadata);
         Box::pin(async move {
-            // Guest read/modify/write sequences in KV are serial for this component within the
-            // daemon. Individual file updates remain locked for concurrent processes.
-            let locks = CALL_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-            let call_lock = {
-                let mut registry = locks.lock().map_err(|_| runtime_error("plugin call locks poisoned"))?;
-                Arc::clone(registry.entry(plugin.hash.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
-            };
-            let _guard = call_lock.lock().await;
-            let engine = ENGINE.get_or_init(create_engine).as_ref().map_err(runtime_error)?.clone();
-            let compile_engine = engine.clone();
-            let compile_hash = plugin.hash.clone();
-            let compile_bytes = Arc::clone(&plugin.bytes);
-            let component = tokio::task::spawn_blocking(move || compiled(&compile_engine, &compile_hash, &compile_bytes))
-                .await
-                .map_err(runtime_error)?
-                .map_err(runtime_error)?;
-            let prefix = format!("plugin__{}__", plugin.manifest.name);
-            let raw_name =
-                name.strip_prefix(&prefix).ok_or_else(|| ProtoError::new(ErrorCode::InvalidParams, "plugin namespace mismatch"))?;
-            let json = serde_json::to_string(&arguments).map_err(|e| ProtoError::new(ErrorCode::InvalidParams, e.to_string()))?;
-            if json.len() > MAX_ARGUMENT_BYTES {
-                return Err(ProtoError::new(ErrorCode::InvalidParams, "plugin arguments exceed 1 MiB"));
-            }
-            let (mut store, guest) =
-                instantiate(&engine, &component, &plugin, delegate, allowed, metadata, key).await.map_err(runtime_error)?;
-            let registration = guest
-                .aim_plugin_plugin()
-                .call_init(&mut store, &"{}".to_owned())
-                .await
-                .map_err(runtime_error)?
-                .map_err(|error| ProtoError::new(ErrorCode::Unavailable, format!("plugin init: {error:?}")))?;
-            validate_registration(&plugin.manifest, &registration).map_err(runtime_error)?;
-            let result = guest
-                .aim_plugin_plugin()
-                .call_call_tool(&mut store, raw_name, &name, &json)
-                .await
-                .map_err(runtime_error)?
-                .map_err(|error| ProtoError::new(ErrorCode::Unavailable, format!("plugin call: {error:?}")))?;
-            serde_json::from_str::<ToolResult>(&result.content)
-                .map_err(|e| ProtoError::new(ErrorCode::Unavailable, format!("invalid plugin result: {e}")))
+            tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+                // Guest read/modify/write sequences in KV are serial for this component within the
+                // daemon. Individual file updates remain locked for concurrent processes.
+                let locks = CALL_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+                let call_lock = {
+                    let mut registry = locks.lock().map_err(|_| runtime_error("plugin call locks poisoned"))?;
+                    Arc::clone(registry.entry(plugin.hash.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
+                };
+                let _guard = call_lock.lock().await;
+                let engine = ENGINE.get_or_init(create_engine).as_ref().map_err(runtime_error)?.clone();
+                let compile_engine = engine.clone();
+                let compile_hash = plugin.hash.clone();
+                let compile_bytes = Arc::clone(&plugin.bytes);
+                let component = tokio::task::spawn_blocking(move || compiled(&compile_engine, &compile_hash, &compile_bytes))
+                    .await
+                    .map_err(runtime_error)?
+                    .map_err(runtime_error)?;
+                let prefix = format!("plugin__{}__", plugin.manifest.name);
+                let raw_name =
+                    name.strip_prefix(&prefix).ok_or_else(|| ProtoError::new(ErrorCode::InvalidParams, "plugin namespace mismatch"))?;
+                let json = serde_json::to_string(&arguments).map_err(|e| ProtoError::new(ErrorCode::InvalidParams, e.to_string()))?;
+                if json.len() > MAX_ARGUMENT_BYTES {
+                    return Err(ProtoError::new(ErrorCode::InvalidParams, "plugin arguments exceed 1 MiB"));
+                }
+                let (mut store, guest) =
+                    instantiate(&engine, &component, &plugin, delegate, allowed, metadata, key).await.map_err(runtime_error)?;
+                let registration = guest
+                    .aim_plugin_plugin()
+                    .call_init(&mut store, &"{}".to_owned())
+                    .await
+                    .map_err(runtime_error)?
+                    .map_err(|error| ProtoError::new(ErrorCode::Unavailable, format!("plugin init: {error:?}")))?;
+                validate_registration(&plugin.manifest, &registration).map_err(runtime_error)?;
+                let result = guest
+                    .aim_plugin_plugin()
+                    .call_call_tool(&mut store, raw_name, &name, &json)
+                    .await
+                    .map_err(runtime_error)?
+                    .map_err(|error| ProtoError::new(ErrorCode::Unavailable, format!("plugin call: {error:?}")))?;
+                serde_json::from_str::<ToolResult>(&result.content)
+                    .map_err(|e| ProtoError::new(ErrorCode::Unavailable, format!("invalid plugin result: {e}")))
+            })
+            .await
+            .map_err(|_| ProtoError::new(ErrorCode::Unavailable, "plugin call deadline exceeded"))?
         })
     }
 }
 
 fn runtime_error(error: impl fmt::Display) -> ProtoError {
-    ProtoError::new(ErrorCode::Unavailable, format!("plugin runtime: {error}"))
+    ProtoError::new(ErrorCode::Unavailable, format!("plugin runtime: {error:#}"))
 }
 
 fn validate_registration(manifest: &PluginManifest, registration: &types::Registration) -> Result<(), PluginError> {
@@ -569,10 +573,15 @@ impl session::Host for HostState {
         if !self.grants.contains("session.read") {
             return Err(denied());
         }
-        if query.len() > 1024 || query != "{}" {
+        let parsed: Value = serde_json::from_str(&query).map_err(|e| types::Error::Invalid(e.to_string()))?;
+        if query.len() > 1024 || parsed != serde_json::json!({}) {
             return Err(types::Error::Invalid("only the full read-only metadata query is supported".into()));
         }
-        serde_json::to_string(&*self.metadata).map_err(|e| types::Error::Failed(e.to_string()))
+        let result = serde_json::to_string(&*self.metadata).map_err(|e| types::Error::Failed(e.to_string()))?;
+        if result.len() > 8192 {
+            return Err(types::Error::Invalid("session metadata exceeds 8 KiB".into()));
+        }
+        Ok(result)
     }
 }
 

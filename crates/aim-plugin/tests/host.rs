@@ -33,6 +33,7 @@ fn source(name: &str, project: bool) -> PluginSource {
     let manifest_text = std::fs::read_to_string(base.join(name).join("aim-plugin.toml")).unwrap();
     let path = match name {
         "kv_counter" => "aim_example_kv_counter.wasm",
+        "runaway" => "aim_example_runaway.wasm",
         _ => "aim_example_delegate_read.wasm",
     };
     let component = std::fs::read(base.join("build").join(path)).unwrap();
@@ -124,4 +125,19 @@ async fn delegated_tool_needs_both_hash_grant_and_agent_allowlist() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "read");
     assert_eq!(calls[0].1.as_str(), "outer-key:plugin:0");
+}
+
+#[tokio::test]
+async fn runaway_component_exhausts_fuel_without_hanging_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut trust = TrustStore::load(dir.path()).unwrap();
+    let src = source("runaway", false);
+    trust.grant(&src.hash(), ["tools.provide".into()]).unwrap();
+    let delegate = Arc::new(Delegate::default());
+    let host = PluginToolHost::load(&trust, vec![src], delegate, HashSet::new()).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), host.call("plugin__runaway__runaway".into(), json!({}), key()))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(result.message.contains("fuel"), "unexpected trap: {}", result.message);
 }
