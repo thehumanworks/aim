@@ -30,6 +30,8 @@ use std::collections::hash_map::RandomState;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::BuildHasher as _;
 
+use aim_kernel::dedup::{BeginDecision, Phase, decide_begin, decide_evict, decide_finish};
+
 /// Table bounds and lifetimes (times in milliseconds).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DedupConfig {
@@ -131,25 +133,23 @@ impl<O: Clone> DedupTable<O> {
     /// it answers `Expired` and is not executed.
     pub fn begin(&mut self, key: &str, fingerprint: u64, stale: bool, now: u64) -> Begin<O> {
         self.expire(now);
-        match self.records.get(key) {
-            Some(Record::InFlight { fingerprint: seen, .. }) => {
-                if *seen == fingerprint {
-                    Begin::InFlight
-                } else {
-                    Begin::Mismatch
-                }
-            }
-            Some(Record::Done { fingerprint: seen, outcome, .. }) => {
-                if *seen == fingerprint {
-                    Begin::Replay(outcome.clone())
-                } else {
-                    Begin::Mismatch
-                }
-            }
-            None if stale || self.tombstones.contains_key(&self.digest(key)) => Begin::Expired,
-            None if self.keys() >= self.config.max_keys => Begin::Full,
-            None if self.in_flight >= self.config.max_in_flight => Begin::Busy,
-            None => {
+        let (phase, same_request) = match self.records.get(key) {
+            Some(Record::InFlight { fingerprint: seen, .. }) => (Phase::InFlight, *seen == fingerprint),
+            Some(Record::Done { fingerprint: seen, .. }) => (Phase::Done, *seen == fingerprint),
+            None if self.tombstones.contains_key(&self.digest(key)) => (Phase::Tombstone, false),
+            None => (Phase::Absent, false),
+        };
+        match decide_begin(phase, same_request, stale, self.keys() >= self.config.max_keys, self.in_flight >= self.config.max_in_flight) {
+            BeginDecision::InFlight => Begin::InFlight,
+            BeginDecision::Replay => match self.records.get(key) {
+                Some(Record::Done { outcome, .. }) => Begin::Replay(outcome.clone()),
+                _ => Begin::Expired,
+            },
+            BeginDecision::Mismatch => Begin::Mismatch,
+            BeginDecision::UnknownOutcome => Begin::Expired,
+            BeginDecision::Full => Begin::Full,
+            BeginDecision::Busy => Begin::Busy,
+            BeginDecision::Execute => {
                 self.records.insert(key.to_owned(), Record::InFlight { fingerprint, since: now });
                 self.in_flight += 1;
                 Begin::Execute
@@ -159,6 +159,14 @@ impl<O: Clone> DedupTable<O> {
 
     /// Records the outcome of an execution started by [`Begin::Execute`].
     pub fn complete(&mut self, key: &str, outcome: O, now: u64) {
+        let phase = match self.records.get(key) {
+            Some(Record::InFlight { .. }) => Phase::InFlight,
+            Some(Record::Done { .. }) => Phase::Done,
+            None => Phase::Absent,
+        };
+        if decide_finish(phase, true) != Some(Phase::Done) {
+            return;
+        }
         let (fingerprint, since) = match self.records.get(key) {
             Some(Record::InFlight { fingerprint, since }) => (*fingerprint, *since),
             // Completing a key that is not in flight is a caller bug; keep the table unchanged.
@@ -177,7 +185,12 @@ impl<O: Clone> DedupTable<O> {
 
     /// Forgets an in-flight key whose execution never started (so a retry may execute).
     pub fn abandon(&mut self, key: &str) {
-        if matches!(self.records.get(key), Some(Record::InFlight { .. })) {
+        let phase = match self.records.get(key) {
+            Some(Record::InFlight { .. }) => Phase::InFlight,
+            Some(Record::Done { .. }) => Phase::Done,
+            None => Phase::Absent,
+        };
+        if decide_finish(phase, false) == Some(Phase::Absent) {
             self.records.remove(key);
             self.in_flight = self.in_flight.saturating_sub(1);
         }
@@ -194,7 +207,7 @@ impl<O: Clone> DedupTable<O> {
             self.bury(&key, expires, now);
         }
         while let Some(Reverse((expires, hash))) = self.tombstone_order.peek().copied() {
-            if expires > now {
+            if decide_evict(Phase::Tombstone, expires <= now) != Phase::Absent {
                 break;
             }
             self.tombstone_order.pop();
@@ -214,7 +227,7 @@ impl<O: Clone> DedupTable<O> {
         };
         self.records.remove(key);
         let until = since.saturating_add(self.config.horizon_ms);
-        if until > now {
+        if decide_evict(Phase::Done, until <= now) == Phase::Tombstone {
             let hash = self.digest(key);
             let until = self.tombstones.get(&hash).map_or(until, |other| until.max(*other));
             self.tombstones.insert(hash, until);

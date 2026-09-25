@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+use aim_kernel::discovery::{Budget, ReadCharge};
 use aim_proto::harness::EntryKind;
 
 use super::files::{FileText, Files, READ_BATCH, Read};
@@ -90,38 +91,33 @@ struct Planned {
 /// file nothing.
 #[derive(Debug)]
 struct Admission {
-    files_left: usize,
-    bytes_left: u64,
-    cap: u64,
+    budget: Budget,
 }
 
 impl Admission {
-    const fn new(bounds: &Bounds) -> Self {
-        Self { files_left: bounds.max_files, bytes_left: bounds.max_total_bytes, cap: bounds.max_file_bytes }
+    fn new(bounds: &Bounds) -> Self {
+        Self { budget: Budget::new(u64::try_from(bounds.max_files).unwrap_or(u64::MAX), bounds.max_total_bytes, bounds.max_file_bytes) }
     }
 
     /// How many of `wanted` files (at most `batch`) the next read may name; reserves their bytes.
     fn admit(&mut self, wanted: usize, batch: usize) -> usize {
-        let by_bytes = self.bytes_left.checked_div(self.cap).map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
-        let admitted = wanted.min(batch).min(self.files_left).min(by_bytes);
-        self.files_left = self.files_left.saturating_sub(admitted);
-        self.bytes_left = self.bytes_left.saturating_sub(self.cap.saturating_mul(u64::try_from(admitted).unwrap_or(u64::MAX)));
-        admitted
+        let selected = self.budget.reserve(u64::try_from(wanted).unwrap_or(u64::MAX), u64::try_from(batch).unwrap_or(u64::MAX));
+        usize::try_from(selected).unwrap_or(usize::MAX)
     }
 
     /// Settles one admitted file's reservation once it was read.
     fn settle(&mut self, read: &Read) {
-        let used = match read {
-            Read::Ok(file) => u64::try_from(file.text.len()).unwrap_or(u64::MAX).min(self.cap),
-            Read::Missing => 0,
-            Read::Failed(_) => self.cap,
+        let charge = match read {
+            Read::Ok(file) => ReadCharge::Bytes(u64::try_from(file.text.len()).unwrap_or(u64::MAX)),
+            Read::Missing => ReadCharge::Missing,
+            Read::Failed(_) => ReadCharge::Failed,
         };
-        self.bytes_left = self.bytes_left.saturating_add(self.cap.saturating_sub(used));
+        let _settled = self.budget.settle(charge);
     }
 
     /// Why the next file is not read.
     fn refusal(&self, bounds: &Bounds) -> String {
-        if self.files_left == 0 {
+        if self.budget.files_left() == 0 {
             format!("not read: more than {} resource files", bounds.max_files)
         } else {
             format!("not read: the {}-byte budget for resources is spent", bounds.max_total_bytes)

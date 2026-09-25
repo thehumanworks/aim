@@ -65,3 +65,4 @@ Rules (enforced by `mise run check`):
 | [0046](0046-per-call-harness-authority.md) | Carry narrowing authority on harness calls and sessions. |
 | [0047](0047-remote-harness-websocket-and-http.md) | Carry the harness protocol over bounded WebSocket and HTTP sessions. |
 | [0048](0048-board-workers-and-integration.md) | Run fenced board attempts in isolated worktrees and integrate accepted evidence serially. |
+| [0050](0050-verified-tool-dedup-and-discovery-decisions.md) | Verify named-agent tool ceilings, mutation replay, and resource-read budgets. |

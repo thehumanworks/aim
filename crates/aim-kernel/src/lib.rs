@@ -27,8 +27,11 @@
 #![cfg_attr(verus_keep_ghost, allow(missing_docs, reason = "Verus derive expansion adds undocumented ghost helpers"))]
 extern crate alloc;
 
+pub mod agent_tools;
 pub mod board;
 pub mod compaction;
+pub mod dedup;
+pub mod discovery;
 pub mod effort;
 pub mod job;
 pub mod negotiate;
