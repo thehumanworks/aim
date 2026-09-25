@@ -88,68 +88,139 @@ impl Integrator {
             return Err("contribution packet disagrees with the queued branch".into());
         }
         let source = GitHarness::connect(&self.aimx, root, &work.location).await.map_err(|err| err.to_string())?;
-        let target_path = self.target_worktree(&source, root, &queued.target_branch).await;
-        let result = match target_path {
-            Ok(path) if path == root => self.integrate_on_host(&source, &job_id, &queued, &contribution).await,
-            Ok(path) => {
-                let target = GitHarness::connect(&self.aimx, &path, &work.location).await.map_err(|err| err.to_string())?;
-                let result = self.integrate_on_host(&target, &job_id, &queued, &contribution).await;
-                target.shutdown().await;
-                result
-            }
-            Err(err) => Err(err),
-        };
+        let result = self.integrate_detached(&source, root, &work.location, &job_id, &queued, &contribution).await;
         source.shutdown().await;
         result
     }
 
-    async fn target_worktree(&self, source: &GitHarness, root: &str, target_branch: &str) -> Result<String, String> {
+    /// Merges and checks in a fresh detached worktree of the pinned target head, never in a
+    /// checkout someone works in (review finding N3), then advances the target branch only by a
+    /// fast-forward of a clean checkout still at the pinned head, or a compare-and-swap ref update
+    /// when the branch is not checked out. The detached worktree is removed either way.
+    async fn integrate_detached(
+        &self,
+        source: &GitHarness,
+        root: &str,
+        location: &aim_proto::daemon::Location,
+        job_id: &str,
+        queued: &IntegrationRecord,
+        contribution: &Contribution,
+    ) -> Result<IntegrationRecord, String> {
+        let target_ref = format!("refs/heads/{}", queued.target_branch);
+        let pinned = valid_git(
+            source
+                .argv(vec!["git".into(), "rev-parse".into(), "--verify".into(), target_ref.clone()], GIT_TIMEOUT_MS)
+                .await
+                .map_err(|err| err.to_string())?,
+            "pin target head",
+        )?;
+        let scratch = format!("{}-board-integration-{}", root.trim_end_matches('/'), Uuid::new_v4());
+        valid_git(
+            source
+                .argv(
+                    vec!["git".into(), "worktree".into(), "add".into(), "--detach".into(), scratch.clone(), pinned.clone()],
+                    GIT_TIMEOUT_MS,
+                )
+                .await
+                .map_err(|err| err.to_string())?,
+            "create detached integration worktree",
+        )?;
+        let merged = match GitHarness::connect(&self.aimx, &scratch, location).await {
+            Ok(target) => {
+                let merged = self.integrate_on_host(&target, source, location, job_id, queued, contribution, &pinned).await;
+                target.shutdown().await;
+                merged
+            }
+            Err(err) => Err(err.to_string()),
+        };
+        let removed =
+            source.argv(vec!["git".into(), "worktree".into(), "remove".into(), "--force".into(), scratch.clone()], GIT_TIMEOUT_MS).await;
+        if !removed.is_ok_and(|out| out.success()) {
+            tracing::warn!(path = %scratch, "could not remove the detached integration worktree");
+        }
+        merged
+    }
+
+    /// Moves the target branch from `pinned` to `result`, touching a checkout only when it is
+    /// clean and still at `pinned`. Returns why it could not.
+    async fn advance_target(
+        &self,
+        source: &GitHarness,
+        target_branch: &str,
+        pinned: &str,
+        result: &str,
+        location: &aim_proto::daemon::Location,
+    ) -> Result<(), String> {
+        let target_ref = format!("refs/heads/{target_branch}");
         let listed = valid_git(
             source
                 .argv(vec!["git".into(), "worktree".into(), "list".into(), "--porcelain".into()], GIT_TIMEOUT_MS)
                 .await
                 .map_err(|err| err.to_string())?,
-            "list target worktrees",
+            "list worktrees",
         )?;
         let mut path = None;
+        let mut checked_out = None;
         for line in listed.lines() {
             if let Some(value) = line.strip_prefix("worktree ") {
                 path = Some(value.to_owned());
-            } else if line == format!("branch refs/heads/{target_branch}")
-                && let Some(path) = path
-            {
-                return Ok(path);
+            } else if line == format!("branch {target_ref}") {
+                checked_out.clone_from(&path);
             }
         }
-        let dedicated = format!("{}-board-integration-{}", root.trim_end_matches('/'), Uuid::new_v4());
-        valid_git(
-            source
-                .argv(vec!["git".into(), "worktree".into(), "add".into(), dedicated.clone(), target_branch.to_owned()], GIT_TIMEOUT_MS)
+        let Some(checkout) = checked_out else {
+            // Not checked out anywhere: a compare-and-swap ref update.
+            let moved = source
+                .argv(vec!["git".into(), "update-ref".into(), target_ref, result.to_owned(), pinned.to_owned()], GIT_TIMEOUT_MS)
                 .await
-                .map_err(|err| err.to_string())?,
-            "create dedicated integration worktree",
-        )?;
-        Ok(dedicated)
+                .map_err(|err| err.to_string())?;
+            return if moved.success() { Ok(()) } else { Err("the target branch moved during integration".into()) };
+        };
+        let target = GitHarness::connect(&self.aimx, &checkout, location).await.map_err(|err| err.to_string())?;
+        let advanced = async {
+            let status = valid_git(
+                target
+                    .argv(vec!["git".into(), "status".into(), "--porcelain".into()], GIT_TIMEOUT_MS)
+                    .await
+                    .map_err(|err| err.to_string())?,
+                "read target status",
+            )?;
+            let head = valid_git(
+                target.argv(vec!["git".into(), "rev-parse".into(), "HEAD".into()], GIT_TIMEOUT_MS).await.map_err(|err| err.to_string())?,
+                "read target head",
+            )?;
+            if !status.is_empty() || head != pinned {
+                return Err(format!(
+                    "the target checkout {checkout} is dirty or moved; the merged commit {result} is left for you to fast-forward"
+                ));
+            }
+            let forwarded = target
+                .argv(vec!["git".into(), "merge".into(), "--ff-only".into(), result.to_owned()], GIT_TIMEOUT_MS)
+                .await
+                .map_err(|err| err.to_string())?;
+            if forwarded.success() {
+                Ok(())
+            } else {
+                Err(format!("could not fast-forward {checkout}; the merged commit {result} is left for you"))
+            }
+        }
+        .await;
+        target.shutdown().await;
+        advanced
     }
 
     #[expect(clippy::too_many_lines, reason = "one serialized merge and check transaction with explicit outcome evidence")]
+    #[expect(clippy::too_many_arguments, reason = "one integration's inputs, kept explicit")]
     async fn integrate_on_host(
         &self,
         harness: &GitHarness,
+        repo: &GitHarness,
+        location: &aim_proto::daemon::Location,
         job_id: &str,
         queued: &IntegrationRecord,
         contribution: &Contribution,
+        pinned: &str,
     ) -> Result<IntegrationRecord, String> {
-        let branch = valid_git(
-            harness
-                .argv(vec!["git".into(), "branch".into(), "--show-current".into()], GIT_TIMEOUT_MS)
-                .await
-                .map_err(|err| err.to_string())?,
-            "read target branch",
-        )?;
-        if branch != queued.target_branch {
-            return Err("target checkout is on a different branch".into());
-        }
         let status = valid_git(
             harness.argv(vec!["git".into(), "status".into(), "--porcelain".into()], GIT_TIMEOUT_MS).await.map_err(|err| err.to_string())?,
             "read target status",
@@ -157,10 +228,7 @@ impl Integrator {
         if !status.is_empty() {
             return Err("target checkout is dirty or has an unfinished merge".into());
         }
-        let target = valid_git(
-            harness.argv(vec!["git".into(), "rev-parse".into(), "HEAD".into()], GIT_TIMEOUT_MS).await.map_err(|err| err.to_string())?,
-            "pin target head",
-        )?;
+        let target = pinned.to_owned();
         let source = valid_git(
             harness
                 .argv(
@@ -212,13 +280,19 @@ impl Integrator {
                         .await
                         .map_err(|err| err.to_string())?;
                     if committed.success() {
-                        result_commit = Some(valid_git(
+                        let commit = valid_git(
                             harness
                                 .argv(vec!["git".into(), "rev-parse".into(), "HEAD".into()], GIT_TIMEOUT_MS)
                                 .await
                                 .map_err(|err| err.to_string())?,
                             "read merge commit",
-                        )?);
+                        )?;
+                        // Only now does anything outside the detached worktree change.
+                        if let Err(why) = self.advance_target(repo, &queued.target_branch, pinned, &commit, location).await {
+                            state = IntegrationState::Failed;
+                            check_log = Some(format!("{}\nnot integrated: {why}", check_log.unwrap_or_default()));
+                        }
+                        result_commit = Some(commit);
                     } else {
                         state = IntegrationState::Failed;
                     }

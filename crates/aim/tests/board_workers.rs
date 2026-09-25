@@ -290,7 +290,58 @@ async fn conflicting_integrations_leave_conflict_files() {
     let conflict = integrator.integrate(b.id).await.unwrap();
     assert_eq!(conflict.state, IntegrationState::Conflict);
     assert_eq!(conflict.conflict_files, vec!["shared.txt"]);
-    assert!(std::fs::read_to_string(repo.join("shared.txt")).unwrap().contains("<<<<<<<"));
+    // The conflict stays in the removed detached worktree: the user's checkout is untouched,
+    // clean, and not mid-merge (review finding N3).
+    assert!(!std::fs::read_to_string(repo.join("shared.txt")).unwrap().contains("<<<<<<<"));
+    let status = std::process::Command::new("git").args(["status", "--porcelain"]).current_dir(&repo).output().unwrap();
+    assert!(status.stdout.is_empty(), "{}", String::from_utf8_lossy(&status.stdout));
+    assert!(!repo.join(".git/MERGE_HEAD").exists(), "no half-done merge");
+}
+
+/// Review finding N3: a check that fails on the merged result never leaves the user's checkout mid-merge,
+/// and the branch is not moved.
+#[tokio::test]
+async fn a_failed_check_leaves_the_users_checkout_untouched() {
+    let (_dir, repo, home, board, sessions) = setup(Script::Separate);
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").args(args).current_dir(&repo).output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let job = board
+        .post(PostParams {
+            run_id: None,
+            spec: JobSpec {
+                title: "A".into(),
+                deliverable: "Write A output".into(),
+                acceptance: vec!["File exists".into()],
+                depends_on: Vec::new(),
+                max_retries: 1,
+                workspace: Some(repo.to_string_lossy().to_string()),
+                work: Some(WorkPolicy {
+                    location: Location::Local,
+                    target_branch: "main".into(),
+                    // Passes in the attempt; fails once main gains blocker.txt below.
+                    check_command: Some("test ! -f blocker.txt".into()),
+                    failure_cleanup: FailureCleanup::Keep,
+                }),
+            },
+            idempotency_key: "post-failing-check".into(),
+        })
+        .await
+        .unwrap()
+        .job;
+    let runner = worker(&home, board.clone(), sessions);
+    assert_eq!(runner.run_once().await.unwrap().succeeded, 1);
+    accept(&board, &job.id).await;
+    std::fs::write(repo.join("blocker.txt"), "x").unwrap();
+    git(&["add", "blocker.txt"]);
+    git(&["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "blocker"]);
+    let before = git(&["rev-parse", "HEAD"]);
+    let integrator = Integrator::new(board, &home, aimx()).unwrap();
+    assert_eq!(integrator.integrate(job.id).await.unwrap().state, IntegrationState::Failed);
+    assert_eq!(git(&["rev-parse", "HEAD"]), before, "the branch did not move");
+    assert!(git(&["status", "--porcelain"]).is_empty(), "the checkout is clean");
+    assert!(!repo.join(".git/MERGE_HEAD").exists(), "no half-done merge");
 }
 
 #[tokio::test]
