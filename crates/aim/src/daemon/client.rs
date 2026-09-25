@@ -11,7 +11,8 @@ use aim_proto::conversation::Part;
 use aim_proto::daemon::{
     DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeParams, DaemonInitializeResult, PromptOutcome, SessionAttach,
     SessionAttachResult, SessionCancel, SessionClose, SessionConfigParams, SessionCreate, SessionDetach, SessionList, SessionListParams,
-    SessionPrompt, SessionPromptParams, SessionRef, SessionSetConfig, SessionSpec, SessionSummary, SessionUpdate, SessionUpdateParams,
+    SessionPrompt, SessionPromptParams, SessionRef, SessionSetConfig, SessionSpec, SessionState, SessionSummary, SessionUpdate,
+    SessionUpdateParams,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{GenerationRange, PeerInfo};
@@ -32,6 +33,14 @@ type Subscribers = Arc<Mutex<HashMap<String, (u64, mpsc::Sender<SessionUpdate>)>
 
 struct UpdateHandler(Subscribers);
 
+struct ClientLifetime(Peer);
+
+impl Drop for ClientLifetime {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 impl Handler for UpdateHandler {
     fn request(&self, _ctx: RequestCtx, method: String, _params: Value) -> Pin<Box<dyn Future<Output = Result<Value, ProtoError>> + Send>> {
         Box::pin(async move { Err(ProtoError::new(ErrorCode::MethodNotFound, format!("unknown method `{method}`"))) })
@@ -44,7 +53,9 @@ impl Handler for UpdateHandler {
                 && let Ok(SessionUpdateParams { session, update }) = serde_json::from_value(params)
             {
                 let mut attached = lock(&subscribers);
-                if attached.get(&session).is_some_and(|(_, sender)| sender.try_send(update).is_err()) {
+                let closed = matches!(update, SessionUpdate::StateChanged { state: SessionState::Closed });
+                let failed = attached.get(&session).is_some_and(|(_, sender)| sender.try_send(update).is_err());
+                if failed || closed {
                     // A lagging UI must reattach for a fresh snapshot. Never hold up the
                     // ordered RPC notification reader or grow a queue without bound.
                     attached.remove(&session);
@@ -54,13 +65,15 @@ impl Handler for UpdateHandler {
     }
 }
 
-/// An initialized connection to one daemon process.
+/// An initialized connection to one daemon process. Each attachment buffers at most 1024
+/// updates; when its consumer falls behind, that stream ends and should be reattached.
 #[derive(Clone)]
 pub struct DaemonClient {
     peer: Peer,
     init: DaemonInitializeResult,
     subscribers: Subscribers,
     serial: Arc<std::sync::atomic::AtomicU64>,
+    lifetime: Arc<ClientLifetime>,
 }
 
 impl DaemonClient {
@@ -95,7 +108,13 @@ impl DaemonClient {
             watched.closed().await;
             lock(&to_clear).clear();
         });
-        Ok(Self { peer, init, subscribers, serial: Arc::new(std::sync::atomic::AtomicU64::new(1)) })
+        Ok(Self {
+            lifetime: Arc::new(ClientLifetime(peer.clone())),
+            peer,
+            init,
+            subscribers,
+            serial: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        })
     }
 
     /// The negotiated generation and daemon process identity.
@@ -129,6 +148,7 @@ struct AttachedUpdates {
     serial: u64,
     subscribers: Subscribers,
     peer: Peer,
+    _lifetime: Arc<ClientLifetime>,
     receiver: mpsc::Receiver<SessionUpdate>,
 }
 
@@ -169,6 +189,7 @@ impl SessionClient for DaemonClient {
         let peer = self.peer.clone();
         let subscribers = Arc::clone(&self.subscribers);
         let serial = self.serial.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lifetime = Arc::clone(&self.lifetime);
         Box::pin(async move {
             let snapshot = peer.call::<SessionAttach>(SessionRef { session: session.clone() }).await?;
             let (sender, receiver) = mpsc::channel(1024);
@@ -181,7 +202,7 @@ impl SessionClient for DaemonClient {
                     .map_err(|e| ProtoError::new(ErrorCode::Internal, format!("encoding ready: {e}")))?,
             )
             .await?;
-            Ok((snapshot, Box::pin(AttachedUpdates { session, serial, subscribers, peer, receiver }) as UpdateStream))
+            Ok((snapshot, Box::pin(AttachedUpdates { session, serial, subscribers, peer, _lifetime: lifetime, receiver }) as UpdateStream))
         })
     }
 

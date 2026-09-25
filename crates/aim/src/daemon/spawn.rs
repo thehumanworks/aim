@@ -45,7 +45,10 @@ pub async fn connect_or_spawn_executable(home: &Path, exe: &Path) -> Result<Daem
     let mut command = Command::new(exe);
     command.arg("daemon").env("AIM_HOME", home).stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
     command.process_group(0);
-    let _child = command.spawn().map_err(|e| ProtoError::new(ErrorCode::Unavailable, format!("spawning daemon: {e}")))?;
+    let mut child = command.spawn().map_err(|e| ProtoError::new(ErrorCode::Unavailable, format!("spawning daemon: {e}")))?;
+    let _reaper = std::thread::Builder::new().name("aim-daemon-reaper".into()).spawn(move || {
+        let _status = child.wait();
+    });
     let start = Instant::now();
     let mut delay = Duration::from_millis(20);
     while start.elapsed() < Duration::from_secs(5) {

@@ -83,7 +83,7 @@ fn host(deltas: usize, delay: Duration) -> (Arc<dyn SessionClient>, Arc<Scripted
         providers: Arc::new(move |_, _| Ok((Arc::clone(&cloned) as Arc<dyn ModelProvider>, "m".into()))),
         workspaces,
         max_requests: 4,
-        update_capacity: 1024,
+        update_capacity: 4096,
     }));
     (host, provider)
 }
@@ -209,6 +209,48 @@ async fn reattach_on_one_connection_replaces_forwarder() {
 }
 
 #[tokio::test]
+async fn close_delivers_terminal_state_then_ends_stream() {
+    let (dir, _, _, task) = started(1, Duration::ZERO).await;
+    let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
+    let session = client.create(spec()).await.unwrap().meta.id;
+    let (_, mut updates) = client.attach(session.clone()).await.unwrap();
+    client.close(session).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), updates.next()).await.unwrap(),
+        Some(SessionUpdate::StateChanged { state: SessionState::Closed })
+    );
+    assert!(tokio::time::timeout(Duration::from_secs(1), updates.next()).await.unwrap().is_none());
+    task.abort();
+}
+
+#[tokio::test]
+async fn slow_ui_stream_ends_at_its_bound_and_can_reattach() {
+    let (dir, _, _, task) = started(1300, Duration::ZERO).await;
+    let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
+    let session = client.create(spec()).await.unwrap().meta.id;
+    let (_, updates) = client.attach(session.clone()).await.unwrap();
+    client.prompt(session.clone(), input()).await.unwrap();
+    for _ in 0..200 {
+        if client
+            .list(SessionListParams::default())
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.meta.id == session && s.state == SessionState::Idle && s.turns == 1)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let received: Vec<_> = tokio::time::timeout(Duration::from_secs(5), updates.collect()).await.unwrap();
+    assert!(received.len() <= 1024);
+    let (snapshot, _) = client.attach(session).await.unwrap();
+    assert_eq!(snapshot.transcript.len(), 2);
+    task.abort();
+}
+
+#[tokio::test]
 async fn attach_during_stream_is_gap_free_and_reconnect_sees_transcript() {
     let (dir, _, _, task) = started(200, Duration::from_millis(1)).await;
     let socket = socket_path(dir.path());
@@ -220,13 +262,17 @@ async fn attach_during_stream_is_gap_free_and_reconnect_sees_transcript() {
     let b = DaemonClient::connect(&socket).await.unwrap();
     let (snapshot, mut second) = b.attach(session.clone()).await.unwrap();
     let updates = until_idle(&mut second).await;
-    let item_count = snapshot.transcript.len() + updates.iter().filter(|u| matches!(u, SessionUpdate::ItemAdded { .. })).count();
-    assert_eq!(item_count, 2);
+    let mut assembled = snapshot.transcript;
+    assembled.extend(updates.iter().filter_map(|u| match u {
+        SessionUpdate::ItemAdded { item } => Some(item.clone()),
+        _ => None,
+    }));
     b.disconnect();
     assert!(tokio::time::timeout(Duration::from_secs(1), second.next()).await.unwrap().is_none());
     let c = DaemonClient::connect(&socket).await.unwrap();
     let (reconnected, _) = c.attach(session).await.unwrap();
-    assert_eq!(reconnected.transcript.len(), 2);
+    assert_eq!(assembled, reconnected.transcript);
+    assert_eq!(assembled.len(), 2);
     task.abort();
 }
 
@@ -313,6 +359,54 @@ async fn idle_exit_waits_for_connections_then_removes_socket() {
 }
 
 #[tokio::test]
+async fn dropping_last_client_releases_idle_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, _) = host(1, Duration::ZERO);
+    let socket = socket_path(dir.path());
+    let task = tokio::spawn({
+        let home = dir.path().to_path_buf();
+        let socket = socket.clone();
+        async move { server::serve(&home, &socket, Some(Duration::from_millis(100)), host).await }
+    });
+    wait_socket(&socket).await;
+    let client = DaemonClient::connect(&socket).await.unwrap();
+    let clone = client.clone();
+    drop(client);
+    assert!(socket.exists());
+    drop(clone);
+    tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
+async fn daemon_lock_is_held_through_workspace_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = socket_path(dir.path());
+    let (host, _) = host(1, Duration::ZERO);
+    let (entered, wait_for_shutdown) = tokio::sync::oneshot::channel();
+    let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn({
+        let home = dir.path().to_path_buf();
+        let socket = socket.clone();
+        let host = Arc::clone(&host);
+        async move {
+            server::serve_with_shutdown(&home, &socket, Some(Duration::ZERO), host, async move {
+                let _sent = entered.send(());
+                let _ignored = finished.await;
+                Ok(())
+            })
+            .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), wait_for_shutdown).await.unwrap().unwrap();
+    let conflict = server::serve(dir.path(), &socket, None, host).await.unwrap_err();
+    assert_eq!(conflict.code, ErrorCode::Conflict);
+    finish.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
 async fn stale_socket_is_recovered() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("run")).unwrap();
@@ -338,6 +432,7 @@ async fn stale_socket_is_recovered() {
 #[tokio::test]
 async fn binary_auto_spawn_status_stop_leaves_no_socket() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let binary = env!("CARGO_BIN_EXE_aim");
     let client = spawn::connect_or_spawn_executable(dir.path(), Path::new(binary)).await.unwrap();
     let socket = socket_path(dir.path());
@@ -354,11 +449,28 @@ async fn binary_auto_spawn_status_stop_leaves_no_socket() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(!socket.exists());
+    let pid = client.initialize_result().pid.to_string();
+    let mut alive = true;
+    for _ in 0..100 {
+        alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!alive, "stopped daemon process is still alive");
 }
 
 #[tokio::test]
 async fn concurrent_auto_spawn_gets_one_process() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let binary = Path::new(env!("CARGO_BIN_EXE_aim"));
     let (first, second) =
         tokio::join!(spawn::connect_or_spawn_executable(dir.path(), binary), spawn::connect_or_spawn_executable(dir.path(), binary),);

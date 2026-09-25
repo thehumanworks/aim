@@ -84,38 +84,42 @@ impl Handler for GuardedRouter {
 
 struct DedupEntry {
     created: Instant,
+    completed: Mutex<Option<Instant>>,
     result: tokio::sync::watch::Sender<Option<Result<PromptOutcome, ProtoError>>>,
 }
 
 #[derive(Default)]
 struct Dedup {
-    entries: Mutex<HashMap<(String, IdempotencyKey), Arc<DedupEntry>>>,
+    entries: Mutex<HashMap<String, HashMap<IdempotencyKey, Arc<DedupEntry>>>>,
 }
 
 impl Dedup {
     async fn prompt(&self, host: Arc<dyn SessionClient>, params: SessionPromptParams) -> Result<PromptOutcome, ProtoError> {
-        let key = (params.session.clone(), params.idempotency_key);
         let (entry, first) = {
             let mut entries = lock(&self.entries);
-            entries.retain(|_, entry| entry.created.elapsed() < Duration::from_secs(600) || entry.result.borrow().is_none());
-            if let Some(entry) = entries.get(&key) {
+            entries.retain(|_, table| {
+                table.retain(|_, entry| lock(&entry.completed).is_none_or(|at| at.elapsed() < Duration::from_secs(600)));
+                !table.is_empty()
+            });
+            let table = entries.entry(params.session.clone()).or_default();
+            if let Some(entry) = table.get(&params.idempotency_key) {
                 (Arc::clone(entry), false)
             } else {
-                if entries.len() >= 1024
-                    && let Some(oldest) = entries
+                if table.len() >= 1024
+                    && let Some(oldest) = table
                         .iter()
                         .filter(|(_, entry)| entry.result.borrow().is_some())
                         .min_by_key(|(_, entry)| entry.created)
                         .map(|(key, _)| key.clone())
                 {
-                    entries.remove(&oldest);
+                    table.remove(&oldest);
                 }
-                if entries.len() >= 1024 {
+                if table.len() >= 1024 {
                     return Err(error(ErrorCode::LimitExceeded, "too many in-flight prompts"));
                 }
                 let (result, _) = tokio::sync::watch::channel(None);
-                let entry = Arc::new(DedupEntry { created: Instant::now(), result });
-                entries.insert(key, Arc::clone(&entry));
+                let entry = Arc::new(DedupEntry { created: Instant::now(), completed: Mutex::new(None), result });
+                table.insert(params.idempotency_key, Arc::clone(&entry));
                 (entry, true)
             }
         };
@@ -124,6 +128,7 @@ impl Dedup {
             tokio::spawn(async move {
                 let outcome = host.prompt(params.session, params.parts).await;
                 entry.result.send_replace(Some(outcome));
+                *lock(&entry.completed) = Some(Instant::now());
             });
         }
         loop {
@@ -277,6 +282,23 @@ fn serve_connection(stream: UnixStream, host: Arc<dyn SessionClient>, dedup: Arc
 /// # Errors
 /// Returns a protocol error if the socket cannot be secured or bound.
 pub async fn serve(home: &Path, socket: &Path, idle_exit: Option<Duration>, host: Arc<dyn SessionClient>) -> Result<(), ProtoError> {
+    serve_with_shutdown(home, socket, idle_exit, host, async { Ok(()) }).await
+}
+
+/// Serves sessions and runs `shutdown` while still holding the exclusive daemon lock.
+///
+/// # Errors
+/// Returns a protocol error if startup, session listing, or shutdown fails.
+pub async fn serve_with_shutdown<F>(
+    home: &Path,
+    socket: &Path,
+    idle_exit: Option<Duration>,
+    host: Arc<dyn SessionClient>,
+    shutdown: F,
+) -> Result<(), ProtoError>
+where
+    F: Future<Output = Result<(), ProtoError>>,
+{
     let (listener, _files) = prepare(home, socket)?;
     let dedup = Arc::new(Dedup::default());
     let connections = Arc::new(AtomicUsize::new(0));
@@ -318,7 +340,7 @@ pub async fn serve(home: &Path, socket: &Path, idle_exit: Option<Duration>, host
             let _ignored = host.close(summary.meta.id).await;
         }
     }
-    Ok(())
+    shutdown.await
 }
 
 #[cfg(unix)]

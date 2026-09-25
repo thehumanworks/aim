@@ -165,19 +165,20 @@ async fn main_async(args: Args) -> Result<i32, String> {
                         backends: aim::providers::backends(cli::find_aimx(None), 64),
                         update_capacity: 1024,
                     }));
-                    match server::serve(
+                    let on_shutdown = {
+                        let host = Arc::clone(&host);
+                        async move { host.shutdown().await }
+                    };
+                    match server::serve_with_shutdown(
                         &home,
                         &socket,
                         idle_exit.map(std::time::Duration::from_secs),
-                        Arc::clone(&host) as Arc<dyn SessionClient>,
+                        host as Arc<dyn SessionClient>,
+                        on_shutdown,
                     )
                     .await
                     {
-                        Ok(()) => {
-                            host.shutdown().await.map_err(|e| e.to_string())?;
-                            Ok(0)
-                        }
-                        Err(aim_proto::error::ProtoError { code: aim_proto::error::ErrorCode::Conflict, .. }) => Ok(0),
+                        Ok(()) | Err(aim_proto::error::ProtoError { code: aim_proto::error::ErrorCode::Conflict, .. }) => Ok(0),
                         Err(err) => Err(err.to_string()),
                     }
                 }
