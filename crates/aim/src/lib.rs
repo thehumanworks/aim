@@ -15,6 +15,7 @@
 //! - [`daemon`] — the local daemon server, client and auto-spawn.
 //! - [`tui`] — the terminal UI: inline chat on a [`host::SessionClient`].
 //! - [`board`] — the durable job ledger and board CLI.
+//! - [`workers`] — isolated board attempt execution and Git integration.
 pub mod acp;
 pub mod agent;
 pub mod board;
@@ -35,3 +36,4 @@ pub mod search;
 pub mod session;
 pub mod store;
 pub mod tui;
+pub mod workers;

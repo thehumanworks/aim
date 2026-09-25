@@ -4,8 +4,10 @@
 //! verified kernel transition before writing a projection and an event in one transaction.
 
 pub mod cli;
+pub mod integration;
 mod service;
 mod sqlite;
+pub mod tools;
 
 use std::path::Path;
 
@@ -13,6 +15,8 @@ use sqlite::Ledger;
 use tokio::sync::broadcast;
 
 use aim_proto::board::BoardEvent;
+
+pub use aim_proto::board::CleanupReceipt;
 
 /// A rejected board operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +61,7 @@ impl Board {
     /// Opening, securing, or migrating the database failed.
     pub fn open(path: &Path) -> Result<Self, Error> {
         let (events, _) = broadcast::channel(256);
-        Ok(Self { ledger: Ledger::open(path)?, events })
+        Ok(Self { ledger: Ledger::open_with_events(path, events.clone())?, events })
     }
 
     /// Subscribe to committed event hints. Reconcile gaps with [`Self::poll`].

@@ -10,13 +10,13 @@ use aim_kernel::job::{
 use aim_proto::board::{
     ArtifactSummary, AssignParams, AttemptSummary, BoardEvent, CancelParams, ClaimParams, ClaimResult, CompleteParams, FailParams,
     HeartbeatParams, JobSnapshot, JobSpec, JobState, ListParams, ListResult, MessageParams, MessageResult, PollParams, PollResult,
-    PostParams, PostResult, RetryParams, ReviewParams, ReviewState,
+    PostParams, PostResult, RegisterWorkerParams, RetryParams, ReviewParams, ReviewState,
 };
 use rusqlite::{OptionalExtension as _, Transaction, params};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use super::{Board, Error};
+use super::{Board, CleanupReceipt, Error};
 
 type JobRow = (String, String, String, String, i64, i64, Option<String>, i64, i64);
 type ClaimDbRow = (i64, i64, String, i64, i64, String, String, Vec<u8>);
@@ -144,9 +144,9 @@ fn kernel_job(tx: &Transaction<'_>, snapshot: &JobSnapshot) -> Result<KernelJob,
         None
     };
     let cleanup = match (&snapshot.attempt, snapshot.state) {
-        (None, _) | (_, JobState::Posted | JobState::Succeeded) => KernelCleanup::Confirmed,
+        (None, _) | (_, JobState::Posted) => KernelCleanup::Confirmed,
         (Some(_), JobState::Claimed | JobState::Running) => KernelCleanup::Active,
-        (Some(attempt), JobState::Failed | JobState::Cancelled) => {
+        (Some(attempt), JobState::Succeeded | JobState::Failed | JobState::Cancelled) => {
             if attempt.cleanup_confirmed {
                 KernelCleanup::Confirmed
             } else {
@@ -159,13 +159,28 @@ fn kernel_job(tx: &Transaction<'_>, snapshot: &JobSnapshot) -> Result<KernelJob,
     } else {
         let evidence: Option<String> = tx
             .query_row(
-                "SELECT evidence_json FROM board_reviews WHERE job_id=?1 ORDER BY created_ms DESC,id DESC LIMIT 1",
-                params![snapshot.id],
+                "SELECT evidence_json FROM board_reviews WHERE job_id=?1 AND attempt_id=?2 ORDER BY created_ms DESC,id DESC LIMIT 1",
+                params![snapshot.id, snapshot.attempt.as_ref().map(|attempt| attempt.id.as_str())],
                 |row| row.get(0),
             )
             .optional()
             .map_err(sql)?;
-        evidence.as_deref().map(decode::<Vec<String>>).transpose()?.is_some_and(|ids| !ids.is_empty())
+        let ids = evidence.as_deref().map(decode::<Vec<String>>).transpose()?.unwrap_or_default();
+        for id in &ids {
+            let artifact: Option<(Vec<u8>, Vec<u8>)> = tx
+                .query_row(
+                    "SELECT sha256,data FROM board_artifacts WHERE id=?1 AND attempt_id=?2",
+                    params![id, snapshot.attempt.as_ref().map(|attempt| attempt.id.as_str())],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql)?;
+            let (stored, bytes) = artifact.ok_or_else(|| Error::Storage("review references missing attempt artifact".into()))?;
+            if !same_hash(&stored, &Sha256::digest(&bytes).into()) {
+                return Err(Error::Storage("review artifact hash mismatch".into()));
+            }
+        }
+        !ids.is_empty()
     };
     KernelJob::restore(
         kernel_state(snapshot.state),
@@ -261,13 +276,51 @@ pub(super) fn load_job(tx: &Transaction<'_>, id: &str) -> Result<JobSnapshot, Er
     })
 }
 
-fn list_jobs(tx: &Transaction<'_>, run_id: Option<&str>, limit: u32) -> Result<Vec<JobSnapshot>, Error> {
+fn list_jobs(
+    tx: &Transaction<'_>,
+    run_id: Option<&str>,
+    limit: u32,
+    after_job: Option<&str>,
+) -> Result<(Vec<JobSnapshot>, Option<String>, bool), Error> {
+    let anchor: Option<(i64, String)> = after_job
+        .map(|id| {
+            tx.query_row("SELECT created_ms,id FROM board_jobs WHERE id=?1 AND (?2 IS NULL OR run_id=?2)", params![id, run_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()
+            .map_err(sql)?
+            .ok_or(Error::Invalid("unknown job page cursor".into()))
+        })
+        .transpose()?;
     let mut statement = tx
-        .prepare_cached("SELECT id FROM board_jobs WHERE (?1 IS NULL OR run_id=?1) ORDER BY created_ms DESC, id DESC LIMIT ?2")
+        .prepare_cached(
+            "SELECT id FROM board_jobs WHERE (?1 IS NULL OR run_id=?1) AND (?2 IS NULL OR (created_ms,id) < (?2,?3))
+         ORDER BY created_ms DESC, id DESC LIMIT ?4",
+        )
         .map_err(sql)?;
-    let rows = statement.query_map(params![run_id, limit], |row| row.get::<_, String>(0)).map_err(sql)?;
+    let rows = statement
+        .query_map(params![run_id, anchor.as_ref().map(|a| a.0), anchor.as_ref().map(|a| a.1.as_str()), limit.min(200) + 1], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(sql)?;
     let ids = rows.collect::<Result<Vec<_>, _>>().map_err(sql)?;
-    ids.iter().map(|id| load_job(tx, id)).collect()
+    let mut jobs = Vec::new();
+    let mut bytes = 0usize;
+    for id in &ids {
+        if jobs.len() >= usize::try_from(limit.min(200)).map_err(sql)? {
+            break;
+        }
+        let job = load_job(tx, id)?;
+        let size = serde_json::to_vec(&job).map_err(sql)?.len();
+        if !jobs.is_empty() && bytes.saturating_add(size) > 8 * 1024 * 1024 {
+            break;
+        }
+        bytes = bytes.saturating_add(size);
+        jobs.push(job);
+    }
+    let truncated = jobs.len() < ids.len();
+    let next_job = if truncated { jobs.last().map(|job| job.id.clone()) } else { None };
+    Ok((jobs, next_job, truncated))
 }
 
 pub(super) fn insert_event(
@@ -311,12 +364,21 @@ pub(super) fn update_job(
     load_job(tx, &job.id)
 }
 
-fn publish(board: &Board, event: BoardEvent) {
-    drop(board.events.send(event));
-}
-
 fn hash_token(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
+}
+
+fn parse_hash(hex: &str) -> Result<[u8; 32], Error> {
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+        return Err(Error::Invalid("claim token hash must be 64 lowercase hex digits".into()));
+    }
+    let mut hash = [0_u8; 32];
+    for (index, slot) in hash.iter_mut().enumerate() {
+        let start = index.saturating_mul(2);
+        *slot = u8::from_str_radix(hex.get(start..start + 2).ok_or_else(|| Error::Invalid("claim hash is incomplete".into()))?, 16)
+            .map_err(|_| Error::Invalid("claim hash is invalid".into()))?;
+    }
+    Ok(hash)
 }
 
 fn same_hash(a: &[u8], b: &[u8; 32]) -> bool {
@@ -325,6 +387,11 @@ fn same_hash(a: &[u8], b: &[u8; 32]) -> bool {
     }
     let difference = a.iter().zip(b).fold(0_u8, |difference, (left, right)| difference | (left ^ right));
     difference == 0
+}
+
+fn cleanup_recorded(tx: &Transaction<'_>, attempt_id: &str) -> Result<bool, Error> {
+    tx.query_row("SELECT EXISTS(SELECT 1 FROM board_cleanup_receipts WHERE attempt_id=?1)", params![attempt_id], |row| row.get(0))
+        .map_err(sql)
 }
 
 struct ClaimRow {
@@ -380,10 +447,153 @@ fn valid_spec(spec: &JobSpec) -> Result<(), Error> {
     {
         return Err(Error::Invalid("job contract field exceeds its bound".into()));
     }
+    if let Some(work) = &spec.work
+        && (spec.workspace.as_deref().is_none_or(|path| path.is_empty() || !path.starts_with('/'))
+            || work.target_branch.is_empty()
+            || work.target_branch.len() > 256
+            || work.target_branch.starts_with('-')
+            || work.check_command.as_deref().is_some_and(|command| command.is_empty() || command.len() > 4096))
+    {
+        return Err(Error::Invalid("work policy needs an absolute workspace, target branch, and bounded check".into()));
+    }
     Ok(())
 }
 
 impl Board {
+    /// Reads one immutable artifact after checking its stored hash.
+    ///
+    /// # Errors
+    /// Returns not-found, hash mismatch, or storage failure.
+    pub async fn artifact_bytes(&self, artifact_id: String) -> Result<Vec<u8>, Error> {
+        self.ledger
+            .transact(move |tx| {
+                let found: Option<(Vec<u8>, Vec<u8>)> = tx
+                    .query_row("SELECT sha256,data FROM board_artifacts WHERE id=?1", params![artifact_id], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .optional()
+                    .map_err(sql)?;
+                let (hash, bytes) = found.ok_or(Error::NotFound)?;
+                if !same_hash(&hash, &Sha256::digest(&bytes).into()) {
+                    return Err(Error::Storage("artifact hash mismatch".into()));
+                }
+                Ok(bytes)
+            })
+            .await
+    }
+
+    /// Persists a runner-produced cleanup receipt under the fenced attempt token.
+    ///
+    /// # Errors
+    /// Refuses an invalid token, incomplete receipt, or storage failure.
+    pub async fn record_cleanup(&self, job_id: String, attempt_id: String, token: String, receipt: CleanupReceipt) -> Result<(), Error> {
+        if !receipt.session_stopped
+            || !receipt.harness_stopped
+            || receipt.worktree.is_empty()
+            || !matches!(receipt.disposition.as_str(), "kept" | "removed")
+        {
+            return Err(Error::Invalid("cleanup receipt does not attest stopped effects".into()));
+        }
+        let now = now_ms()?;
+        let _event = self
+            .ledger
+            .transact(move |tx| {
+                let job = load_job(tx, &job_id)?;
+                if job.attempt.as_ref().is_none_or(|attempt| attempt.id != attempt_id) {
+                    return Err(Error::StaleClaim);
+                }
+                let stored: Vec<u8> = tx
+                    .query_row(
+                        "SELECT token_hash FROM board_attempts WHERE id=?1 AND job_id=?2 AND generation=?3",
+                        params![attempt_id, job_id, job.generation],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql)?;
+                if !same_hash(&stored, &hash_token(&token)) {
+                    return Err(Error::StaleClaim);
+                }
+                let encoded = encode(&receipt)?;
+                let prior: Option<String> = tx
+                    .query_row("SELECT receipt_json FROM board_cleanup_receipts WHERE attempt_id=?1", params![attempt_id], |row| row.get(0))
+                    .optional()
+                    .map_err(sql)?;
+                if let Some(prior) = prior {
+                    if prior != encoded {
+                        return Err(Error::Conflict("cleanup receipt changed on retry".into()));
+                    }
+                    return Ok(None);
+                }
+                tx.execute(
+                    "INSERT INTO board_cleanup_receipts (attempt_id,job_id,receipt_json,created_ms) VALUES (?1,?2,?3,?4)",
+                    params![attempt_id, job_id, encoded, as_i64(now)?],
+                )
+                .map_err(sql)?;
+                let current = job.attempt.as_ref().ok_or(Error::StaleClaim)?;
+                let job = if !current.cleanup_confirmed && matches!(job.state, JobState::Succeeded | JobState::Failed | JobState::Cancelled)
+                {
+                    let mut kernel = kernel_job(tx, &job)?;
+                    kernel.transition(KernelEvent::ConfirmCleanup, now).map_err(kernel_error)?;
+                    tx.execute("UPDATE board_attempts SET cleanup_state='confirmed' WHERE id=?1", params![attempt_id]).map_err(sql)?;
+                    update_from_kernel(tx, &job, &kernel, now)?
+                } else {
+                    job
+                };
+                insert_event(tx, &job.run_id, &job.id, job.version, "attempt.cleanup_confirmed", now).map(Some)
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Records an expired attempt as failed with a pending cleanup hold.
+    ///
+    /// # Errors
+    /// Refuses a live lease, wrong version, or storage failure.
+    pub async fn expire(&self, job_id: String, expected_version: u64) -> Result<JobSnapshot, Error> {
+        let now = now_ms()?;
+        let (job, _event) = self
+            .ledger
+            .transact(move |tx| {
+                let current = load_job(tx, &job_id)?;
+                let attempt = current.attempt.as_ref().ok_or(Error::StaleClaim)?;
+                if current.version != expected_version
+                    || now < attempt.lease_until_ms
+                    || !matches!(current.state, JobState::Claimed | JobState::Running)
+                {
+                    return Err(Error::Conflict("attempt is not expired and active".into()));
+                }
+                let mut kernel = kernel_job(tx, &current)?;
+                kernel.transition(KernelEvent::Expire { generation: current.generation }, now).map_err(kernel_error)?;
+                tx.execute(
+                    "UPDATE board_attempts SET state='failed',cleanup_state='pending',ended_ms=?1 WHERE id=?2",
+                    params![as_i64(now)?, attempt.id],
+                )
+                .map_err(sql)?;
+                let job = update_from_kernel(tx, &current, &kernel, now)?;
+                let event = insert_event(tx, &job.run_id, &job.id, job.version, "attempt.expired", now)?;
+                Ok((job, event))
+            })
+            .await?;
+
+        Ok(job)
+    }
+
+    /// Reads bounded committed messages addressed to a job or written on that job.
+    ///
+    /// # Errors
+    /// Returns a missing-job or ledger error.
+    pub async fn messages(&self, job_id: String) -> Result<Vec<String>, Error> {
+        self.ledger.transact(move |tx| {
+            let job = load_job(tx,&job_id)?;
+            let mut statement = tx.prepare(
+                "SELECT sender,kind,body FROM board_messages WHERE run_id=?1 AND (job_id=?2 OR recipient=?2) ORDER BY created_ms,id LIMIT 100",
+            ).map_err(sql)?;
+            statement.query_map(params![job.run_id,job_id], |row| {
+                Ok(format!("{} [{}]: {}",row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))
+            }).map_err(sql)?.collect::<Result<Vec<_>,_>>().map_err(sql)
+        }).await
+    }
+
     /// Post a job and its outbox event atomically. A stable key returns the original job.
     ///
     /// # Errors
@@ -394,7 +604,7 @@ impl Board {
             return Err(Error::Invalid("idempotency key is empty or too long".into()));
         }
         let now = now_ms()?;
-        let (result, event) = self.ledger.transact(move |tx| {
+        let (result, _event) = self.ledger.transact(move |tx| {
             let _fresh = KernelJob::new(params.spec.max_retries);
             let spec_json = encode(&params.spec)?;
             let prior: Option<(String, String)> = tx
@@ -442,9 +652,7 @@ impl Board {
             let event = insert_event(tx, &run_id, &id, job.version, "job.posted", now)?;
             Ok((PostResult { job }, Some(event)))
         }).await?;
-        if let Some(event) = event {
-            publish(self, event);
-        }
+
         Ok(result)
     }
 
@@ -457,7 +665,7 @@ impl Board {
             return Err(Error::Invalid("worker name is empty or too long".into()));
         }
         let now = now_ms()?;
-        let (job, event) = self
+        let (job, _event) = self
             .ledger
             .transact(move |tx| {
                 let current = load_job(tx, &params.job_id)?;
@@ -475,23 +683,72 @@ impl Board {
                 Ok((job, event))
             })
             .await?;
-        publish(self, event);
+
         Ok(job)
     }
 
-    /// Claim a posted and dependency-ready job, returning the bearer token once.
+    /// Register a stable worker capacity before it makes claims.
+    ///
+    /// # Errors
+    /// Rejects an invalid worker or an attempt to change its registered capacity.
+    pub async fn register_worker(&self, params: RegisterWorkerParams) -> Result<(), Error> {
+        if params.worker.is_empty() || params.worker.len() > 256 || !(1..=64).contains(&params.capacity) {
+            return Err(Error::Invalid("invalid worker registration".into()));
+        }
+        self.ledger
+            .transact(move |tx| {
+                let prior: Option<u32> = tx
+                    .query_row("SELECT capacity FROM board_workers WHERE worker=?1", params![params.worker], |row| row.get(0))
+                    .optional()
+                    .map_err(sql)?;
+                if let Some(prior) = prior {
+                    if prior != params.capacity {
+                        return Err(Error::Conflict("worker capacity is already registered".into()));
+                    }
+                } else {
+                    tx.execute("INSERT INTO board_workers (worker,capacity) VALUES (?1,?2)", params![params.worker, params.capacity])
+                        .map_err(sql)?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Claim a posted and dependency-ready job with its pre-registered capacity.
     ///
     /// # Errors
     /// An ineligible worker, capacity limit, dependency gate, or concurrent claim is rejected.
     pub async fn claim(&self, params: ClaimParams) -> Result<ClaimResult, Error> {
-        if params.worker.is_empty() || params.worker.len() > 256 || params.capacity == 0 || params.lease_ms == 0 {
+        if params.worker.is_empty()
+            || params.worker.len() > 256
+            || params.capacity == 0
+            || params.lease_ms == 0
+            || params.idempotency_key.is_empty()
+            || params.idempotency_key.len() > 256
+            || Uuid::parse_str(&params.attempt_id).is_err()
+        {
             return Err(Error::Invalid("invalid worker, capacity, or lease".into()));
         }
+        let hash = parse_hash(&params.token_sha256)?;
         let now = now_ms()?;
         let lease_until = now.checked_add(params.lease_ms.min(300_000)).ok_or_else(|| Error::Invalid("lease overflow".into()))?;
-        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let hash = hash_token(&token);
-        let (job, attempt, event) = self.ledger.transact(move |tx| {
+        let (job, attempt, _event) = self.ledger.transact(move |tx| {
+            let capacity: Option<u32> = tx.query_row("SELECT capacity FROM board_workers WHERE worker=?1",params![params.worker],
+                |row|row.get(0)).optional().map_err(sql)?;
+            if capacity != Some(params.capacity) { return Err(Error::Conflict("worker capacity is not registered".into())); }
+            let prior: Option<(String,String,String,Vec<u8>)> = tx.query_row(
+                "SELECT id,job_id,assignee,token_hash FROM board_attempts WHERE claim_key=?1",
+                params![params.idempotency_key],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).optional().map_err(sql)?;
+            if let Some((attempt_id,job_id,worker,stored)) = prior {
+                if attempt_id != params.attempt_id || job_id != params.job_id || worker != params.worker || !same_hash(&stored,&hash) {
+                    return Err(Error::Conflict("claim key was reused with different identity".into()));
+                }
+                let job = load_job(tx,&job_id)?;
+                let attempt = job.attempt.clone().filter(|attempt| attempt.id == attempt_id)
+                    .ok_or_else(|| Error::Conflict("claim was already retired".into()))?;
+                return Ok((job,attempt,None));
+            }
             let current = load_job(tx, &params.job_id)?;
             if current.state != JobState::Posted || params.expected_version.is_some_and(|version| version != current.version) {
                 return Err(Error::Conflict("job is no longer claimable".into()));
@@ -499,32 +756,37 @@ impl Board {
             if current.assigned_worker.as_deref().is_some_and(|worker| worker != params.worker) {
                 return Err(Error::Conflict("job is assigned to another worker".into()));
             }
-            let unaccepted: i64 = tx.query_row(
-                "SELECT count(*) FROM board_dependencies d JOIN board_jobs parent ON parent.id=d.dependency_id WHERE d.job_id=?1 AND (parent.review_state!='accepted' OR NOT EXISTS (SELECT 1 FROM board_artifacts a JOIN board_attempts t ON a.attempt_id=t.id WHERE a.job_id=parent.id AND t.generation=parent.generation))",
-                params![params.job_id], |row| row.get(0),
-            ).map_err(sql)?;
-            let held: i64 = tx.query_row(
-                "SELECT count(*) FROM board_attempts WHERE assignee=?1 AND (state IN ('claimed','running') OR cleanup_state='pending')",
-                params![params.worker], |row| row.get(0),
-            ).map_err(sql)?;
-            aim_kernel::board::check_admission(unaccepted == 0,usize::try_from(held).map_err(sql)?,
-                usize::try_from(params.capacity).map_err(sql)?).map_err(|err| Error::Conflict(format!("claim admission: {err:?}")))?;
+            let dependency_ids = {
+                let mut query = tx.prepare("SELECT dependency_id FROM board_dependencies WHERE job_id=?1 ORDER BY dependency_id").map_err(sql)?;
+                query.query_map(params![params.job_id], |row| row.get::<_,String>(0)).map_err(sql)?
+                    .collect::<Result<Vec<_>,_>>().map_err(sql)?
+            };
+            let deps = dependency_ids.iter().map(|id| kernel_job(tx,&load_job(tx,id)?)).collect::<Result<Vec<_>,_>>()?;
+            let job_ids = {
+                let mut query = tx.prepare("SELECT id FROM board_jobs ORDER BY id").map_err(sql)?;
+                query.query_map([],|row|row.get::<_,String>(0)).map_err(sql)?
+                    .collect::<Result<Vec<_>,_>>().map_err(sql)?
+            };
+            let others = job_ids.iter().map(|id| kernel_job(tx,&load_job(tx,id)?)).collect::<Result<Vec<_>,_>>()?;
             let generation = current.generation;
             let claim_id = u64::from(generation).saturating_add(1);
             let mut kernel = kernel_job(tx,&current)?;
-            kernel.apply(KernelEvent::Claim {worker:worker_id(&params.worker),claim_id,lease_until},now).map_err(kernel_error)?;
-            let attempt_id = Uuid::new_v4().to_string();
+            aim_kernel::board::claim_admitted(
+                &mut kernel,&deps,&others,worker_id(&params.worker),usize::try_from(capacity.ok_or(Error::Conflict("worker not registered".into()))?).map_err(sql)?,
+                claim_id,lease_until,now,
+            ).map_err(|err| Error::Conflict(format!("claim admission: {err:?}")))?;
+            let attempt_id = params.attempt_id.clone();
             tx.execute(
-                "INSERT INTO board_attempts (id,job_id,generation,assignee,claim_id,token_hash,lease_until_ms,state,launch_intent) VALUES (?1,?2,?3,?4,?5,?6,?7,'claimed',1)",
-                params![attempt_id, current.id, generation, params.worker, as_i64(claim_id)?, hash.as_slice(), as_i64(lease_until)?],
+                "INSERT INTO board_attempts (id,job_id,generation,assignee,claim_id,token_hash,claim_key,lease_until_ms,state,launch_intent) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'claimed',1)",
+                params![attempt_id, current.id, generation, params.worker, as_i64(claim_id)?, hash.as_slice(),params.idempotency_key, as_i64(lease_until)?],
             ).map_err(sql)?;
             let job = update_from_kernel(tx, &current, &kernel, now)?;
             let attempt = job.attempt.clone().ok_or_else(|| Error::Storage("claimed attempt missing".into()))?;
             let event = insert_event(tx, &job.run_id, &job.id, job.version, "job.claimed", now)?;
-            Ok((job,attempt,event))
+            Ok((job,attempt,Some(event)))
         }).await?;
-        publish(self, event);
-        Ok(ClaimResult { job, attempt, claim_token: token })
+
+        Ok(ClaimResult { job, attempt })
     }
 
     /// Start or renew an attempt. Heartbeat sequence must increase.
@@ -536,19 +798,19 @@ impl Board {
             return Err(Error::Invalid("lease must be positive".into()));
         }
         let now = now_ms()?;
-        let (job,event) = self.ledger.transact(move |tx| {
+        let (job,_event) = self.ledger.transact(move |tx| {
             let current = load_job(tx, &params.job_id)?;
             let claim = claim_row(tx, &current, &params.attempt_id, &params.claim_token, now)?;
             if !matches!(claim.state, JobState::Claimed | JobState::Running) || params.sequence <= claim.heartbeat_seq {
                 return Err(Error::Conflict("attempt cannot accept heartbeat sequence".into()));
             }
             let lease_until = now.checked_add(params.lease_ms.min(300_000)).ok_or_else(|| Error::Invalid("lease overflow".into()))?
-                .max(claim.lease_until_ms.checked_add(1).ok_or_else(|| Error::Invalid("lease cannot advance".into()))?);
+                .max(claim.lease_until_ms);
             let mut kernel = kernel_job(tx,&current)?;
             if claim.state == JobState::Claimed {
-                kernel.apply(KernelEvent::Start {generation:claim.generation,claim_id:claim.claim_id},now).map_err(kernel_error)?;
+                kernel.transition(KernelEvent::Start {generation:claim.generation,claim_id:claim.claim_id},now).map_err(kernel_error)?;
             }
-            kernel.apply(KernelEvent::Heartbeat {generation:claim.generation,claim_id:claim.claim_id,lease_until},now).map_err(kernel_error)?;
+            kernel.transition(KernelEvent::Heartbeat {generation:claim.generation,claim_id:claim.claim_id,lease_until},now).map_err(kernel_error)?;
             tx.execute(
                 "UPDATE board_attempts SET heartbeat_seq=?1,lease_until_ms=?2,state='running',started_ms=COALESCE(started_ms,?3) WHERE id=?4",
                 params![as_i64(params.sequence)?,as_i64(lease_until)?,as_i64(now)?,params.attempt_id],
@@ -557,7 +819,7 @@ impl Board {
             let event = insert_event(tx,&job.run_id,&job.id,job.version,"attempt.heartbeat",now)?;
             Ok((job,event))
         }).await?;
-        publish(self, event);
+
         Ok(job)
     }
 
@@ -578,7 +840,7 @@ impl Board {
             return Err(Error::Invalid("message field is empty or exceeds its bound".into()));
         }
         let now = now_ms()?;
-        let (receipt,event) = self.ledger.transact(move |tx| {
+        let (receipt,_event) = self.ledger.transact(move |tx| {
             let current = load_job(tx,&params.job_id)?;
             let claim = claim_row(tx,&current,&params.attempt_id,&params.claim_token,now)?;
             if !matches!(claim.state,JobState::Claimed | JobState::Running) { return Err(Error::Conflict("attempt cannot send messages".into())); }
@@ -604,9 +866,7 @@ impl Board {
             tx.execute("UPDATE board_outbox SET payload_json=?1 WHERE event_id=?2",params![id,event.id]).map_err(sql)?;
             Ok((MessageResult{id,seq:event.seq},Some(event)))
         }).await?;
-        if let Some(event) = event {
-            publish(self, event);
-        }
+
         Ok(receipt)
     }
 
@@ -616,20 +876,21 @@ impl Board {
     /// Invalid or expired claim, artifact size, or execution state is rejected.
     pub async fn complete(&self, params: CompleteParams) -> Result<JobSnapshot, Error> {
         if params.artifacts.len() > 32
+            || params.artifacts.iter().map(|artifact| artifact.data.0.len()).sum::<usize>() > 24 * 1024 * 1024
             || params.artifacts.iter().any(|artifact| artifact.data.0.len() > 1_048_576 || artifact.media_type.len() > 128)
         {
             return Err(Error::Invalid("artifact limit exceeded".into()));
         }
         let now = now_ms()?;
-        let (job,event) = self.ledger.transact(move |tx| {
+        let (job,_event) = self.ledger.transact(move |tx| {
             let current = load_job(tx,&params.job_id)?;
             let claim = claim_row(tx,&current,&params.attempt_id,&params.claim_token,now)?;
             if !matches!(claim.state,JobState::Claimed | JobState::Running) { return Err(Error::Conflict("attempt is not live".into())); }
             let mut kernel = kernel_job(tx,&current)?;
             if claim.state == JobState::Claimed {
-                kernel.apply(KernelEvent::Start {generation:claim.generation,claim_id:claim.claim_id},now).map_err(kernel_error)?;
+                kernel.transition(KernelEvent::Start {generation:claim.generation,claim_id:claim.claim_id},now).map_err(kernel_error)?;
             }
-            kernel.apply(KernelEvent::Complete {generation:claim.generation,claim_id:claim.claim_id},now).map_err(kernel_error)?;
+            kernel.transition(KernelEvent::Complete {generation:claim.generation,claim_id:claim.claim_id},now).map_err(kernel_error)?;
             for artifact in &params.artifacts {
                 let digest = Sha256::digest(&artifact.data.0);
                 let hex = hex_bytes(&digest);
@@ -639,12 +900,12 @@ impl Board {
                     params![id,current.id,params.attempt_id,format!("sha256:{hex}"),artifact.media_type,as_i64(u64::try_from(artifact.data.0.len()).map_err(sql)?)?,digest.as_slice(),artifact.data.0,as_i64(now)?],
                 ).map_err(sql)?;
             }
-            tx.execute("UPDATE board_attempts SET state='succeeded',cleanup_state='confirmed',ended_ms=?1 WHERE id=?2",params![as_i64(now)?,params.attempt_id]).map_err(sql)?;
+            tx.execute("UPDATE board_attempts SET state='succeeded',cleanup_state='pending',ended_ms=?1 WHERE id=?2",params![as_i64(now)?,params.attempt_id]).map_err(sql)?;
             let job = update_from_kernel(tx,&current,&kernel,now)?;
             let event = insert_event(tx,&job.run_id,&job.id,job.version,"job.succeeded",now)?;
             Ok((job,event))
         }).await?;
-        publish(self, event);
+
         Ok(job)
     }
 
@@ -657,31 +918,25 @@ impl Board {
             return Err(Error::Invalid("failure class is empty or too long".into()));
         }
         let now = now_ms()?;
-        let (job, event) = self
+        let (job, _event) = self
             .ledger
             .transact(move |tx| {
                 let current = load_job(tx, &params.job_id)?;
                 let claim = claim_row(tx, &current, &params.attempt_id, &params.claim_token, now)?;
+                let cleanup_confirmed = cleanup_recorded(tx, &params.attempt_id)?;
                 if !matches!(claim.state, JobState::Claimed | JobState::Running) {
                     return Err(Error::Conflict("attempt is not live".into()));
                 }
                 let mut kernel = kernel_job(tx, &current)?;
                 if claim.state == JobState::Claimed {
                     kernel
-                        .apply(KernelEvent::Start { generation: claim.generation, claim_id: claim.claim_id }, now)
+                        .transition(KernelEvent::Start { generation: claim.generation, claim_id: claim.claim_id }, now)
                         .map_err(kernel_error)?;
                 }
                 kernel
-                    .apply(
-                        KernelEvent::Fail {
-                            generation: claim.generation,
-                            claim_id: claim.claim_id,
-                            cleanup_confirmed: params.cleanup_confirmed,
-                        },
-                        now,
-                    )
+                    .transition(KernelEvent::Fail { generation: claim.generation, claim_id: claim.claim_id, cleanup_confirmed }, now)
                     .map_err(kernel_error)?;
-                let cleanup = if params.cleanup_confirmed { "confirmed" } else { "pending" };
+                let cleanup = if cleanup_confirmed { "confirmed" } else { "pending" };
                 tx.execute(
                     "UPDATE board_attempts SET state='failed',cleanup_state=?1,ended_ms=?2,failure_reason=?3 WHERE id=?4",
                     params![cleanup, as_i64(now)?, params.reason, params.attempt_id],
@@ -692,7 +947,7 @@ impl Board {
                 Ok((job, event))
             })
             .await?;
-        publish(self, event);
+
         Ok(job)
     }
 
@@ -702,7 +957,7 @@ impl Board {
     /// A stale version or terminal job is rejected.
     pub async fn cancel(&self, params: CancelParams) -> Result<JobSnapshot, Error> {
         let now = now_ms()?;
-        let (job, event) = self
+        let (job, _event) = self
             .ledger
             .transact(move |tx| {
                 let current = load_job(tx, &params.job_id)?;
@@ -712,7 +967,7 @@ impl Board {
                     return Err(Error::Conflict("job is terminal or version changed".into()));
                 }
                 let mut kernel = kernel_job(tx, &current)?;
-                kernel.apply(KernelEvent::Cancel, now).map_err(kernel_error)?;
+                kernel.transition(KernelEvent::Cancel, now).map_err(kernel_error)?;
                 if let Some(attempt) = &current.attempt {
                     tx.execute(
                         "UPDATE board_attempts SET state='cancelled',cleanup_state='pending',ended_ms=?1 WHERE id=?2",
@@ -725,7 +980,7 @@ impl Board {
                 Ok((job, event))
             })
             .await?;
-        publish(self, event);
+
         Ok(job)
     }
 
@@ -735,40 +990,24 @@ impl Board {
     /// Stale version, unconfirmed cleanup, or exhausted budget is rejected.
     pub async fn retry(&self, params: RetryParams) -> Result<JobSnapshot, Error> {
         let now = now_ms()?;
-        let (job,event) = self.ledger.transact(move |tx| {
-            let current = load_job(tx,&params.job_id)?;
-            if current.version != params.expected_version {
-                return Err(Error::Conflict("job cannot retry at this version".into()));
-            }
-            let mut kernel = kernel_job(tx,&current)?;
-            let expired = matches!(current.state,JobState::Claimed | JobState::Running)
-                && current.attempt.as_ref().is_some_and(|attempt| now >= attempt.lease_until_ms);
-            if !expired && !matches!(current.state,JobState::Failed | JobState::Cancelled) && current.review != ReviewState::Rejected {
-                return Err(Error::Conflict("job is not failed, cancelled, rejected, or expired".into()));
-            }
-            if expired {
-                kernel.apply(KernelEvent::Expire {generation:current.generation},now).map_err(kernel_error)?;
-            }
-            if let Some(attempt) = &current.attempt {
-                if (expired || !attempt.cleanup_confirmed) && !params.cleanup_confirmed {
-                    return Err(Error::Conflict("prior attempt cleanup is uncertain".into()));
+        let (job, _event) = self
+            .ledger
+            .transact(move |tx| {
+                let current = load_job(tx, &params.job_id)?;
+                if current.version != params.expected_version {
+                    return Err(Error::Conflict("job cannot retry at this version".into()));
                 }
-                if (expired || !attempt.cleanup_confirmed) && params.cleanup_confirmed {
-                    kernel.apply(KernelEvent::ConfirmCleanup,now).map_err(kernel_error)?;
+                let mut kernel = kernel_job(tx, &current)?;
+                if !matches!(current.state, JobState::Failed | JobState::Cancelled) && current.review != ReviewState::Rejected {
+                    return Err(Error::Conflict("job is not failed, cancelled, or rejected".into()));
                 }
-                if params.cleanup_confirmed {
-                    tx.execute(
-                        "UPDATE board_attempts SET state=CASE WHEN ?1 THEN 'failed' ELSE state END,cleanup_state='confirmed',ended_ms=COALESCE(ended_ms,?2) WHERE id=?3",
-                        params![expired,as_i64(now)?,attempt.id],
-                    ).map_err(sql)?;
-                }
-            }
-            kernel.apply(KernelEvent::Retry,now).map_err(kernel_error)?;
-            let job = update_from_kernel(tx,&current,&kernel,now)?;
-            let event = insert_event(tx,&job.run_id,&job.id,job.version,"job.retried",now)?;
-            Ok((job,event))
-        }).await?;
-        publish(self, event);
+                kernel.transition(KernelEvent::Retry, now).map_err(kernel_error)?;
+                let job = update_from_kernel(tx, &current, &kernel, now)?;
+                let event = insert_event(tx, &job.run_id, &job.id, job.version, "job.retried", now)?;
+                Ok((job, event))
+            })
+            .await?;
+
         Ok(job)
     }
 
@@ -781,11 +1020,14 @@ impl Board {
             return Err(Error::Invalid("reviewer or evidence limit invalid".into()));
         }
         let now = now_ms()?;
-        let (job,event) = self.ledger.transact(move |tx| {
+        let (job,_event) = self.ledger.transact(move |tx| {
             let current = load_job(tx,&params.job_id)?;
             if current.version != params.expected_version || current.state != JobState::Succeeded || current.review != ReviewState::Pending
                 || current.attempt.as_ref().is_none_or(|attempt| attempt.id != params.attempt_id) {
                 return Err(Error::Conflict("job is not reviewable at this version".into()));
+            }
+            if current.attempt.as_ref().is_some_and(|attempt| attempt.worker == params.reviewer) {
+                return Err(Error::Conflict("worker cannot review its own attempt".into()));
             }
             if params.accepted && params.evidence.is_empty() {
                 return Err(Error::Invalid("acceptance requires artifact evidence".into()));
@@ -803,28 +1045,40 @@ impl Board {
                 }
             }
             let mut kernel = kernel_job(tx,&current)?;
-            kernel.apply(KernelEvent::Review {accepted:params.accepted,evidence_present:!params.evidence.is_empty()},now).map_err(kernel_error)?;
+            kernel.transition(KernelEvent::Review {accepted:params.accepted,evidence_present:!params.evidence.is_empty()},now).map_err(kernel_error)?;
             let decision = if params.accepted {ReviewState::Accepted} else {ReviewState::Rejected};
             let review_id = Uuid::new_v4().to_string();
             tx.execute(
                 "INSERT INTO board_reviews (id,job_id,attempt_id,reviewer,decision,evidence_json,created_ms) VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![review_id,current.id,params.attempt_id,params.reviewer,review_name(decision),encode(&params.evidence)?,as_i64(now)?],
             ).map_err(sql)?;
+            if params.accepted && let Some(work) = &current.spec.work {
+                let branch = format!("board/{}/{}", current.id, params.attempt_id);
+                tx.execute(
+                    "INSERT INTO board_integrations (job_id,attempt_id,source_branch,target_branch,state,created_ms,updated_ms) VALUES (?1,?2,?3,?4,'queued',?5,?5)",
+                    params![current.id,params.attempt_id,branch,work.target_branch,as_i64(now)?],
+                ).map_err(sql)?;
+            }
             let job = update_from_kernel(tx,&current,&kernel,now)?;
             let event = insert_event(tx,&job.run_id,&job.id,job.version,if params.accepted {"review.accepted"} else {"review.rejected"},now)?;
             Ok((job,event))
         }).await?;
-        publish(self, event);
+
         Ok(job)
     }
 
-    /// List current authoritative snapshots, capped at 200 jobs.
+    /// List current authoritative snapshots with a stable page cursor.
     ///
     /// # Errors
     /// The database read failed.
     pub async fn list(&self, params: ListParams) -> Result<ListResult, Error> {
-        let jobs = self.ledger.transact(move |tx| list_jobs(tx, params.run_id.as_deref(), params.limit.unwrap_or(50).min(200))).await?;
-        Ok(ListResult { jobs })
+        let (jobs, next_job, truncated) = self
+            .ledger
+            .transact(move |tx| {
+                list_jobs(tx, params.run_id.as_deref(), params.limit.unwrap_or(50).clamp(1, 200), params.after_job.as_deref())
+            })
+            .await?;
+        Ok(ListResult { jobs, next_job, truncated })
     }
 
     /// Read one authoritative job snapshot.
@@ -848,7 +1102,7 @@ impl Board {
                 if !exists {
                     return Err(Error::NotFound);
                 }
-                let jobs = list_jobs(tx, Some(&params.run_id), 200)?;
+                let (jobs, next_job, truncated) = list_jobs(tx, Some(&params.run_id), 200, params.after_job.as_deref())?;
                 let mut statement = tx.prepare_cached(
                 "SELECT seq,event_id,job_id,job_version,kind,created_ms FROM board_outbox WHERE run_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3",
             ).map_err(sql)?;
@@ -879,7 +1133,7 @@ impl Board {
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
                 let next_seq = events.last().map_or(params.after_seq, |event| event.seq);
-                Ok(PollResult { jobs, events, next_seq })
+                Ok(PollResult { jobs, events, next_seq, next_job, truncated })
             })
             .await
     }
@@ -889,6 +1143,6 @@ impl Board {
     /// # Errors
     /// The run was not found or the database read failed.
     pub async fn watch(&self, run_id: String, after_seq: u64) -> Result<PollResult, Error> {
-        self.poll(PollParams { run_id, after_seq, limit: 500 }).await
+        self.poll(PollParams { run_id, after_seq, limit: 500, after_job: None }).await
     }
 }
