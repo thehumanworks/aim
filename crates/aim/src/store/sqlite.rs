@@ -79,11 +79,13 @@ fn backend(err: impl core::fmt::Display) -> StoreError {
 }
 
 fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")
+        .map_err(|err| StoreError::Backend(format!("setting SQLite journal pragmas: {err}")))?;
+    // Both auto-spawn attempts may open this file before either owns the daemon lock. The
+    // version read and all schema changes must share one write transaction.
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|err| StoreError::Backend(format!("starting SQLite schema migration: {err}")))?;
     conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;
-         PRAGMA foreign_keys = ON;
-         CREATE TABLE IF NOT EXISTS db_schema (version INTEGER NOT NULL);
+        "CREATE TABLE IF NOT EXISTS db_schema (version INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS sessions (
              id TEXT PRIMARY KEY,
              created_ms INTEGER NOT NULL,
@@ -110,24 +112,21 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     crate::search::index::migrate(conn)?;
     match version {
         None => {
-            conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
             conn.execute_batch(CREATE_STATS).map_err(backend)?;
             conn.execute(BACKFILL_STATS, params![i64::try_from(MAX_FORK_DEPTH).map_err(backend)?]).map_err(backend)?;
             conn.execute("INSERT INTO db_schema (version) VALUES (?1)", params![DB_SCHEMA]).map_err(backend)?;
-            conn.execute_batch("COMMIT").map_err(backend)?;
         }
         Some(v) if v < DB_SCHEMA => {
-            conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
             if v < 2 {
                 crate::search::index::queue_existing(conn)?;
             }
             conn.execute_batch(CREATE_STATS).map_err(backend)?;
             conn.execute(BACKFILL_STATS, params![i64::try_from(MAX_FORK_DEPTH).map_err(backend)?]).map_err(backend)?;
             conn.execute("UPDATE db_schema SET version = ?1", params![DB_SCHEMA]).map_err(backend)?;
-            conn.execute_batch("COMMIT").map_err(backend)?;
         }
         Some(_) => {}
     }
+    conn.execute_batch("COMMIT").map_err(backend)?;
     Ok(())
 }
 
@@ -375,6 +374,7 @@ impl SqliteStore {
     /// [`StoreError::Backend`] when the database cannot be opened or migrated.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         private_store_files(path)?;
+        let _schema_lock = super::schema_lock(path).map_err(backend)?;
         let conn = Connection::open(path).map_err(backend)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(backend)?;
         migrate(&conn)?;

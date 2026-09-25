@@ -4,13 +4,26 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use aim_proto::error::{ErrorCode, ProtoError};
 
 use super::client::DaemonClient;
 use super::socket_path;
+
+/// Owns a daemon until startup succeeds. A failed or cancelled connection attempt must not
+/// leave the process running after its caller has given up.
+struct PendingDaemon(Option<Child>);
+
+impl Drop for PendingDaemon {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            drop(child.kill());
+            drop(child.wait());
+        }
+    }
+}
 
 /// Connects to a running daemon, starting this binary as a detached daemon when needed.
 ///
@@ -45,14 +58,17 @@ pub async fn connect_or_spawn_executable(home: &Path, exe: &Path) -> Result<Daem
     let mut command = Command::new(exe);
     command.arg("daemon").env("AIM_HOME", home).stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
     command.process_group(0);
-    let mut child = command.spawn().map_err(|e| ProtoError::new(ErrorCode::Unavailable, format!("spawning daemon: {e}")))?;
-    let _reaper = std::thread::Builder::new().name("aim-daemon-reaper".into()).spawn(move || {
-        let _status = child.wait();
-    });
+    let mut pending =
+        PendingDaemon(Some(command.spawn().map_err(|e| ProtoError::new(ErrorCode::Unavailable, format!("spawning daemon: {e}")))?));
     let start = Instant::now();
     let mut delay = Duration::from_millis(20);
     while start.elapsed() < Duration::from_secs(5) {
         if let Ok(client) = DaemonClient::connect(&socket).await {
+            if let Some(mut child) = pending.0.take() {
+                let _reaper = std::thread::Builder::new().name("aim-daemon-reaper".into()).spawn(move || {
+                    let _status = child.wait();
+                });
+            }
             return Ok(client);
         }
         tokio::time::sleep(delay).await;

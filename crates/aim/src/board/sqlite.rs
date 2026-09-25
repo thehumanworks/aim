@@ -260,9 +260,13 @@ impl Ledger {
 
     pub(super) fn open_with_events(path: &Path, events: broadcast::Sender<BoardEvent>) -> Result<Self, Error> {
         private_files(path)?;
+        let _schema_lock = crate::store::schema_lock(path).map_err(backend)?;
         let conn = Connection::open(path).map_err(backend)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(backend)?;
         conn.execute_batch(SCHEMA).map_err(backend)?;
+        // Two cold daemon starts can reach this migration before the singleton lock. Keep
+        // column inspection and ALTER together so only one connection applies the upgrade.
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
         let mut columns = conn.prepare("PRAGMA table_info(board_attempts)").map_err(backend)?;
         let names =
             columns.query_map([], |row| row.get::<_, String>(1)).map_err(backend)?.collect::<Result<Vec<_>, _>>().map_err(backend)?;
@@ -274,6 +278,7 @@ impl Ledger {
             "CREATE UNIQUE INDEX IF NOT EXISTS board_attempts_by_claim_key ON board_attempts(claim_key) WHERE claim_key != ''",
         )
         .map_err(backend)?;
+        conn.execute_batch("COMMIT").map_err(backend)?;
         private_files(path)?;
         let (tx, rx) = mpsc::channel::<Task>();
         std::thread::Builder::new()
@@ -330,6 +335,38 @@ mod tests {
         connection.execute_batch(SCHEMA).unwrap();
         let mode: i64 = connection.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
         assert_eq!(mode, 2);
+    }
+
+    #[test]
+    fn concurrent_board_opens_upgrade_claim_key_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".aim");
+        std::fs::create_dir(&home).unwrap();
+        let path = home.join("aim.db");
+        let conn = Connection::open(&path).unwrap();
+        let legacy = SCHEMA.replace("claim_key TEXT NOT NULL DEFAULT '',", "");
+        conn.execute_batch(&legacy).unwrap();
+        drop(conn);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Ledger::open(&path)
+                })
+            })
+            .collect();
+        barrier.wait();
+        for worker in workers {
+            assert!(worker.join().unwrap().is_ok(), "concurrent board startup failed to upgrade the shared database");
+        }
+        let conn = Connection::open(path).unwrap();
+        let mut columns = conn.prepare("PRAGMA table_info(board_attempts)").unwrap();
+        let names = columns.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(names.iter().filter(|name| *name == "claim_key").count(), 1);
     }
 
     #[tokio::test]
