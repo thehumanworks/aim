@@ -215,10 +215,13 @@ impl ToolHost for ProgramToolHost {
     fn call(&self, name: String, arguments: Value, key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
         let host = self.clone();
         Box::pin(async move {
+            // A workspace or program error reaches the model: it is bounded like a cell's
+            // failure (codex re-check B1). The code tools bound their own.
+            let bounded = |error| aim_coderun::runtime::bounded_error(error, DEFAULT_OUTPUT_BYTES);
             match name.as_str() {
-                "save_program" => host.save(arguments).await,
-                "run_program" => host.run(arguments).await,
-                "list_programs" => host.list().await,
+                "save_program" => host.save(arguments).await.map_err(bounded),
+                "run_program" => host.run(arguments).await.map_err(bounded),
+                "list_programs" => host.list().await.map_err(bounded),
                 _ => host.code.call(name, arguments, key).await,
             }
         })

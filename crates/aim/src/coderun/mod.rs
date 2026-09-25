@@ -462,8 +462,11 @@ async fn run_exec(shared: Arc<Shared>, mut ticket: CellTicket, cell_id: String, 
     cell.record.finish(outcome);
 }
 
+/// The smallest response budget: room for the truncation warning and marker (codex re-check B1).
+const MIN_RESPONSE_BYTES: usize = 256;
+
 fn response_bytes(tokens: Option<usize>) -> usize {
-    tokens.unwrap_or(10_000).saturating_mul(4).clamp(1, MAX_OUTPUT_BYTES)
+    tokens.unwrap_or(10_000).saturating_mul(4).clamp(MIN_RESPONSE_BYTES, MAX_OUTPUT_BYTES)
 }
 
 fn not_found() -> ProtoError {
