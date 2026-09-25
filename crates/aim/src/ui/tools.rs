@@ -9,7 +9,10 @@ use aim_proto::ui::catalog::TERMINAL;
 use aim_proto::ui::{Component, DataOp, Placement, ROOT_ID, TERMINAL_CATALOG, UiMessage};
 use serde_json::{Map, Value, json};
 
-use super::session::{current, submit};
+use std::collections::HashSet;
+
+use super::limits::Limits;
+use super::session::{current, limits, submit};
 use super::validate::Notes;
 use crate::agent::ToolHost;
 use crate::agent::tools::BoxFuture;
@@ -65,15 +68,36 @@ fn surface_arg(arguments: &Value) -> Result<String, ProtoError> {
         .ok_or_else(|| invalid("`surface` (the surface id) is required"))
 }
 
-fn components_arg(arguments: &Value, required: bool) -> Result<Vec<Component>, ProtoError> {
+fn too_big(message: impl Into<String>) -> ProtoError {
+    ProtoError::new(ErrorCode::LimitExceeded, message)
+}
+
+/// The raw arguments within the session's bounds before any lenient work (flattening, root
+/// detection) is spent on them: their size, and the number of components they list.
+fn check_raw(arguments: &Value, limits: &Limits) -> Result<(), ProtoError> {
+    let size = serde_json::to_vec(arguments).map_or(usize::MAX, |bytes| bytes.len());
+    if size > limits.message_bytes {
+        return Err(too_big(format!("the arguments are {size} bytes; the limit is {}", limits.message_bytes)));
+    }
+    if let Some(Value::Array(list)) = arguments.get("components")
+        && list.len() > limits.components
+    {
+        return Err(too_big(format!("`components` lists {} components; a surface holds at most {}", list.len(), limits.components)));
+    }
+    Ok(())
+}
+
+fn components_arg(arguments: &Value, required: bool, limits: &Limits) -> Result<Vec<Component>, ProtoError> {
     match arguments.get("components") {
         None | Some(Value::Null) if !required => Ok(Vec::new()),
         None | Some(Value::Null) => Err(invalid("`components` is required: [{id, component, ...props}], one with id \"root\"")),
         Some(Value::Array(list)) => {
             let mut flat = Vec::new();
             for (index, value) in list.iter().enumerate() {
-                flatten(value.clone(), &format!("c{index}"), &mut flat)
-                    .map_err(|e| invalid(format!("components[{index}] is not {{id, component, ...props}}: {e}")))?;
+                flatten(value.clone(), &format!("c{index}"), 1, limits, &mut flat).map_err(|e| match e {
+                    Flatten::Limit(error) => error,
+                    Flatten::Shape(e) => invalid(format!("components[{index}] is not {{id, component, ...props}}: {e}")),
+                })?;
             }
             Ok(flat)
         }
@@ -81,10 +105,24 @@ fn components_arg(arguments: &Value, required: bool) -> Result<Vec<Component>, P
     }
 }
 
+/// Why flattening stopped.
+enum Flatten {
+    /// A bound was reached (components or nesting).
+    Limit(ProtoError),
+    /// A component is not `{id, component, ...props}`.
+    Shape(serde_json::Error),
+}
+
 /// Forgiving at the model boundary: a component nested inline as a `child` or in `children` is
 /// moved into the flat list (with an id made from its parent's when it has none) and referenced
-/// by id, as the protocol wants.
-fn flatten(mut value: Value, fallback_id: &str, out: &mut Vec<Component>) -> Result<String, serde_json::Error> {
+/// by id, as the protocol wants. Bounded by the session's component count and tree depth.
+fn flatten(mut value: Value, fallback_id: &str, depth: usize, limits: &Limits, out: &mut Vec<Component>) -> Result<String, Flatten> {
+    if depth > limits.depth {
+        return Err(Flatten::Limit(too_big(format!("components are nested deeper than {} levels", limits.depth))));
+    }
+    if out.len() >= limits.components {
+        return Err(Flatten::Limit(too_big(format!("more than {} components; a surface holds at most that many", limits.components))));
+    }
     if let Value::Object(map) = &mut value {
         let id = if let Some(id) = map.get("id").and_then(Value::as_str) {
             id.to_owned()
@@ -95,19 +133,19 @@ fn flatten(mut value: Value, fallback_id: &str, out: &mut Vec<Component>) -> Res
         if let Some(child) = map.get_mut("child")
             && child.is_object()
         {
-            let nested = flatten(child.take(), &format!("{id}.0"), out)?;
+            let nested = flatten(child.take(), &format!("{id}.0"), depth + 1, limits, out)?;
             *child = Value::String(nested);
         }
         if let Some(Value::Array(children)) = map.get_mut("children") {
             for (index, child) in children.iter_mut().enumerate() {
                 if child.is_object() {
-                    let nested = flatten(child.take(), &format!("{id}.{index}"), out)?;
+                    let nested = flatten(child.take(), &format!("{id}.{index}"), depth + 1, limits, out)?;
                     *child = Value::String(nested);
                 }
             }
         }
     }
-    let component: Component = serde_json::from_value(value)?;
+    let component: Component = serde_json::from_value(value).map_err(Flatten::Shape)?;
     let id = component.id.clone();
     out.push(component);
     Ok(id)
@@ -139,8 +177,8 @@ fn ensure_root(components: &mut Vec<Component>) {
     if components.iter().any(|c| c.id == ROOT_ID) {
         return;
     }
-    let contained: Vec<String> = components.iter().flat_map(|c| c.child_ids().into_iter().map(str::to_owned)).collect();
-    let tops: Vec<String> = components.iter().filter(|c| !contained.contains(&c.id)).map(|c| c.id.clone()).collect();
+    let contained: HashSet<&str> = components.iter().flat_map(Component::child_ids).collect();
+    let tops: Vec<String> = components.iter().filter(|c| !contained.contains(c.id.as_str())).map(|c| c.id.clone()).collect();
     match tops.as_slice() {
         [] => {}
         [single] => {
@@ -167,7 +205,8 @@ fn summary(verb: &str, surface: &str, notes: &Notes) -> ToolResult {
     ToolResult::text(text)
 }
 
-fn show(arguments: &Value) -> Result<ToolResult, ProtoError> {
+fn show(arguments: &Value, limits: &Limits) -> Result<ToolResult, ProtoError> {
+    check_raw(arguments, limits)?;
     // A new surface needs no id from the model: the result names the one it got.
     let surface_id = surface_arg(arguments).unwrap_or_else(|_| fresh_surface_id());
     let placement = match arguments.get("placement").and_then(Value::as_str) {
@@ -175,20 +214,19 @@ fn show(arguments: &Value) -> Result<ToolResult, ProtoError> {
             .ok_or_else(|| invalid(format!("unknown placement `{name}` (one of {}, tool(<call_id>))", Placement::NAMES.join(", "))))?,
         None => Placement::default(),
     };
-    let mut components = components_arg(arguments, true)?;
+    let mut components = components_arg(arguments, true, limits)?;
     ensure_root(&mut components);
     let data = match arguments.get("data") {
         None | Some(Value::Null) => None,
         Some(Value::Object(members)) => Some(Value::Object(members.clone())),
         Some(_) => return Err(invalid("`data` must be an object (the surface's initial data model)")),
     };
-    // Showing an existing id replaces that surface.
+    // Showing an existing id replaces that surface, in one message: a refused replacement leaves
+    // the old surface as it was.
     let replaced = current(&surface_id).is_some();
-    if replaced {
-        submit(UiMessage::DeleteSurface { surface_id: surface_id.clone() })?;
-    }
     let (_, notes) = submit(UiMessage::CreateSurface {
         surface_id: surface_id.clone(),
+        replace: replaced,
         catalog_id: TERMINAL_CATALOG.to_owned(),
         placement: placement.clone(),
         components,
@@ -198,20 +236,21 @@ fn show(arguments: &Value) -> Result<ToolResult, ProtoError> {
     Ok(summary(&format!("{verb} ({placement})"), &surface_id, &notes))
 }
 
-fn update(arguments: &Value) -> Result<ToolResult, ProtoError> {
+fn update(arguments: &Value, limits: &Limits) -> Result<ToolResult, ProtoError> {
+    check_raw(arguments, limits)?;
     let surface_id = surface_arg(arguments)?;
-    let components = components_arg(arguments, false)?;
+    let components = components_arg(arguments, false, limits)?;
     let ops = ops_arg(arguments)?;
     if components.is_empty() && ops.is_empty() {
         return Err(invalid("nothing to update: give `components` and/or `data`"));
     }
-    let mut notes = Notes::default();
-    if !components.is_empty() {
-        notes = submit(UiMessage::UpdateComponents { surface_id: surface_id.clone(), components })?.1;
-    }
-    if !ops.is_empty() {
-        notes = submit(UiMessage::UpdateDataModel { surface_id: surface_id.clone(), ops })?.1;
-    }
+    // Components and data are one message: all of it applies, or none.
+    let message = if components.is_empty() {
+        UiMessage::UpdateDataModel { surface_id: surface_id.clone(), ops }
+    } else {
+        UiMessage::UpdateComponents { surface_id: surface_id.clone(), components, ops }
+    };
+    let (_, notes) = submit(message)?;
     Ok(summary("updated", &surface_id, &notes))
 }
 
@@ -252,8 +291,8 @@ impl ToolHost for UiTools {
         Box::pin(async move {
             let arguments = if arguments.is_object() { arguments } else { Value::Object(Map::new()) };
             match name.as_str() {
-                SHOW => show(&arguments),
-                UPDATE => update(&arguments),
+                SHOW => show(&arguments, &limits()),
+                UPDATE => update(&arguments, &limits()),
                 CLOSE => close(&arguments),
                 CATALOG => Ok(catalog(&arguments)),
                 other => Err(ProtoError::new(ErrorCode::NotFound, format!("no tool named `{other}`"))),
@@ -309,12 +348,83 @@ mod tests {
         let (replaced, sent) =
             run(&ui, SHOW, json!({"surface": "t", "placement": "dialog", "components": [{"id": "root", "component": "Spinner"}]})).await;
         assert!(text(&replaced.unwrap()).contains("replaced (dialog)"));
-        assert_eq!(sent.len(), 2, "a delete, then the new surface");
+        assert_eq!(sent.len(), 1, "one replacing message");
         let (closed, _) = run(&ui, CLOSE, json!({"surface": "t"})).await;
         assert!(closed.is_ok() && ui.accepted("t").is_none());
         let (again, sent) = run(&ui, CLOSE, json!({"surface": "t"})).await;
         assert_eq!(again.unwrap_err().code, ErrorCode::NotFound);
         assert!(sent.is_empty(), "a refused message is never published");
+    }
+
+    fn ui_messages(sent: &[SessionUpdate]) -> Vec<UiMessage> {
+        sent.iter()
+            .filter_map(|u| match u {
+                SessionUpdate::Ui { message } => Some(message.message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// REV19 A1: a refused replacement leaves the shown surface as it was and publishes nothing.
+    #[tokio::test]
+    async fn rev19_a_refused_replacement_keeps_the_surface() {
+        let ui = Arc::new(SessionUi::new("A"));
+        let good = json!({"surface": "s", "components": [{"id": "root", "component": "Text", "text": "kept"}]});
+        assert!(run(&ui, SHOW, good).await.0.is_ok());
+        let bad = json!({"surface": "s", "components": [{"id": "root", "component": "Text"}]});
+        let (refused, sent) = run(&ui, SHOW, bad).await;
+        assert_eq!(refused.unwrap_err().code, ErrorCode::InvalidParams);
+        assert!(sent.is_empty(), "nothing was published: {sent:?}");
+        assert_eq!(ui.accepted("s").and_then(|s| s.root().and_then(|c| c.prop("text").cloned())), Some(json!("kept")));
+        // With one token left, a valid replacement is one message and succeeds.
+        let limited = Arc::new(SessionUi::with_limits("A", Limits { burst: 2, per_second: 0, ..Limits::default() }));
+        assert!(run(&limited, SHOW, json!({"surface": "s", "components": [{"id": "root", "component": "Divider"}]})).await.0.is_ok());
+        let (replaced, sent) = run(&limited, SHOW, json!({"surface": "s", "components": [{"id": "root", "component": "Spinner"}]})).await;
+        assert!(replaced.is_ok(), "{replaced:?}");
+        assert!(matches!(ui_messages(&sent).as_slice(), [UiMessage::CreateSurface { replace: true, .. }]));
+    }
+
+    /// REV19 A2: components and data are one transaction: a bad data op publishes nothing and
+    /// leaves the components as they were.
+    #[tokio::test]
+    async fn rev19_an_update_with_components_and_data_is_all_or_nothing() {
+        let ui = Arc::new(SessionUi::new("A"));
+        assert!(
+            run(&ui, SHOW, json!({"surface": "s", "components": [{"id": "root", "component": "Text", "text": "old"}]})).await.0.is_ok()
+        );
+        let mixed = json!({"surface": "s", "components": [{"id": "root", "component": "Text", "text": "new"}], "data": [{"path": "bad", "value": 1}]});
+        let (refused, sent) = run(&ui, UPDATE, mixed).await;
+        assert_eq!(refused.unwrap_err().code, ErrorCode::InvalidParams);
+        assert!(sent.is_empty(), "nothing was published: {sent:?}");
+        assert_eq!(ui.accepted("s").and_then(|s| s.root().and_then(|c| c.prop("text").cloned())), Some(json!("old")));
+        let good =
+            json!({"surface": "s", "components": [{"id": "root", "component": "Text", "text": {"path": "/t"}}], "data": {"t": "new"}});
+        let (updated, sent) = run(&ui, UPDATE, good).await;
+        assert!(updated.is_ok());
+        assert!(matches!(ui_messages(&sent).as_slice(), [UiMessage::UpdateComponents { ops, .. }] if ops.len() == 1), "one message");
+    }
+
+    /// REV19 A4: raw arguments are bounded before any lenient work: their bytes (whatever they
+    /// hold), how many components they list, and how deep inline components nest.
+    #[tokio::test]
+    async fn rev19_raw_arguments_are_bounded_before_flattening() {
+        let ui = Arc::new(SessionUi::new("A"));
+        let padded = json!({"surface": "s", "components": [{"id": "root", "component": "Divider"}], "note": "x".repeat(70_000)});
+        let (refused, sent) = run(&ui, SHOW, padded).await;
+        let refused = refused.unwrap_err();
+        assert_eq!(refused.code, ErrorCode::LimitExceeded);
+        assert!(refused.message.contains("the arguments are"), "{}", refused.message);
+        assert!(sent.is_empty() && ui.accepted("s").is_none());
+        let many: Vec<Value> =
+            (0..300).map(|n| json!({"id": format!("c{n}"), "component": "Column", "children": [format!("m{n}")]})).collect();
+        let refused = run(&ui, SHOW, json!({"surface": "s", "components": many})).await.0.unwrap_err();
+        assert!(refused.message.contains("`components` lists 300 components"), "{}", refused.message);
+        let mut nested = json!({"component": "Text", "text": "leaf"});
+        for _ in 0..40 {
+            nested = json!({"component": "Column", "children": [nested]});
+        }
+        let refused = run(&ui, SHOW, json!({"surface": "s", "components": [nested]})).await.0.unwrap_err();
+        assert!(refused.message.contains("nested deeper than 16"), "{}", refused.message);
     }
 
     #[tokio::test]

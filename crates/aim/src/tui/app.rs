@@ -712,7 +712,8 @@ impl App {
         let meta = &summary.meta;
         let same = self.session.as_ref().is_some_and(|s| s.id == meta.id);
         if resync && same {
-            self.resync(items, surfaces);
+            let running = matches!(summary.state, SessionState::Running | SessionState::RequiresAction);
+            self.resync(items, surfaces, running);
         } else {
             let switching = self.session.is_some();
             self.transcript.settle();
@@ -783,25 +784,36 @@ impl App {
     /// A re-attach after the stream dropped: the snapshot is the truth. New items are applied,
     /// steering they contain counts as delivered, and streamed text is dropped (the finished item
     /// is in the snapshot, or will arrive whole).
-    fn resync(&mut self, items: &[Item], surfaces: Vec<Surface>) {
+    fn resync(&mut self, items: &[Item], surfaces: Vec<Surface>, running: bool) {
         for item in items.iter().skip(self.transcript.items_seen()) {
             self.transcript.push_item(item);
             if let Item::User { parts } = item {
                 self.mark_delivered(&user_text(parts));
             }
         }
-        // The snapshot is the truth for surfaces too; transcript ones not shown yet are added.
+        // The snapshot is the truth for surfaces too. A transcript surface not shown yet is added;
+        // one that changed while the stream was down is reconciled like a live update: replaced
+        // while not in scrollback, else its current state is added once (scrollback is never
+        // rewritten).
         self.surfaces = Surfaces::from_snapshot(surfaces);
-        let unseen: Vec<Surface> = self
-            .surfaces
-            .list
-            .iter()
-            .filter(|s| surfaces::slot(&s.placement) == Slot::Transcript && self.transcript.latest_surface(&s.id).is_none())
-            .cloned()
-            .collect();
-        for surface in unseen {
-            self.show_in_transcript(surface);
+        let transcript: Vec<Surface> =
+            self.surfaces.list.iter().filter(|s| surfaces::slot(&s.placement) == Slot::Transcript).cloned().collect();
+        for surface in transcript {
+            let shown = self.transcript.latest_surface(&surface.id).and_then(|index| match self.transcript.entries().get(index) {
+                Some(Entry::Surface { surface }) => Some(surface.as_ref().clone()),
+                _ => None,
+            });
+            match shown {
+                None => self.show_in_transcript(surface),
+                Some(shown) if shown != surface && !self.live_surfaces.contains(&surface.id) => {
+                    self.place_update(surface, running);
+                }
+                Some(_) => {}
+            }
         }
+        let current = &self.surfaces;
+        self.live_surfaces.retain(|id| current.get(id).is_some());
+        self.toasts.retain(|id, _| current.get(id).is_some());
         self.fix_focus();
         self.live_text.clear();
         self.live_reasoning.clear();
@@ -909,6 +921,24 @@ impl App {
                 self.live_surfaces.retain(|s| *s != surface.id);
                 self.toasts.remove(&surface.id);
             }
+            // A new surface under an old id: the old one is gone (what it showed in scrollback
+            // stays), the new one shows like a fresh one.
+            Change::Replaced(old) => {
+                self.live_surfaces.retain(|s| *s != old.id);
+                self.toasts.remove(&old.id);
+                if let Some(surface) = self.surfaces.get(&old.id).cloned() {
+                    match surfaces::slot(&surface.placement) {
+                        Slot::Transcript => self.show_in_transcript(surface),
+                        Slot::Toast => {
+                            self.toasts.insert(old.id.clone(), TOAST_TICKS);
+                        }
+                        Slot::Dialog if self.composer.is_empty() => {
+                            self.focus = surfaces::buttons(&surface).first().map(|button| (old.id.clone(), button.clone()));
+                        }
+                        Slot::Dialog | Slot::Above | Slot::Below | Slot::Status { .. } | Slot::Panel => {}
+                    }
+                }
+            }
         }
         self.fix_focus();
     }
@@ -927,9 +957,16 @@ impl App {
     /// A transcript surface changed: its snapshot is replaced while not in scrollback; otherwise
     /// it shows live until the turn ends (and is committed once then), or at once when idle.
     fn update_in_transcript(&mut self, surface: Surface) {
+        let running = self.running();
+        self.place_update(surface, running);
+    }
+
+    /// [`App::update_in_transcript`] with the session's running state given (a resync knows it
+    /// before the session view does).
+    fn place_update(&mut self, surface: Surface, running: bool) {
         match self.transcript.latest_surface(&surface.id) {
             Some(index) if index >= self.transcript.committed() => self.transcript.replace_surface(index, surface),
-            _ if self.running() => {
+            _ if running => {
                 if !self.live_surfaces.contains(&surface.id) {
                     self.live_surfaces.push(surface.id);
                 }

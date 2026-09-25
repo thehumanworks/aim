@@ -248,10 +248,15 @@ pub struct DataOp {
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiMessage {
-    /// Creates a surface, optionally with its components and data in the same message.
+    /// Creates a surface, optionally with its components and data in the same message. With
+    /// `replace`, a surface with the same id is replaced in the same step (ADR 0064).
     CreateSurface {
         /// The surface's id (unique within its session).
         surface_id: String,
+        /// Replace a surface with this id if there is one (one atomic step, not a delete and a
+        /// create that could half succeed).
+        #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+        replace: bool,
         /// The catalog its components come from.
         #[serde(default = "terminal_catalog")]
         catalog_id: String,
@@ -265,12 +270,15 @@ pub enum UiMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<Value>,
     },
-    /// Adds or replaces components by id.
+    /// Adds or replaces components by id, then applies `ops` to the data: all of it or none.
     UpdateComponents {
         /// The surface.
         surface_id: String,
         /// Components to upsert.
         components: Vec<Component>,
+        /// Data operations applied after the upsert, in the same step (ADR 0064).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ops: Vec<DataOp>,
     },
     /// Applies data operations in order.
     UpdateDataModel {

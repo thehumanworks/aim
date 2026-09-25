@@ -18,8 +18,8 @@ use aim_proto::daemon::{
 };
 use aim_proto::harness::{AuthProof, GenerationRange, PeerInfo};
 use aim_proto::ids::IdempotencyKey;
-use aim_proto::ui::model::{Change, Surface, Surfaces};
-use aim_proto::ui::{UiAction, UiMessage};
+use aim_proto::ui::UiAction;
+use aim_proto::ui::model::{Surface, Surfaces};
 use leptos::prelude::*;
 use serde_json::{Value, json};
 use wasm_bindgen::JsCast;
@@ -376,22 +376,20 @@ impl Client {
             }
             SessionUpdate::ConfigRejected { message, .. } | SessionUpdate::TurnFailed { message } => s.error = message,
             SessionUpdate::TurnEnded { .. } => s.streaming.clear(),
-            SessionUpdate::Ui { message } => match s.surfaces.apply(&message.message, 0) {
-                Ok(Change::Created(id)) => {
-                    let transcript = s.surfaces.get(&id).is_some_and(|x| surface::slot(&x.placement) == surface::Slot::Transcript);
-                    if transcript && matches!(message.message, UiMessage::CreateSurface { .. }) {
-                        s.rows.push(Row::Surface { id });
-                    }
-                }
-                Ok(Change::Deleted(gone)) => {
-                    for row in &mut s.rows {
-                        if matches!(row, Row::Surface { id } if *id == gone.id) {
-                            *row = Row::Closed { surface: gone.clone() };
+            SessionUpdate::Ui { message } => {
+                for edit in surface::fold(&mut s.surfaces, &message.message) {
+                    match edit {
+                        surface::RowEdit::Append(id) => s.rows.push(Row::Surface { id }),
+                        surface::RowEdit::Archive(gone) => {
+                            for row in &mut s.rows {
+                                if matches!(row, Row::Surface { id } if *id == gone.id) {
+                                    *row = Row::Closed { surface: gone.clone() };
+                                }
+                            }
                         }
                     }
                 }
-                Ok(Change::Updated(_)) | Err(_) => {}
-            },
+            }
             _ => {}
         });
     }
@@ -480,7 +478,13 @@ fn App() -> impl IntoView {
     let private = RwSignal::new(false);
     let draft = RwSignal::new(String::new());
     // A pressed surface button goes to the attached session as user input (ADR 0064).
+    // A click that is no longer current (a closed or replaced surface, a changed button) is not
+    // sent (REV19 A6).
     let press = move |action: UiAction| {
+        if !ui.with_untracked(|s| surface::is_current(&s.surfaces, &action)) {
+            ui.update(|s| s.status = "That control is no longer current".into());
+            return;
+        }
         if let Some(c) = client.get_value().borrow().as_ref()
             && let Some(s) = ui.get_untracked().selected
         {
@@ -580,7 +584,7 @@ fn App() -> impl IntoView {
                             Row::Text { kind, text } => view! { <div class=format!("entry {kind}")>{text}</div> }.into_any(),
                             Row::Tool { name, detail, done } => view! { <details class="tool"><summary>{format!("{} {}", if done { "✓" } else { "◌" }, name)}</summary><pre>{detail}</pre></details> }.into_any(),
                             Row::Surface { id } => ui.with(|s| s.surfaces.get(&id).map(surface::render)).map_or_else(|| ().into_any(), |node| surface::view(node, &press)),
-                            Row::Closed { surface: last } => surface::view(surface::render(&last), &press),
+                            Row::Closed { surface: last } => surface::view(surface::render_archived(&last), &press),
                         }).collect_view()}
                         <div class="entry assistant">{move || ui.get().streaming}</div>
                         <div class="entry error">{move || ui.get().error}</div>

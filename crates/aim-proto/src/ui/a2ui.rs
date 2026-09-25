@@ -9,7 +9,10 @@
 //! Mappings:
 //! - `create_surface` ↔ `createSurface{surfaceId, catalogId, components, dataModel,
 //!   metadata.extensions.dev_aim.placement}`;
-//! - `update_components` ↔ `updateComponents{surfaceId, components}`;
+//! - `create_surface{replace: true}` → `deleteSurface` then `createSurface` (A2UI has no replace;
+//!   an import is never a replacement);
+//! - `update_components` ↔ `updateComponents{surfaceId, components}`, its `ops` following as
+//!   `updateDataModel`s;
 //! - `update_data_model{ops}` → one `updateDataModel{surfaceId, path, value}` per op (and back,
 //!   one op per message);
 //! - `delete_surface` ↔ `deleteSurface{surfaceId}`;
@@ -94,7 +97,11 @@ fn import_component(value: &Value) -> Result<Component, ImportError> {
 pub fn export(envelope: &UiEnvelope) -> Vec<Value> {
     let wrap = |key: &str, body: Value| json!({"version": WIRE_VERSION, key: body});
     match &envelope.message {
-        UiMessage::CreateSurface { surface_id, catalog_id, placement, components, data } => {
+        UiMessage::CreateSurface { surface_id, replace, catalog_id, placement, components, data } => {
+            let mut out = Vec::new();
+            if *replace {
+                out.push(wrap("deleteSurface", json!({"surfaceId": surface_id})));
+            }
             let mut body = Map::new();
             body.insert("surfaceId".into(), json!(surface_id));
             body.insert("catalogId".into(), json!(catalog_id));
@@ -105,21 +112,29 @@ pub fn export(envelope: &UiEnvelope) -> Vec<Value> {
                 body.insert("dataModel".into(), data.clone());
             }
             body.insert("metadata".into(), extension(&json!({"placement": placement.name()})));
-            vec![wrap("createSurface", Value::Object(body))]
+            out.push(wrap("createSurface", Value::Object(body)));
+            out
         }
-        UiMessage::UpdateComponents { surface_id, components } => vec![wrap(
-            "updateComponents",
-            json!({"surfaceId": surface_id, "components": components.iter().map(export_component).collect::<Vec<_>>()}),
-        )],
-        UiMessage::UpdateDataModel { surface_id, ops } => ops
-            .iter()
-            .map(|op| {
-                let path = if op.path.is_empty() { "/" } else { op.path.as_str() };
-                wrap("updateDataModel", json!({"surfaceId": surface_id, "path": path, "value": op.value}))
-            })
-            .collect(),
+        UiMessage::UpdateComponents { surface_id, components, ops } => {
+            let mut out = vec![wrap(
+                "updateComponents",
+                json!({"surfaceId": surface_id, "components": components.iter().map(export_component).collect::<Vec<_>>()}),
+            )];
+            out.extend(export_ops(surface_id, ops));
+            out
+        }
+        UiMessage::UpdateDataModel { surface_id, ops } => export_ops(surface_id, ops),
         UiMessage::DeleteSurface { surface_id } => vec![wrap("deleteSurface", json!({"surfaceId": surface_id}))],
     }
+}
+
+fn export_ops(surface_id: &str, ops: &[DataOp]) -> Vec<Value> {
+    ops.iter()
+        .map(|op| {
+            let path = if op.path.is_empty() { "/" } else { op.path.as_str() };
+            json!({"version": WIRE_VERSION, "updateDataModel": {"surfaceId": surface_id, "path": path, "value": op.value}})
+        })
+        .collect()
 }
 
 fn surface_id(body: &Value) -> Result<String, ImportError> {
@@ -152,13 +167,14 @@ pub fn import(message: &Value) -> Result<UiEnvelope, ImportError> {
         };
         UiMessage::CreateSurface {
             surface_id: surface_id(body)?,
+            replace: false,
             catalog_id: body.get("catalogId").and_then(Value::as_str).unwrap_or(super::TERMINAL_CATALOG).to_owned(),
             placement,
             components: components(body)?,
             data: body.get("dataModel").cloned(),
         }
     } else if let Some(body) = message.get("updateComponents") {
-        UiMessage::UpdateComponents { surface_id: surface_id(body)?, components: components(body)? }
+        UiMessage::UpdateComponents { surface_id: surface_id(body)?, components: components(body)?, ops: Vec::new() }
     } else if let Some(body) = message.get("updateDataModel") {
         let path = body.get("path").and_then(Value::as_str).unwrap_or_default().to_owned();
         let value = body.get("value").cloned().unwrap_or(Value::Null);
@@ -220,6 +236,7 @@ mod tests {
         text.fallback = Some(Fallback::Text("deploy?".into()));
         let create = UiEnvelope::new(UiMessage::CreateSurface {
             surface_id: "s".into(),
+            replace: false,
             catalog_id: super::super::TERMINAL_CATALOG.into(),
             placement: Placement::Dialog,
             components: vec![text, button],
@@ -237,6 +254,24 @@ mod tests {
             ops: vec![DataOp { path: "/n".into(), value: json!(2) }],
         });
         assert_eq!(import(&export(&data)[0]).unwrap(), data);
+        let replace = UiEnvelope::new(UiMessage::CreateSurface {
+            surface_id: "s".into(),
+            replace: true,
+            catalog_id: super::super::TERMINAL_CATALOG.into(),
+            placement: Placement::Transcript,
+            components: Vec::new(),
+            data: None,
+        });
+        let wire = export(&replace);
+        assert_eq!((wire.len(), wire[0].get("deleteSurface").is_some(), wire[1].get("createSurface").is_some()), (2, true, true));
+        let mixed = UiEnvelope::new(UiMessage::UpdateComponents {
+            surface_id: "s".into(),
+            components: vec![Component::new("x", "Divider")],
+            ops: vec![DataOp { path: String::new(), value: json!({"n": 3}) }],
+        });
+        let wire = export(&mixed);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[1]["updateDataModel"]["path"], "/");
         let delete = UiEnvelope::new(UiMessage::DeleteSurface { surface_id: "s".into() });
         assert_eq!(export(&delete), vec![json!({"version": "v1.0", "deleteSurface": {"surfaceId": "s"}})]);
         assert_eq!(import(&export(&delete)[0]).unwrap(), delete);

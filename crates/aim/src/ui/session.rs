@@ -56,6 +56,12 @@ impl Registry {
         &self.surfaces
     }
 
+    /// The bounds this session's surfaces are held to.
+    #[must_use]
+    pub const fn limits(&self) -> Limits {
+        self.limits
+    }
+
     /// Accepts `envelope` from `requester` (a session id) at `now_ms`: ownership, rate, then the
     /// catalog and bounds. A refused message changes nothing (the rate limit only counts
     /// messages that were allowed to try).
@@ -236,6 +242,12 @@ pub(crate) fn current(id: &str) -> Option<Surface> {
     OUTLET.try_with(|outlet| outlet.ui.accepted(id)).ok().flatten()
 }
 
+/// The bounds of the session whose turn is running (the defaults outside a turn, where every
+/// submission is refused anyway).
+pub(crate) fn limits() -> Limits {
+    OUTLET.try_with(|outlet| lock(&outlet.ui.accepted).limits()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use aim_proto::ui::{Component, DataOp, Placement, TERMINAL_CATALOG};
@@ -247,6 +259,7 @@ mod tests {
     fn create(id: &str) -> UiMessage {
         UiMessage::CreateSurface {
             surface_id: id.into(),
+            replace: false,
             catalog_id: TERMINAL_CATALOG.into(),
             placement: Placement::Transcript,
             components: vec![Component::new("root", "Text").with("text", json!("x"))],
@@ -258,7 +271,7 @@ mod tests {
         /// Ownership: whatever another session sends — in any order, for any surface id — it is
         /// refused, and the owner's surfaces are exactly what the owner's accepted messages built.
         #[test]
-        fn only_the_owning_session_touches_its_surfaces(steps in prop::collection::vec((any::<bool>(), 0_usize..4, 0_usize..4), 1..60)) {
+        fn only_the_owning_session_touches_its_surfaces(steps in prop::collection::vec((any::<bool>(), 0_usize..5, 0_usize..4), 1..60)) {
             let unlimited = Limits { burst: 1_000, per_second: 1_000, ..Limits::default() };
             let mut registry = Registry::new("A", unlimited, 0);
             let mut expected = Surfaces::default();
@@ -267,8 +280,20 @@ mod tests {
                 let message = match kind {
                     0 => create(&id),
                     1 => UiMessage::UpdateDataModel { surface_id: id, ops: vec![DataOp { path: "/n".into(), value: json!(step) }] },
-                    2 => UiMessage::UpdateComponents { surface_id: id, components: vec![Component::new("root", "Badge").with("text", json!("b"))] },
-                    _ => UiMessage::DeleteSurface { surface_id: id },
+                    2 => UiMessage::UpdateComponents {
+                        surface_id: id,
+                        components: vec![Component::new("root", "Badge").with("text", json!("b"))],
+                        ops: vec![DataOp { path: "/m".into(), value: json!(step) }],
+                    },
+                    3 => UiMessage::DeleteSurface { surface_id: id },
+                    _ => UiMessage::CreateSurface {
+                        surface_id: id,
+                        replace: true,
+                        catalog_id: TERMINAL_CATALOG.into(),
+                        placement: Placement::Dialog,
+                        components: Vec::new(),
+                        data: None,
+                    },
                 };
                 let requester = if from_owner { "A" } else { "B" };
                 let result = registry.accept(requester, &UiEnvelope::new(message.clone()), 0);

@@ -16,8 +16,8 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use aim_proto::ui::catalog::TEXT_STYLES;
-use aim_proto::ui::model::Surface;
-use aim_proto::ui::{Component, Fallback, Placement, ROOT_ID, UiAction};
+use aim_proto::ui::model::{Change, Surface, Surfaces};
+use aim_proto::ui::{Component, Fallback, Placement, ROOT_ID, UiAction, UiMessage};
 use leptos::prelude::*;
 use pulldown_cmark::{Event, Options, Parser, Tag as Md, TagEnd};
 use serde_json::Value;
@@ -140,6 +140,11 @@ pub enum Node {
         /// What a press sends.
         action: UiAction,
     },
+    /// A button of an archived surface (closed or replaced): shown, never pressable.
+    Inert {
+        /// Its text.
+        label: String,
+    },
 }
 
 fn el(tag: Tag, class: &'static str, children: Vec<Node>) -> Node {
@@ -172,7 +177,7 @@ impl Node {
             Self::El { tag: Tag::Br, .. } => "\n".to_owned(),
             Self::El { children, .. } | Self::Link { children, .. } => children.iter().map(Self::text).collect::<Vec<_>>().join(" "),
             Self::Progress { .. } => String::new(),
-            Self::Button { label, .. } => label.clone(),
+            Self::Button { label, .. } | Self::Inert { label } => label.clone(),
         }
     }
 
@@ -212,6 +217,11 @@ impl Node {
             }
             Self::Button { label, .. } => {
                 out.push_str("<button class=\"ui-button\">");
+                escape(label, out);
+                out.push_str("</button>");
+            }
+            Self::Inert { label } => {
+                out.push_str("<button class=\"ui-button\" disabled>");
                 escape(label, out);
                 out.push_str("</button>");
             }
@@ -360,6 +370,8 @@ pub fn markdown(source: &str) -> Vec<Node> {
 
 struct Ctx<'a> {
     surface: &'a Surface,
+    /// An archived surface: its buttons are inert.
+    archived: bool,
 }
 
 impl Ctx<'_> {
@@ -482,6 +494,7 @@ impl Ctx<'_> {
                     None => self.text(component, "label").unwrap_or_default(),
                 };
                 match self.surface.action(&component.id) {
+                    Some(_) if self.archived => Node::Inert { label },
                     Some(action) => Node::Button { label, action },
                     None => el(Tag::Span, "ui-muted", vec![text(label)]),
                 }
@@ -511,10 +524,59 @@ impl Ctx<'_> {
 /// A surface as nodes, from its `root` (else its first component).
 #[must_use]
 pub fn render(surface: &Surface) -> Node {
-    let ctx = Ctx { surface };
+    render_with(surface, false)
+}
+
+/// An archived surface (closed or replaced, kept in the transcript as it last was): the same
+/// nodes with every button inert, so it can never send an action.
+#[must_use]
+pub fn render_archived(surface: &Surface) -> Node {
+    render_with(surface, true)
+}
+
+fn render_with(surface: &Surface, archived: bool) -> Node {
+    let ctx = Ctx { surface, archived };
     let start = if surface.root().is_some() { Some(ROOT_ID.to_owned()) } else { surface.components.first().map(|c| c.id.clone()) };
     let body = start.map(|id| ctx.node(&id, 1, &mut BTreeSet::new())).into_iter().collect();
     el(Tag::Div, "ui-surface", body)
+}
+
+/// Whether `action` is what its button on the *current* surfaces sends: the surface still exists,
+/// the component is still a button, and its action (context resolved against today's data) is the
+/// same. A click on anything else — a closed surface, a reused id, a changed button — is stale and
+/// must not reach the agent.
+#[must_use]
+pub fn is_current(surfaces: &Surfaces, action: &UiAction) -> bool {
+    surfaces.get(&action.surface_id).and_then(|surface| surface.action(&action.source_component_id)).as_ref() == Some(action)
+}
+
+/// How the transcript's surface rows change after a `ui` message.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RowEdit {
+    /// Rows showing this surface now show it archived, as it last was.
+    Archive(Box<Surface>),
+    /// A new row showing surface `id` goes at the end.
+    Append(String),
+}
+
+/// Folds `message` into `surfaces` and says how transcript rows follow: a created transcript
+/// surface gets a row, a deleted one is archived, and a replaced one is archived and gets a new
+/// row. A message that does not apply changes nothing.
+pub fn fold(surfaces: &mut Surfaces, message: &UiMessage) -> Vec<RowEdit> {
+    let in_transcript = |surfaces: &Surfaces, id: &str| surfaces.get(id).is_some_and(|s| slot(&s.placement) == Slot::Transcript);
+    match surfaces.apply(message, 0) {
+        Ok(Change::Created(id)) if in_transcript(surfaces, &id) => vec![RowEdit::Append(id)],
+        Ok(Change::Deleted(gone)) => vec![RowEdit::Archive(gone)],
+        Ok(Change::Replaced(old)) => {
+            let id = old.id.clone();
+            let mut edits = vec![RowEdit::Archive(old)];
+            if in_transcript(surfaces, &id) {
+                edits.push(RowEdit::Append(id));
+            }
+            edits
+        }
+        Ok(Change::Created(_) | Change::Updated(_)) | Err(_) => Vec::new(),
+    }
 }
 
 /// An action as a transcript row shows it.
@@ -537,6 +599,7 @@ where
             let press = press.clone();
             view! { <button type="button" class="ui-button" on:click=move |_| press(action.clone())>{label}</button> }.into_any()
         }
+        Node::Inert { label } => view! { <button type="button" class="ui-button" disabled=true>{label}</button> }.into_any(),
         Node::Link { href, children } => {
             let children = children.into_iter().map(|child| view(child, press)).collect_view();
             view! { <a href=href rel="noopener noreferrer" target="_blank">{children}</a> }.into_any()
@@ -661,6 +724,62 @@ mod tests {
         assert!(
             matches!(safe.first(), Some(Node::El { children, .. }) if matches!(children.first(), Some(Node::Link { href, .. }) if href == "https://example.com/x"))
         );
+    }
+
+    fn button(id: &str, name: &str) -> Value {
+        json!([{"id": "root", "component": "Button", "label": "Go", "action": {"name": name, "context": {"v": {"path": "/v"}}}}])
+            .as_array()
+            .and_then(|a| a.first().cloned())
+            .map(|mut b| {
+                b["id"] = json!(id);
+                b
+            })
+            .unwrap()
+    }
+
+    fn create(id: &str, replace: bool, components: Value) -> UiMessage {
+        UiMessage::CreateSurface {
+            surface_id: id.into(),
+            replace,
+            catalog_id: aim_proto::ui::TERMINAL_CATALOG.into(),
+            placement: Placement::Transcript,
+            components: serde_json::from_value(components).unwrap(),
+            data: Some(json!({"v": 1})),
+        }
+    }
+
+    /// REV19 A6: an archived surface's buttons are inert, and a click is sent only when its
+    /// surface, component and action are still current.
+    #[test]
+    fn rev19_archived_surfaces_are_inert_and_stale_clicks_are_refused() {
+        let mut surfaces = Surfaces::default();
+        assert_eq!(fold(&mut surfaces, &create("s", false, json!([button("root", "deploy")]))), [RowEdit::Append("s".into())]);
+        let live = surfaces.get("s").unwrap().clone();
+        let Node::El { children, .. } = render(&live) else { panic!("a div") };
+        let Some(Node::Button { action, .. }) = children.first().cloned() else { panic!("a live button") };
+        assert!(is_current(&surfaces, &action));
+        assert!(render_archived(&live).to_html().contains("<button class=\"ui-button\" disabled>Go</button>"));
+        assert!(!matches!(render_archived(&live), Node::El { children, .. } if matches!(children.first(), Some(Node::Button { .. }))));
+
+        // The data the context binds to changed: the old click no longer matches.
+        surfaces
+            .apply(
+                &UiMessage::UpdateDataModel {
+                    surface_id: "s".into(),
+                    ops: vec![aim_proto::ui::DataOp { path: "/v".into(), value: json!(2) }],
+                },
+                0,
+            )
+            .unwrap();
+        assert!(!is_current(&surfaces, &action), "a changed context is stale");
+        // Replaced under the same id with another action: archived, and the old click is stale.
+        let edits = fold(&mut surfaces, &create("s", true, json!([button("root", "rollback")])));
+        assert!(matches!(edits.as_slice(), [RowEdit::Archive(old), RowEdit::Append(id)] if old.id == "s" && id == "s"), "{edits:?}");
+        assert!(!is_current(&surfaces, &action));
+        // Closed: archived, and nothing on it is current.
+        let edits = fold(&mut surfaces, &UiMessage::DeleteSurface { surface_id: "s".into() });
+        assert!(matches!(edits.as_slice(), [RowEdit::Archive(_)]));
+        assert!(!is_current(&surfaces, &UiAction { name: "rollback".into(), ..action }));
     }
 
     #[test]

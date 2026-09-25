@@ -58,11 +58,13 @@ pub fn check(envelope: &UiEnvelope, surfaces: &Surfaces, limits: &Limits) -> Res
         return Err(invalid(format!("surface id `{id}` must be 1–64 of A-Z a-z 0-9 _ . -")));
     }
     match message {
-        UiMessage::CreateSurface { catalog_id, components, data, .. } => {
-            if surfaces.get(id).is_some() {
+        UiMessage::CreateSurface { replace, catalog_id, components, data, .. } => {
+            let exists = surfaces.get(id).is_some();
+            if exists && !replace {
                 return Err(ProtoError::new(ErrorCode::Conflict, format!("surface `{id}` already exists")));
             }
-            if surfaces.list.len() >= limits.surfaces {
+            // A replacement does not add a surface.
+            if !exists && surfaces.list.len() >= limits.surfaces {
                 return Err(too_big(format!("a session shows at most {} surfaces; close one first", limits.surfaces)));
             }
             let Some(catalog) = catalog(catalog_id) else {
@@ -73,10 +75,13 @@ pub fn check(envelope: &UiEnvelope, surfaces: &Surfaces, limits: &Limits) -> Res
                 return Err(invalid("`data` must be an object"));
             }
         }
-        UiMessage::UpdateComponents { components, .. } => {
+        UiMessage::UpdateComponents { components, ops, .. } => {
             let surface = surfaces.get(id).ok_or_else(|| missing(id))?;
             let catalog = catalog(&surface.catalog_id).unwrap_or(&TERMINAL);
             check_components(components, catalog)?;
+            for op in ops {
+                parse_pointer(&op.path).map_err(|e| invalid(e.to_string()))?;
+            }
         }
         UiMessage::UpdateDataModel { ops, .. } => {
             surfaces.get(id).ok_or_else(|| missing(id))?;
@@ -204,8 +209,10 @@ fn fits(kind: PropKind, value: &Value) -> bool {
     }
 }
 
-/// Checks a surface's size and its tree from `root`: bounded depth, no cycles, no component
-/// reached twice. Missing children are allowed (clients show a placeholder) and reported.
+/// Checks a surface's size and its whole component graph — `root`'s tree and any component not
+/// under it: every component is contained at most once, there are no cycles, and no tree is
+/// deeper than the limit. Missing children (and a missing `root`) are allowed: clients show a
+/// placeholder, and they are reported.
 fn check_surface(surface: &Surface, limits: &Limits) -> Result<Notes, ProtoError> {
     if surface.components.len() > limits.components {
         return Err(too_big(format!("a surface holds at most {} components", limits.components)));
@@ -214,31 +221,40 @@ fn check_surface(surface: &Surface, limits: &Limits) -> Result<Notes, ProtoError
     if size > limits.surface_bytes {
         return Err(too_big(format!("the surface would be {size} bytes; the limit is {}", limits.surface_bytes)));
     }
-    let by_id: HashMap<&str, &Component> = surface.components.iter().map(|c| (c.id.as_str(), c)).collect();
+    let by_id: HashMap<&str, usize> = surface.components.iter().enumerate().map(|(index, c)| (c.id.as_str(), index)).collect();
     let mut notes = Notes::default();
-    if !by_id.contains_key(ROOT_ID) {
-        if !surface.components.is_empty() {
-            notes.missing.push(ROOT_ID.to_owned());
-        }
-        return Ok(notes);
+    if !surface.components.is_empty() && !by_id.contains_key(ROOT_ID) {
+        notes.missing.push(ROOT_ID.to_owned());
     }
-    // Depth-first from root with an explicit stack: (id, depth).
-    let mut visited: BTreeSet<&str> = BTreeSet::new();
-    let mut stack = vec![(ROOT_ID, 1_usize)];
-    while let Some((id, depth)) = stack.pop() {
-        if depth > limits.depth {
-            return Err(too_big(format!("the component tree is deeper than {} levels", limits.depth)));
-        }
-        let Some(component) = by_id.get(id) else {
-            notes.missing.push(id.to_owned());
-            continue;
-        };
-        if !visited.insert(id) {
-            return Err(invalid(format!("component `{id}` is reached twice (a cycle, or a child shared by two parents)")));
-        }
+    // Every component is contained at most once: the graph is then a forest plus, possibly,
+    // cycles, which are exactly the components no walk from an uncontained one reaches.
+    let mut contained = vec![false; surface.components.len()];
+    for component in &surface.components {
         for child in component.child_ids() {
-            stack.push((child, depth.saturating_add(1)));
+            match by_id.get(child).and_then(|index| contained.get_mut(*index)) {
+                Some(seen) if *seen => {
+                    return Err(invalid(format!(
+                        "component `{child}` is contained twice (a child shared by two parents, or listed twice)"
+                    )));
+                }
+                Some(seen) => *seen = true,
+                None => notes.missing.push(child.to_owned()),
+            }
         }
+    }
+    let mut reached = vec![false; surface.components.len()];
+    let mut stack: Vec<(usize, usize)> = contained.iter().enumerate().filter(|(_, c)| !**c).map(|(index, _)| (index, 1)).collect();
+    while let Some((index, depth)) = stack.pop() {
+        if depth > limits.depth {
+            return Err(too_big(format!("a component tree is deeper than {} levels", limits.depth)));
+        }
+        let (Some(component), Some(seen)) = (surface.components.get(index), reached.get_mut(index)) else { continue };
+        *seen = true;
+        stack.extend(component.child_ids().into_iter().filter_map(|child| by_id.get(child)).map(|child| (*child, depth.saturating_add(1))));
+    }
+    if let Some(index) = reached.iter().position(|r| !r) {
+        let id = surface.components.get(index).map_or("?", |c| c.id.as_str());
+        return Err(invalid(format!("component `{id}` is part of a cycle")));
     }
     notes.missing.sort();
     notes.missing.dedup();
@@ -256,6 +272,7 @@ mod tests {
     fn create(components: Vec<Component>) -> UiEnvelope {
         UiEnvelope::new(UiMessage::CreateSurface {
             surface_id: "s".into(),
+            replace: false,
             catalog_id: TERMINAL_CATALOG.into(),
             placement: Placement::Transcript,
             components,
@@ -321,6 +338,46 @@ mod tests {
         assert_eq!(code(check(&duplicate, &none, &limits)), Some(ErrorCode::InvalidParams));
     }
 
+    /// REV19 A3: the whole graph is checked, not only what `root` reaches.
+    #[test]
+    fn rev19_cycles_and_depth_outside_root_are_refused() {
+        let limits = Limits { depth: 3, ..Limits::default() };
+        let none = Surfaces::default();
+        let rootless_cycle = create(vec![column("a", &["b"]), column("b", &["a"])]);
+        let refused = check(&rootless_cycle, &none, &limits).unwrap_err();
+        assert!(refused.message.contains("cycle"), "{}", refused.message);
+        let beside_root = create(vec![text("root"), column("a", &["b"]), column("b", &["a"])]);
+        assert_eq!(code(check(&beside_root, &none, &limits)), Some(ErrorCode::InvalidParams));
+        let self_loop = create(vec![text("root"), column("x", &["x"])]);
+        assert_eq!(code(check(&self_loop, &none, &limits)), Some(ErrorCode::InvalidParams));
+        let deep_orphan = create(vec![text("root"), column("a", &["b"]), column("b", &["c"]), column("c", &["d"]), text("d")]);
+        assert_eq!(code(check(&deep_orphan, &none, &limits)), Some(ErrorCode::LimitExceeded));
+        // A rootless forest is still accepted and reported: clients show a placeholder.
+        let (_, notes) = check(&create(vec![column("a", &["t"]), text("t")]), &none, &limits).unwrap();
+        assert_eq!(notes.missing, ["root"]);
+    }
+
+    /// REV19 A1: replacing is one message; validation never leaves the old surface deleted.
+    #[test]
+    fn rev19_a_refused_replacement_keeps_the_old_surface() {
+        let limits = Limits { surfaces: 1, ..Limits::default() };
+        let (one, _) = check(&create(vec![text("root")]), &Surfaces::default(), &limits).unwrap();
+        let replace = |components| {
+            UiEnvelope::new(UiMessage::CreateSurface {
+                surface_id: "s".into(),
+                replace: true,
+                catalog_id: TERMINAL_CATALOG.into(),
+                placement: Placement::Dialog,
+                components,
+                data: None,
+            })
+        };
+        let bad = replace(vec![Component::new("root", "Text")]);
+        assert_eq!(code(check(&bad, &one, &limits)), Some(ErrorCode::InvalidParams));
+        let (next, _) = check(&replace(vec![text("root")]), &one, &limits).unwrap();
+        assert_eq!(next.get("s").map(|s| s.placement.clone()), Some(Placement::Dialog), "at the session's surface limit, too");
+    }
+
     #[test]
     fn surfaces_must_exist_and_ids_must_be_plain() {
         let limits = Limits::default();
@@ -347,17 +404,24 @@ mod tests {
         let path = prop::sample::select(vec!["", "/", "/p", "/p/q", "/list", "/list/0", "/list/-", "bad"]).prop_map(str::to_owned);
         let value = prop_oneof![Just(Value::Null), any::<i32>().prop_map(|n| json!(n)), Just(json!([1, 2])), Just(json!({"q": 1}))];
         prop_oneof![
-            (surface.clone(), prop::collection::vec(component.clone(), 0..5)).prop_map(|(surface_id, components)| {
-                UiMessage::CreateSurface {
-                    surface_id,
-                    catalog_id: TERMINAL_CATALOG.into(),
-                    placement: Placement::Transcript,
-                    components,
-                    data: None,
+            (surface.clone(), prop::collection::vec(component.clone(), 0..5), any::<bool>()).prop_map(
+                |(surface_id, components, replace)| {
+                    UiMessage::CreateSurface {
+                        surface_id,
+                        replace,
+                        catalog_id: TERMINAL_CATALOG.into(),
+                        placement: Placement::Transcript,
+                        components,
+                        data: None,
+                    }
                 }
-            }),
-            (surface.clone(), prop::collection::vec(component, 1..4))
-                .prop_map(|(surface_id, components)| UiMessage::UpdateComponents { surface_id, components }),
+            ),
+            (
+                surface.clone(),
+                prop::collection::vec(component, 1..4),
+                prop::collection::vec((path.clone(), value.clone()).prop_map(|(path, value)| DataOp { path, value }), 0..3)
+            )
+                .prop_map(|(surface_id, components, ops)| UiMessage::UpdateComponents { surface_id, components, ops }),
             (surface.clone(), prop::collection::vec((path, value).prop_map(|(path, value)| DataOp { path, value }), 1..4))
                 .prop_map(|(surface_id, ops)| UiMessage::UpdateDataModel { surface_id, ops }),
             surface.prop_map(|surface_id| UiMessage::DeleteSurface { surface_id }),

@@ -922,6 +922,7 @@ mod surfaces {
         SessionUpdate::Ui {
             message: UiEnvelope::new(UiMessage::CreateSurface {
                 surface_id: id.into(),
+                replace: false,
                 catalog_id: aim_proto::ui::TERMINAL_CATALOG.into(),
                 placement: Placement::parse(placement).unwrap(),
                 components,
@@ -1107,6 +1108,59 @@ mod surfaces {
         assert!(block_text(&app, 60).iter().any(|r| r.starts_with("▸ [ Deploy ] on b")), "a hint names the focused button");
         typed(&mut app, "x");
         assert_eq!((app.focus.clone(), app.composer.text()), (None, "x"), "typing leaves the focus and types");
+    }
+
+    fn reconnect(app: &mut App, state: SessionState, surfaces: Vec<Surface>) {
+        app.handle(Input::StreamEnded { session: "s1".into(), attempt: app.attempt });
+        app.handle(Input::Attached { summary: summary("s1", state), transcript: Vec::new(), surfaces, resync: true, attempt: app.attempt });
+    }
+
+    /// REV19 A5: a transcript surface that changed while the stream was down is reconciled on
+    /// resync: its current state is added once (idle), or shown live and committed once at the
+    /// turn's end (running); the printed rows stay as they were.
+    #[test]
+    fn rev19_resync_reconciles_a_changed_transcript_surface() {
+        let mut app = attached();
+        update(&mut app, create("p", "transcript", progress()));
+        assert!(history(&mut app).iter().any(|r| r.contains(" 10% build")));
+        let mut advanced = app.surfaces.get("p").unwrap().clone();
+        advanced.data = json!({"done": 60});
+        reconnect(&mut app, SessionState::Idle, vec![advanced.clone()]);
+        let printed = history(&mut app);
+        assert_eq!(printed.iter().filter(|r| r.contains(" 60% build")).count(), 1, "{printed:?}");
+        assert!(printed.iter().all(|r| !r.contains(" 10% build")), "scrollback is not rewritten, only added to");
+        reconnect(&mut app, SessionState::Idle, vec![advanced.clone()]);
+        assert!(history(&mut app).iter().all(|r| !r.contains("build")), "an unchanged surface adds nothing");
+
+        advanced.data = json!({"done": 90});
+        reconnect(&mut app, SessionState::Running, vec![advanced]);
+        assert!(history(&mut app).iter().all(|r| !r.contains("build")));
+        assert!(block_text(&app, 40).iter().any(|r| r.contains(" 90% build")), "live while the turn runs");
+        update(&mut app, SessionUpdate::StateChanged { state: SessionState::Idle });
+        assert_eq!(history(&mut app).iter().filter(|r| r.contains(" 90% build")).count(), 1);
+    }
+
+    /// REV19 A1 in the TUI: a replaced surface shows its new content once; a replaced dialog
+    /// takes the focus again.
+    #[test]
+    fn rev19_a_replaced_surface_shows_its_new_content() {
+        let mut app = attached();
+        update(&mut app, create("r", "transcript", label("first")));
+        assert!(history(&mut app).contains(&"first".to_owned()));
+        let replace = SessionUpdate::Ui {
+            message: UiEnvelope::new(UiMessage::CreateSurface {
+                surface_id: "r".into(),
+                replace: true,
+                catalog_id: aim_proto::ui::TERMINAL_CATALOG.into(),
+                placement: Placement::Transcript,
+                components: serde_json::from_value(label("second")).unwrap(),
+                data: None,
+            }),
+        };
+        update(&mut app, replace);
+        let printed = history(&mut app);
+        assert_eq!(printed.iter().filter(|r| *r == "second").count(), 1, "{printed:?}");
+        assert_eq!(app.surfaces.list.len(), 1);
     }
 
     /// The same session attached fresh renders the same transcript as the client that watched it

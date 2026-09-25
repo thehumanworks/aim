@@ -285,6 +285,9 @@ pub enum Change {
     Created(String),
     /// A surface's components or data changed.
     Updated(String),
+    /// A surface was replaced by a new one with the same id (its last state; the new one is in
+    /// place).
+    Replaced(Box<Surface>),
     /// A surface was removed (its last state).
     Deleted(Box<Surface>),
 }
@@ -316,8 +319,9 @@ impl Surfaces {
     /// [`ApplyError`]; nothing changed then.
     pub fn apply(&mut self, message: &UiMessage, anchor: u64) -> Result<Change, ApplyError> {
         match message {
-            UiMessage::CreateSurface { surface_id, catalog_id, placement, components, data } => {
-                if self.get(surface_id).is_some() {
+            UiMessage::CreateSurface { surface_id, replace, catalog_id, placement, components, data } => {
+                let existing = self.list.iter().position(|s| s.id == *surface_id);
+                if existing.is_some() && !replace {
                     return Err(ApplyError::Exists(surface_id.clone()));
                 }
                 let mut surface = Surface::new(surface_id.clone(), catalog_id.clone(), placement.clone(), anchor);
@@ -325,12 +329,22 @@ impl Surfaces {
                 if let Some(data) = data {
                     surface.apply_data(&DataOp { path: String::new(), value: data.clone() })?;
                 }
+                // A replacement is a new surface: it goes last, like a fresh one.
+                let old = existing.map(|at| self.list.remove(at));
                 self.list.push(surface);
-                Ok(Change::Created(surface_id.clone()))
+                Ok(match old {
+                    Some(old) => Change::Replaced(Box::new(old)),
+                    None => Change::Created(surface_id.clone()),
+                })
             }
-            UiMessage::UpdateComponents { surface_id, components } => {
+            UiMessage::UpdateComponents { surface_id, components, ops } => {
                 let surface = self.get_mut(surface_id)?;
-                surface.upsert(components);
+                let mut next = surface.clone();
+                next.upsert(components);
+                for op in ops {
+                    next.apply_data(op)?;
+                }
+                *surface = next;
                 Ok(Change::Updated(surface_id.clone()))
             }
             UiMessage::UpdateDataModel { surface_id, ops } => {
@@ -433,6 +447,7 @@ mod tests {
         let mut all = Surfaces::default();
         let create = UiMessage::CreateSurface {
             surface_id: "s".into(),
+            replace: false,
             catalog_id: super::super::TERMINAL_CATALOG.into(),
             placement: Placement::Dialog,
             components: vec![Component::new("root", "Text").with("text", json!("hi"))],
@@ -443,6 +458,7 @@ mod tests {
         let update = UiMessage::UpdateComponents {
             surface_id: "s".into(),
             components: vec![Component::new("root", "Text").with("text", json!("bye")), Component::new("x", "Divider")],
+            ops: Vec::new(),
         };
         assert_eq!(all.apply(&update, 9), Ok(Change::Updated("s".into())));
         let s = all.get("s").cloned().unwrap_or_else(surface);
@@ -451,6 +467,25 @@ mod tests {
         let bad = UiMessage::UpdateDataModel { surface_id: "s".into(), ops: vec![op("/m", json!(2)), op("/n/x", json!(1))] };
         assert!(all.apply(&bad, 9).is_err());
         assert_eq!(all.get("s").map(|s| s.data.clone()), Some(json!({"n": 1})), "all or nothing");
+        // Components and data in one step: a bad op leaves the components as they were too.
+        let mixed = UiMessage::UpdateComponents {
+            surface_id: "s".into(),
+            components: vec![Component::new("root", "Text").with("text", json!("half"))],
+            ops: vec![op("/n/x", json!(1))],
+        };
+        assert!(all.apply(&mixed, 9).is_err());
+        assert_eq!(all.get("s").and_then(|s| s.root()).and_then(|c| c.prop("text")), Some(&json!("bye")), "all or nothing");
+        // A replacement is one step and reports what it replaced.
+        let replace = UiMessage::CreateSurface {
+            surface_id: "s".into(),
+            replace: true,
+            catalog_id: super::super::TERMINAL_CATALOG.into(),
+            placement: Placement::Toast,
+            components: Vec::new(),
+            data: None,
+        };
+        assert!(matches!(all.apply(&replace, 11), Ok(Change::Replaced(old)) if old.placement == Placement::Dialog));
+        assert_eq!(all.get("s").map(|s| (s.anchor, s.components.len())), Some((11, 0)));
         assert!(matches!(all.apply(&UiMessage::DeleteSurface { surface_id: "s".into() }, 9), Ok(Change::Deleted(_))));
         assert_eq!(all.apply(&UiMessage::DeleteSurface { surface_id: "s".into() }, 9), Err(ApplyError::Missing("s".into())));
     }
