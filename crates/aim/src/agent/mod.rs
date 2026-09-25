@@ -202,7 +202,13 @@ pub struct Agent {
     decider: Option<Arc<dyn Decider>>,
     explicit_effort: bool,
     decisions_since_change: u32,
+    /// The provider's catalog as this session last saw it, for its options (ADR 0074); shared
+    /// with the lookups [`Backend::options`] hands out.
+    catalog: SharedCatalog,
 }
+
+/// A session's last-seen provider catalog.
+type SharedCatalog = Arc<std::sync::Mutex<Option<Arc<Vec<aim_llm::ModelInfo>>>>>;
 
 fn emit(events: &UnboundedSender<AgentEvent>, event: AgentEvent) {
     // A closed receiver only means nobody is watching; the turn carries on.
@@ -240,7 +246,28 @@ impl Agent {
             decider: None,
             explicit_effort,
             decisions_since_change: 2,
+            catalog: SharedCatalog::default(),
         }
+    }
+
+    /// Reuse the catalog fetched while the session was built for its options (ADR 0074). `None`
+    /// (not fetched at start) leaves the first options lookup to fetch it in the background.
+    #[must_use]
+    pub(crate) fn with_catalog(self, models: Option<Vec<aim_llm::ModelInfo>>) -> Self {
+        if let Some(models) = models.filter(|models| !models.is_empty()) {
+            self.remember_catalog(&models);
+        }
+        self
+    }
+
+    /// Keeps `models` as the session's catalog (a fresher fetch replaces an older one).
+    pub(crate) fn remember_catalog(&self, models: &[aim_llm::ModelInfo]) {
+        *self.catalog.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(models.to_vec()));
+    }
+
+    /// The shared catalog slot.
+    pub(crate) fn catalog_handle(&self) -> SharedCatalog {
+        Arc::clone(&self.catalog)
     }
 
     /// Reuse the capability snapshot fetched while the session was built. `None` leaves the

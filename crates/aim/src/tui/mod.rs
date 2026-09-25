@@ -11,11 +11,13 @@
 //! - `markdown`, `text` — Markdown to styled, wrapped rows; `theme` — colours in one place;
 //! - `composer` — the multiline editor, paste chips, history and reverse search;
 //! - `complete` — the async completion broker and its sources; `commands` — slash commands;
+//! - `choices` — what `/new`, `/clear`, `/provider`, `/model` and `/effort` derive and offer;
 //! - `view` — the pinned block, fullscreen and picker layouts;
 //! - `inline` — the scrollback writer; `schedule` — the frame scheduler;
 //! - `shell` — terminal I/O and effects; `history` — the prompt history file.
 
 mod app;
+mod choices;
 mod commands;
 mod complete;
 mod composer;

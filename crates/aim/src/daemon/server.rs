@@ -411,6 +411,7 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
                 total_bytes,
                 first_chunk,
                 surfaces: snapshot.surfaces,
+                options: snapshot.options,
             };
             let encoded = serde_json::to_vec(&result).map_err(|_| error(ErrorCode::Internal, "encoding paged attachment failed"))?;
             if encoded.len() >= MAX_DAEMON_MESSAGE_BYTES.saturating_sub(1024) {

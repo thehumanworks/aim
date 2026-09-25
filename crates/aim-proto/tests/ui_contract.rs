@@ -261,8 +261,12 @@ fn an_old_client_skips_ui_updates_and_keeps_everything_else() {
     }
     let summary = json!({"meta": {"id": "s", "created_ms": 1, "workspace": "/w", "location": "local", "provider": "p", "model": "m"},
                          "state": "idle", "persistence": "persistent", "last_activity_ms": 1, "turns": 0});
-    let new_reply =
-        SessionAttachResult { summary: serde_json::from_value(summary).unwrap(), transcript: Vec::new(), surfaces: surfaces.list };
+    let new_reply = SessionAttachResult {
+        summary: serde_json::from_value(summary).unwrap(),
+        transcript: Vec::new(),
+        surfaces: surfaces.list,
+        options: None,
+    };
     let old: pre_ui::SessionAttachResult = serde_json::from_value(serde_json::to_value(&new_reply).unwrap()).unwrap();
     assert_eq!((old.summary, old.transcript), (new_reply.summary, new_reply.transcript), "surfaces are ignored");
 

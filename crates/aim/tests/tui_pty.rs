@@ -371,3 +371,106 @@ fn rev12_a_silent_terminal_claiming_kitty_does_not_stall() {
     assert!(sent.elapsed() < Duration::from_millis(500), "the key painted after {:?}", sent.elapsed());
     tui.quit();
 }
+
+// ---- ADR 0074: /provider, /model and /effort completion, /clear ----
+
+/// `/provider ` lists every provider this build knows, each with a line about it.
+#[test]
+fn provider_popup_lists_the_known_providers() {
+    let tui = Tui::start(&json!({"responses": []}), &Start { rows: 30, ..Start::default() });
+    tui.wait_for("idle");
+    tui.type_text("/provider ");
+    tui.wait("the provider popup", Duration::from_secs(10), |s| {
+        ["openrouter", "ai-gateway", "codex", "acp:claude", "acp:claude-native"].iter().all(|id| s.contains(id))
+            && s.contains("OpenRouter gateway")
+    });
+    tui.send("\x1b");
+    tui.send("\x15");
+    tui.quit();
+}
+
+/// `/model ` lists the session's catalog (hidden models left out, names as details); `/effort `
+/// lists the current model's ladder and `auto`, and follows a model change.
+#[test]
+fn model_popup_lists_the_scripted_catalog_and_efforts_follow_the_model() {
+    let script = json!({"responses": [], "catalog": [
+        {"id": "scripted-model", "name": "Scripted Model", "efforts": ["low", "high"], "default_effort": "low"},
+        {"id": "alpha-1", "name": "Alpha One", "efforts": ["minimal"]},
+        {"id": "secret-model", "hidden": true}
+    ]});
+    let tui = Tui::start(&script, &Start { rows: 30, ..Start::default() });
+    tui.wait_for("idle");
+    tui.type_text("/model ");
+    tui.wait("the model popup", Duration::from_secs(10), |s| {
+        s.contains("alpha-1") && s.contains("Alpha One") && s.contains("Scripted Model")
+    });
+    assert!(!tui.screen().contains("secret-model"), "hidden models are not offered:\n{}", tui.screen());
+    tui.send("\x1b");
+    tui.send("\x15");
+    tui.type_text("/effort ");
+    tui.wait("the effort popup", Duration::from_secs(10), |s| s.contains("high") && s.contains("auto") && s.contains("default"));
+    tui.send("\x1b");
+    tui.send("\x15");
+    tui.type_text("/model alpha-1");
+    tui.wait_for("Alpha One");
+    // Enter takes the highlighted value and runs the command.
+    tui.send("\r");
+    tui.wait_for("idle · alpha-1");
+    tui.type_text("/effort ");
+    tui.wait("alpha-1's ladder", Duration::from_secs(10), |s| s.contains("minimal") && s.contains("auto"));
+    let screen = tui.screen();
+    let popup: Vec<&str> = screen.lines().filter(|l| l.contains("minimal") || l.contains(" high")).collect();
+    assert!(!popup.iter().any(|l| l.contains(" high")), "the old model's ladder is gone:\n{screen}");
+    tui.send("\x1b");
+    tui.send("\x15");
+    tui.quit();
+}
+
+/// `/clear` wipes the visible screen of the old chat and starts a new session that works.
+#[test]
+fn clear_wipes_the_screen_and_starts_a_new_session() {
+    let script = json!({"responses": [[text("An old answer.", 1, 0)], [text("A fresh answer.", 1, 0)]]});
+    let tui = Tui::start(&script, &Start { before: &["$ aim"], ..Start::default() });
+    tui.wait_for("idle");
+    tui.type_text("old question");
+    tui.send("\r");
+    tui.wait_for("An old answer.");
+    tui.wait_for("idle");
+    tui.type_text("/clear");
+    tui.send("\r");
+    tui.wait("a cleared screen", Duration::from_secs(10), |s| {
+        !s.contains("old question") && !s.contains("An old answer.") && !s.contains("$ aim") && s.contains("idle")
+    });
+    tui.type_text("new question");
+    tui.send("\r");
+    tui.wait_for("A fresh answer.");
+    let screen = tui.screen();
+    assert!(!screen.contains("An old answer."), "{screen}");
+    tui.quit();
+}
+
+/// `/clear` in fullscreen clears the canvas, and the inline view it returns to holds none of the
+/// old chat either.
+#[test]
+fn clear_in_fullscreen_leaves_no_old_rows_on_either_screen() {
+    let script = json!({"responses": [[text("An old answer.", 1, 0)]]});
+    let tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    tui.type_text("old question");
+    tui.send("\r");
+    tui.wait_for("An old answer.");
+    tui.wait_for("idle");
+    tui.send("/fullscreen\r");
+    tui.wait("fullscreen", Duration::from_secs(10), |_| tui.alternate());
+    tui.wait_for("An old answer.");
+    tui.type_text("/clear");
+    tui.send("\r");
+    tui.wait("a cleared canvas", Duration::from_secs(10), |s| !s.contains("An old answer.") && s.contains("idle"));
+    assert!(tui.alternate(), "still fullscreen");
+    tui.send("/fullscreen\r");
+    tui.wait("inline again", Duration::from_secs(10), |_| !tui.alternate());
+    tui.wait_for("idle");
+    let screen = tui.screen();
+    assert!(!screen.contains("old question") && !screen.contains("An old answer."), "{screen}");
+    tui.quit();
+}

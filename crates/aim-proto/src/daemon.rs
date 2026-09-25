@@ -248,6 +248,14 @@ pub enum SessionUpdate {
         /// Why (no secrets).
         message: String,
     },
+    /// What this session can switch to now (ADR 0074): the models of its provider and the
+    /// current model's effort ladder. Sent when the backend knows them (never on the create or
+    /// attach path) and again when they change; the latest is replayed to attaching clients in
+    /// [`SessionAttachResult::options`]. Not recorded in the session log.
+    Options {
+        /// The choices.
+        options: SessionOptions,
+    },
     /// The model's context was compacted: its first `replaced` items were replaced by `items`
     /// (a provider compaction item or a summary). The user's transcript keeps everything.
     Compacted {
@@ -327,6 +335,10 @@ pub struct SessionAttachResult {
     /// records where in the transcript it was created.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<crate::ui::model::Surface>,
+    /// The latest [`SessionUpdate::Options`] as of the same instant (ADR 0074), when the session
+    /// has sent one; later ones follow on the stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<SessionOptions>,
 }
 
 method!(
@@ -349,6 +361,9 @@ pub struct SessionAttachPagedResult {
     /// limits, so they travel whole in this reply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<crate::ui::model::Surface>,
+    /// The session's latest options at the snapshot boundary (ADR 0074).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<SessionOptions>,
 }
 
 method!(
@@ -440,6 +455,34 @@ pub struct SessionConfigParams {
 /// The `effort` value that makes a session's effort automatic again (ADR 0038). Reserved: a
 /// catalog level with this name cannot be pinned through `session.set_config`.
 pub const AUTO_EFFORT: &str = "auto";
+
+/// One value a session can switch to (ADR 0074): what `session.set_config` takes, and how to show
+/// it. Values are the provider's or agent's data, never aim enums.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ChoiceValue {
+    /// The value `session.set_config` takes (a model id, an effort level).
+    pub value: String,
+    /// Display name, when the source gives one that differs from the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// A short description (the agent's, or facts from the catalog such as the context window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// What a session can switch to (ADR 0074), as its backend knows it: the models of its provider
+/// (a native provider's catalog without hidden models; an ACP agent's advertised `model` values)
+/// and the effort ladder of the model in force (empty: no effort control is known). [`AUTO_EFFORT`]
+/// is never listed here; clients offer it themselves.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionOptions {
+    /// Models, in the source's order.
+    #[serde(default)]
+    pub models: Vec<ChoiceValue>,
+    /// The current model's effort levels, least effort first.
+    #[serde(default)]
+    pub efforts: Vec<ChoiceValue>,
+}
 
 method!(
     /// `session.set_config` — change model or effort. When idle it applies at once and a refusal is
