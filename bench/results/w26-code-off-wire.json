@@ -1,0 +1,363 @@
+{
+  "binary_sha256": {
+    "aim": "c64f6e24d4ea39fc801555a203fdd9070a50015571850bde4d3a6c2e2e994ec9",
+    "aim_coderun": "217dc043a4269398e25fb427a89e72f31976afd5ac67381a14a79ca2e82a50f2",
+    "aimx": "1a4874ea3c523853346df68276289c9f5edf7a2d463dd4c20b7839db184f856c",
+    "codex": "8b93eddd656ee85e07785fed7b0c6f445491abfba80d52e278d0afd1fe680a4e",
+    "pi": "0fcda879f854b95368a4c217782a78808f7fea61cf60cc1e6fbec4f5b5d700f9",
+    "python": "ab15cbe78b02b5fc939765827e0b1c2dc3668def22c6952f06a369bfbde01163"
+  },
+  "budget_used_including_transport_reserve_usd": 0.0,
+  "finished_unix": 1790316914.645901,
+  "hardware": {
+    "machine": "arm64",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "python": "3.14.7"
+  },
+  "manifest_sha256": "0869f86272eef6928bf8db172647e790c3e810eccdd89a3c494f680a1e7035d3",
+  "prewarm": [
+    {
+      "auxiliary_requests": 1,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 7200,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 20.06,
+      "first_request_tokens_estimate": 1800,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 649,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 274,
+          "name": "LS"
+        },
+        {
+          "bytes": 434,
+          "name": "Glob"
+        },
+        {
+          "bytes": 1081,
+          "name": "Grep"
+        },
+        {
+          "bytes": 696,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 258,
+          "name": "KillShell"
+        },
+        {
+          "bytes": 374,
+          "name": "search_sessions"
+        },
+        {
+          "bytes": 348,
+          "name": "read_session"
+        }
+      ],
+      "first_request_tools": 11,
+      "first_request_tools_json_bytes": 5391,
+      "first_token_ms": 0.416,
+      "harness": "aim_openrouter",
+      "http_exchanges": 2,
+      "ite": 1805.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 26.07,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": -1,
+      "request_json_bytes": [
+        7200
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          7200,
+          515
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0,
+          "input_tokens": 1800,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 1800,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 23.02
+    }
+  ],
+  "recorded_spend_usd": 0.0,
+  "runs": [
+    {
+      "auxiliary_requests": 1,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 7200,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 19.92,
+      "first_request_tokens_estimate": 1800,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 649,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 274,
+          "name": "LS"
+        },
+        {
+          "bytes": 434,
+          "name": "Glob"
+        },
+        {
+          "bytes": 1081,
+          "name": "Grep"
+        },
+        {
+          "bytes": 696,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 258,
+          "name": "KillShell"
+        },
+        {
+          "bytes": 374,
+          "name": "search_sessions"
+        },
+        {
+          "bytes": 348,
+          "name": "read_session"
+        }
+      ],
+      "first_request_tools": 11,
+      "first_request_tools_json_bytes": 5391,
+      "first_token_ms": 0.672,
+      "harness": "aim_openrouter",
+      "http_exchanges": 2,
+      "ite": 1805.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 26.18,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        7200
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          7200,
+          515
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0,
+          "input_tokens": 1800,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 1800,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 23.08
+    },
+    {
+      "auxiliary_requests": 1,
+      "case": "W1",
+      "effort": "low",
+      "exit_code": 0,
+      "first_request_bytes": 7200,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 19.38,
+      "first_request_tokens_estimate": 1800,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 649,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 274,
+          "name": "LS"
+        },
+        {
+          "bytes": 434,
+          "name": "Glob"
+        },
+        {
+          "bytes": 1081,
+          "name": "Grep"
+        },
+        {
+          "bytes": 696,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 258,
+          "name": "KillShell"
+        },
+        {
+          "bytes": 374,
+          "name": "search_sessions"
+        },
+        {
+          "bytes": 348,
+          "name": "read_session"
+        }
+      ],
+      "first_request_tools": 11,
+      "first_request_tools_json_bytes": 5391,
+      "first_token_ms": 0.555,
+      "harness": "aim_openrouter",
+      "http_exchanges": 2,
+      "ite": 1805.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 26.17,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        7200
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          7200,
+          515
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0,
+          "input_tokens": 1800,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": false,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 1800,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 22.4
+    }
+  ],
+  "source_sha": "263efb6bf03db41f50d9205aa120ff13934a7d29",
+  "spend_cap_usd": null,
+  "started_unix": 1790316914.282419,
+  "summary": [
+    {
+      "harness": "aim_openrouter",
+      "ite_per_passed": 1805.0,
+      "p50_wall_ms": 22.74,
+      "pass_rate": 1.0,
+      "pass_rate_ci95": [
+        0.342,
+        1.0
+      ],
+      "passed": 2,
+      "runs": 2,
+      "usd_per_passed": 0.0
+    }
+  ],
+  "tier": "wire"
+}

@@ -249,15 +249,18 @@ pub fn native_backends_with(
             let (provider, default_model) =
                 providers(&spec.provider, spec.model.as_deref()).map_err(|e| err(ErrorCode::InvalidParams, e))?;
             let workspace = workspaces(&spec).await?;
-            let guess = spec.model.clone().unwrap_or_else(|| default_model.clone());
-            let window = async {
-                match resources.skill_budget {
-                    Some(_) => None,
-                    None => context::context_window(provider.as_ref(), &guess).await,
+            // Codex needs the catalog to select its code-mode contract. OpenAI-compatible
+            // profiles use portable run_code; their catalog can refresh the compaction window
+            // after the first small request instead of holding up that request.
+            let capabilities = async {
+                if matches!(provider.id(), "openrouter" | "ai-gateway") {
+                    None
+                } else {
+                    tokio::time::timeout(context::WINDOW_LOOKUP, provider.catalog()).await.ok().and_then(Result::ok)
                 }
             };
-            let (catalog, mut window) =
-                tokio::join!(resources::discover(&resources, workspace.project.as_deref(), &workspace.location, ""), window);
+            let (catalog, models) =
+                tokio::join!(resources::discover(&resources, workspace.project.as_deref(), &workspace.location, ""), capabilities);
             for diagnostic in &catalog.diagnostics {
                 tracing::info!(path = %diagnostic.path, problem = ?diagnostic.problem, "resource: {}", diagnostic.message);
             }
@@ -278,11 +281,9 @@ pub fn native_backends_with(
                 }
                 None => (spec.model.clone().unwrap_or(default_model), spec.effort.clone()),
             };
-            // The skill budget is a share of the window of the model the session runs, which an
-            // agent may have chosen (REV8-15).
-            if resources.skill_budget.is_none() && model != guess {
-                window = context::context_window(provider.as_ref(), &model).await;
-            }
+            // A named agent can select another model; the fetched catalog covers both ids.
+            let model_info = models.as_ref().and_then(|models| models.iter().find(|entry| entry.id == model));
+            let window = model_info.and_then(|entry| entry.context_window);
             // An effort that is not set is automatic. A set one is explicit for a new session, and
             // keeps its recorded source on resume (older logs, with no source, resume as they did).
             let effort_source = match (&effort, &recorded) {
@@ -294,7 +295,7 @@ pub fn native_backends_with(
             // the source, so `effort: "auto"` can hand the effort back later.
             let decider = if spec.persistence == Persistence::Persistent { services.decider.clone() } else { None };
             let start = if effort_source == EffortSource::Auto && effort.is_none() && decider.is_some() {
-                starting_effort(provider.as_ref(), &model).await
+                model_info.and_then(crate::agent::ladder_start)
             } else {
                 None
             };
@@ -314,7 +315,8 @@ pub fn native_backends_with(
             // too. A missing credential omits the tools rather than making every call fail. Private
             // and ephemeral sessions do not send prompts to them: there is no per-session opt-in
             // yet, so theirs stays off (ADR 0042).
-            if let Some(media) = &services.media
+            if spec.persistence == Persistence::Persistent
+                && let Some(media) = &services.media
                 && let Some(media) = media().await
             {
                 tools = Arc::new(Dispatcher::with_policy(tools, media, spec.persistence == Persistence::Persistent));
@@ -329,7 +331,8 @@ pub fn native_backends_with(
             };
             if let Some(code) = services.code.as_ref().filter(|_| code_permitted) {
                 let agent = agent.as_ref().map(|(agent, policy)| (agent, policy));
-                tools = with_code_mode(tools, code, agent, provider.as_ref(), &model, &session_id, &spec.location, &root).await;
+                let mode = model_info.map_or(crate::coderun::CodeMode::RunCode, crate::coderun::CodeMode::from_model);
+                tools = with_code_mode(tools, code, agent, mode, &session_id, &spec.location, &root);
             }
             let config = AgentConfig {
                 model: model.clone(),
@@ -341,7 +344,8 @@ pub fn native_backends_with(
                 parallel_tool_calls: true,
                 max_requests,
             };
-            let mut native = Agent::with_transcript(provider, tools, config, transcript).with_effort_source(effort_source);
+            let mut native =
+                Agent::with_transcript(provider, tools, config, transcript).with_initial_window(window).with_effort_source(effort_source);
             if let Some(decider) = decider {
                 native = native.with_decider(decider);
             }
@@ -349,13 +353,6 @@ pub fn native_backends_with(
             Ok(Built { backend, model, root, location, agent: record, shutdown })
         })
     })
-}
-
-/// The level automatic effort starts from before its first decision: the catalog's default, else
-/// its lowest level (some catalogs omit a default; guessing what the endpoint would choose for
-/// `effort: None` would give the controller no real index).
-async fn starting_effort(provider: &dyn ModelProvider, model: &str) -> Option<String> {
-    crate::agent::ladder_start(&provider.catalog().await.ok()?.into_iter().find(|entry| entry.id == model)?)
 }
 
 /// `tools` narrowed to `policy`, the ceiling of `agent`.
@@ -372,25 +369,22 @@ async fn with_extra_tools(tools: Arc<dyn ToolHost>, factories: &[ToolsFactory], 
 
 /// Adds code mode and the saved-program tools over `tools`, the session's final (narrowed) set,
 /// so nested calls in a cell reach exactly the tools the session may use.
-#[expect(clippy::too_many_arguments, reason = "one session's composition inputs, kept explicit")]
-async fn with_code_mode(
+fn with_code_mode(
     tools: Arc<dyn ToolHost>,
     code: &CodeConfig,
     agent: Option<(&resources::agents::AgentDef, &ToolPolicy)>,
-    provider: &dyn ModelProvider,
-    model: &str,
+    mode: crate::coderun::CodeMode,
     session_id: &str,
     location: &Location,
     root: &str,
 ) -> Arc<dyn ToolHost> {
-    let catalog = provider.catalog().await.unwrap_or_default();
-    let mode = catalog.iter().find(|m| m.id == model).map_or(crate::coderun::CodeMode::RunCode, crate::coderun::CodeMode::from_model);
     let host = crate::coderun::CodeToolHost::new(Arc::clone(&tools), code.worker.clone(), session_id.to_owned(), mode);
     // Project programs live in the workspace; remote workspaces get user programs only for now.
     let project = matches!(location, Location::Local).then(|| PathBuf::from(root).join(".agents/programs"));
     let store = Arc::new(crate::programs::ProgramStore::new(code.user_programs.clone(), project));
     let programs: Arc<dyn ToolHost> = Arc::new(crate::coderun::ProgramToolHost::new(host, store));
-    let composed: Arc<dyn ToolHost> = Arc::new(crate::agent::tools::Compose::new(tools, vec![programs]));
+    let direct: Arc<dyn ToolHost> = Arc::new(crate::coderun::DirectCodeTools(tools));
+    let composed: Arc<dyn ToolHost> = Arc::new(crate::agent::tools::Compose::new(direct, vec![programs]));
     // The model-visible code and program tools obey the agent's allowlist too: `save_program`,
     // `run_program` and `list_programs` need their own permission; codex's `exec`/`wait` are
     // `run_code` under another name.

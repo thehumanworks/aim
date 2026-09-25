@@ -13,6 +13,7 @@ import gzip
 import hashlib
 import http.client
 import json
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,64 @@ HOP_HEADERS = {"connection", "proxy-connection", "keep-alive", "transfer-encodin
 
 def encoded(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def canonical(value: object) -> bytes:
+    """Deterministic rendering of one prompt element, independent of JSON field order."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def message_list(body: dict) -> list | None:
+    messages = body.get("messages", body.get("input"))
+    return messages if isinstance(messages, list) else None
+
+
+def render_order(body: dict) -> bytes:
+    """Tools, instructions, system messages, then growing conversation messages."""
+    messages = message_list(body) or []
+    system = [item for item in messages if isinstance(item, dict) and item.get("role") in {"system", "developer"}]
+    turns = [item for item in messages if item not in system]
+    pieces = [canonical(["tool", tool]) for tool in body.get("tools", [])]
+    if "instructions" in body:
+        pieces.append(canonical(["instructions", body["instructions"]]))
+    pieces.extend(canonical(["system", item]) for item in system)
+    pieces.extend(canonical(["turn", item]) for item in turns)
+    return b"\x1e".join(pieces)
+
+
+def append_only(previous: dict, current: dict) -> bool:
+    old_messages, new_messages = message_list(previous), message_list(current)
+    if old_messages is None or new_messages is None:
+        return False
+    old_static = {key: value for key, value in previous.items() if key not in {"messages", "input"}}
+    new_static = {key: value for key, value in current.items() if key not in {"messages", "input"}}
+    return old_static == new_static and new_messages[:len(old_messages)] == old_messages
+
+
+def process_group_rss(pgid_file: Path | None) -> tuple[float | None, float | None]:
+    """Snapshot the live harness and helpers while they wait for this model response."""
+    if pgid_file is None or not pgid_file.exists():
+        return None, None
+    try:
+        pgid = pgid_file.read_text().strip()
+        rows = subprocess.run(["ps", "-axo", "pgid=,rss=,comm="], capture_output=True, text=True,
+                              timeout=2, check=True).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    total = helpers = 0
+    for row in rows:
+        fields = row.split(maxsplit=2)
+        if len(fields) != 3 or fields[0] != pgid:
+            continue
+        try:
+            size = int(fields[1]) * 1024
+        except ValueError:
+            continue
+        total += size
+        if Path(fields[2]).name in {"aimx", "aim-coderun"}:
+            helpers += size
+    return (round(total / 1_000_000, 2) if total else None,
+            round(helpers / 1_000_000, 2) if helpers else None)
 
 
 def token_estimate(body: bytes) -> int:
@@ -65,9 +124,14 @@ def request_shape(body: dict) -> dict:
     return {
         "tools_count": len(tools),
         "tools_json_bytes": len(encoded(tools)),
+        "tool_schema_bytes": [{"name": tool.get("function", tool).get("name", ""), "bytes": len(encoded(tool))} for tool in tools],
         "instructions_chars": system_chars,
         "tool_output_chars": sum(len(value) for value in tool_outputs),
-        "tool_output_has_recovery_hint": any(any(word in value.lower() for word in ("truncat", "handle", "full output", "artifact")) for value in tool_outputs),
+        "tool_output_has_recovery_hint": any(
+            ("handle" in value.lower() and ("bashoutput" in value.lower() or "exec.read" in value.lower()))
+            or ("/tmp/" in value and ".log" in value)
+            for value in tool_outputs
+        ),
     }
 
 
@@ -78,20 +142,33 @@ class Recorder:
         self.path.touch(mode=0o600)
         self.lock = threading.Lock()
         self.previous: bytes | None = None
+        self.previous_parsed: dict | None = None
+        self.previous_rendered: bytes | None = None
         self.count = 0
         self.scenario = scenario
         self.steps = steps
         self.command = command
         self.harness = harness
 
-    def reserve(self, body: bytes) -> tuple[int, int | None]:
+    def reserve(self, body: bytes, parsed: dict) -> tuple[int, int | None, bool | None, int | None, int | None]:
         with self.lock:
             self.count += 1
             prefix = None
+            semantic = None
+            stable_head = None
+            previous_head = None
             if self.previous is not None:
                 prefix = next((i for i, (a, b) in enumerate(zip(self.previous, body)) if a != b), min(len(self.previous), len(body)))
+            rendered = render_order(parsed)
+            if self.previous_parsed is not None and self.previous_rendered is not None:
+                semantic = append_only(self.previous_parsed, parsed)
+                stable_head = next((i for i, (a, b) in enumerate(zip(self.previous_rendered, rendered)) if a != b),
+                                   min(len(self.previous_rendered), len(rendered)))
+                previous_head = len(self.previous_rendered)
             self.previous = body
-            return self.count, prefix
+            self.previous_parsed = parsed
+            self.previous_rendered = rendered
+            return self.count, prefix, semantic, stable_head, previous_head
 
     def write(self, row: dict) -> None:
         with self.lock, self.path.open("a", encoding="utf-8") as stream:
@@ -201,11 +278,18 @@ class Handler(BaseHTTPRequestHandler):
         host, route = self.target()
         start = time.monotonic_ns()
         row = {"kind": "auxiliary", "method": "GET", "host": host, "path": urlsplit(route).path,
-               "arrival_wall_ns": time.time_ns(), "request_wire_bytes": 0, "request_json_bytes": 0,
+               "arrival_wall_ns": time.time_ns(), "arrival_monotonic_ns": time.monotonic_ns(),
+               "request_wire_bytes": 0, "request_json_bytes": 0,
                "response_bytes": 0, "status": None, "usage": {}}
         try:
             if self.server.mode == "mock":
-                payload = encoded({"models": [{"slug": self.server.model, "id": self.server.model, "context_window": 128000, "supported_reasoning_levels": [{"effort": "low"}], "default_reasoning_level": "low", "input_modalities": ["text"]}]})
+                payload = encoded({
+                    "models": [{"slug": self.server.model, "id": self.server.model, "context_window": 128000,
+                                "supported_reasoning_levels": [{"effort": "low"}], "default_reasoning_level": "low",
+                                "input_modalities": ["text"]}],
+                    "data": [{"id": self.server.model, "context_length": 128000,
+                              "supported_parameters": ["tools"], "architecture": {"input_modalities": ["text"]}}],
+                })
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
@@ -215,11 +299,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.forward(host, route, None, row, start)
         except (OSError, http.client.HTTPException) as error:
-            row.update(status=502, proxy_error_type=type(error).__name__)
-            try:
-                self.send_error(502)
-            except OSError:
-                pass
+            row["proxy_error_type"] = type(error).__name__
+            if row["status"] is None:
+                row["status"] = 502
+                if not getattr(self, "response_started", False):
+                    try:
+                        self.send_error(502)
+                    except OSError:
+                        pass
         finally:
             row["wall_ms"] = round((time.monotonic_ns() - start) / 1e6, 3)
             self.server.recorder.write(row)
@@ -238,38 +325,53 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeError):
             self.send_error(400)
             return
-        index, prefix = self.server.recorder.reserve(body)
+        index, prefix, semantic, stable_head, previous_head = self.server.recorder.reserve(body, parsed)
         start = time.monotonic_ns()
         row = {"kind": "model", "method": "POST", "index": index, "mode": self.server.mode, "host": host, "path": urlsplit(route).path,
-               "arrival_wall_ns": time.time_ns(),
+               "arrival_wall_ns": time.time_ns(), "arrival_monotonic_ns": time.monotonic_ns(),
                "request_wire_bytes": len(wire), "request_json_bytes": len(body), "request_tokens_estimate": token_estimate(body),
                "request_sha256": hashlib.sha256(body).hexdigest(), "lcp_bytes_with_previous": prefix,
+               "append_only_with_previous": semantic, "stable_head_bytes_with_previous": stable_head,
+               "stable_head_previous_bytes": previous_head,
                "status": None, "response_bytes": 0, "first_byte_ms": None, "first_token_ms": None, "wall_ms": None,
+               "client_disconnected": False, "spend_cap_hit": False,
                "usage": {}, **request_shape(parsed)}
+        row["process_group_rss_mb"], row["helpers_rss_mb"] = process_group_rss(self.server.pgid_file)
+        admitted = self.server.admit_spend()
         try:
+            if not admitted:
+                row.update(status=429, spend_cap_hit=True)
+                self.send_error(429, "benchmark spend cap reached")
+                return
             if self.server.mode == "mock":
                 payload = mock_response(route, parsed.get("model", self.server.model), index, self.server.recorder, len(body))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
-                self.wfile.flush()
                 events = SseUsage()
                 events.add(payload)
                 row.update(status=200, response_bytes=len(payload), first_byte_ms=0.0,
                            first_token_ms=round((events.first_token_ns - start) / 1e6, 3) if events.first_token_ns else None,
                            usage=events.usage)
+                self.wfile.write(payload)
+                self.wfile.flush()
             else:
                 self.forward(host, route, body, row, start)
         except (OSError, http.client.HTTPException) as error:
-            row["status"] = 502
             row["proxy_error_type"] = type(error).__name__
-            try:
-                self.send_error(502)
-            except OSError:
-                pass
+            if row["status"] is None:
+                row["status"] = 502
+                if not getattr(self, "response_started", False):
+                    try:
+                        self.send_error(502)
+                    except OSError:
+                        pass
+            else:
+                row["client_disconnected"] = True
         finally:
+            if admitted:
+                self.server.settle_spend(row.get("usage", {}))
             row["wall_ms"] = round((time.monotonic_ns() - start) / 1e6, 3)
             self.server.recorder.write(row)
 
@@ -283,39 +385,56 @@ class Handler(BaseHTTPRequestHandler):
             route = self.server.upstream_base.rstrip("/") + route[len(incoming):]
         headers = {key: value for key, value in self.headers.items() if key.lower() not in HOP_HEADERS}
         headers["Accept-Encoding"] = "identity"
+        events = SseUsage()
+        received = 0
+        first_byte_ns = None
+        status = None
+        client_disconnected = False
         try:
             upstream.request(self.command, route, body=body, headers=headers)
             response = upstream.getresponse()
-            self.send_response(response.status)
-            content_type = response.getheader("Content-Type", "application/octet-stream")
-            self.send_header("Content-Type", content_type)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            events = SseUsage()
-            received = 0
-            first_byte_ns = None
+            status = response.status
+            try:
+                self.response_started = True
+                self.send_response(response.status)
+                content_type = response.getheader("Content-Type", "application/octet-stream")
+                self.send_header("Content-Type", content_type)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+            except OSError:
+                client_disconnected = True
             while chunk := response.read1(65536):
                 if first_byte_ns is None:
                     first_byte_ns = time.monotonic_ns()
                 received += len(chunk)
                 events.add(chunk)
-                self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
-                self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+                if not client_disconnected:
+                    try:
+                        self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                        self.wfile.flush()
+                    except OSError:
+                        client_disconnected = True
+            if not client_disconnected:
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except OSError:
+                    client_disconnected = True
+        finally:
             if row is not None and start is not None:
-                row.update(status=response.status, response_bytes=received,
+                row.update(status=status, response_bytes=received,
                            first_byte_ms=round((first_byte_ns - start) / 1e6, 3) if first_byte_ns else None,
                            first_token_ms=round((events.first_token_ns - start) / 1e6, 3) if events.first_token_ns else None,
-                           usage=events.usage)
-        finally:
+                           usage=events.usage, client_disconnected=client_disconnected)
             upstream.close()
 
 
 class BenchServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, port: int, recorder: Recorder, mode: str, model: str, upstream_host: str, incoming_base: str, upstream_base: str):
+    def __init__(self, port: int, recorder: Recorder, mode: str, model: str, upstream_host: str, incoming_base: str, upstream_base: str,
+                 spend_cap_usd: float | None = None, request_reserve_usd: float = 0.0,
+                 pgid_file: Path | None = None):
         super().__init__(("127.0.0.1", port), Handler)
         self.recorder = recorder
         self.mode = mode
@@ -323,6 +442,25 @@ class BenchServer(ThreadingHTTPServer):
         self.upstream_host = upstream_host
         self.incoming_base = incoming_base
         self.upstream_base = upstream_base
+        self.spend_cap_usd = spend_cap_usd
+        self.request_reserve_usd = request_reserve_usd
+        self.spent_usd = 0.0
+        self.reserved_usd = 0.0
+        self.spend_lock = threading.Lock()
+        self.pgid_file = pgid_file
+
+    def admit_spend(self) -> bool:
+        with self.spend_lock:
+            if self.spend_cap_usd is not None and self.spent_usd + self.reserved_usd + self.request_reserve_usd > self.spend_cap_usd:
+                return False
+            self.reserved_usd += self.request_reserve_usd
+            return True
+
+    def settle_spend(self, usage: dict) -> None:
+        with self.spend_lock:
+            self.reserved_usd -= self.request_reserve_usd
+            cost = usage.get("cost_usd")
+            self.spent_usd += cost if isinstance(cost, (int, float)) and cost >= 0 else self.request_reserve_usd
 
 
 def main() -> None:
@@ -335,12 +473,18 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--command", default="true")
     parser.add_argument("--harness", required=True)
+    parser.add_argument("--spend-cap-usd", type=float)
+    parser.add_argument("--request-reserve-usd", type=float, default=0.0)
+    parser.add_argument("--pgid-file", type=Path)
     parser.add_argument("--upstream-host", choices=["openrouter.ai", "chatgpt.com"], default="openrouter.ai")
     parser.add_argument("--incoming-base", default="/v1")
     parser.add_argument("--upstream-base", default="/api/v1")
     args = parser.parse_args()
+    if args.spend_cap_usd is not None and (args.spend_cap_usd <= 0 or args.request_reserve_usd <= 0):
+        parser.error("a live spend cap requires a positive per-request reserve")
     BenchServer(args.port, Recorder(args.out, args.scenario, args.steps, args.command, args.harness), args.mode,
-                args.model, args.upstream_host, args.incoming_base, args.upstream_base).serve_forever()
+                args.model, args.upstream_host, args.incoming_base, args.upstream_base,
+                args.spend_cap_usd, args.request_reserve_usd, args.pgid_file).serve_forever()
 
 
 if __name__ == "__main__":

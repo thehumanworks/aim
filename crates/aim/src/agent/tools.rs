@@ -8,11 +8,55 @@ use std::pin::Pin;
 
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::ids::IdempotencyKey;
-use aim_proto::tool::{ToolResult, ToolSpec};
+use aim_proto::tool::{ToolContent, ToolResult, ToolSpec};
 use serde_json::Value;
 
 /// A boxed, sendable, owned future.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// Most bytes from each end of a large Bash result shown to the model. aimx retains the complete
+/// stream behind the result handle; only the transcript view is shortened (ADR 0056).
+const BASH_MODEL_END_BYTES: usize = 5_500;
+const BASH_MAX_END_BYTES: usize = 15_000;
+
+fn bash_end_bytes() -> usize {
+    std::env::var("AIM_BASH_MODEL_END_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|bytes| (1..=BASH_MAX_END_BYTES).contains(bytes))
+        .unwrap_or(BASH_MODEL_END_BYTES)
+}
+
+/// Bound a large shell result without losing its recovery handle or final status.
+pub(crate) fn bound_bash_result(name: &str, mut result: ToolResult) -> ToolResult {
+    let end_bytes = bash_end_bytes();
+    if name != "Bash" || result.handle.is_none() {
+        return result;
+    }
+    let handle = result.handle.as_ref().map_or("", aim_proto::ids::OutputHandle::as_str).to_owned();
+    for part in &mut result.content {
+        if let ToolContent::Text { text } = part
+            && text.len() > 2 * end_bytes
+        {
+            let mut head = end_bytes;
+            while !text.is_char_boundary(head) {
+                head -= 1;
+            }
+            let mut tail = text.len() - end_bytes;
+            while !text.is_char_boundary(tail) {
+                tail += 1;
+            }
+            let omitted = tail - head;
+            *text = format!(
+                "{}\n… [{omitted} preview bytes omitted; read the full output with BashOutput({{\"id\":\"{handle}\"}}) or harness exec.read(proc={handle}, after_seq=0)] …\n{}",
+                text.get(..head).unwrap_or_default(),
+                text.get(tail..).unwrap_or_default()
+            );
+            result.truncated = true;
+        }
+    }
+    result
+}
 
 /// Offers tools to the model and runs their calls.
 pub trait ToolHost: Send + Sync {
@@ -117,6 +161,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use aim_proto::ids::OutputHandle;
 
     struct Named(&'static [&'static str], &'static str);
 
@@ -150,5 +195,21 @@ mod tests {
         assert_eq!(composed.call("Bash".into(), Value::Null, key()).await.unwrap(), ToolResult::text("workspace"));
         assert_eq!(composed.call("search_sessions".into(), Value::Null, key()).await.unwrap(), ToolResult::text("extra"));
         assert!(composed.call("nope".into(), Value::Null, key()).await.is_err());
+    }
+
+    #[test]
+    fn shell_model_view_keeps_ends_and_recovery_handle() {
+        let original = format!("START\n{}\nEND\n[full output is kept as handle h (BashOutput/exec.read)]", "x".repeat(30_000));
+        let result = ToolResult { handle: Some(OutputHandle::new("h")), ..ToolResult::text(&original) };
+        let bounded = bound_bash_result("Bash", result);
+        let Some(ToolContent::Text { text }) = bounded.content.first() else {
+            panic!("expected text");
+        };
+        assert!(text.starts_with("START"));
+        assert!(text.ends_with("(BashOutput/exec.read)]"));
+        assert!(text.contains("preview bytes omitted; read the full output with BashOutput({\"id\":\"h\"})"));
+        assert!(text.len() < 12_000);
+        assert_eq!(bounded.handle.as_ref().map(OutputHandle::as_str), Some("h"));
+        assert!(bounded.truncated);
     }
 }

@@ -75,17 +75,16 @@ pub fn declarations(specs: &[ToolSpec]) -> String {
 /// A compact list of available tools for a code-mode prompt.
 #[must_use]
 pub fn index(specs: &[ToolSpec]) -> String {
-    let mut result = String::from(
-        "Tools are available as await tools.NAME(args). Use ALL_TOOLS, describe(name), or search(query) inside a cell for details.\n",
-    );
+    let mut result = String::from("Cell tools: ");
     for spec in specs {
-        let summary = spec.description.lines().next().unwrap_or("");
-        let line = format!("{}: {}\n", spec.name, summary);
-        if result.len().saturating_add(line.len()) > 8 * 1024 {
+        let separator = if result.ends_with(": ") { "" } else { ", " };
+        if result.len().saturating_add(separator.len()).saturating_add(spec.name.len()) > 512 {
             break;
         }
-        result.push_str(&line);
+        result.push_str(separator);
+        result.push_str(&spec.name);
     }
+    result.push_str(". Use ALL_TOOLS, describe(name), or search(query) for schemas.\n");
     result
 }
 
@@ -109,9 +108,6 @@ mod tests {
         assert!(ts.contains("\"path\": string"));
         assert!(ts.contains("\"limit\"?: number"));
         assert!(ts.len() < 32 * 1024);
-        assert_eq!(
-            index(&[spec]),
-            "Tools are available as await tools.NAME(args). Use ALL_TOOLS, describe(name), or search(query) inside a cell for details.\nread.file: Read one file.\n"
-        );
+        assert_eq!(index(&[spec]), "Cell tools: read.file. Use ALL_TOOLS, describe(name), or search(query) for schemas.\n");
     }
 }

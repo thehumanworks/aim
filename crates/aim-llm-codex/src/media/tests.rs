@@ -53,10 +53,11 @@ async fn preflight_chooses_visible_tools_capable_catalog_default() {
     })
     .await;
     let media = client_with(&server, catalog_media());
-    assert!(!media.search_enabled());
+    assert!(media.search_enabled());
     assert!(media.image_enabled());
     assert!(media.has_credentials().await);
     assert!(media.search_enabled());
+    assert!(server.requests().await.is_empty(), "the catalog is deferred until web search is called");
     media.web_search("capital of France").await.unwrap();
     let requests = server.requests().await;
     assert_eq!(requests.len(), 2);
@@ -94,7 +95,7 @@ async fn failed_catalog_disables_only_search() {
     let server = FakeServer::start(|_, _| Reply::json(500, &json!({"error":{"message":"unavailable"}}))).await;
     let media = client_with(&server, catalog_media());
     assert!(media.has_credentials().await);
-    assert!(!media.search_enabled());
+    assert!(media.search_enabled(), "catalog discovery is attempted when search is called");
     assert!(media.image_enabled());
     assert_eq!(media.web_search("test").await.unwrap_err().kind, LlmErrorKind::Unavailable);
 }

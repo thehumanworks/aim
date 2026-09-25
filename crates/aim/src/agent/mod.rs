@@ -39,6 +39,8 @@ pub mod tools;
 
 #[cfg(test)]
 mod jev_tests;
+#[cfg(test)]
+mod window_tests;
 
 pub use backend::{Backend, BackendFuture, InForce};
 pub use tools::ToolHost;
@@ -179,6 +181,9 @@ enum Window {
     Known(Option<u64>),
 }
 
+/// Conservative context size while a catalog refresh is in flight (ADR 0056).
+const FALLBACK_CONTEXT_WINDOW: u64 = 8_192;
+
 /// The native agent: a provider, a tool host and a transcript.
 pub struct Agent {
     provider: Arc<dyn ModelProvider>,
@@ -189,6 +194,8 @@ pub struct Agent {
     turns: u64,
     /// The model's context window, once the catalog was asked.
     window: Window,
+    /// A catalog refresh never delays a small first request.
+    window_lookup: Option<tokio::task::JoinHandle<Option<u64>>>,
     /// The provider-measured context size (last request plus its response) and the transcript
     /// length it covers.
     measured: Option<(u64, usize)>,
@@ -228,11 +235,22 @@ impl Agent {
             next_call: 0,
             turns: 0,
             window: Window::Unasked,
+            window_lookup: None,
             measured: None,
             decider: None,
             explicit_effort,
             decisions_since_change: 2,
         }
+    }
+
+    /// Reuse the capability snapshot fetched while the session was built. `None` leaves the
+    /// existing lazy lookup in place (for providers whose catalog was unavailable at startup).
+    #[must_use]
+    pub(crate) fn with_initial_window(mut self, window: Option<u64>) -> Self {
+        if let Some(window) = window {
+            self.window = Window::Known(Some(window));
+        }
+        self
     }
 
     /// Enable bounded advice for a persistent session. The host never calls this for private or
@@ -448,13 +466,14 @@ impl Agent {
         };
         match args {
             Ok(args) => {
-                let call = self.tools.call(name.to_owned(), args, key);
+                let name = name.to_owned();
+                let call = self.tools.call(name.clone(), args, key);
                 Box::pin(async move {
                     let result = match call.await {
                         Ok(result) => result,
                         Err(err) => ToolResult::error(format!("{}: {}", err.code, err.message)),
                     };
-                    (id, result)
+                    (id, tools::bound_bash_result(&name, result))
                 })
             }
             Err(err) => {
@@ -767,6 +786,9 @@ impl Agent {
 
     /// Forgets the model's window (the model changed).
     pub(crate) fn forget_window(&mut self) {
+        if let Some(lookup) = self.window_lookup.take() {
+            lookup.abort();
+        }
         self.window = Window::Unasked;
         self.decisions_since_change = 2;
         if !self.explicit_effort {
@@ -774,17 +796,36 @@ impl Agent {
         }
     }
 
-    /// The model's context window, from the provider's catalog (asked once per model).
-    async fn window(&mut self) -> Option<u64> {
+    /// The model's context window. A fallback can only prove this request is safely below the
+    /// compaction threshold; a possible compaction waits for the bounded catalog lookup.
+    async fn window(&mut self, estimate: u64, force: bool) -> Option<u64> {
         if let Window::Known(window) = self.window {
             return window;
         }
-        let window = match self.provider.catalog().await {
-            Ok(models) => models.iter().find(|m| m.id == self.config.model).and_then(|m| m.context_window),
-            Err(err) => {
-                tracing::debug!(%err, "no catalog: the context window is unknown");
-                None
-            }
+        if !matches!(self.provider.id(), "openrouter" | "ai-gateway") {
+            let window = tokio::time::timeout(crate::context::WINDOW_LOOKUP, self.provider.catalog())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|models| models.iter().find(|entry| entry.id == self.config.model).and_then(|entry| entry.context_window));
+            self.window = Window::Known(window);
+            return window;
+        }
+        if self.window_lookup.is_none() {
+            let provider = Arc::clone(&self.provider);
+            let model = self.config.model.clone();
+            self.window_lookup = Some(tokio::spawn(async move {
+                let models = tokio::time::timeout(crate::context::WINDOW_LOOKUP, provider.catalog()).await.ok()?.ok()?;
+                models.iter().find(|entry| entry.id == model).and_then(|entry| entry.context_window)
+            }));
+        }
+        let below_fallback = !force && estimate.saturating_mul(100) < FALLBACK_CONTEXT_WINDOW.saturating_mul(compact::COMPACT_AT_PERCENT);
+        if below_fallback && !self.window_lookup.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
+            return Some(FALLBACK_CONTEXT_WINDOW);
+        }
+        let window = match self.window_lookup.take() {
+            Some(lookup) => lookup.await.ok().flatten(),
+            None => None,
         };
         self.window = Window::Known(window);
         window
@@ -820,7 +861,7 @@ impl Agent {
     ) -> Compaction {
         let before = self.context_estimate(specs);
         let known = tokio::select! {
-            known = self.window() => known,
+            known = self.window(before, force) => known,
             () = cancel.cancelled() => return Compaction::Cancelled,
         };
         let window = match known {

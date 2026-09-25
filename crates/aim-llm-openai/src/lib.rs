@@ -34,7 +34,7 @@ pub use profile::{EnvRef, HeaderSource, MaxOutputTokensField, Profile, Quirks, R
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aim_llm::{BoxFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::Item;
@@ -51,6 +51,13 @@ use crate::sse::Sse;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+const CATALOG_TTL: Duration = Duration::from_secs(300);
+const CATALOG_FAILURE_TTL: Duration = Duration::from_secs(1);
+
+struct CatalogCache {
+    at: Instant,
+    result: Result<Vec<ModelInfo>, LlmError>,
+}
 
 /// An OpenAI-compatible provider configured by a profile.
 pub struct OpenAiProvider {
@@ -65,6 +72,8 @@ pub struct OpenAiProvider {
     vision: Mutex<BTreeMap<String, bool>>,
     /// Whether `stream` already fetched the catalog to learn an unseen model's image support.
     catalog_looked_up: AtomicBool,
+    catalog_cache: Mutex<Option<CatalogCache>>,
+    catalog_fetch: tokio::sync::Mutex<()>,
 }
 
 fn invalid(message: impl Into<String>) -> LlmError {
@@ -203,6 +212,8 @@ impl OpenAiProvider {
             session_header,
             vision: Mutex::new(vision),
             catalog_looked_up: AtomicBool::new(false),
+            catalog_cache: Mutex::new(None),
+            catalog_fetch: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -255,6 +266,13 @@ impl OpenAiProvider {
         }
     }
 
+    fn cached_catalog(&self) -> Option<Result<Vec<ModelInfo>, LlmError>> {
+        let cache = self.catalog_cache.lock().ok()?;
+        let cache = cache.as_ref()?;
+        let ttl = if cache.result.is_ok() { CATALOG_TTL } else { CATALOG_FAILURE_TTL };
+        (cache.at.elapsed() < ttl).then(|| cache.result.clone())
+    }
+
     /// Reads the key and the environment-referenced header values for one request.
     fn credentials(&self) -> Result<Credentials, LlmError> {
         let key = credential(&self.profile.api_key_env, "the API key")?;
@@ -302,12 +320,25 @@ impl ModelProvider for OpenAiProvider {
 
     fn catalog(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
         Box::pin(async move {
-            let models = match &self.profile.models {
-                Some(models) => models.clone(),
-                None => self.fetch_catalog().await?,
+            if let Some(cached) = self.cached_catalog() {
+                return cached;
+            }
+            // A session's background lookup and another session's startup share one in-flight GET.
+            let _fetch = self.catalog_fetch.lock().await;
+            if let Some(cached) = self.cached_catalog() {
+                return cached;
+            }
+            let result = match &self.profile.models {
+                Some(models) => Ok(models.clone()),
+                None => self.fetch_catalog().await,
             };
-            self.remember(&models);
-            Ok(models)
+            if let Ok(models) = &result {
+                self.remember(models);
+            }
+            if let Ok(mut cache) = self.catalog_cache.lock() {
+                *cache = Some(CatalogCache { at: Instant::now(), result: result.clone() });
+            }
+            result
         })
     }
 
@@ -316,7 +347,8 @@ impl ModelProvider for OpenAiProvider {
             self.learn_image_support(&request).await;
             let body = self.request_body(&request)?;
             let credentials = self.credentials()?;
-            let mut builder = Self::authorized(self.client.post(self.endpoint("chat/completions")), &credentials).json(&body);
+            let mut builder =
+                Self::authorized(self.client.post(self.endpoint("chat/completions")), &credentials).json(&request::OrderedChat(&body));
             if let (Some(name), Some(session)) = (&self.session_header, &request.session_id) {
                 let value = HeaderValue::from_str(session).map_err(|_| invalid("the session id is not a valid header value"))?;
                 builder = builder.header(name.clone(), value);

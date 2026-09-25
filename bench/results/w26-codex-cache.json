@@ -1,0 +1,21 @@
+{
+  "method": "cargo test -p aim-llm-codex live_codex_cache_ten_steps --locked -- --ignored --nocapture",
+  "model": "gpt-6-sol",
+  "source": "provider-reported usage from one live ten-step Responses session, transcribed from the ignored smoke test output",
+  "prompt_cache_key_stable": true,
+  "session_id_stable": true,
+  "steps": [
+    {"step": 1, "input_tokens": 1104, "cached_tokens": 0},
+    {"step": 2, "input_tokens": 1122, "cached_tokens": 0},
+    {"step": 3, "input_tokens": 1140, "cached_tokens": 0},
+    {"step": 4, "input_tokens": 1158, "cached_tokens": 1024},
+    {"step": 5, "input_tokens": 1176, "cached_tokens": 1024},
+    {"step": 6, "input_tokens": 1194, "cached_tokens": 0},
+    {"step": 7, "input_tokens": 1212, "cached_tokens": 1024},
+    {"step": 8, "input_tokens": 1230, "cached_tokens": 1024},
+    {"step": 9, "input_tokens": 1248, "cached_tokens": 1024},
+    {"step": 10, "input_tokens": 1266, "cached_tokens": 1024}
+  ],
+  "input_tokens": 11850,
+  "cached_tokens": 6144
+}

@@ -1,0 +1,651 @@
+{
+  "aim_sha256": "c64f6e24d4ea39fc801555a203fdd9070a50015571850bde4d3a6c2e2e994ec9",
+  "model": "openai/gpt-4.1-mini",
+  "prompt": "First call the direct Bash tool once with command `seq 1 100000` and inspect its output. Do not use run_code for this command. Then fix sum_even in calc.py and run the tests.",
+  "runs": [
+    {
+      "auxiliary_requests": 1,
+      "bash_model_end_bytes": 15000,
+      "case": "even_sum",
+      "effort": null,
+      "exit_code": 0,
+      "first_request_bytes": 6050,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 19.26,
+      "first_request_tokens_estimate": 1513,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 649,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 696,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 541,
+          "name": "run_code"
+        },
+        {
+          "bytes": 425,
+          "name": "save_program"
+        },
+        {
+          "bytes": 318,
+          "name": "run_program"
+        },
+        {
+          "bytes": 194,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 9,
+      "first_request_tools_json_bytes": 4098,
+      "first_token_ms": 1058.695,
+      "harness": "aim_openrouter",
+      "http_exchanges": 6,
+      "ite": 25022.8,
+      "max_tool_output_chars": 30680,
+      "missing_success_cost": false,
+      "model": "openai/gpt-4.1-mini",
+      "passed": true,
+      "peak_rss_mb": 50.84,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        6050,
+        42254,
+        42626,
+        43134,
+        43807
+      ],
+      "request_lcp_bytes": [
+        6048,
+        42252,
+        42624,
+        43132
+      ],
+      "request_response_sizes": [
+        [
+          6050,
+          8737
+        ],
+        [
+          42254,
+          6748
+        ],
+        [
+          42626,
+          23347
+        ],
+        [
+          43134,
+          7095
+        ],
+        [
+          43807,
+          9837
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0004804,
+          "input_tokens": 1077,
+          "output_tokens": 31,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0069712,
+          "input_tokens": 17332,
+          "output_tokens": 24,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17280,
+          "cost_usd": 0.0018884,
+          "input_tokens": 17385,
+          "output_tokens": 74,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17280,
+          "cost_usd": 0.001846,
+          "input_tokens": 17471,
+          "output_tokens": 26,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17408,
+          "cost_usd": 0.0018656,
+          "input_tokens": 17584,
+          "output_tokens": 34,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 5,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 51968,
+        "cost_usd": 0.0130516,
+        "input_tokens": 70849,
+        "output_tokens": 189,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 6493.28
+    },
+    {
+      "auxiliary_requests": 1,
+      "bash_model_end_bytes": 5500,
+      "case": "even_sum",
+      "effort": null,
+      "exit_code": 0,
+      "first_request_bytes": 6050,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 22.8,
+      "first_request_tokens_estimate": 1513,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 649,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 696,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 541,
+          "name": "run_code"
+        },
+        {
+          "bytes": 425,
+          "name": "save_program"
+        },
+        {
+          "bytes": 318,
+          "name": "run_program"
+        },
+        {
+          "bytes": 194,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 9,
+      "first_request_tools_json_bytes": 4098,
+      "first_token_ms": 863.652,
+      "harness": "aim_openrouter",
+      "http_exchanges": 6,
+      "ite": 11632.0,
+      "max_tool_output_chars": 11953,
+      "missing_success_cost": false,
+      "model": "openai/gpt-4.1-mini",
+      "passed": true,
+      "peak_rss_mb": 51.07,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 0,
+      "request_json_bytes": [
+        6050,
+        19772,
+        20144,
+        20652,
+        21602
+      ],
+      "request_lcp_bytes": [
+        6048,
+        19770,
+        20142,
+        20650
+      ],
+      "request_response_sizes": [
+        [
+          6050,
+          8737
+        ],
+        [
+          19772,
+          6742
+        ],
+        [
+          20144,
+          23344
+        ],
+        [
+          20652,
+          7752
+        ],
+        [
+          21602,
+          9281
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0004812,
+          "input_tokens": 1079,
+          "output_tokens": 31,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.00279,
+          "input_tokens": 6879,
+          "output_tokens": 24,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6784,
+          "cost_usd": 0.000856,
+          "input_tokens": 6932,
+          "output_tokens": 74,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6784,
+          "cost_usd": 0.0008168,
+          "input_tokens": 7018,
+          "output_tokens": 28,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6912,
+          "cost_usd": 0.000862,
+          "input_tokens": 7211,
+          "output_tokens": 32,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 5,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 20480,
+        "cost_usd": 0.005806,
+        "input_tokens": 29119,
+        "output_tokens": 189,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 7379.08
+    },
+    {
+      "auxiliary_requests": 1,
+      "bash_model_end_bytes": 5500,
+      "case": "even_sum",
+      "effort": null,
+      "exit_code": 0,
+      "first_request_bytes": 6050,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 18.91,
+      "first_request_tokens_estimate": 1513,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 649,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 696,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 541,
+          "name": "run_code"
+        },
+        {
+          "bytes": 425,
+          "name": "save_program"
+        },
+        {
+          "bytes": 318,
+          "name": "run_program"
+        },
+        {
+          "bytes": 194,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 9,
+      "first_request_tools_json_bytes": 4098,
+      "first_token_ms": 814.234,
+      "harness": "aim_openrouter",
+      "http_exchanges": 6,
+      "ite": 10602.4,
+      "max_tool_output_chars": 11411,
+      "missing_success_cost": false,
+      "model": "openai/gpt-4.1-mini",
+      "passed": true,
+      "peak_rss_mb": 51.49,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        6050,
+        19771,
+        20143,
+        20651,
+        21049
+      ],
+      "request_lcp_bytes": [
+        6048,
+        19769,
+        20141,
+        20649
+      ],
+      "request_response_sizes": [
+        [
+          6050,
+          8736
+        ],
+        [
+          19771,
+          6749
+        ],
+        [
+          20143,
+          23346
+        ],
+        [
+          20651,
+          7752
+        ],
+        [
+          21049,
+          8732
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0004808,
+          "input_tokens": 1078,
+          "output_tokens": 31,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 1024,
+          "cost_usd": 0.0024876,
+          "input_tokens": 6891,
+          "output_tokens": 24,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6784,
+          "cost_usd": 0.0008608,
+          "input_tokens": 6944,
+          "output_tokens": 74,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6784,
+          "cost_usd": 0.0008216,
+          "input_tokens": 7030,
+          "output_tokens": 28,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6912,
+          "cost_usd": 0.0008056,
+          "input_tokens": 7078,
+          "output_tokens": 30,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 5,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 21504,
+        "cost_usd": 0.0054564,
+        "input_tokens": 29021,
+        "output_tokens": 187,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 5884.02
+    },
+    {
+      "auxiliary_requests": 1,
+      "bash_model_end_bytes": 15000,
+      "case": "even_sum",
+      "effort": null,
+      "exit_code": 0,
+      "first_request_bytes": 6050,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 21.42,
+      "first_request_tokens_estimate": 1513,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 649,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 696,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 541,
+          "name": "run_code"
+        },
+        {
+          "bytes": 425,
+          "name": "save_program"
+        },
+        {
+          "bytes": 318,
+          "name": "run_program"
+        },
+        {
+          "bytes": 194,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 9,
+      "first_request_tools_json_bytes": 4098,
+      "first_token_ms": 858.521,
+      "harness": "aim_openrouter",
+      "http_exchanges": 6,
+      "ite": 24992.8,
+      "max_tool_output_chars": 30951,
+      "missing_success_cost": false,
+      "model": "openai/gpt-4.1-mini",
+      "passed": true,
+      "peak_rss_mb": 51.28,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "repetition": 1,
+      "request_json_bytes": [
+        6050,
+        42253,
+        42625,
+        43077,
+        44027
+      ],
+      "request_lcp_bytes": [
+        6048,
+        42251,
+        42623,
+        43075
+      ],
+      "request_response_sizes": [
+        [
+          6050,
+          8736
+        ],
+        [
+          42253,
+          6747
+        ],
+        [
+          42625,
+          18043
+        ],
+        [
+          43077,
+          7754
+        ],
+        [
+          44027,
+          9839
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0004808,
+          "input_tokens": 1078,
+          "output_tokens": 31,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0069704,
+          "input_tokens": 17330,
+          "output_tokens": 24,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17280,
+          "cost_usd": 0.001862,
+          "input_tokens": 17383,
+          "output_tokens": 58,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17280,
+          "cost_usd": 0.001842,
+          "input_tokens": 17453,
+          "output_tokens": 28,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 17408,
+          "cost_usd": 0.00189,
+          "input_tokens": 17645,
+          "output_tokens": 34,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 5,
+      "response_statuses": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "timed_out": false,
+      "tool_output_recovery_hint": true,
+      "transport_errors": 0,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 51968,
+        "cost_usd": 0.0130452,
+        "input_tokens": 70889,
+        "output_tokens": 175,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 6132.32
+    }
+  ]
+}

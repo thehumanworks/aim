@@ -27,12 +27,34 @@ use aim_proto::conversation::{Item, NativeItem, Part};
 use aim_proto::tool::{ToolContent, ToolInput, ToolResult, ToolSpec};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use serde::ser::SerializeMap as _;
+use serde::{Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
 use crate::profile::{Profile, ReasoningParam};
 
 /// The single string parameter a freeform tool is exposed with.
 pub(crate) const FREEFORM_FIELD: &str = "input";
+
+/// Send stable request fields before the growing transcript. This keeps the raw wire prefix
+/// stable across tool steps without changing the public `request_body` value (ADR 0056).
+pub(crate) struct OrderedChat<'a>(pub &'a Value);
+
+impl Serialize for OrderedChat<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Some(fields) = self.0.as_object() else {
+            return self.0.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(Some(fields.len()))?;
+        for (key, value) in fields.iter().filter(|(key, _)| key.as_str() != "messages") {
+            map.serialize_entry(key, value)?;
+        }
+        if let Some(messages) = fields.get("messages") {
+            map.serialize_entry("messages", messages)?;
+        }
+        map.end()
+    }
+}
 
 /// Names of the request's freeform tools.
 pub(crate) fn freeform_names(tools: &[ToolSpec]) -> BTreeSet<String> {
@@ -303,6 +325,14 @@ mod tests {
     use super::*;
     use aim_proto::content::Base64Bytes;
     use aim_proto::tool::ToolAnnotations;
+
+    #[test]
+    fn growing_messages_are_last_on_the_wire() {
+        let body = json!({"messages": [{"role": "user", "content": "hi"}], "tools": [{"name": "read"}], "model": "test"});
+        let encoded = serde_json::to_string(&OrderedChat(&body)).unwrap();
+        assert!(encoded.find("\"tools\"") < encoded.find("\"messages\""));
+        assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), body);
+    }
 
     fn request(items: Vec<Item>) -> Request {
         Request {

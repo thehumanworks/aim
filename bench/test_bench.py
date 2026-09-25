@@ -1,12 +1,21 @@
 """Checks the measurement boundary and independent task baselines."""
 
+import copy
+import json
+import os
+import subprocess
 import tempfile
+import time
+import tomllib
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 from pathlib import Path
 
 from live_tasks import TASKS, grade, prepare
-from proxy import SseUsage, has_generated_delta, request_shape, usage_fields
-from run import summary
+from compare import compare_wire
+from proxy import BenchServer, Handler, Recorder, SseUsage, append_only, has_generated_delta, render_order, request_shape, usage_fields
+from run import path_map, summary, update_diagnostics
 
 
 class RecorderTests(unittest.TestCase):
@@ -34,10 +43,88 @@ class RecorderTests(unittest.TestCase):
 
     def test_tool_output_measure_does_not_return_body(self):
         shape = request_shape({"tools": [{"name": "Bash"}], "messages": [
-            {"role": "system", "content": "hidden"}, {"role": "tool", "content": "secret full output handle"}]})
-        self.assertEqual(shape["tool_output_chars"], len("secret full output handle"))
+            {"role": "system", "content": "hidden"}, {"role": "tool", "content": "secret full output handle h (BashOutput/exec.read)"}]})
+        self.assertEqual(shape["tool_output_chars"], len("secret full output handle h (BashOutput/exec.read)"))
         self.assertTrue(shape["tool_output_has_recovery_hint"])
         self.assertNotIn("secret", str(shape))
+
+    def test_render_order_recognizes_append_only_despite_json_key_order(self):
+        first = {"messages": [{"role": "system", "content": "stable"}, {"role": "user", "content": "one"}],
+                 "tools": [{"name": "Bash"}], "model": "m"}
+        second = {**first, "messages": [*first["messages"], {"role": "assistant", "content": "two"}]}
+        self.assertTrue(append_only(first, second))
+        self.assertTrue(render_order(second).startswith(render_order(first)))
+        changed = {**second, "tools": [{"name": "Read"}]}
+        self.assertFalse(append_only(first, changed))
+        self.assertFalse(request_shape({"messages": [{"role": "tool", "content": "Warning: truncated output"}]})[
+            "tool_output_has_recovery_hint"])
+
+    def test_proxy_keeps_usage_when_client_disconnects_after_completion(self):
+        class Response:
+            status = 200
+            chunks = [b'data: {"usage":{"prompt_tokens":10,"completion_tokens":2,"cost":0.001}}\n\n', b'']
+
+            def getheader(self, _name, default):
+                return default
+
+            def read1(self, _size):
+                return self.chunks.pop(0)
+
+        class Connection:
+            def request(self, *_args, **_kwargs):
+                pass
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        class ClosedWriter:
+            def write(self, _data):
+                raise BrokenPipeError
+
+        client = SimpleNamespace(
+            server=SimpleNamespace(incoming_base="/v1", upstream_base="/api/v1"),
+            headers={}, command="POST", wfile=ClosedWriter(),
+            send_response=lambda _status: None, send_header=lambda *_args: None, end_headers=lambda: None,
+        )
+        row = {}
+        with mock.patch("proxy.http.client.HTTPSConnection", return_value=Connection()):
+            Handler.forward(client, "openrouter.ai", "/v1/chat/completions", b"{}", row, time.monotonic_ns())
+        self.assertEqual(row["status"], 200)
+        self.assertTrue(row["client_disconnected"])
+        self.assertEqual(row["usage"]["input_tokens"], 10)
+        self.assertEqual(row["usage"]["cost_usd"], 0.001)
+        self.assertGreater(row["response_bytes"], 0)
+
+    def test_wire_gate_rejects_failed_trajectory_and_byte_growth(self):
+        bench = Path(__file__).resolve().parent
+        baseline = json.loads((bench / "results/w26-main-baseline.json").read_text())
+        candidate = json.loads((bench / "results/w26-after-wire.json").read_text())
+        with (bench / "manifest.toml").open("rb") as stream:
+            manifest = tomllib.load(stream)
+        self.assertEqual(compare_wire(candidate, baseline, manifest), [])
+        broken = copy.deepcopy(candidate)
+        broken["runs"][0]["passed"] = False
+        broken["runs"][0]["first_request_bytes"] += 10_000
+        errors = compare_wire(broken, baseline, manifest)
+        self.assertTrue(any("trajectory failed" in error for error in errors))
+        self.assertTrue(any("first request grew" in error for error in errors))
+
+    def test_proxy_reserves_spend_before_each_request_and_settles_usage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            server = BenchServer(0, Recorder(Path(temp) / "requests.jsonl", "reply", 0, "true", "aim_openrouter"),
+                                 "mock", "m", "openrouter.ai", "/v1", "/api/v1", 1.0, 0.6)
+            try:
+                self.assertTrue(server.admit_spend())
+                self.assertFalse(server.admit_spend(), "a concurrent request cannot spend the same reserve")
+                server.settle_spend({"cost_usd": 0.1})
+                self.assertTrue(server.admit_spend())
+                server.settle_spend({"cost_usd": 0.5})
+                self.assertFalse(server.admit_spend(), "the run stops when the remaining cap cannot cover one request")
+            finally:
+                server.server_close()
 
 
 class LiveTaskTests(unittest.TestCase):
@@ -57,6 +144,27 @@ class LiveTaskTests(unittest.TestCase):
             (workspace / "mathutil.py").write_text("def clamp(value, low, high):\n    return max(low, min(high, value))\n")
             self.assertTrue(grade("clamp", workspace))
 
+    def test_grader_ignores_workspace_import_hooks_and_credentials(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "work"
+            prepare("clamp", workspace)
+            (workspace / "sitecustomize.py").write_text("import os; os._exit(0)\n")
+            (workspace / "unittest.py").write_text("raise RuntimeError('shadowed')\n")
+            (workspace / "mathutil.py").write_text(
+                "import os\n"
+                "if os.getenv('OPENROUTER_API_KEY'): raise RuntimeError('credential leaked')\n"
+                "def clamp(value, low, high): return max(low, min(high, value))\n"
+            )
+            with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "fixture-secret"}):
+                self.assertTrue(grade("clamp", workspace))
+
+    def test_grader_timeout_fails_one_trial(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "work"
+            prepare("clamp", workspace)
+            with mock.patch("live_tasks.subprocess.run", side_effect=subprocess.TimeoutExpired("grader", 30)):
+                self.assertFalse(grade("clamp", workspace))
+
     def test_cost_per_pass_includes_failed_attempts_and_missing_cost_stays_unknown(self):
         runs = [
             {"harness": "aim", "passed": True, "ite": 100, "usage": {"cost_usd": 0.01}, "provider_cost_complete": True, "wall_ms": 1},
@@ -67,6 +175,25 @@ class LiveTaskTests(unittest.TestCase):
         self.assertEqual(measured["usd_per_passed"], 0.03)
         runs[1]["provider_cost_complete"] = False
         self.assertIsNone(summary(runs, ["aim"])[0]["usd_per_passed"])
+
+    def test_binary_paths_use_cargo_metadata_target_directory(self):
+        metadata = SimpleNamespace(stdout=json.dumps({"target_directory": "/tmp/isolated-target"}))
+        with mock.patch("run.subprocess.run", return_value=metadata), mock.patch("run.pinned", return_value=Path("/tmp/pinned")):
+            paths = path_map(SimpleNamespace(omp=None, unreal=None))
+        self.assertEqual(paths["aim"], Path("/tmp/isolated-target/debug/aim"))
+        self.assertEqual(paths["aimx"], Path("/tmp/isolated-target/debug/aimx"))
+
+    def test_diagnostics_keep_counts_without_model_or_argument_text(self):
+        lines = b'\n'.join((
+            b'{"type":"tool_started","name":"Bash","arguments":"secret-value"}',
+            b'{"type":"tool_finished","name":"Bash","result":{"is_error":true,"content":"secret-value"}}',
+            b'{"type":"turn_failed","message":"turn exceeded 24 model requests"}',
+        ))
+        diagnostic = update_diagnostics(lines)
+        self.assertEqual(diagnostic["tool_calls_by_name"], {"Bash": 1})
+        self.assertEqual(diagnostic["failed_tools_by_name"], {"Bash": 1})
+        self.assertEqual(diagnostic["turn_failure_class"], "max_requests")
+        self.assertNotIn("secret-value", str(diagnostic))
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@
 //!   local built-ins. Both are agent backends, not model providers: sessions run them through
 //!   [`crate::acp::with_acp`].
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -53,6 +54,8 @@ fn with_base_url(mut profile: Profile, var: &str) -> Profile {
 pub const CODEX_DEFAULT_MODEL: &str = "gpt-6-sol";
 
 static CODEX: Mutex<Option<Arc<CodexProvider>>> = Mutex::new(None);
+type GatewayMap = HashMap<(String, String), Arc<OpenAiProvider>>;
+static GATEWAYS: Mutex<Option<GatewayMap>> = Mutex::new(None);
 
 /// The process's codex provider (created on first use).
 ///
@@ -84,8 +87,17 @@ pub const KNOWN: &[&str] = &["openrouter", "ai-gateway", "codex", "acp:claude", 
 /// A message for the user: unknown provider, or one this build cannot construct.
 pub fn build(id: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, String), String> {
     let gateway = |profile: Profile| -> Result<(Arc<dyn ModelProvider>, String), String> {
-        let provider = OpenAiProvider::new(profile).map_err(|e| format!("{id}: {e}"))?;
-        Ok((Arc::new(provider), model.unwrap_or(GATEWAY_DEFAULT_MODEL).to_owned()))
+        let key = (profile.id.clone(), profile.base_url.clone());
+        let mut slot = GATEWAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        let gateways = slot.get_or_insert_with(HashMap::new);
+        let provider = if let Some(provider) = gateways.get(&key) {
+            Arc::clone(provider)
+        } else {
+            let provider = Arc::new(OpenAiProvider::new(profile).map_err(|e| format!("{id}: {e}"))?);
+            gateways.insert(key, Arc::clone(&provider));
+            provider
+        };
+        Ok((provider as Arc<dyn ModelProvider>, model.unwrap_or(GATEWAY_DEFAULT_MODEL).to_owned()))
     };
     match id {
         "openrouter" => gateway(with_base_url(Profile::openrouter(), "AIM_OPENROUTER_BASE_URL")),
@@ -322,7 +334,8 @@ mod tests {
     use aim_proto::daemon::{Location, Persistence, SessionSpec};
     use aim_proto::ids::IdempotencyKey;
 
-    use super::board_tools_at;
+    use super::{board_tools_at, build};
+    use std::sync::Arc;
 
     fn spec(persistence: Persistence) -> SessionSpec {
         SessionSpec {
@@ -349,6 +362,13 @@ mod tests {
             board.call("board_list".to_owned(), serde_json::json!({}), IdempotencyKey::new("list")).await.expect("real board list");
         assert!(!listed.is_error);
         assert!(aim_home.join("aim.db").exists());
+    }
+
+    #[test]
+    fn gateway_sessions_share_one_provider_and_catalog_cache() {
+        let (first, _) = build("openrouter", Some("test/model")).expect("provider");
+        let (second, _) = build("openrouter", Some("other/model")).expect("provider");
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
 
