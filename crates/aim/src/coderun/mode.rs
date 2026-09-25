@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 pub use aim_kernel::code_mode::{CodeModeRequest, DEFAULT_MODE, Direct, Exposure, Fallback, Mode};
+use aim_proto::event::CodeModeSetting;
 use aim_proto::tool::ToolSpec;
 
 /// The environment variable that selects code mode: `off`, `on` or `only` (also `0`, `1`,
@@ -27,6 +28,26 @@ pub fn parse(value: &str) -> Option<Mode> {
         "on" | "1" | "true" => Some(Mode::On),
         "only" => Some(Mode::Only),
         _ => None,
+    }
+}
+
+/// The kernel's mode for a protocol setting.
+#[must_use]
+pub const fn from_setting(setting: CodeModeSetting) -> Mode {
+    match setting {
+        CodeModeSetting::Off => Mode::Off,
+        CodeModeSetting::On => Mode::On,
+        CodeModeSetting::Only => Mode::Only,
+    }
+}
+
+/// The protocol setting for a kernel mode.
+#[must_use]
+pub const fn to_setting(mode: Mode) -> CodeModeSetting {
+    match mode {
+        Mode::Off => CodeModeSetting::Off,
+        Mode::On => CodeModeSetting::On,
+        Mode::Only => CodeModeSetting::Only,
     }
 }
 
@@ -102,6 +123,27 @@ pub const fn reason(fallback: Fallback) -> &'static str {
 #[must_use]
 pub fn decide(requested: CodeModeRequest, worker: bool, platform: bool, permitted: bool) -> Exposure {
     let exposure = aim_kernel::code_mode::decide(requested, DEFAULT_MODE, worker, platform, permitted);
+    log_fallback(requested, exposure);
+    exposure
+}
+
+/// [`decide`] for one session: its own setting (from its client) wins over the daemon's request
+/// ([`aim_kernel::code_mode::decide_for_session`]); the guards apply after that.
+#[must_use]
+pub fn decide_for_session(
+    session: Option<CodeModeSetting>,
+    daemon: CodeModeRequest,
+    worker: bool,
+    platform: bool,
+    permitted: bool,
+) -> Exposure {
+    let session = session.map(from_setting);
+    let exposure = aim_kernel::code_mode::decide_for_session(session, daemon, DEFAULT_MODE, worker, platform, permitted);
+    log_fallback(session.map_or(daemon, CodeModeRequest::Set), exposure);
+    exposure
+}
+
+fn log_fallback(requested: CodeModeRequest, exposure: Exposure) {
     if let Some(fallback) = exposure.fallback {
         let (explicit, wanted) = match requested {
             CodeModeRequest::Set(mode) => (true, label(mode)),
@@ -113,7 +155,38 @@ pub fn decide(requested: CodeModeRequest, worker: bool, platform: bool, permitte
             tracing::debug!("code mode `{wanted}` (the default) is off: {}", reason(fallback));
         }
     }
-    exposure
+}
+
+/// The code mode a client sends with each new session (ADR 0076): its `--code-mode` flag, else
+/// its own `AIM_CODE_MODE` (an invalid value fails closed to `off`), else none, and the daemon
+/// decides. The client's environment, not the daemon's, is what the user just set.
+#[must_use]
+pub fn client_setting(flag: Option<CodeModeSetting>, env: Option<&str>) -> Option<CodeModeSetting> {
+    if flag.is_some() {
+        return flag;
+    }
+    match requested(env) {
+        CodeModeRequest::Unset => None,
+        CodeModeRequest::Invalid => Some(CodeModeSetting::Off),
+        CodeModeRequest::Set(mode) => Some(to_setting(mode)),
+    }
+}
+
+/// [`client_setting`] from this process's `AIM_CODE_MODE`, with the warning an invalid value
+/// deserves when the flag did not override it.
+#[must_use]
+pub fn client_setting_from_env(flag: Option<CodeModeSetting>) -> (Option<CodeModeSetting>, Option<String>) {
+    let env = env_value();
+    let warning = if flag.is_none() { invalid_warning(env.as_deref()) } else { None };
+    (client_setting(flag, env.as_deref()), warning)
+}
+
+/// Parses a `--code-mode` flag: `off`, `on` or `only` (also `0`, `1`, `false`, `true`).
+///
+/// # Errors
+/// A value that names no mode.
+pub fn parse_flag(value: &str) -> Result<CodeModeSetting, String> {
+    parse(value).map(to_setting).ok_or_else(|| "expected off, on or only".to_owned())
 }
 
 /// Which of `names` (in order) `direct` offers directly: all, all but `hidden`, or none. The
@@ -216,6 +289,22 @@ mod tests {
         let off = decide(CodeModeRequest::Set(Mode::Off), false, false, false);
         assert_eq!((off.code, off.fallback), (false, None), "off asked for is not a fallback");
         assert_eq!(decide(CodeModeRequest::Unset, true, true, true).mode, DEFAULT_MODE);
+    }
+
+    /// T4c (ADR 0076): what a client sends with its sessions: the flag, else its own
+    /// `AIM_CODE_MODE` (an invalid value fails closed to off), else nothing.
+    #[test]
+    fn a_client_sends_its_flag_else_its_environment() {
+        use aim_proto::event::CodeModeSetting;
+
+        use super::client_setting;
+        assert_eq!(client_setting(Some(CodeModeSetting::Only), Some("on")), Some(CodeModeSetting::Only), "the flag wins");
+        assert_eq!(client_setting(None, Some("1")), Some(CodeModeSetting::On));
+        assert_eq!(client_setting(None, Some("OFF")), Some(CodeModeSetting::Off));
+        assert_eq!(client_setting(None, Some("onn")), Some(CodeModeSetting::Off), "invalid fails closed");
+        assert_eq!(client_setting(None, None), None, "unset: the daemon decides");
+        assert_eq!(super::parse_flag("only"), Ok(CodeModeSetting::Only));
+        assert!(super::parse_flag("sometimes").is_err());
     }
 
     fn spec(name: &str) -> ToolSpec {

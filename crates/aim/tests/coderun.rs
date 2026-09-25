@@ -568,6 +568,7 @@ async fn nested_calls_are_child_tool_events_and_recorded() {
         title: None,
         parent: None,
         agent: None,
+        code_mode: None,
     };
     let mut recorder = Recorder::create(Arc::clone(&store), meta).await.unwrap();
     for update in &updates {
@@ -856,6 +857,7 @@ async fn a_session_ends_its_turn_while_a_cell_runs_and_closes_it_with_the_sessio
         effort: None,
         agent: None,
         persistence: Persistence::Persistent,
+        code_mode: None,
     };
     let id = host.create(spec).await.expect("session").meta.id;
     let (_, mut updates) = host.attach(id.clone()).await.expect("attached");

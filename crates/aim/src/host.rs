@@ -28,7 +28,7 @@ use aim_proto::daemon::{
     SessionListParams, SessionOptions, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::event::{EffortSource, EventBody, SessionAgent, SessionEvent, SessionMeta};
+use aim_proto::event::{CodeModeSetting, EffortSource, EventBody, SessionAgent, SessionEvent, SessionMeta};
 use futures_core::Stream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -171,6 +171,9 @@ pub struct Built {
     /// Ends what the backend's session needs besides the backend itself (e.g. the workspace
     /// connection); run after the backend has shut down.
     pub shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send>,
+    /// The code mode the session got after its guards (ADR 0076); `None` for a backend without
+    /// code mode.
+    pub code_mode: Option<CodeModeSetting>,
 }
 
 /// Builds sessions' backends: the native loop, Claude Code over ACP, or a fake in tests.
@@ -209,7 +212,8 @@ pub struct CodeConfig {
     pub worker: PathBuf,
     /// The user's program repository (`~/.aim/programs`).
     pub user_programs: PathBuf,
-    /// `On` or `Only` (ADR 0076); `Off` composes no code tools.
+    /// What this process asks for (ADR 0076: its `AIM_CODE_MODE`, else the default). A session's
+    /// own setting overrides it; `Off` composes no code tools.
     pub mode: crate::coderun::mode::Mode,
 }
 
@@ -304,7 +308,7 @@ pub fn native_backends_with(
                 None
             };
             // One exposure decision selects the code tools below and the prompt's code-mode section (ADR 0076).
-            let code = code_exposure(services.code.as_ref(), agent.as_ref().is_none_or(|(_, policy)| policy.permits("run_code")));
+            let (code_mode, code) = code_exposure(services.code.as_ref(), spec.code_mode, agent.as_ref().map(|(_, policy)| policy));
             let budget = resources.skill_budget.unwrap_or_else(|| resources::instructions::skill_budget(window));
             let prefix = context::instructions(&catalog, agent.as_ref().map(|(agent, _)| agent), budget, code.is_some());
             for diagnostic in &prefix.diagnostics {
@@ -355,7 +359,7 @@ pub fn native_backends_with(
                 native = native.with_decider(decider);
             }
             let backend: Box<dyn Backend> = Box::new(WithSkills::new(Box::new(native), Arc::new(catalog)));
-            Ok(Built { backend, model, root, location, agent: record, shutdown })
+            Ok(Built { backend, model, root, location, agent: record, shutdown, code_mode: Some(code_mode) })
         })
     })
 }
@@ -386,13 +390,21 @@ fn cells_first(
     })
 }
 
-/// A session's code-mode exposure, when code mode applies to it (ADR 0076). A `CodeConfig` stands
-/// for a worker found on a sandboxing platform; the session's ceiling decides the rest, and a
-/// ceiling without `run_code` never gets code tools, whatever the mode.
-fn code_exposure(code: Option<&CodeConfig>, permitted: bool) -> Option<(&CodeConfig, crate::coderun::mode::Exposure)> {
-    let code = code?;
-    let exposure = crate::coderun::mode::decide(crate::coderun::mode::CodeModeRequest::Set(code.mode), true, true, permitted);
-    exposure.code.then_some((code, exposure))
+/// A session's code mode (ADR 0076): the session's own setting, else this process's; then the
+/// guards. A `CodeConfig` stands for a worker found on a sandboxing platform, and a ceiling without
+/// `run_code` never gets code tools, whatever was asked. Returns the effective mode and, when code
+/// mode applies, what composes it.
+fn code_exposure<'a>(
+    code: Option<&'a CodeConfig>,
+    session: Option<CodeModeSetting>,
+    ceiling: Option<&ToolPolicy>,
+) -> (CodeModeSetting, Option<(&'a CodeConfig, crate::coderun::mode::Exposure)>) {
+    use crate::coderun::mode;
+    let permitted = ceiling.is_none_or(|policy| policy.permits("run_code"));
+    let daemon = code.map_or(mode::CodeModeRequest::Unset, |code| mode::CodeModeRequest::Set(code.mode));
+    let platform = code.is_some() || cfg!(target_os = "macos");
+    let exposure = mode::decide_for_session(session, daemon, code.is_some(), platform, permitted);
+    (mode::to_setting(exposure.mode), code.filter(|_| exposure.code).map(|code| (code, exposure)))
 }
 
 /// Adds code mode and the saved-program tools over `tools`, the session's final (narrowed) set,
@@ -705,7 +717,7 @@ impl SessionHost {
         let context = resume.as_ref().map(|r| model_items_of(&r.events)).unwrap_or_default();
         let prior = resume.as_ref().map(|r| Recorded { agent: r.meta.agent.clone(), effort_source: last_config(&r.meta, &r.events).2 });
         let request = BackendRequest { spec: spec.clone(), session_id: session_id.clone(), transcript: context, recorded: prior };
-        let Built { mut backend, model, root, location, agent, shutdown } = (self.config.backends)(request).await?;
+        let Built { mut backend, model, root, location, agent, shutdown, code_mode } = (self.config.backends)(request).await?;
 
         let store: Arc<dyn SessionStore> = match spec.persistence {
             Persistence::Persistent => Arc::clone(&self.config.store),
@@ -725,6 +737,8 @@ impl SessionHost {
                 title: None,
                 parent: None,
                 agent,
+                // Stored as it is now, so a resumed session asks for the same (ADR 0076).
+                code_mode,
             };
             let created = Recorder::create(Arc::clone(&store), meta.clone()).await;
             match created {
@@ -750,7 +764,7 @@ impl SessionHost {
                 Err(e) => Err(e),
             }
         };
-        let (meta, recorder, announced) = match opened {
+        let (mut meta, recorder, announced) = match opened {
             Ok(opened) => opened,
             Err(e) => {
                 backend.shutdown().await;
@@ -758,6 +772,11 @@ impl SessionHost {
                 return Err(err(ErrorCode::Internal, e.to_string()));
             }
         };
+        // What the session got now, after the guards (a resumed one may get less than it recorded,
+        // e.g. without the worker); the stored record keeps what it had (ADR 0076).
+        if code_mode.is_some() {
+            meta.code_mode = code_mode;
+        }
         // Shutdown began while this session was starting: it must not go live.
         if self.closing.load(Ordering::SeqCst) {
             backend.shutdown().await;
@@ -817,6 +836,8 @@ impl SessionHost {
             // The agent is applied again, within the ceiling it recorded (ADR 0038).
             agent: meta.agent.as_ref().map(|agent| agent.name.clone()),
             persistence: Persistence::Persistent,
+            // It asks for the code mode it had; the guards apply again (ADR 0076).
+            code_mode: meta.code_mode,
         };
         self.start(spec, Some(Resume { meta, events })).await?;
         self.live(id)
@@ -1383,6 +1404,7 @@ mod tests {
             title: None,
             parent: None,
             agent: None,
+            code_mode: None,
         }
     }
 

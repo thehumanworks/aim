@@ -217,6 +217,7 @@ fn spec(persistence: Persistence) -> SessionSpec {
         effort: None,
         agent: None,
         persistence,
+        code_mode: None,
     }
 }
 
@@ -828,6 +829,7 @@ fn two_step_host(store: Arc<dyn SessionStore>, gate: Option<Arc<tokio::sync::Sem
                 location: "local".into(),
                 agent: None,
                 shutdown,
+                code_mode: None,
             })
         })
     });
@@ -948,6 +950,7 @@ async fn a_log_from_before_adr_0038_resumes_as_it_did() {
             title: None,
             parent: None,
             agent: None,
+            code_mode: None,
         };
         store.create(meta).await.unwrap();
         let body: EventBody = serde_json::from_value(json!({"kind": "config_changed", "model": "m1", "effort": effort})).unwrap();

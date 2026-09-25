@@ -345,3 +345,139 @@ fn live_acp_claude_code_mode_only_works_through_the_relay() {
     assert!(tools.iter().all(|tool| tool.starts_with("mcp__aim__")), "strict authority: {tools:?}");
     assert!(names_every_todo(&answer), "{answer}");
 }
+
+/// Replays one scripted response per request and records every request (its tools, its input).
+struct Recording {
+    responses: std::sync::Mutex<std::collections::VecDeque<Vec<aim_llm::StreamEvent>>>,
+    seen: std::sync::Mutex<Vec<aim_llm::Request>>,
+}
+
+impl aim_llm::ModelProvider for Recording {
+    fn id(&self) -> &'static str {
+        "scripted"
+    }
+
+    fn catalog(&self) -> aim_llm::BoxFuture<'_, Result<Vec<aim_llm::ModelInfo>, aim_llm::LlmError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn stream(&self, request: aim_llm::Request) -> aim_llm::BoxFuture<'_, Result<aim_llm::EventStream, aim_llm::LlmError>> {
+        self.seen.lock().expect("seen").push(request);
+        let next = self.responses.lock().expect("responses").pop_front().unwrap_or_default();
+        Box::pin(async move {
+            let stream: aim_llm::EventStream = Box::pin(futures_util::stream::iter(next.into_iter().map(Ok)));
+            Ok(stream)
+        })
+    }
+}
+
+fn finished(stop: aim_proto::conversation::StopReason) -> aim_llm::StreamEvent {
+    aim_llm::StreamEvent::Completed { response_id: None, usage: aim_proto::conversation::Usage::default(), stop }
+}
+
+/// T4c: the maintainer's case. A daemon whose own `AIM_CODE_MODE` is off (here explicitly, with the
+/// worker present) serves a client that asks for `on` over a real unix socket: the session says
+/// `on`, offers `run_code`, and a cell really runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_without_code_mode_gives_a_session_the_mode_its_client_asks_for() {
+    use aim::daemon::{client::DaemonClient, server, socket_path};
+    use aim::host::{Connected, HostConfig, NativeServices, SessionClient, SessionHost, native_backends_with};
+    use aim_proto::conversation::{Item, Part, StopReason};
+    use aim_proto::daemon::{Persistence, SessionSpec, SessionState, SessionUpdate};
+    use aim_proto::event::CodeModeSetting;
+    use futures_util::StreamExt as _;
+
+    assert!(worker().exists(), "build the worker first (`cargo build -p aim-coderun`)");
+    let call = Item::ToolCall {
+        call_id: "c1".into(),
+        name: "run_code".into(),
+        arguments: json!({"code": "text(20 + 22)"}).to_string(),
+        native: None,
+    };
+    let answer = Item::Assistant { id: None, parts: vec![Part::Text { text: "done".into() }], native: None };
+    let provider = Arc::new(Recording {
+        responses: std::sync::Mutex::new(
+            vec![
+                vec![aim_llm::StreamEvent::ItemDone { item: call }, finished(StopReason::ToolUse)],
+                vec![aim_llm::StreamEvent::ItemDone { item: answer }, finished(StopReason::EndTurn)],
+            ]
+            .into(),
+        ),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let for_factory = Arc::clone(&provider);
+    let workspaces: aim::host::WorkspaceFactory = Arc::new(|spec: &SessionSpec| {
+        let connected = Connected {
+            tools: Arc::new(Services) as Arc<dyn ToolHost>,
+            root: spec.workspace.clone(),
+            location: "local".into(),
+            project: None,
+            shutdown: Box::new(|| Box::pin(async {})),
+        };
+        Box::pin(async move { Ok(connected) })
+    });
+    let programs = tempfile::tempdir().expect("programs");
+    let host: Arc<dyn SessionClient> = Arc::new(SessionHost::new(HostConfig {
+        store: Arc::new(aim::store::MemoryStore::default()),
+        backends: native_backends_with(
+            Arc::new(move |_, _| Ok((Arc::clone(&for_factory) as Arc<dyn aim_llm::ModelProvider>, "m".into()))),
+            workspaces,
+            4,
+            aim::resources::ResourceConfig::default(),
+            // The daemon's own setting: off. Its worker exists.
+            NativeServices {
+                code: Some(CodeConfig { worker: worker(), user_programs: programs.path().join("programs"), mode: Mode::Off }),
+                ..NativeServices::default()
+            },
+        ),
+        update_capacity: 1024,
+    }));
+    let home = tempfile::tempdir().expect("home");
+    std::fs::set_permissions(home.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("private home");
+    let socket = socket_path(home.path());
+    let served = tokio::spawn({
+        let (home, socket, host) = (home.path().to_path_buf(), socket.clone(), Arc::clone(&host));
+        async move { server::serve(&home, &socket, None, host).await }
+    });
+    let mut client = None;
+    for _ in 0..200 {
+        if let Ok(connected) = DaemonClient::connect(&socket).await {
+            client = Some(connected);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let client = client.expect("the daemon listens");
+    let spec = SessionSpec {
+        workspace: "/w".into(),
+        location: Location::Local,
+        provider: "scripted".into(),
+        model: None,
+        effort: None,
+        agent: None,
+        persistence: Persistence::Ephemeral,
+        code_mode: Some(CodeModeSetting::On),
+    };
+    let created = client.create(spec).await.expect("created");
+    assert_eq!(created.meta.code_mode, Some(CodeModeSetting::On), "the session says what it got");
+    let id = created.meta.id;
+    let (_, mut updates) = client.attach(id.clone()).await.expect("attached");
+    client.prompt(id, vec![Part::Text { text: "go".into() }]).await.expect("prompted");
+    loop {
+        let update = tokio::time::timeout(Duration::from_secs(20), updates.next()).await.expect("the turn ends").expect("an update");
+        if matches!(update, SessionUpdate::StateChanged { state: SessionState::Idle }) {
+            break;
+        }
+    }
+    let seen = provider.seen.lock().expect("seen").clone();
+    assert!(seen.first().is_some_and(|request| request.tools.iter().any(|tool| tool.name == "run_code")), "run_code is offered");
+    let result = seen.get(1).and_then(|request| {
+        request.items.iter().find_map(|item| match item {
+            Item::ToolResult { call_id, result } if call_id == "c1" => Some(result.clone()),
+            _ => None,
+        })
+    });
+    let result = result.expect("the cell's result reached the model");
+    assert!(!result.is_error && format!("{:?}", result.content).contains("42"), "{result:?}");
+    served.abort();
+}

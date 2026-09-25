@@ -687,6 +687,7 @@ fn spec(agent: Option<&str>) -> SessionSpec {
         effort: None,
         agent: agent.map(str::to_owned),
         persistence: Persistence::Ephemeral,
+        code_mode: None,
     }
 }
 
@@ -1220,4 +1221,89 @@ async fn code_modes_compose_their_tool_lists_and_never_widen_a_ceiling() {
         assert_eq!(instructions.contains("# Code mode"), code, "mode {mode:?}, agent tools {agent_tools:?}");
         assert!(instructions.starts_with(aim::context::SYSTEM_PROMPT.trim_end()), "the system prompt comes first");
     }
+}
+
+/// T4c (ADR 0076): a session's own code mode wins over the daemon's, its guards still apply, the
+/// summary publishes what it got, and a resumed session asks for what it had.
+#[tokio::test]
+async fn a_session_s_code_mode_wins_is_guarded_and_is_kept_on_resume() {
+    use aim::coderun::mode::Mode;
+    use aim_proto::event::CodeModeSetting;
+    type Case<'a> = (Option<Mode>, Option<&'a str>, Option<CodeModeSetting>, &'a [&'a str], CodeModeSetting);
+
+    let programs = tempfile::tempdir().unwrap();
+    let code = |mode| CodeConfig { worker: "/nonexistent/aim-coderun".into(), user_programs: programs.path().join("programs"), mode };
+    // (daemon's CodeConfig, agent tools, session setting) → (offered, effective).
+    let cases: [Case<'_>; 5] = [
+        (
+            Some(Mode::Off),
+            None,
+            Some(CodeModeSetting::On),
+            &["Read", "Write", "run_code", "save_program", "run_program", "list_programs"],
+            CodeModeSetting::On,
+        ),
+        (Some(Mode::On), None, Some(CodeModeSetting::Off), &["Read", "Glob", "Write"], CodeModeSetting::Off),
+        (Some(Mode::Off), None, None, &["Read", "Glob", "Write"], CodeModeSetting::Off),
+        // Guards after precedence: no worker, or a ceiling without run_code, leaves it off.
+        (None, None, Some(CodeModeSetting::Only), &["Read", "Glob", "Write"], CodeModeSetting::Off),
+        (Some(Mode::Off), Some("Read, Glob"), Some(CodeModeSetting::Only), &["Read", "Glob"], CodeModeSetting::Off),
+    ];
+    for (daemon, agent_tools, session_mode, expected, effective) in cases {
+        let services = NativeServices { code: daemon.map(code), ..NativeServices::default() };
+        let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(reader_project(agent_tools)));
+        let f = fixture_on(Arc::new(MemoryStore::default()), Vec::new(), vec![text("done")], services, move |spec| Connected {
+            tools: Arc::new(CodeModeWorkspace) as Arc<dyn ToolHost>,
+            root: spec.workspace.clone(),
+            location: "local".into(),
+            project: Some(Arc::clone(&files)),
+            shutdown: Box::new(|| Box::pin(async {})),
+        });
+        let mut session =
+            if agent_tools.is_some() { persistent("reader") } else { SessionSpec { persistence: Persistence::Persistent, ..spec(None) } };
+        session.code_mode = session_mode;
+        let created = f.host.create(session).await.unwrap();
+        assert_eq!(created.meta.code_mode, Some(effective), "the summary says what it got: {daemon:?} {agent_tools:?} {session_mode:?}");
+        let id = created.meta.id;
+        let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+        f.host.prompt(id, vec![Part::Text { text: "go".into() }]).await.unwrap();
+        until_idle(&mut updates).await;
+        let offered: Vec<String> = f.provider.seen.lock().unwrap()[0].tools.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(offered, expected, "{daemon:?} {agent_tools:?} {session_mode:?}");
+    }
+
+    // Resume: a session created `on` under a daemon whose own mode is off comes back `on`.
+    let store = Arc::new(MemoryStore::default());
+    let services = NativeServices { code: Some(code(Mode::Off)), ..NativeServices::default() };
+    let f = fixture_on(Arc::clone(&store), Vec::new(), vec![text("first"), text("second")], services, move |spec| Connected {
+        tools: Arc::new(CodeModeWorkspace) as Arc<dyn ToolHost>,
+        root: spec.workspace.clone(),
+        location: "local".into(),
+        project: None,
+        shutdown: Box::new(|| Box::pin(async {})),
+    });
+    let mut session = SessionSpec { persistence: Persistence::Persistent, ..spec(None) };
+    session.code_mode = Some(CodeModeSetting::On);
+    let id = f.host.create(session).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    f.host.prompt(id.clone(), vec![Part::Text { text: "go".into() }]).await.unwrap();
+    until_idle(&mut updates).await;
+    f.host.close(id.clone()).await.unwrap();
+    // Another host (as after a daemon restart) on the same store, whose own mode is still off.
+    let services = NativeServices { code: Some(code(Mode::Off)), ..NativeServices::default() };
+    let g = fixture_on(Arc::clone(&store), Vec::new(), vec![text("second")], services, move |spec| Connected {
+        tools: Arc::new(CodeModeWorkspace) as Arc<dyn ToolHost>,
+        root: spec.workspace.clone(),
+        location: "local".into(),
+        project: None,
+        shutdown: Box::new(|| Box::pin(async {})),
+    });
+    let (resumed, mut updates) = g.host.attach(id.clone()).await.unwrap();
+    assert_eq!(resumed.summary.meta.code_mode, Some(CodeModeSetting::On), "resumed as it was");
+    g.host.prompt(id, vec![Part::Text { text: "again".into() }]).await.unwrap();
+    until_idle(&mut updates).await;
+    let seen = g.provider.seen.lock().unwrap();
+    assert!(
+        seen.first().is_some_and(|request| request.tools.iter().any(|t| t.name == "run_code")),
+        "the resumed session still offers run_code"
+    );
 }

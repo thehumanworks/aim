@@ -31,7 +31,7 @@ use aim_acp::{
 use aim_proto::conversation::{Item, Part, StopReason};
 use aim_proto::daemon::{Location, Persistence, SessionSpec, SessionUpdate};
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::event::EffortSource;
+use aim_proto::event::{CodeModeSetting, EffortSource};
 use aim_proto::harness::{FsRead, FsReadParams, FsRemove, FsRemoveParams};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::ToolResult;
@@ -238,7 +238,11 @@ impl AcpBackend {
         Ok(Self { client, session, scratch: None })
     }
 
-    async fn start_strict(agent: AcpAgentConfig, spec: &SessionSpec, aimx: &Path) -> Result<(Self, String, String), String> {
+    async fn start_strict(
+        agent: AcpAgentConfig,
+        spec: &SessionSpec,
+        aimx: &Path,
+    ) -> Result<(Self, String, String, CodeModeSetting), String> {
         let (root, location, scratch, project, remote) = match &spec.location {
             Location::Local => {
                 let root = std::fs::canonicalize(&spec.workspace).map_err(|err| format!("{}: {err}", spec.workspace))?;
@@ -261,7 +265,8 @@ impl AcpBackend {
         };
         let cwd = scratch.as_ref().map_or_else(|| PathBuf::from(&root), |dir| dir.path().to_path_buf());
         let aim = aim_executable();
-        let (relay, route) = strict_relay(aim.as_deref(), aimx, &root, &spec.location, crate::providers::code_mode());
+        let (relay, route, code_mode) =
+            strict_relay(aim.as_deref(), aimx, &root, &spec.location, crate::providers::code_mode(), spec.code_mode);
         let client = AcpClient::spawn(agent.with_cwd(cwd.clone())).await.map_err(|err| err.to_string())?;
         let mut options = SessionOptions::strict_aim_via(&cwd, relay.clone(), route.clone()).map_err(|err| err.to_string())?;
         options.system_prompt_append = Some(authority_prompt(&root, &location, project.as_ref()));
@@ -322,7 +327,7 @@ impl AcpBackend {
         if let Some(effort) = spec.effort.as_deref() {
             session.set_config(&ConfigKey::Effort, effort).await.map_err(|err| err.to_string())?;
         }
-        Ok((Self { client, session, scratch }, root, location))
+        Ok((Self { client, session, scratch }, root, location, code_mode))
     }
 
     /// The model and effort in force.
@@ -546,30 +551,37 @@ fn aim_executable() -> Option<PathBuf> {
     std::env::current_exe().ok().filter(|exe| exe.file_name().is_some_and(|name| name == "aim"))
 }
 
-/// The strict relay for a workspace, and its kind. When code mode is on or only (ADR 0076) and
-/// aim's own executable is known, it is aim's code-mode relay (`aim code-mcp`), which connects the
-/// workspace through `aimx` and shows the mode's direct tools beside `run_code`; otherwise it is
-/// `aimx mcp`, as before.
+/// The strict relay for a workspace, its kind, and the session's effective code mode. The mode is
+/// the session's own setting, else this process's (ADR 0076), after the guards (the worker, and
+/// aim's own executable to serve the relay). When it is on or only, the relay is aim's code-mode
+/// relay (`aim code-mcp`), which connects the workspace through `aimx` and shows the mode's direct
+/// tools beside `run_code`; otherwise it is `aimx mcp`, as before.
 fn strict_relay(
     aim: Option<&Path>,
     aimx: &Path,
     root: &str,
     location: &Location,
     code: Option<crate::host::CodeConfig>,
-) -> (McpServerSpec, aim_acp::AimRoute) {
-    let (Some(aim), Some(code)) = (aim, code) else { return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx) };
+    session: Option<CodeModeSetting>,
+) -> (McpServerSpec, aim_acp::AimRoute, CodeModeSetting) {
+    use crate::coderun::mode;
+    let daemon = code.as_ref().map_or(mode::CodeModeRequest::Unset, |code| mode::CodeModeRequest::Set(code.mode));
     // An ACP session has no named agent (refused above), so its ceiling permits `run_code`.
-    let exposure = crate::coderun::mode::decide(crate::coderun::mode::CodeModeRequest::Set(code.mode), true, true, true);
-    if !exposure.code {
-        return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx);
-    }
+    let available = code.is_some() && aim.is_some();
+    let exposure = mode::decide_for_session(session, daemon, available, code.is_some() || cfg!(target_os = "macos"), true);
+    let effective = mode::to_setting(exposure.mode);
+    let (Some(aim), Some(code)) = (aim, code.filter(|_| exposure.code)) else {
+        return (aimx_relay(aimx, root, location), aim_acp::AimRoute::Aimx, effective);
+    };
+    // The relay serves the session's effective mode, not this process's.
+    let code = crate::host::CodeConfig { mode: exposure.mode, ..code };
     // The built-ins aim replaces, by the names the relay shows them under.
     let builtins: Vec<&str> = aim_acp::DEFAULT_ALIASES.iter().map(|(name, _)| *name).collect();
-    let direct = crate::coderun::mode::direct_names(exposure.direct, &builtins, &crate::coderun::mode::COMPACT_HIDDEN);
+    let direct = mode::direct_names(exposure.direct, &builtins, &mode::COMPACT_HIDDEN);
     let relay = crate::mcp::proxy::CodeRelay { root: root.to_owned(), location: location.clone(), aimx: aimx.to_path_buf(), code };
     let spec =
         McpServerSpec::Stdio { name: aim_acp::AIM_MCP_SERVER.to_owned(), command: aim.to_path_buf(), args: relay.args(), env: relay.env() };
-    (spec, aim_acp::AimRoute::Code { direct })
+    (spec, aim_acp::AimRoute::Code { direct }, effective)
 }
 
 fn aimx_relay(aimx: &Path, root: &str, location: &Location) -> McpServerSpec {
@@ -630,7 +642,7 @@ pub fn with_acp_at(native: BackendFactory, aimx: PathBuf) -> BackendFactory {
                     "this session's context lives in Claude Code, and resuming it (session/load) is not wired yet; start a new session",
                 ));
             }
-            let (backend, root, location) = if spec.provider == "acp:claude-native" {
+            let (backend, root, location, code_mode) = if spec.provider == "acp:claude-native" {
                 if !matches!(spec.location, Location::Local) {
                     return Err(unavailable("Claude Code native tools cannot act on a remote workspace"));
                 }
@@ -640,13 +652,14 @@ pub fn with_acp_at(native: BackendFactory, aimx: PathBuf) -> BackendFactory {
                 let backend = AcpBackend::start(agent, root.clone(), spec.model.as_deref(), spec.effort.as_deref())
                     .await
                     .map_err(|e| unavailable(&format!("{}: {e}", spec.provider)))?;
-                (backend, root.to_string_lossy().into_owned(), "local:native-tools".to_owned())
+                // Claude's own tools: aim's code mode does not apply.
+                (backend, root.to_string_lossy().into_owned(), "local:native-tools".to_owned(), CodeModeSetting::Off)
             } else {
                 AcpBackend::start_strict(agent, &spec, &aimx).await.map_err(|e| unavailable(&format!("{}: {e}", spec.provider)))?
             };
             let (model, _) = backend.config();
             let shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send> = Box::new(|| Box::pin(async {}));
-            Ok(Built { backend: Box::new(backend), model, root, location, agent: None, shutdown })
+            Ok(Built { backend: Box::new(backend), model, root, location, agent: None, shutdown, code_mode: Some(code_mode) })
         });
         fut
     })
@@ -780,17 +793,19 @@ mod tests {
         use std::path::Path;
 
         use aim_proto::daemon::Location;
+        use aim_proto::event::CodeModeSetting;
 
         use crate::coderun::mode::Mode;
         use crate::host::CodeConfig;
 
         let (aim, aimx) = (Path::new("/opt/aim/aim"), Path::new("/opt/aim/aimx"));
         let code = |mode| CodeConfig { worker: "/opt/aim/aim-coderun".into(), user_programs: "/home/u/.aim/programs".into(), mode };
-        let params = |code: Option<CodeConfig>, location: &Location| {
-            let (relay, route) = super::strict_relay(Some(aim), aimx, "/w", location, code);
+        let params = |code: Option<CodeConfig>, session: Option<CodeModeSetting>, location: &Location| {
+            let (relay, route, _) = super::strict_relay(Some(aim), aimx, "/w", location, code, session);
             SessionOptions::strict_aim_via("/w", relay, route).unwrap().new_session_params()
         };
-        let on = params(Some(code(Mode::On)), &Location::Local);
+        // T4c: a daemon whose own mode is off serves a session that asks for `on` through the relay.
+        let on = params(Some(code(Mode::Off)), Some(CodeModeSetting::On), &Location::Local);
         assert_eq!(on["mcpServers"][0]["name"], "aim");
         assert_eq!(on["mcpServers"][0]["command"], "/opt/aim/aim");
         assert_eq!(
@@ -820,15 +835,21 @@ mod tests {
             (&options["tools"], &options["allowedTools"], &options["strictMcpConfig"]),
             (&json!([]), &json!(["mcp__aim"]), &json!(true))
         );
-        let only = params(Some(code(Mode::Only)), &Location::Ssh { destination: "box".into() });
+        let only = params(Some(code(Mode::Only)), None, &Location::Ssh { destination: "box".into() });
         assert_eq!(only["mcpServers"][0]["args"][10], "only");
         assert_eq!((&only["mcpServers"][0]["args"][11], &only["mcpServers"][0]["args"][12]), (&json!("--ssh"), &json!("box")));
         assert_eq!(only["_meta"]["claudeCode"]["options"]["toolAliases"], json!({}), "`only` shows no direct tool to alias");
-        let off = params(None, &Location::Local);
+        let off = params(None, Some(CodeModeSetting::On), &Location::Local);
         assert_eq!(off["mcpServers"][0]["command"], "/opt/aim/aimx");
         assert_eq!(off["mcpServers"][0]["args"], json!(["mcp", "--stdio", "--root", "/w"]));
         assert_eq!(off["_meta"]["claudeCode"]["options"]["toolAliases"]["Glob"], "mcp__aim__glob");
         assert!(off["_meta"]["claudeCode"]["options"]["env"].get("MCP_TOOL_TIMEOUT").is_none(), "aimx mcp is unchanged");
+        // Without the worker a request for `on` gets `aimx mcp`, and the session says it is off.
+        let (_, route, effective) = super::strict_relay(Some(aim), aimx, "/w", &Location::Local, None, Some(CodeModeSetting::On));
+        assert_eq!((route, effective), (aim_acp::AimRoute::Aimx, CodeModeSetting::Off));
+        // A session that asks for `off` gets `aimx mcp` from a daemon whose own mode is on.
+        let asked_off = params(Some(code(Mode::On)), Some(CodeModeSetting::Off), &Location::Local);
+        assert_eq!(asked_off["mcpServers"][0]["command"], "/opt/aim/aimx");
     }
 
     #[test]

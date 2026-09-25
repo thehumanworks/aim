@@ -517,6 +517,7 @@ impl Runner {
                     effort: self.options.effort.clone(),
                     agent: Some(confined_agent),
                     persistence: Persistence::Persistent,
+                    code_mode: None,
                 })
                 .await
                 .map_err(error)?;

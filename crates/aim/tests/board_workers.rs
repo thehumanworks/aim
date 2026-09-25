@@ -100,6 +100,7 @@ impl SessionClient for Scripted {
                         allow: Some(["Edit", "Glob", "Grep", "LS", "Read", "Write"].into_iter().map(str::to_owned).collect()),
                         deny: Vec::new(),
                     }),
+                    code_mode: None,
                 },
                 state: SessionState::Idle,
                 persistence: Persistence::Persistent,
