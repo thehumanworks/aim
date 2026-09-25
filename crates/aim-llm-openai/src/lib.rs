@@ -68,8 +68,14 @@ fn http_error(status: StatusCode, retry_after: Option<&header::HeaderValue>, bod
         _ => LlmErrorKind::InvalidRequest,
     };
     let message = if status.as_u16() == 402 { "provider payment required" } else { "provider rejected request" };
-    let retry_after_ms =
-        retry_after.and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u64>().ok()).map(|seconds| seconds.saturating_mul(1000));
+    let retry_after_ms = retry_after.and_then(|v| v.to_str().ok()).and_then(|value| {
+        value.parse::<u64>().ok().map(|seconds| seconds.saturating_mul(1000)).or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()
+                .and_then(|date| date.duration_since(std::time::SystemTime::now()).ok())
+                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        })
+    });
     LlmError { kind, message: message.into(), status: Some(status.as_u16()), retry_after_ms }
 }
 
@@ -231,6 +237,9 @@ cost_in_usage = false
             assert_eq!(error.kind, expected);
             assert_eq!(error.retry_after_ms, Some(2000));
         }
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let date = header::HeaderValue::from_str(&httpdate::fmt_http_date(future))?;
+        assert!(http_error(StatusCode::TOO_MANY_REQUESTS, Some(&date), "").retry_after_ms.is_some_and(|delay| delay > 0));
         Ok(())
     }
 
