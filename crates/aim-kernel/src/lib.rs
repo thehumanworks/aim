@@ -37,4 +37,5 @@ pub mod job;
 pub mod negotiate;
 pub mod path;
 pub mod policy;
+pub mod subagents;
 pub mod turn;

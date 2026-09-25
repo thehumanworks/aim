@@ -35,6 +35,12 @@ pub struct SessionMeta {
     /// For a fork: the parent session and the last parent event the fork shares.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ForkPoint>,
+    /// The parent agent call that created this child session, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_parent: Option<SubagentParent>,
+    /// Inherited tool ceiling for a child session, applied again on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_ceiling: Option<SessionToolCeiling>,
     /// The named agent definition the session runs as, with the tool ceiling in force when it was
     /// created. A resumed session applies the agent again and can only narrow that ceiling
     /// (ADR 0038). Absent for the default agent and in logs written before ADR 0038.
@@ -84,6 +90,38 @@ pub struct ForkPoint {
     pub seq: u64,
 }
 
+/// The agent call responsible for creating a child session.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SubagentParent {
+    /// Parent session id.
+    pub session: String,
+    /// Tool call id in the parent session.
+    pub call_id: String,
+}
+
+/// A child session's inherited tool ceiling, retained for safe resume.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SessionToolCeiling {
+    /// Only these tools may be offered or called (`None`: every tool the parent offers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+    /// These tools are never offered or called.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+/// How a child agent stopped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    /// The child returned a final answer.
+    Completed,
+    /// The child failed or crashed.
+    Failed,
+    /// The child was cancelled.
+    Cancelled,
+}
+
 /// One entry of a session log.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SessionEvent {
@@ -105,6 +143,32 @@ pub struct SessionEvent {
 pub enum EventBody {
     /// A turn started.
     TurnStarted,
+    /// A child session started for an agent tool call.
+    #[serde(rename = "subagent.start")]
+    SubagentStarted {
+        /// Parent session id.
+        parent_session: String,
+        /// Tool call id in the parent session.
+        call_id: String,
+        /// Child session id.
+        child_session: String,
+        /// Short user-facing task description.
+        description: String,
+    },
+    /// A child session stopped.
+    #[serde(rename = "subagent.stop")]
+    SubagentStopped {
+        /// Parent session id.
+        parent_session: String,
+        /// Tool call id in the parent session.
+        call_id: String,
+        /// Child session id.
+        child_session: String,
+        /// Short user-facing task description.
+        description: String,
+        /// How the child stopped.
+        status: SubagentStatus,
+    },
     /// A conversation item was added.
     Item {
         /// The item.
@@ -200,4 +264,63 @@ pub struct DecisionRecord {
     pub input_tokens: Option<u64>,
     /// Estimated list-price cost, in micro-US dollars.
     pub cost_micro_usd: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{EventBody, SessionMeta, SessionToolCeiling, SubagentParent, SubagentStatus};
+    use crate::daemon::SessionUpdate;
+
+    #[test]
+    fn subagent_parent_is_optional_and_distinct_from_fork() {
+        let old = json!({
+            "id": "child", "created_ms": 1, "workspace": "/w", "location": "local",
+            "provider": "p", "model": "m"
+        });
+        let mut meta: SessionMeta = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(meta.subagent_parent, None);
+        assert_eq!(meta.subagent_ceiling, None);
+        assert_eq!(serde_json::to_value(&meta).unwrap(), old);
+        meta.subagent_parent = Some(SubagentParent { session: "parent".into(), call_id: "call".into() });
+        meta.subagent_ceiling = Some(SessionToolCeiling { allow: Some(vec!["Read".into()]), deny: vec!["Write".into()] });
+        let wire = serde_json::to_value(&meta).unwrap();
+        assert_eq!(wire["subagent_parent"], json!({"session": "parent", "call_id": "call"}));
+        assert_eq!(wire["subagent_ceiling"], json!({"allow": ["Read"], "deny": ["Write"]}));
+        assert_eq!(serde_json::from_value::<SessionMeta>(wire).unwrap(), meta);
+    }
+
+    #[test]
+    fn subagent_lifecycle_round_trips_on_log_and_wire() {
+        let started = EventBody::SubagentStarted {
+            parent_session: "parent".into(),
+            call_id: "call".into(),
+            child_session: "child".into(),
+            description: "Inspect parser".into(),
+        };
+        let stopped = EventBody::SubagentStopped {
+            parent_session: "parent".into(),
+            call_id: "call".into(),
+            child_session: "child".into(),
+            description: "Inspect parser".into(),
+            status: SubagentStatus::Completed,
+        };
+        for (body, kind) in [(started, "subagent.start"), (stopped, "subagent.stop")] {
+            let wire = serde_json::to_value(&body).unwrap();
+            assert_eq!(wire["kind"], kind);
+            assert_eq!(serde_json::from_value::<EventBody>(wire).unwrap(), body);
+        }
+        let update = SessionUpdate::SubagentStopped {
+            parent_session: "parent".into(),
+            call_id: "call".into(),
+            child_session: "child".into(),
+            description: "Inspect parser".into(),
+            status: SubagentStatus::Failed,
+        };
+        let wire = serde_json::to_value(&update).unwrap();
+        assert_eq!(wire["type"], "subagent.stop");
+        assert_eq!(wire["status"], "failed");
+        assert_eq!(serde_json::from_value::<SessionUpdate>(wire).unwrap(), update);
+    }
 }

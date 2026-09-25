@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::content::Base64Bytes;
 use crate::conversation::{Item, Part, RateLimits, StopReason, Usage};
-use crate::event::{EffortSource, SessionMeta};
+use crate::event::{EffortSource, SessionMeta, SubagentStatus};
 use crate::harness::{AuthProof, GenerationRange, PeerInfo};
 use crate::ids::IdempotencyKey;
 use crate::tool::ToolResult;
@@ -151,6 +151,32 @@ pub enum SessionUpdate {
     TurnStarted {
         /// Turn number (1-based).
         turn: u64,
+    },
+    /// A child session started for an agent tool call.
+    #[serde(rename = "subagent.start")]
+    SubagentStarted {
+        /// Parent session id.
+        parent_session: String,
+        /// Tool call id in the parent session.
+        call_id: String,
+        /// Child session id.
+        child_session: String,
+        /// Short user-facing task description.
+        description: String,
+    },
+    /// A child session stopped.
+    #[serde(rename = "subagent.stop")]
+    SubagentStopped {
+        /// Parent session id.
+        parent_session: String,
+        /// Tool call id in the parent session.
+        call_id: String,
+        /// Child session id.
+        child_session: String,
+        /// Short user-facing task description.
+        description: String,
+        /// How the child stopped.
+        status: SubagentStatus,
     },
     /// A model request started (1-based within the turn).
     RequestStarted {
