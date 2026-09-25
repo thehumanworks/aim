@@ -143,9 +143,33 @@ pub(super) async fn connect_ssh(options: &ForwardOptions) -> Result<Connection, 
     Ok(connection)
 }
 
+/// Whether a binary built for this process's OS and CPU runs on `target` (a triple from
+/// [`bootstrap::target_for_uname`]). Linux C-library differences are not checked here: the
+/// resident install then fails and the caller falls back to agentless SSH.
+fn runs_here(target: &str) -> bool {
+    let os = if target.contains("-apple-darwin") {
+        "macos"
+    } else if target.contains("-linux") {
+        "linux"
+    } else {
+        return false;
+    };
+    target.split('-').next() == Some(std::env::consts::ARCH) && os == std::env::consts::OS
+}
+
 pub(super) async fn remote_binary(connection: &Connection, options: &ForwardOptions) -> Result<VerifiedBinary, String> {
     let probe = bootstrap::probe(connection).await.map_err(|err| format!("probe: {err:?}"))?;
     let target = probe.target.ok_or("unsupported SSH host")?;
+    // Without an explicit artifact, the only binary on hand is this aimx: offer it only to a host
+    // of the same OS and CPU. A macOS aimx must never be installed on a Linux host (it would
+    // fail to execute there instead of falling back to agentless SSH).
+    if options.artifact.is_none() && !runs_here(target) {
+        return Err(format!(
+            "no aimx build for {target} (this aimx is {}-{}); pass --artifact",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+    }
     let path = options.artifact.clone().map_or_else(std::env::current_exe, Ok).map_err(|err| err.to_string())?;
     let sha256 = if let Some(hash) = &options.sha256 {
         hash.clone()
@@ -178,6 +202,18 @@ async fn serve_agentless(connection: Connection, options: &ForwardOptions) -> Re
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_a_host_of_this_os_and_cpu_gets_this_aimx() {
+        let here = format!("{}-{}", std::env::consts::ARCH, if cfg!(target_os = "macos") { "apple-darwin" } else { "unknown-linux-musl" });
+        assert!(super::runs_here(&here));
+        assert!(!super::runs_here(if cfg!(target_os = "macos") { "aarch64-unknown-linux-musl" } else { "aarch64-apple-darwin" }));
+        assert!(!super::runs_here(if cfg!(target_os = "macos") { "x86_64-unknown-linux-musl" } else { "x86_64-apple-darwin" }));
+        let other_arch = if std::env::consts::ARCH == "aarch64" { "x86_64" } else { "aarch64" };
+        assert!(!super::runs_here(&here.replacen(std::env::consts::ARCH, other_arch, 1)));
+        assert!(!super::runs_here("riscv64-unknown-freebsd"));
+    }
+
     use std::os::unix::fs::symlink;
 
     use super::AskpassScript;

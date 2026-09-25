@@ -21,46 +21,128 @@ W25), and the [ADR index](adr/README.md).
 - **`main` is at `eaee693` or later.** The last merges were W30 (UI surfaces), FIX15 (board, with three new locks), FIX19, W29 (MCP) and the REV13b web fixes.
 - **Not on `main`:** ten branches, listed in §4. None of them is needed for `main` to work.
 
-## 2. How to build and try it
+## 2. Build and run
+
+### 2.1 Build (once, and after every `git pull`)
 
 ```sh
-mise install                      # the pinned toolchain: Rust 1.98.1, Verus, node, python…
-CARGO_PROFILE_DEV_DEBUG=0 cargo build --release -p aim -p aimx -p aim-coderun
-export PATH="$PWD/target/release:$PATH"   # aim finds aimx and aim-coderun next to itself
+cd ~/projects/aim
+git pull                                   # main is 5618108 or later
+mise install                               # pinned toolchain; a no-op when already installed
+cargo build --release --locked -p aim -p aimx -p aim-coderun     # about 3 min
+export PATH="$PWD/target/release:$PATH"    # aim finds aimx and aim-coderun next to itself
+aim daemon stop 2>/dev/null                # so the next `aim` starts a daemon from this build
 ```
 
-**Credentials:**
-- **codex:** reads `~/.codex/auth.json`. The agents only borrowed it read-only; `aim login codex`
-  exists but was never run.
-- **OpenRouter:** `OPENROUTER_API_KEY`.
-- **Vercel AI Gateway:** `AI_GATEWAY_API_KEY`.
-- **Claude Code:** `aim login claude`, through the pinned `claude-agent-acp`.
+- Release binaries are small: `aim` 19.5 MB, `aimx` 7.7 MB, `aim-coderun` 3.7 MB.
+- The three binaries always go together:
+  - `aim`: the CLI, TUI and daemon;
+  - `aimx`: the tool harness that every file, shell and search call goes through;
+  - `aim-coderun`: the code-mode sandbox worker, macOS only.
+- After rebuilding, always run `aim daemon stop`. Persistent sessions live in a background daemon
+  that the TUI starts on demand, and a daemon left over from an old build would keep serving the
+  old code.
 
-If a daemon from an older build is running, stop it first with `aim daemon stop`.
+### 2.2 Credentials
 
-A suggested validation pass, roughly in order of value:
-
-| Try | Command | What to look for |
+| Provider (`-p`) | Needs | Notes |
 |---|---|---|
-| TUI, inline | `aim` (codex by default) or `aim -p openrouter -m openai/gpt-4.1-mini` | Streaming, tool rows, `/` commands, `/fullscreen` |
-| TUI, fullscreen | `aim --fullscreen` | Layout, the side panel |
-| Private session | `aim --ephemeral` | Nothing written to `~/.aim` (no session, no history) |
-| Headless | `aim run -p openrouter -m openai/gpt-4.1-mini "…"` (add `--json` for events) | One turn, exit code, edits in the cwd |
-| SSH shadowing | `aim run --ssh <host> -C /remote/dir "…"` | Every tool call runs on the remote; the local tree is untouched |
-| Claude Code | `aim -p acp:claude` | Claude runs on aim's tools, under aim's authority |
-| Resume and attach | `aim sessions`, then `aim --session <id>` | The session survives closing the TUI (it lives in the daemon) |
-| Search past sessions | `aim search-sessions "…"` | Ranked excerpts |
-| Codex services | `aim search "…"`, `aim image "…" out.png`, `aim transcribe f.wav` | Answers, citations, files |
-| MCP | `aim mcp list`, `aim mcp trust <name>`, then a session | `mcp__<server>__<tool>` tools. `aim mcp --stdio` serves aim's tools to other agents |
-| Board | `aim board post …`, `aim board list`, `aim board show <job>` | Durable jobs. Workers are file-only for now (§5) |
-| Web UI | `mise run web:build`, `aim daemon token create`, `aim daemon --web 127.0.0.1:8080` | A browser client with private sessions (Origin, CSP, TLS rules in ADR 0051) |
-| Code mode (macOS) | Ask a model to use `run_code` | A sandboxed QuickJS worker, and saved programs |
-| UI surfaces (W30) | Ask for "a table of X with a progress bar via `ui_show`" | A rendered table and progress bar in the TUI and the web |
-| Offline benchmark | `mise run bench:wire` | The wire tier against the pinned peers (codex, pi) |
-| Live smokes | `mise run smoke` | **Costs money and codex subscription runs**; needs every credential |
+| `codex` (default) | `~/.codex/auth.json` from the Codex CLI | aim only reads it. `aim login codex` exists but has never been run |
+| `openrouter` | `OPENROUTER_API_KEY` | e.g. `-m openai/gpt-4.1-mini` (cheap) or any OpenRouter model id |
+| `ai-gateway` | `AI_GATEWAY_API_KEY` | Vercel AI Gateway model ids |
+| `acp:claude` | Claude Code signed in (`aim login claude` if not) | Claude Code runs on aim's tools, under aim's authority |
 
-The live smoke tests (`#[ignore]`, named `live_*`) are the evidence behind every integration
-(ADR 0022). Run them selectively with `cargo test -p <crate> -- --ignored live_<name>`.
+### 2.3 Run
+
+```sh
+aim                                  # TUI, inline, codex, in the current directory
+aim -p openrouter -m openai/gpt-4.1-mini -C ~/some/repo
+aim --fullscreen                     # or toggle with /fullscreen
+aim --ephemeral                      # private: nothing written to disk
+aim run "fix the failing test"       # headless, one turn; --json prints every event
+aim run --ssh myhost -C /srv/app "…" # every tool call runs on myhost (see the gap below)
+aim sessions                         # list sessions; `aim --session <id>` re-attaches
+```
+
+- **TUI keys:** `Enter` sends. `Ctrl-C` cancels a running turn, clears the composer when idle, and
+  quits when pressed twice. `/` opens the commands: `/model`, `/effort`, `/new`, `/sessions`,
+  `/cancel`, `/fullscreen`, `/help`, `/quit`. `/dictate` is listed but not wired in the TUI yet.
+- **The web UI**, in its own terminal:
+
+  ```sh
+  mise run web:build                           # about 40 s; builds crates/aim-web/dist
+  aim daemon stop 2>/dev/null
+  aim daemon token create                      # prints a bearer once; copy it
+  aim daemon --web 127.0.0.1:8080              # foreground; the TUI shares this daemon
+  ```
+
+  Open **exactly** `http://127.0.0.1:8080`. `localhost` is a different Origin and is refused.
+  Paste the token when the page asks for it.
+- **Logs:** `~/.aim/logs/daemon.log`. **Store:** `~/.aim/aim.db`.
+
+### 2.4 Known gaps to expect
+
+- **SSH from your Mac to a Linux host.** The resident mode would need a Linux `aimx` build, and
+  aim does not cross-compile one. Until the fix in `main` after `5618108`, aim tried to install the
+  macOS `aimx` there and failed; it now falls back to plain SSH commands (agentless mode). A
+  Mac-to-Mac host with the same CPU gets the resident aimx.
+- **The TUI has no `--ssh` flag.** Start an SSH session with `aim run --ssh <host> -C <dir> "…"`,
+  then attach to it from the TUI with `/sessions`. `aim --remote wss://…` (a network aimx) does work
+  in the TUI. Adding `--ssh` to the TUI is a small follow-up.
+- Board workers are file-only (no shell) until W31 lands (§5).
+- Code mode and the plugin worker sandbox are macOS only.
+
+### 2.5 What I'd like you to test
+
+These need a human: judgement of feel and looks, your real machines and accounts. They are in
+priority order, and even the first three help a lot.
+
+1. **Daily-drive the TUI on a real task, about 20 minutes.** Run `aim` in this repo or another
+   repo you work on, with codex, and give it a genuine small change.
+   - Is streaming smooth?
+   - Are tool rows readable?
+   - Does `Ctrl-C` cancel promptly?
+   - Can you type the next prompt while a turn runs?
+   - Do `/model` and `/effort` apply?
+   - Quit, run `aim` again, and use `/sessions`: the conversation should come back intact.
+   - Tell me what feels slow, ugly, confusing or missing compared with Codex CLI and Claude Code.
+2. **Inline against fullscreen, in your terminal.** Try both layouts through a long answer, a big
+   diff and a window resize. Screenshots of anything that renders wrong are ideal.
+3. **SSH shadowing on a host you really use:** `aim run --ssh <host> -C <dir> "create hello.txt
+   and list the directory"`.
+   - The file must appear **on the host** and nowhere locally.
+   - Then attach from the TUI with `/sessions` and continue the conversation.
+   - aim installs a resident aimx on the host if it can, and falls back to plain SSH commands if
+     not. Tell me the host's OS, and whether `~/.aim` appeared there.
+4. **Claude Code through aim:** `aim -p acp:claude`, with one small edit. It should behave like
+   Claude Code, but every tool call goes through aim.
+5. **Private mode:** `aim --ephemeral`, then chat. Afterwards `aim sessions` must not list it, and
+   your prompt history must not contain it.
+6. **The web UI** (§2.3): open a session in the browser, send a prompt, and watch it stream. Open
+   the same session in the TUI with `/sessions` and see that both follow it.
+7. **Your existing MCP servers:** `aim mcp list` should show the servers from your Claude, Codex
+   and Cursor configs as untrusted. Trust one with `aim mcp trust <name>`, and a new session
+   should offer its tools as `mcp__<name>__…`.
+8. **Search your history:** after a few sessions, `aim search-sessions "<something you discussed>"`.
+9. **Spot checks:**
+   - **Code mode (macOS):** in a session, ask it to "use run_code to count the lines of every .rs
+     file under crates/aim/src".
+   - **UI surfaces:** ask it to "use ui_show to show a table of the 5 largest files with a
+     progress bar".
+   - **Codex services:** `aim search "…"`, `aim image "…" -o out.png`.
+
+**Please don't run yet:**
+- `aim login codex`: it has not been tested against your shared codex auth.
+- `mise run smoke`: it spends money and codex subscription runs across every provider. Individual
+  tests are fine.
+
+**What helps me most in a report:**
+- what you did, what you expected, and what happened;
+- the session id from `aim sessions`;
+- a screenshot for anything visual;
+- the tail of `~/.aim/logs/daemon.log` if something failed.
+
+Rough notes are enough. I turn each one into a fix task with a regression test.
 
 ## 3. What `main` contains
 
