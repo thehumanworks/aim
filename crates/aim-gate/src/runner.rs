@@ -81,10 +81,25 @@ fn complete(mut command: Command, timeout: Duration) -> Result<CommandResult> {
         }
         thread::sleep(Duration::from_millis(25));
     };
+    // The leader may have left a descendant that closed its output socket. Stop the entire
+    // confined process group before inspecting final artifacts or accepting a result.
+    if let Some(pid) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) {
+        let _signal = kill_process_group(pid, Signal::KILL);
+    }
     leader_done.store(true, Ordering::Release);
     let captured = output.join().map_err(|_| anyhow::anyhow!("sandbox output reader failed"))??;
     ensure!(status.success(), "sandbox command failed with {status}");
     Ok(CommandResult { output: captured })
+}
+
+fn clone_local_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => ensure!(meta.file_type().is_dir(), "clone-local command path is not a directory"),
+        Err(err) if err.kind() == ErrorKind::NotFound => fs::create_dir(path).context("create clone-local command directory")?,
+        Err(err) => return Err(err).context("inspect clone-local command path"),
+    }
+    ensure!(fs::symlink_metadata(path)?.file_type().is_dir(), "clone-local command path was replaced");
+    Ok(())
 }
 
 fn protected_homes() -> Vec<PathBuf> {
@@ -181,10 +196,10 @@ impl Sandbox {
         let temp = self.root.join(".gate-tmp");
         let target = self.root.join("target");
         for dir in [&home, &temp, &target] {
-            fs::create_dir_all(dir).context("create clone-local command directory")?;
+            clone_local_directory(dir)?;
         }
         let cargo_home = home.join(".cargo");
-        fs::create_dir_all(&cargo_home).context("create isolated Cargo home")?;
+        clone_local_directory(&cargo_home)?;
         for (name, source) in [("registry", &self.cargo_registry), ("git", &self.cargo_git)] {
             if let Some(source) = source {
                 let link = cargo_home.join(name);
@@ -301,5 +316,17 @@ mod tests {
     fn refuses_unsafe_git_sha() {
         assert!(validate_sha("--upload-pack=evil").is_err());
         assert!(validate_sha(&"a".repeat(40)).is_ok());
+    }
+
+    #[test]
+    fn refuses_clone_local_symlink_before_gate_side_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let clone = temp.path().join("clone");
+        fs::create_dir(&clone).unwrap();
+        symlink(&outside, clone.join(".gate-home")).unwrap();
+        assert!(clone_local_directory(&clone.join(".gate-home")).is_err());
+        assert!(!outside.join(".cargo").exists());
     }
 }
