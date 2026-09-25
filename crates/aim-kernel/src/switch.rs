@@ -4,6 +4,7 @@
 //! effort) a `u64` from one registry, so equal ids mean equal strings; this module never sees
 //! text. A session's provider is fixed at creation, so `/provider` means a new session, and a
 //! model or effort chosen under the old provider must not travel into it.
+use crate::code_mode::Mode;
 use alloc::vec::Vec;
 use vstd::prelude::*;
 
@@ -24,6 +25,8 @@ pub struct Shape {
     pub model: Option<u64>,
     /// Effort, when one is chosen.
     pub effort: Option<u64>,
+    /// Code mode (ADR 0076): the attached session's, else the client's setting, if any.
+    pub code_mode: Option<Mode>,
 }
 
 /// What the user asked for.
@@ -46,8 +49,8 @@ pub open spec fn base_spec(attached: Option<Shape>, configured: Shape) -> Shape 
 }
 
 /// DRAFT(ADR-0074): the session a switch creates from `base`, or `None` when it changes nothing.
-/// `/new` and `/clear` keep everything; `/provider` keeps the place and privacy but no model or
-/// effort, and is a no-op for the provider already in use.
+/// `/new` and `/clear` keep everything; `/provider` keeps the place, privacy and code mode but no
+/// model or effort, and is a no-op for the provider already in use.
 pub open spec fn switch_spec(base: Shape, switch: Switch) -> Option<Shape> {
     match switch {
         Switch::New => Some(base),
@@ -63,6 +66,7 @@ pub open spec fn switch_spec(base: Shape, switch: Switch) -> Option<Shape> {
                     persistent: base.persistent,
                     model: None,
                     effort: None,
+                    code_mode: base.code_mode,
                 },
             )
         },
@@ -104,12 +108,13 @@ pub proof fn new_and_clear_keep_the_session_shape(base: Shape)
 }
 
 /// Every switch stays in the same workspace, place and privacy: an ephemeral session never begets
-/// a kept one.
+/// a kept one. It also keeps the code mode (ADR 0076): `/new`, `/clear` and `/provider` never
+/// change what the session runs in.
 pub proof fn switches_keep_place_and_privacy(base: Shape, switch: Switch)
     ensures
         match switch_spec(base, switch) {
             Some(out) => out.location == base.location && out.workspace == base.workspace
-                && out.persistent == base.persistent,
+                && out.persistent == base.persistent && out.code_mode == base.code_mode,
             None => true,
         },
 {
@@ -139,6 +144,7 @@ pub fn derive(attached: Option<Shape>, configured: Shape, switch: Switch) -> (ou
                     persistent: base.persistent,
                     model: None,
                     effort: None,
+                    code_mode: base.code_mode,
                 },
             )
         },
