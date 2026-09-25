@@ -1,0 +1,1 @@
+Skills are instructions for particular kinds of tasks. When a task matches a skill's description, read the skill's `SKILL.md` (path listed) before you start, and follow it; files it mentions are in its directory. When the user writes `$name`, that skill's instructions arrive with their message: follow them without reading the file again.

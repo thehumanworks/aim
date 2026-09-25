@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture, ToolHost};
-use aim::host::{Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends};
+use aim::host::{Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends_with};
+use aim::resources::{MemoryFiles, ResourceConfig};
 use aim::store::{MemoryStore, SessionStore, StoreError, StoredSessionSummary};
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
@@ -135,7 +136,7 @@ fn fixture_full(
                 tools: Arc::new(Echo),
                 root,
                 location: "local".into(),
-                project: Some(("AGENTS.md".into(), "Be terse.".into())),
+                project: Some(Arc::new(MemoryFiles::new([("AGENTS.md", "Be terse.")]))),
                 shutdown,
             })
         })
@@ -143,10 +144,11 @@ fn fixture_full(
     let for_factory = Arc::clone(&provider);
     let host = SessionHost::new(HostConfig {
         store: backing,
-        backends: native_backends(
+        backends: native_backends_with(
             Arc::new(move |_name, _model| Ok((Arc::clone(&for_factory) as Arc<dyn ModelProvider>, "m1".to_owned()))),
             workspaces,
             8,
+            ResourceConfig::default(),
         ),
         update_capacity: 256,
     });

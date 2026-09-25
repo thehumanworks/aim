@@ -34,6 +34,9 @@ use crate::agent::{Agent, AgentConfig, Backend, ToolHost};
 use crate::context;
 use crate::harness::HarnessClient;
 use crate::remote::RemoteHarness;
+use crate::resources::backend::WithSkills;
+use crate::resources::tools::AllowedTools;
+use crate::resources::{self, Files, HarnessFiles, ResourceConfig};
 use crate::session::{self, Recorder};
 use crate::store::{MemoryStore, SessionStore};
 
@@ -55,8 +58,9 @@ pub struct Connected {
     pub root: String,
     /// Where it is (`local`, or `ssh:<destination>`), as the agent is told.
     pub location: String,
-    /// Project instructions (`AGENTS.md`, …) as `(file name, text)`.
-    pub project: Option<(String, String)>,
+    /// The project's files, for its resources (`AGENTS.md`, `.agents/`, foreign formats), read
+    /// through the workspace so a remote project's apply; `None` when the workspace has none.
+    pub project: Option<Arc<dyn Files>>,
     /// Ends the connection; run after the session's agent is gone.
     pub shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send>,
 }
@@ -70,7 +74,8 @@ pub fn aimx_workspaces(aimx: PathBuf) -> WorkspaceFactory {
         Box::pin(async move {
             if let Location::Ssh { destination } = &spec.location {
                 let harness = RemoteHarness::connect(&aimx, destination, &spec.workspace).await?;
-                let project = context::project_instructions(harness.client.peer(), &harness.client.workspace().id).await;
+                let project: Option<Arc<dyn Files>> =
+                    Some(Arc::new(HarnessFiles::new(harness.client.peer().clone(), harness.client.workspace().id.clone())));
                 let root = harness.client.workspace().root.clone();
                 let harness = Arc::new(harness);
                 let held = Arc::clone(&harness);
@@ -90,7 +95,7 @@ pub fn aimx_workspaces(aimx: PathBuf) -> WorkspaceFactory {
                 });
             }
             let harness = HarnessClient::spawn_stdio(&aimx.to_string_lossy(), &spec.workspace).await?;
-            let project = context::project_instructions(harness.peer(), &harness.workspace().id).await;
+            let project: Option<Arc<dyn Files>> = Some(Arc::new(HarnessFiles::new(harness.peer().clone(), harness.workspace().id.clone())));
             let root = harness.workspace().root.clone();
             let harness = Arc::new(harness);
             let held = Arc::clone(&harness);
@@ -136,21 +141,72 @@ pub struct Built {
 pub type BackendFactory = Arc<dyn Fn(BackendRequest) -> BoxFuture<Result<Built, ProtoError>> + Send + Sync>;
 
 /// The native loop: a provider from `providers` and tools from a workspace `workspaces`
-/// connects, with aim's instructions (system prompt plus the workspace's project instructions).
+/// connects, with aim's instructions and the session's resources (the project's through the
+/// workspace, the user's from `~/.aim`; see [`native_backends_with`]).
 #[must_use]
 pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory, max_requests: u32) -> BackendFactory {
+    native_backends_with(providers, workspaces, max_requests, ResourceConfig::user(crate::cli::aim_home()))
+}
+
+/// [`native_backends`] with explicit resource settings (tests use a temporary user home, or none).
+///
+/// A session's resources are discovered once, when it starts ([`resources::discover`]), and
+/// shape it:
+/// - its instructions: system prompt, project instructions, rules index, skill catalog, memory
+///   index ([`context::instructions`]);
+/// - `SessionSpec::agent` selects an agent definition: its model and effort are defaults
+///   (explicit session values win; they apply on the agent's own provider), its `tools` narrow
+///   the session's tools ([`AllowedTools`]), and its instructions follow the others;
+/// - `$skill` mentions in prompts inject the skill into the user turn ([`WithSkills`]).
+#[must_use]
+pub fn native_backends_with(
+    providers: ProviderFactory,
+    workspaces: WorkspaceFactory,
+    max_requests: u32,
+    resources: ResourceConfig,
+) -> BackendFactory {
+    let resources = Arc::new(resources);
     Arc::new(move |request: BackendRequest| {
-        let (providers, workspaces) = (Arc::clone(&providers), Arc::clone(&workspaces));
+        let (providers, workspaces, resources) = (Arc::clone(&providers), Arc::clone(&workspaces), Arc::clone(&resources));
         Box::pin(async move {
             let BackendRequest { spec, session_id, transcript } = request;
             let (provider, default_model) =
                 providers(&spec.provider, spec.model.as_deref()).map_err(|e| err(ErrorCode::InvalidParams, e))?;
-            let model = spec.model.clone().unwrap_or(default_model);
+            let workspace = workspaces(&spec).await?;
+            let guess = spec.model.clone().unwrap_or_else(|| default_model.clone());
+            let window = async {
+                match resources.skill_budget {
+                    Some(_) => None,
+                    None => context::context_window(provider.as_ref(), &guess).await,
+                }
+            };
+            let (catalog, window) =
+                tokio::join!(resources::discover(&resources, workspace.project.as_deref(), &workspace.location, ""), window);
+            for diagnostic in &catalog.diagnostics {
+                tracing::info!(path = %diagnostic.path, problem = ?diagnostic.problem, "resource: {}", diagnostic.message);
+            }
+            let agent = match session_agent(&catalog, spec.agent.as_deref()) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    (workspace.shutdown)().await;
+                    return Err(error);
+                }
+            };
+            let (model, effort) = match &agent {
+                Some(agent) => {
+                    let defaults = agent.defaults(&spec.provider, spec.model.as_deref(), spec.effort.as_deref());
+                    if let Some(note) = &defaults.note {
+                        tracing::warn!("{note}");
+                    }
+                    (defaults.model.unwrap_or(default_model), defaults.effort)
+                }
+                None => (spec.model.clone().unwrap_or(default_model), spec.effort.clone()),
+            };
             // Establish a real index before the first provider request. Some catalogs omit a
             // default, so use their lowest supported level rather than guessing what the remote
             // endpoint would choose for `effort: None`.
             let auto_effort = if spec.persistence == Persistence::Persistent
-                && spec.effort.is_none()
+                && effort.is_none()
                 && std::env::var_os("TYPESAFE_API_KEY").is_some_and(|value| !value.is_empty())
             {
                 provider.catalog().await.ok().and_then(|models| {
@@ -164,28 +220,65 @@ pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory,
             } else {
                 None
             };
-            let workspace = workspaces(&spec).await?;
-            let instructions = context::instructions(workspace.project.as_ref(), &workspace.location);
+            let budget = resources.skill_budget.unwrap_or_else(|| resources::instructions::skill_budget(window));
+            let prefix = context::instructions(&catalog, agent.as_ref(), budget);
+            for diagnostic in &prefix.diagnostics {
+                tracing::info!(path = %diagnostic.path, "instructions: {}", diagnostic.message);
+            }
             let root = workspace.root.clone();
+            let cache_key = match &agent {
+                // A different tool profile and prefix must not share a prompt-cache key.
+                Some(agent) => format!("aim:{root}:agent:{}", agent.meta.name),
+                None => format!("aim:{root}"),
+            };
+            let Connected { tools, location, shutdown, .. } = workspace;
+            let tools: Arc<dyn ToolHost> = match &agent {
+                Some(agent) if !agent.tools.is_unrestricted() => {
+                    let allowed = AllowedTools::new(tools, agent.tools.clone(), agent.meta.name.clone());
+                    let unknown = allowed.unknown();
+                    if !unknown.is_empty() {
+                        tracing::warn!(agent = %agent.meta.name, ?unknown, "the agent allows tools this workspace does not offer");
+                    }
+                    Arc::new(allowed)
+                }
+                _ => tools,
+            };
             let config = AgentConfig {
                 model: model.clone(),
-                instructions,
-                effort: spec.effort.clone().or_else(|| auto_effort.clone()),
+                instructions: prefix.text,
+                effort: effort.or_else(|| auto_effort.clone()),
                 tier: None,
                 session_id,
-                cache_key: Some(format!("aim:{root}")),
+                cache_key: Some(cache_key),
                 parallel_tool_calls: true,
                 max_requests,
             };
-            let Connected { tools, location, shutdown, .. } = workspace;
-            let mut agent = Agent::with_transcript(provider, tools, config, transcript);
+            let mut native = Agent::with_transcript(provider, tools, config, transcript);
             if auto_effort.is_some() {
-                agent = agent.with_decider(Arc::new(crate::jev::JevDecider));
+                native = native.with_decider(Arc::new(crate::jev::JevDecider));
             }
-            let backend: Box<dyn Backend> = Box::new(agent);
+            let backend: Box<dyn Backend> = Box::new(WithSkills::new(Box::new(native), Arc::new(catalog)));
             Ok(Built { backend, model, root, location, shutdown })
         })
     })
+}
+
+/// The agent definition a session asked for, if it can be applied.
+fn session_agent(catalog: &resources::Catalog, name: Option<&str>) -> Result<Option<resources::agents::AgentDef>, ProtoError> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let Some(agent) = catalog.agent(name) else {
+        let known = catalog.agents.iter().map(|a| a.meta.name.as_str()).collect::<Vec<_>>().join(", ");
+        return Err(err(
+            ErrorCode::NotFound,
+            format!("no agent definition `{name}` (known: {})", if known.is_empty() { "none" } else { &known }),
+        ));
+    };
+    match &agent.importable {
+        Ok(()) => Ok(Some(agent.clone())),
+        Err(why) => Err(err(ErrorCode::InvalidParams, format!("agent `{name}` ({}) cannot be applied: {why}", agent.meta.path))),
+    }
 }
 
 /// What UIs program against: in process ([`SessionHost`]) or over `aim-daemon/1`.

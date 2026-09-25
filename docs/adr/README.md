@@ -51,4 +51,5 @@ Rules (enforced by `mise run check`):
 | [0028](0028-jev-decision-event.md) | Record bounded Jev decisions as typed session events |
 | [0031](0031-session-host-and-agent-backends.md) | Host sessions as actors over pluggable agent backends. |
 | [0032](0032-compaction-events-and-model-context.md) | Record compaction as events; rebuild the model's context from the log. |
+| [0033](0033-resource-catalog-and-activation.md) | Discover resources into one bounded catalog and activate skills in the user turn. |
 | [0036](0036-log-failure-closes-and-config-replies.md) | A session stops at its first log-write failure; config changes answer their requester. |
