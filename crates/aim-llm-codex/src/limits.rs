@@ -53,6 +53,11 @@ pub(crate) fn from_headers(headers: &HeaderMap, now: i64) -> Option<RateLimits> 
     for (name, value) in headers {
         let key = name.as_str();
         let ours = key.starts_with("x-codex-") || families.iter().any(|family| key.starts_with(&format!("x-{family}-")));
+        // Opaque server state (turn affinity) is not rate-limit information: it must never be
+        // copied into events that are printed, broadcast or stored.
+        if OPAQUE_STATE_HEADERS.contains(&key) {
+            continue;
+        }
         if ours && let Ok(value) = value.to_str() {
             native.insert(key.to_owned(), json!(value));
         }
@@ -64,6 +69,9 @@ pub(crate) fn from_headers(headers: &HeaderMap, now: i64) -> Option<RateLimits> 
 }
 
 /// Rate limits from an in-stream `codex.rate_limits` event (refs:codex-api/src/rate_limits.rs:135-170).
+/// Response headers that carry opaque server state rather than rate-limit information.
+const OPAQUE_STATE_HEADERS: &[&str] = &["x-codex-turn-state"];
+
 pub(crate) fn from_event(value: &Value) -> RateLimits {
     let family = value
         .get("metered_limit_name")
@@ -122,7 +130,7 @@ mod tests {
         assert_eq!(native["x-codex-plan-type"], "pro");
         assert_eq!(native["x-codex-active-limit"], "premium");
         assert_eq!(native["x-codex-credits-has-credits"], "False");
-        assert!(native.get("x-codex-turn-state").is_some());
+        assert!(native.get("x-codex-turn-state").is_none(), "opaque turn state never reaches events");
     }
 
     #[test]
