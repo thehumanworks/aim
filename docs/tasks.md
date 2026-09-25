@@ -9,6 +9,16 @@ step as it lands. The lead updates it at every state change and commits it with 
   for each branch below. A worker's worktree holds its uncommitted state; its branch holds the
   rest.
 
+## Idea to explore: Jev as a hackable system-one service
+
+**Status:** todo — exploration prompt; no implementation decision yet.
+
+> Explore the idea of **TypeSafe Jev as a hackable “system-one brain” for aim**: a lightweight decision engine that can make small, instinct-like assessments on an agent’s behalf while the agent focuses on deliberate work. Its decision trees or definitions should be changeable at runtime, so agents and users can evolve what the engine notices and when it offers advice.
+>
+> Consider how to expose this as an **isolated harness service**, available to agents and other clients through a clear interface. The TUI may display or interact with its decisions, but it should be a client of the service—not where the engine lives.
+>
+> Use decisions such as “might this code-mode workflow be worth saving for reuse?” as examples, not as the limits of the design. Explore what makes the engine useful without making it intrusive: when it should stay quiet, when it should surface an observation, and how its judgments could improve with experience. Ground the proposal in aim’s existing Jev integration and architecture, and leave room for alternative designs rather than assuming a particular implementation.
+
 ## Batch 2026-09-25: TUI completion, /clear, parallel tools and code mode, ACP models
 
 Integration branch: `agent/claude/tui-codemode-acp` (from `main` at `1e8cf8c`). Workers run as
@@ -26,7 +36,7 @@ client still builds.
 | T2 | `/clear` clears the chat and starts fresh | done | Merged with T1 (transcript, inline rows, row cache, screen + scrollback best effort, new session) | With T1 | with T1 |
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | done | Merged incl. REV-T4a and REV-T4a-b fixes (`e569a5e`) | Residual in ADR 0076: aimx needs a SIGTERM handler (orphan shells if it ignores close) | `agent/claude/code-mode` · `../aim-wt/code-mode` |
-| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | review | Merged (`f286d31`): exact graders, cohort 2 rerun (rule: off), default On per maintainer, wire baseline at the default | Codex re-check of the grader fix + default flip | `agent/claude/code-mode-bench` |
+| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | done | Merged (`2df7b76`): exact graders (codex REV-T4b3: MERGE), cohort 2 rule verdict `off`, shipped default On per maintainer, wire gate green | — | `agent/claude/code-mode-bench` |
 | T4c | Per-session code mode: client-side `AIM_CODE_MODE` / `--code-mode` carried in the session spec, kept on resume and `/new`, shown in the status line; ACP relay follows it | in progress | T4a's worker (context kept), on `agent/claude/code-mode` | Merge; codex review | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | done | Merged incl. REV-T5 fixes (`c4a1b35`); codex re-check: MERGE | Follow-up (not in this batch): adapter resets mode/effort on model switch | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
@@ -178,3 +188,4 @@ client still builds.
   B1 `callers` accepts duplicate call sites; B2 `todo_table` rejects correct tables with the File
   column not first or linked paths. Sent back: fix, then re-grade cohort 2's kept reports offline
   (cohort 3 only if reports were not kept); default stays On.
+- 2026-09-25 — REV-T4b2 fixes merged (`9807c7c`): graders reject duplicates, accept decorated tables; offline re-grade of 66 kept trials changed 0 verdicts; $0. Codex REV-T4b3 (final; auth.json unchanged): VERDICT MERGE (34 adversarial probes as expected). T4b closed.
