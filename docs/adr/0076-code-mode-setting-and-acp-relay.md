@@ -285,8 +285,9 @@ repair"). The mock now scripts a `run_code` cell for `only`, so every mode has a
 
 - **What `only` costs.** The model reaches every workspace tool through a cell, so a single
   simple action costs a script. The benchmark measured it (§6).
-- **Code mode is opt-in.** With the default `off`, `aim mcp` offers no `run_code` and a strict
-  `acp:claude` session uses `aimx mcp`, as before this ADR; `AIM_CODE_MODE=on` or `only` selects
+- **Code mode is opt-in.** With the default `off`, native sessions and `aim mcp` offer no
+  `run_code` (before this ADR both always did, where the worker was found), and a strict
+  `acp:claude` session uses `aimx mcp`, as before this ADR. `AIM_CODE_MODE=on` or `only` selects
   the code tool and the relay. A default `off` session still sends the system prompt's two-line
   "# Code mode" section (241 bytes) and does not get ADR 0056's shorter `Read`/`Bash`/`LS`
   descriptions, which only code-mode sessions apply: both are follow-ups.
