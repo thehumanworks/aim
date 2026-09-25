@@ -129,6 +129,20 @@ pub fn decide_begin(
     }
 }
 
+/// Every execution decision is for an absent key whose mint time is still within its horizon.
+pub proof fn theorem_execute_requires_fresh_absent(
+    phase: Phase,
+    same_request: bool,
+    stale: bool,
+    full: bool,
+    busy: bool,
+)
+    ensures
+        begin_decision(phase, same_request, stale, full, busy) == BeginDecision::Execute ==> phase
+            == Phase::Absent && !stale,
+{
+}
+
 /// LOCKED(ADR-0050): a pre-execution refusal forgets its reservation, while any attempted
 /// mutation, including a failed one, retains a replayable outcome.
 pub open spec fn finish_phase(phase: Phase, attempted: bool) -> Option<Phase> {

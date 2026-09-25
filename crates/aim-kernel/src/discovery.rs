@@ -85,6 +85,43 @@ pub open spec fn charged(cap: nat, read: ReadCharge) -> nat {
     }
 }
 
+/// The budget state produced by `new` before any reads are admitted.
+pub open spec fn initial_budget(max_files: nat, max_bytes: nat, cap: nat) -> BudgetView {
+    BudgetView {
+        max_files,
+        max_bytes,
+        cap,
+        files_left: max_files,
+        bytes_left: max_bytes,
+        reserved_bytes: 0,
+    }
+}
+
+/// The exact accounting transition for one reservation.
+pub open spec fn reserved_budget(v: BudgetView, wanted: nat, batch: nat) -> BudgetView {
+    let count = reservable(v, wanted, batch);
+    BudgetView {
+        max_files: v.max_files,
+        max_bytes: v.max_bytes,
+        cap: v.cap,
+        files_left: (v.files_left - count) as nat,
+        bytes_left: (v.bytes_left - count * v.cap) as nat,
+        reserved_bytes: v.reserved_bytes + count * v.cap,
+    }
+}
+
+/// The exact accounting transition for one successful settlement.
+pub open spec fn settled_budget(v: BudgetView, read: ReadCharge) -> BudgetView {
+    BudgetView {
+        max_files: v.max_files,
+        max_bytes: v.max_bytes,
+        cap: v.cap,
+        files_left: v.files_left,
+        bytes_left: (v.bytes_left + v.cap - charged(v.cap, read)) as nat,
+        reserved_bytes: (v.reserved_bytes - v.cap) as nat,
+    }
+}
+
 /// One scope's verified admission counter. It owns no I/O or parser state.
 #[derive(Debug)]
 pub struct Budget {
@@ -122,6 +159,7 @@ impl Budget {
     pub fn new(max_files: u64, max_bytes: u64, cap: u64) -> (out: Self)
         ensures
             budget_wf(out@),
+            out@ == initial_budget(max_files as nat, max_bytes as nat, cap as nat),
             out@.files_left == max_files as nat,
             out@.bytes_left == max_bytes as nat,
     {
@@ -141,6 +179,7 @@ impl Budget {
         ensures
             selected as nat == reservable(old(self)@, wanted as nat, batch as nat),
             budget_wf(final(self)@),
+            final(self)@ == reserved_budget(old(self)@, wanted as nat, batch as nat),
             final(self)@.files_left + selected as nat == old(self)@.files_left,
             final(self)@.reserved_bytes == old(self)@.reserved_bytes + selected as nat
                 * final(self)@.cap,
@@ -189,7 +228,11 @@ impl Budget {
     pub fn settle(&mut self, read: ReadCharge) -> (result: Result<(), BudgetError>)
         ensures
             budget_wf(final(self)@),
+            (result is Err) <==> (old(self)@.cap == 0 || old(self)@.reserved_bytes < old(
+                self,
+            )@.cap),
             result is Err ==> final(self)@ == old(self)@,
+            result is Ok ==> final(self)@ == settled_budget(old(self)@, read),
             result is Ok ==> old(self)@.reserved_bytes == final(self)@.reserved_bytes + old(
                 self,
             )@.cap && final(self)@.bytes_left == old(self)@.bytes_left + old(self)@.cap - charged(
@@ -246,14 +289,165 @@ impl Budget {
     }
 }
 
-/// Reserving and settling any number of files cannot overspend either bound.
-pub proof fn theorem_budget_bounds(v: BudgetView)
+/// A reservation or settlement in a discovery trace.
+pub enum BudgetEvent {
+    /// Admit the largest prefix that fits the current credit.
+    Reserve {
+        /// Files requested by the caller.
+        wanted: nat,
+        /// Maximum batch size.
+        batch: nat,
+    },
+    /// Settle one pending read, or leave the state unchanged when none is pending.
+    Settle {
+        /// Observed read outcome.
+        read: ReadCharge,
+    },
+}
+
+/// Accounting state for a discovery trace, including ghost totals.
+pub struct BudgetTraceState {
+    /// The executable budget's view.
+    pub budget: BudgetView,
+    /// Total file slots admitted by reservations.
+    pub admitted: nat,
+    /// Total settled byte charges.
+    pub charged_bytes: nat,
+}
+
+/// The state before the first reservation.
+pub open spec fn initial_trace(max_files: nat, max_bytes: nat, cap: nat) -> BudgetTraceState {
+    BudgetTraceState {
+        budget: initial_budget(max_files, max_bytes, cap),
+        admitted: 0,
+        charged_bytes: 0,
+    }
+}
+
+/// One budget operation and its ghost accounting. A failed settle is a no-op.
+pub open spec fn budget_next(pre: BudgetTraceState, event: BudgetEvent) -> BudgetTraceState {
+    match event {
+        BudgetEvent::Reserve { wanted, batch } => {
+            let count = reservable(pre.budget, wanted, batch);
+            BudgetTraceState {
+                budget: reserved_budget(pre.budget, wanted, batch),
+                admitted: pre.admitted + count,
+                charged_bytes: pre.charged_bytes,
+            }
+        },
+        BudgetEvent::Settle { read } => {
+            if pre.budget.cap == 0 || pre.budget.reserved_bytes < pre.budget.cap {
+                pre
+            } else {
+                BudgetTraceState {
+                    budget: settled_budget(pre.budget, read),
+                    admitted: pre.admitted,
+                    charged_bytes: pre.charged_bytes + charged(pre.budget.cap, read),
+                }
+            }
+        },
+    }
+}
+
+/// Admitted files and settled charges exactly account for spent credit.
+pub open spec fn budget_trace_wf(s: BudgetTraceState) -> bool {
+    budget_wf(s.budget) && s.budget.files_left + s.admitted == s.budget.max_files
+        && s.budget.bytes_left + s.budget.reserved_bytes + s.charged_bytes == s.budget.max_bytes
+}
+
+proof fn lemma_budget_step(pre: BudgetTraceState, event: BudgetEvent)
     requires
-        budget_wf(v),
+        budget_trace_wf(pre),
     ensures
-        v.max_files - v.files_left <= v.max_files,
-        v.max_bytes - v.bytes_left - v.reserved_bytes <= v.max_bytes,
+        budget_trace_wf(budget_next(pre, event)),
+        budget_next(pre, event).budget.max_files == pre.budget.max_files,
+        budget_next(pre, event).budget.max_bytes == pre.budget.max_bytes,
+        budget_next(pre, event).budget.cap == pre.budget.cap,
 {
+    match event {
+        BudgetEvent::Reserve { wanted, batch } => {
+            let v = pre.budget;
+            let count = reservable(v, wanted, batch);
+            if v.cap > 0 {
+                assert(count <= v.bytes_left / v.cap);
+                assert(count * v.cap <= v.bytes_left) by (nonlinear_arith)
+                    requires
+                        count <= v.bytes_left / v.cap,
+                        v.cap > 0,
+                ;
+            }
+            assert(count <= v.files_left);
+        },
+        BudgetEvent::Settle { read } => {
+            if pre.budget.cap > 0 && pre.budget.reserved_bytes >= pre.budget.cap {
+                match read {
+                    ReadCharge::Bytes(n) => {},
+                    ReadCharge::Missing => {},
+                    ReadCharge::Failed => {},
+                }
+                assert(charged(pre.budget.cap, read) <= pre.budget.cap);
+            }
+        },
+    }
+}
+
+/// Traces start at `Budget::new` and follow exact reserve and settle transitions.
+pub open spec fn budget_valid_trace(
+    states: Seq<BudgetTraceState>,
+    events: Seq<BudgetEvent>,
+    max_files: nat,
+    max_bytes: nat,
+    cap: nat,
+) -> bool {
+    states.len() == events.len() + 1 && states[0] == initial_trace(max_files, max_bytes, cap) && (
+    forall|i: int| 0 <= i < events.len() ==> states[i + 1] == budget_next(states[i], events[i]))
+}
+
+proof fn lemma_budget_prefix(
+    states: Seq<BudgetTraceState>,
+    events: Seq<BudgetEvent>,
+    max_files: nat,
+    max_bytes: nat,
+    cap: nat,
+    n: nat,
+)
+    requires
+        budget_valid_trace(states, events, max_files, max_bytes, cap),
+        n <= events.len(),
+    ensures
+        budget_trace_wf(states[n as int]),
+        states[n as int].budget.max_files == max_files,
+        states[n as int].budget.max_bytes == max_bytes,
+        states[n as int].budget.cap == cap,
+    decreases n,
+{
+    if n > 0 {
+        lemma_budget_prefix(states, events, max_files, max_bytes, cap, (n - 1) as nat);
+        lemma_budget_step(states[(n - 1) as int], events[(n - 1) as int]);
+    }
+}
+
+/// Across any trace from `new`, admitted files stay within the file limit, and settled charges
+/// plus outstanding reservations stay within the byte limit at every prefix.
+pub proof fn theorem_budget_bounds(
+    states: Seq<BudgetTraceState>,
+    events: Seq<BudgetEvent>,
+    max_files: nat,
+    max_bytes: nat,
+    cap: nat,
+)
+    requires
+        budget_valid_trace(states, events, max_files, max_bytes, cap),
+    ensures
+        forall|i: int|
+            0 <= i < states.len() ==> states[i].admitted <= max_files && states[i].charged_bytes
+                + states[i].budget.reserved_bytes <= max_bytes && budget_trace_wf(states[i]),
+{
+    assert forall|i: int| 0 <= i < states.len() implies states[i].admitted <= max_files
+        && states[i].charged_bytes + states[i].budget.reserved_bytes <= max_bytes
+        && budget_trace_wf(states[i]) by {
+        lemma_budget_prefix(states, events, max_files, max_bytes, cap, i as nat);
+    }
 }
 
 } // verus!
