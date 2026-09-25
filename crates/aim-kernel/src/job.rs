@@ -363,6 +363,38 @@ pub proof fn lemma_stale_attempt_fenced(pre: JobView, generation: u32, claim_id:
 {
 }
 
+/// A second claim cannot succeed within the same generation.
+pub proof fn lemma_claim_exclusive(
+    pre: JobView,
+    first_worker: WorkerId,
+    first_id: u64,
+    first_lease: u64,
+    second_worker: WorkerId,
+    second_id: u64,
+    second_lease: u64,
+    first_now: u64,
+    second_now: u64,
+)
+    requires
+        wf(pre),
+        next(
+            pre,
+            Event::Claim { worker: first_worker, claim_id: first_id, lease_until: first_lease },
+            first_now,
+        ) is Some,
+    ensures
+        next(
+            next(
+                pre,
+                Event::Claim { worker: first_worker, claim_id: first_id, lease_until: first_lease },
+                first_now,
+            )->0,
+            Event::Claim { worker: second_worker, claim_id: second_id, lease_until: second_lease },
+            second_now,
+        ) is None,
+{
+}
+
 /// Retrying advances exactly one generation, never past the fixed bound.
 pub proof fn lemma_retry_bounded(pre: JobView, now: u64)
     requires
