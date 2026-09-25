@@ -22,8 +22,8 @@ client still builds.
 | ID | Task | Status | Now | Next | Branch / worktree |
 |---|---|---|---|---|---|
 | T0 | Base: merge FIX16 (`agent/claude/fix16-coderun`) and W26 (`agent/perf/tokens`) as-is (maintainer decision) | done | Merged (`eda6444`, `36f1bd8`); conflicts resolved in event.rs, session.rs, agent/mod.rs, agent/tools.rs, host.rs; clippy, xtask and 963/963 tests green | — | integration branch |
-| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | review | Merged incl. follow-ups and REV-T1 fixes (`b975ac7`, merge `d3a31a0`); kernel 323 verified on branch; codex re-check running | Close on re-check verdict | `agent/claude/tui-options` · `../aim-wt/tui-options` |
-| T2 | `/clear` clears the chat and starts fresh | review | Merged with T1 (transcript, inline rows, row cache, screen + scrollback best effort, new session) | With T1 | with T1 |
+| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | done | Merged incl. follow-ups, REV-T1 and REV-T1b fixes (`147a5a9`); a model change reaches summary and stream in one locked step | — | `agent/claude/tui-options` · `../aim-wt/tui-options` |
+| T2 | `/clear` clears the chat and starts fresh | done | Merged with T1 (transcript, inline rows, row cache, screen + scrollback best effort, new session) | With T1 | with T1 |
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | review | Merged (`58f857e`); codex REV-T4a: MERGE AFTER FIXES (B1 unbounded error text, B2 relay outlives a disconnected client, N1 invalid AIM_CODE_MODE silent); worker fixing | Merge the fix commits | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | in progress | Worker running (budget: OpenRouter ≤ $3, codex ≤ 12, acp:claude ≤ 16 runs) | Merge; decision into ADR 0076 | `agent/claude/code-mode-bench` · `../aim-wt/code-mode-bench` |
@@ -127,3 +127,4 @@ client still builds.
   verified). New B2: `announce` broadcasts ConfigChanged before updating the summary's model
   (host.rs:1045/1050), so a concurrent attach can pair the old model with the new ladder. Sent
   back to the T1 worker.
+- 2026-09-25 — REV-T1b B2 fixed (`147a5a9`, merged): publish() updates the summary and broadcasts ConfigChanged under the transcript lock; deterministic + stress tests. Branch Verus 358 verified.
