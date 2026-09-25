@@ -79,6 +79,15 @@ pub struct Client {
 pub async fn connect(socket: &Path) -> Client {
     let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
     let (reader, writer) = stream.into_split();
+    client_over(reader, writer)
+}
+
+/// A client over any byte stream (e.g. a spawned `aimx serve --stdio`).
+pub fn client_over<R, W>(reader: R, writer: W) -> Client
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (tx, notes) = mpsc::unbounded_channel();
     let peer = Peer::spawn(reader, writer, Collector { tx }, PeerConfig::default());
     Client { peer, notes }

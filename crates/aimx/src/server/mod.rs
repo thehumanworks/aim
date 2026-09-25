@@ -345,7 +345,8 @@ impl Server {
                     self.connect(reader, writer);
                 }
                 Ok(cred) => tracing::warn!(peer_uid = cred.uid(), "refusing a connection from another user"),
-                Err(err) => tracing::warn!(%err, "refusing a connection without peer credentials"),
+                // Usually a peer that connected and hung up at once (a liveness probe).
+                Err(err) => tracing::debug!(%err, "dropping a connection without peer credentials"),
             }
         }
     }

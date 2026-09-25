@@ -2,7 +2,8 @@
 //! docs/architecture.md §15): a real server on a tempdir unix socket, driven through
 //! `aim_rpc::Peer`, plus the spawned binary over `--unix` and `--stdio`.
 
-// mod binary;
+#[cfg(test)]
+mod binary;
 #[cfg(test)]
 mod common;
 #[cfg(test)]
@@ -17,5 +18,7 @@ mod idempotency;
 mod resume;
 #[cfg(test)]
 mod safety;
-// mod search;
-// mod tools;
+#[cfg(test)]
+mod search;
+#[cfg(test)]
+mod tools;
