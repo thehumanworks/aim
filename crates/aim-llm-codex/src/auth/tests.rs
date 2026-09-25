@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use super::*;
-use crate::fake::{self, FakeServer, MemoryStore, Reply, jwt, unix_now};
+use crate::fake::{self, FakeServer, MemoryStore, Recorded, Reply, jwt, unix_now};
 
 fn tokens(exp: u64, refresh: &str) -> Value {
     json!({"access_token": jwt(exp, "acct-fixture"), "refresh_token": refresh, "id_token": jwt(exp, "acct-fixture")})
@@ -196,6 +196,27 @@ async fn file_store_is_private_and_atomic() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// Sends raw bytes to the callback server and returns the response text (empty if none).
+async fn raw_request(port: u16, request: &str) -> String {
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    drop(tokio::time::timeout(Duration::from_secs(10), socket.read_to_string(&mut response)).await);
+    response
+}
+
+async fn get(port: u16, target: &str) -> String {
+    raw_request(port, &format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")).await
+}
+
+fn state_of(url: &str) -> String {
+    url::Url::parse(url).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.into_owned()
+}
+
+async fn issuer_with(reply: impl Fn(&Recorded) -> Reply + Send + Sync + 'static) -> FakeServer {
+    FakeServer::start(move |request, _| reply(request)).await
+}
+
 #[tokio::test]
 async fn browser_login_url_carries_the_pkce_parameters() {
     let config = CodexConfig { callback_ports: vec![0], ..CodexConfig::default() };
@@ -214,4 +235,216 @@ async fn browser_login_url_carries_the_pkce_parameters() {
     assert_eq!(params["id_token_add_organizations"], "true");
     assert_eq!(params["codex_cli_simplified_flow"], "true");
     assert_eq!(params["originator"], "aim");
+}
+
+#[tokio::test]
+async fn browser_login_survives_stray_requests_and_confirms_after_the_exchange() {
+    let issuer = issuer_with(|_| Reply::json(200, &tokens(unix_now() + 3_600, "rt-new"))).await;
+    let config = issuer.config();
+    let challenge = begin_browser_login(&config).await.unwrap();
+    let (port, state, url) = (challenge.port().unwrap(), state_of(&challenge.url), challenge.url.clone());
+    let login = tokio::spawn({
+        let client = fake::client(&config);
+        async move { finish_browser_login(&client, challenge).await }
+    });
+    // A speculative preconnect that sends nothing and closes, and one that stays silent.
+    drop(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+    let _silent = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(get(port, "/favicon.ico").await.starts_with("HTTP/1.1 404"));
+    let mismatch = get(port, "/auth/callback?code=stolen&state=wrong").await;
+    assert!(mismatch.starts_with("HTTP/1.1 400") && mismatch.contains("State mismatch"), "{mismatch}");
+    assert!(!login.is_finished(), "a wrong state never ends the login");
+    let done = get(port, &format!("/auth/callback?code=good-code&state={state}")).await;
+    assert!(done.starts_with("HTTP/1.1 200") && done.contains("Signed in"), "{done}");
+    let credentials = login.await.unwrap().unwrap();
+    assert_eq!(credentials.refresh_token.unwrap().expose(), "rt-new");
+    let requests = issuer.requests().await;
+    assert_eq!(requests.len(), 1, "only the valid callback was exchanged");
+    let exchange = &requests[0];
+    assert_eq!(exchange.path(), "/oauth/token");
+    assert_eq!(exchange.header("content-type"), Some("application/x-www-form-urlencoded"));
+    assert_eq!(exchange.form("grant_type").as_deref(), Some("authorization_code"));
+    assert_eq!(exchange.form("code").as_deref(), Some("good-code"));
+    assert_eq!(exchange.form("client_id").as_deref(), Some(CLIENT_ID));
+    assert_eq!(exchange.form("redirect_uri"), Some(format!("http://127.0.0.1:{port}/auth/callback")));
+    // PKCE: the exchanged verifier hashes to the challenge in the authorization URL.
+    let verifier = exchange.form("code_verifier").unwrap();
+    let challenge_param = url::Url::parse(&url).unwrap().query_pairs().find(|(k, _)| k == "code_challenge").unwrap().1.into_owned();
+    assert_eq!(URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())), challenge_param);
+}
+
+#[tokio::test]
+async fn browser_login_accepts_the_onboarding_state_suffix() {
+    let issuer = issuer_with(|_| Reply::json(200, &tokens(unix_now() + 3_600, "rt"))).await;
+    let config = issuer.config();
+    let challenge = begin_browser_login(&config).await.unwrap();
+    let (port, state) = (challenge.port().unwrap(), state_of(&challenge.url));
+    let client = fake::client(&config);
+    let login = tokio::spawn(async move { finish_browser_login(&client, challenge).await });
+    let suffixed = url::form_urlencoded::byte_serialize(format!("{state}{STATE_SUFFIX}").as_bytes()).collect::<String>();
+    assert!(get(port, &format!("/auth/callback?code=c&state={suffixed}")).await.starts_with("HTTP/1.1 200"));
+    assert!(login.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn browser_login_reports_provider_errors_distinctly() {
+    let issuer = issuer_with(|_| Reply::json(200, &json!({}))).await;
+    let config = issuer.config();
+    let challenge = begin_browser_login(&config).await.unwrap();
+    let (port, state) = (challenge.port().unwrap(), state_of(&challenge.url));
+    let client = fake::client(&config);
+    let login = tokio::spawn(async move { finish_browser_login(&client, challenge).await });
+    let page = get(port, &format!("/auth/callback?error=access_denied&error_description=The+user+said+%3Cno%3E&state={state}")).await;
+    assert!(page.contains("Sign-in failed: access_denied") && page.contains("&lt;no&gt;"), "{page}");
+    let error = login.await.unwrap().unwrap_err();
+    assert_eq!(error.kind, LlmErrorKind::Auth);
+    assert_eq!(error.message, "browser login failed: the provider returned access_denied: The user said <no>");
+    assert!(issuer.requests().await.is_empty(), "nothing exchanged");
+}
+
+#[tokio::test]
+async fn browser_login_shows_failure_when_the_exchange_fails() {
+    let issuer = issuer_with(|_| Reply::json(400, &json!({"error":"invalid_grant"}))).await;
+    let config = issuer.config();
+    let challenge = begin_browser_login(&config).await.unwrap();
+    let (port, state) = (challenge.port().unwrap(), state_of(&challenge.url));
+    let client = fake::client(&config);
+    let login = tokio::spawn(async move { finish_browser_login(&client, challenge).await });
+    let page = get(port, &format!("/auth/callback?code=c&state={state}")).await;
+    assert!(page.starts_with("HTTP/1.1 500") && page.contains("Sign-in failed") && !page.contains("Signed in"), "{page}");
+    let error = login.await.unwrap().unwrap_err();
+    assert_eq!(error.kind, LlmErrorKind::Auth);
+    assert!(error.message.contains("[invalid_grant]"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn browser_login_cancel_missing_code_and_timeout() {
+    let config = CodexConfig { callback_ports: vec![0], login_timeout: Duration::from_secs(20), ..CodexConfig::default() };
+    let client = fake::client(&config);
+    let challenge = begin_browser_login(&config).await.unwrap();
+    let port = challenge.port().unwrap();
+    let login = tokio::spawn({
+        let client = client.clone();
+        async move { finish_browser_login(&client, challenge).await }
+    });
+    assert!(get(port, "/cancel").await.contains("Sign-in cancelled"));
+    assert_eq!(login.await.unwrap().unwrap_err().message, "browser login cancelled");
+
+    let challenge = begin_browser_login(&config).await.unwrap();
+    let (port, state) = (challenge.port().unwrap(), state_of(&challenge.url));
+    let login = tokio::spawn({
+        let client = client.clone();
+        async move { finish_browser_login(&client, challenge).await }
+    });
+    assert!(get(port, &format!("/auth/callback?state={state}")).await.starts_with("HTTP/1.1 400"));
+    assert!(login.await.unwrap().unwrap_err().message.contains("no authorization code"));
+
+    let quick = CodexConfig { login_timeout: Duration::from_millis(200), ..config };
+    let challenge = begin_browser_login(&quick).await.unwrap();
+    assert_eq!(finish_browser_login(&client, challenge).await.unwrap_err().message, "browser login timed out");
+}
+
+#[tokio::test]
+async fn device_login_polls_until_approved() {
+    let issuer = issuer_with(|request| match request.path() {
+        // `usercode` is the alias codex also accepts; the interval arrives as a string.
+        "/api/accounts/deviceauth/usercode" => Reply::json(200, &json!({"device_auth_id":"dev-1","usercode":"ABCD-1234","interval":"1"})),
+        "/api/accounts/deviceauth/token" if request.json()["device_auth_id"] == "dev-1" => {
+            Reply::json(200, &json!({"authorization_code":"auth-code","code_challenge":"x","code_verifier":"device-verifier"}))
+        }
+        "/oauth/token" => Reply::json(200, &tokens(unix_now() + 3_600, "rt-device")),
+        _ => Reply::json(404, &json!({})),
+    })
+    .await;
+    let config = issuer.config();
+    let client = fake::client(&config);
+    let challenge = begin_device_login(&client, &config).await.unwrap();
+    assert_eq!(challenge.user_code, "ABCD-1234");
+    assert_eq!(challenge.verification_url, format!("{}/codex/device", issuer.url));
+    let credentials = finish_device_login(&client, &challenge).await.unwrap();
+    assert_eq!(credentials.refresh_token.unwrap().expose(), "rt-device");
+    let requests = issuer.requests().await;
+    let poll = requests.iter().find(|r| r.path() == "/api/accounts/deviceauth/token").unwrap();
+    assert_eq!(poll.json(), json!({"device_auth_id":"dev-1","user_code":"ABCD-1234"}));
+    let exchange = requests.iter().find(|r| r.path() == "/oauth/token").unwrap();
+    assert_eq!(exchange.form("code_verifier").as_deref(), Some("device-verifier"));
+    assert_eq!(exchange.form("redirect_uri"), Some(format!("{}/deviceauth/callback", issuer.url)));
+}
+
+#[tokio::test]
+async fn device_login_pending_transient_denied_and_expired() {
+    // Pending (403), then a transient 503, then approved.
+    let issuer = FakeServer::start(|request, index| match (request.path(), index) {
+        ("/api/accounts/deviceauth/usercode", _) => Reply::json(200, &json!({"device_auth_id":"d","user_code":"C","interval":1})),
+        ("/api/accounts/deviceauth/token", 1) => Reply::json(403, &json!({})),
+        ("/api/accounts/deviceauth/token", 2) => Reply::text(503, "busy"),
+        ("/api/accounts/deviceauth/token", _) => Reply::json(200, &json!({"authorization_code":"a","code_verifier":"v"})),
+        _ => Reply::json(200, &tokens(unix_now() + 3_600, "rt")),
+    })
+    .await;
+    let config = issuer.config();
+    let client = fake::client(&config);
+    let challenge = begin_device_login(&client, &config).await.unwrap();
+    assert!(finish_device_login(&client, &challenge).await.is_ok());
+
+    let denied = issuer_with(|request| match request.path() {
+        "/api/accounts/deviceauth/usercode" => Reply::json(200, &json!({"device_auth_id":"d","user_code":"C","interval":1})),
+        _ => Reply::json(410, &json!({"error":"expired_token"})),
+    })
+    .await;
+    let config = denied.config();
+    let challenge = begin_device_login(&client, &config).await.unwrap();
+    let error = finish_device_login(&client, &challenge).await.unwrap_err();
+    assert!(error.message.contains("denied or has expired"), "{}", error.message);
+
+    let pending = issuer_with(|request| match request.path() {
+        "/api/accounts/deviceauth/usercode" => Reply::json(200, &json!({"device_auth_id":"d","user_code":"C","interval":600})),
+        _ => Reply::json(404, &json!({})),
+    })
+    .await;
+    // The sleep is clamped to the login window even when the server asks for a long interval.
+    let config = CodexConfig { login_timeout: Duration::from_millis(1_500), ..pending.config() };
+    let challenge = begin_device_login(&client, &config).await.unwrap();
+    let started = std::time::Instant::now();
+    let error = finish_device_login(&client, &challenge).await.unwrap_err();
+    assert!(error.message.contains("expired"), "{}", error.message);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// Maintainer-run: a real browser login into aim's own store. Never run by agents
+/// (docs/adr/0010 `live_codex_oauth_browser`; renamed `interactive_` so `-- --ignored live_`
+/// never starts it). Set `AIM_INTERACTIVE_SAVE=1` to persist the result to `~/.aim/auth`.
+#[tokio::test]
+#[ignore = "interactive: needs the maintainer's browser; never touches ~/.codex"]
+async fn interactive_codex_oauth_browser() {
+    let config = CodexConfig::default();
+    let client = config.http_client().unwrap();
+    let challenge = begin_browser_login(&config).await.unwrap();
+    eprintln!("open this URL to sign in:\n{}", challenge.url);
+    let credentials = finish_browser_login(&client, challenge).await.unwrap();
+    eprintln!("signed in; token expires_at={} account=***", credentials.expires_at);
+    assert!(credentials.refresh_token.is_some());
+    if std::env::var_os("AIM_INTERACTIVE_SAVE").is_some() {
+        let store = Arc::new(FileCredentialStore::new(FileCredentialStore::default_path().unwrap()));
+        AuthManager::new(client, store).save(credentials).await.unwrap();
+        eprintln!("saved to ~/.aim/auth/codex.json");
+    }
+}
+
+/// Maintainer-run: a real device-code login (docs/adr/0010 `live_codex_oauth_device`).
+#[tokio::test]
+#[ignore = "interactive: needs the maintainer to approve a device code; never touches ~/.codex"]
+async fn interactive_codex_oauth_device() {
+    let config = CodexConfig::default();
+    let client = config.http_client().unwrap();
+    let challenge = begin_device_login(&client, &config).await.unwrap();
+    eprintln!("visit {} and enter {}", challenge.verification_url, challenge.user_code);
+    let credentials = finish_device_login(&client, &challenge).await.unwrap();
+    eprintln!("signed in; token expires_at={} account=***", credentials.expires_at);
+    assert!(credentials.refresh_token.is_some());
+    if std::env::var_os("AIM_INTERACTIVE_SAVE").is_some() {
+        let store = Arc::new(FileCredentialStore::new(FileCredentialStore::default_path().unwrap()));
+        AuthManager::new(client, store).save(credentials).await.unwrap();
+        eprintln!("saved to ~/.aim/auth/codex.json");
+    }
 }

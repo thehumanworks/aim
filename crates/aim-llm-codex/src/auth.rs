@@ -21,21 +21,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::CodexConfig;
-use crate::errors::sanitize_code;
+use crate::errors::{sanitize, sanitize_code};
 
 /// The Codex CLI's OAuth client id (refs:login/src/auth/manager.rs:1716-1729).
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Scopes requested by the browser login (refs:login/src/server.rs:584-615).
 const SCOPE: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
+/// `ChatGPT` may append this to the callback `state` (`refs:login/src/callback_params.rs:1`).
+const STATE_SUFFIX: &str = ".onboarding_entrypoint=life_sciences";
 /// Refresh (or refuse a borrowed token) when it expires within this many seconds.
 const EXPIRY_MARGIN_SECS: u64 = 300;
 /// How long credentials are served from memory before the sources are read again.
 const CACHE_TTL: Duration = Duration::from_secs(60);
+/// Per-connection read deadline on the login callback server.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest callback request head read.
+const MAX_CALLBACK_REQUEST: usize = 16 * 1024;
 /// Longest wait for another process's refresh lease.
 const LEASE_WAIT: Duration = Duration::from_secs(30);
 
@@ -570,50 +577,156 @@ pub async fn begin_browser_login(config: &CodexConfig) -> Result<BrowserChalleng
     })
 }
 
-/// Waits for the loopback callback and exchanges its verified code. The caller persists the
-/// result ([`AuthManager::save`]).
+/// What one callback request asks for.
+enum Callback {
+    /// Answer and keep waiting.
+    Reply(u16, &'static str, String),
+    /// A verified authorization code.
+    Code(String),
+    /// The provider reported an error (`error=`), sanitized.
+    ProviderError(String, Option<String>),
+    /// Valid state but no code.
+    MissingCode,
+    /// `/cancel`.
+    Cancel,
+}
+
+fn route(target: &str, expected_state: &str) -> Callback {
+    let Ok(url) = url::Url::parse(&format!("http://localhost{target}")) else {
+        return Callback::Reply(400, "Bad Request", page("Bad request", "The request could not be read."));
+    };
+    match url.path() {
+        "/auth/callback" => {
+            let param = |key: &str| url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned());
+            let state = param("state");
+            let state = state.as_deref().map(|s| s.strip_suffix(STATE_SUFFIX).unwrap_or(s));
+            if state != Some(expected_state) {
+                // A stale tab, a reload or another process: never fatal to the login in progress.
+                return Callback::Reply(
+                    400,
+                    "Bad Request",
+                    page("State mismatch", "This sign-in link does not belong to the login in progress."),
+                );
+            }
+            if let Some(error) = param("error") {
+                return Callback::ProviderError(sanitize_code(&error), param("error_description").map(|d| sanitize(&d)));
+            }
+            match param("code").filter(|code| !code.is_empty()) {
+                Some(code) => Callback::Code(code),
+                None => Callback::MissingCode,
+            }
+        }
+        "/cancel" => Callback::Cancel,
+        _ => Callback::Reply(404, "Not Found", page("Not found", "")),
+    }
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn page(title: &str, body: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>aim: {0}</title></head><body><h1>{0}</h1><p>{1}</p></body></html>",
+        escape(title),
+        escape(body)
+    )
+}
+
+/// Reads one request head; `None` for an empty, slow, oversized or unreadable connection.
+async fn read_request(mut socket: TcpStream) -> Option<(TcpStream, String)> {
+    let head = tokio::time::timeout(CALLBACK_READ_TIMEOUT, async {
+        let mut buffer = Vec::with_capacity(1024);
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = socket.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(chunk.get(..read)?);
+            if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+                return Some(buffer);
+            }
+            if buffer.len() > MAX_CALLBACK_REQUEST {
+                return None;
+            }
+        }
+    })
+    .await
+    .ok()??;
+    let text = String::from_utf8_lossy(&head);
+    let mut request_line = text.lines().next()?.split_whitespace();
+    let (_method, target) = (request_line.next()?, request_line.next()?);
+    Some((socket, target.to_owned()))
+}
+
+async fn respond(mut socket: TcpStream, status: u16, reason: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    drop(tokio::time::timeout(CALLBACK_READ_TIMEOUT, socket.write_all(response.as_bytes())).await);
+    drop(socket.shutdown().await);
+}
+
+/// Serves the loopback callback until the login completes, fails or times out, then exchanges
+/// the code. Every request gets an answer: stray requests (preconnects, `favicon.ico`, reloads,
+/// a stale tab's state) are answered and the wait goes on. The success page is shown only after
+/// the code exchange succeeds. The caller persists the result ([`AuthManager::save`]).
 ///
 /// # Errors
-/// `Auth` if the callback times out, fails or carries a wrong state; the exchange's errors otherwise.
+/// `Auth` on timeout, cancellation, a provider error, a missing code or a rejected exchange;
+/// `Transport`/`Unavailable` when the issuer cannot be reached.
 pub async fn finish_browser_login(client: &Client, challenge: BrowserChallenge) -> Result<Credentials, LlmError> {
-    let (mut socket, _) = tokio::time::timeout(challenge.login_timeout, challenge.listener.accept())
-        .await
-        .map_err(|_| auth_error("OAuth callback timed out"))?
-        .map_err(|_| auth_error("OAuth callback failed"))?;
-    let mut buffer = [0_u8; 8192];
-    let mut count = 0;
+    let deadline = Instant::now() + challenge.login_timeout;
+    let mut readers = JoinSet::new();
     loop {
-        let remaining = buffer.get_mut(count..).ok_or_else(|| auth_error("OAuth callback too large"))?;
-        if remaining.is_empty() {
-            return Err(auth_error("OAuth callback too large"));
-        }
-        let received = tokio::time::timeout(Duration::from_secs(15), socket.read(remaining))
-            .await
-            .map_err(|_| auth_error("OAuth callback timed out"))?
-            .map_err(|_| auth_error("OAuth callback failed"))?;
-        if received == 0 {
-            return Err(auth_error("OAuth callback closed early"));
-        }
-        count += received;
-        if buffer.get(..count).is_some_and(|bytes| bytes.windows(4).any(|window| window == b"\r\n\r\n")) {
-            break;
+        let request = tokio::select! {
+            () = tokio::time::sleep_until(deadline) => return Err(auth_error("browser login timed out")),
+            accepted = challenge.listener.accept() => {
+                if let Ok((socket, _)) = accepted {
+                    readers.spawn(read_request(socket));
+                }
+                None
+            }
+            Some(read) = readers.join_next(), if !readers.is_empty() => read.ok().flatten(),
+        };
+        let Some((socket, target)) = request else { continue };
+        match route(&target, challenge.state.expose()) {
+            Callback::Reply(status, reason, body) => respond(socket, status, reason, &body).await,
+            Callback::Cancel => {
+                respond(socket, 200, "OK", &page("Sign-in cancelled", "You can close this window.")).await;
+                return Err(auth_error("browser login cancelled"));
+            }
+            Callback::MissingCode => {
+                respond(socket, 400, "Bad Request", &page("Sign-in failed", "The callback carried no authorization code.")).await;
+                return Err(auth_error("browser login failed: the callback carried no authorization code"));
+            }
+            Callback::ProviderError(code, description) => {
+                let detail = description.clone().unwrap_or_default();
+                respond(socket, 200, "OK", &page(&format!("Sign-in failed: {code}"), &detail)).await;
+                let detail = description.map(|d| format!(": {d}")).unwrap_or_default();
+                return Err(auth_error(format!("browser login failed: the provider returned {code}{detail}")));
+            }
+            Callback::Code(code) => {
+                let exchanged = exchange_code(
+                    client,
+                    &challenge.issuer,
+                    challenge.request_timeout,
+                    &code,
+                    challenge.verifier.expose(),
+                    &challenge.redirect_uri,
+                )
+                .await;
+                let (status, reason, body) = match &exchanged {
+                    Ok(_) => (200, "OK", page("Signed in to aim", "You can close this window and return to the terminal.")),
+                    Err(error) => (500, "Internal Server Error", page("Sign-in failed", &error.message)),
+                };
+                respond(socket, status, reason, &body).await;
+                return exchanged;
+            }
         }
     }
-    let request = std::str::from_utf8(buffer.get(..count).ok_or_else(|| auth_error("invalid OAuth callback"))?)
-        .map_err(|_| auth_error("invalid OAuth callback"))?;
-    let target = request.split_whitespace().nth(1).ok_or_else(|| auth_error("invalid OAuth callback"))?;
-    let url = url::Url::parse(&format!("http://localhost{target}")).map_err(|_| auth_error("invalid OAuth callback"))?;
-    let state = url.query_pairs().find(|(key, _)| key == "state").map(|(_, value)| value.into_owned());
-    if url.path() != "/auth/callback" || state.as_deref() != Some(challenge.state.expose()) {
-        return Err(auth_error("OAuth callback state mismatch"));
-    }
-    let code = url
-        .query_pairs()
-        .find(|(key, _)| key == "code")
-        .map(|(_, value)| value.into_owned())
-        .ok_or_else(|| auth_error("OAuth callback has no code"))?;
-    drop(socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 23\r\n\r\nAuthentication complete").await);
-    exchange_code(client, &challenge.issuer, challenge.request_timeout, &code, challenge.verifier.expose(), &challenge.redirect_uri).await
 }
 
 /// Exchanges an authorization code (form-encoded, refs:login/src/server.rs:795-827).
@@ -649,7 +762,7 @@ pub struct DeviceChallenge {
     /// The code to enter.
     pub user_code: String,
     device_auth_id: Secret,
-    interval: u64,
+    interval: Duration,
     issuer: String,
     request_timeout: Duration,
     login_timeout: Duration,
@@ -658,7 +771,7 @@ pub struct DeviceChallenge {
 /// Requests a device code (research §2, refs:login/src/device_code_auth.rs:19-96).
 ///
 /// # Errors
-/// `Auth` if the issuer cannot be reached or refuses.
+/// `Transport`/`Unavailable` if the issuer cannot be reached; `Auth` if it refuses.
 pub async fn begin_device_login(client: &Client, config: &CodexConfig) -> Result<DeviceChallenge, LlmError> {
     let response = client
         .post(format!("{}/api/accounts/deviceauth/usercode", config.issuer))
@@ -666,59 +779,69 @@ pub async fn begin_device_login(client: &Client, config: &CodexConfig) -> Result
         .json(&json!({"client_id": CLIENT_ID}))
         .send()
         .await
-        .map_err(|_| auth_error("device authorization failed"))?;
-    if !response.status().is_success() {
-        return Err(auth_error("device authorization rejected"));
+        .map_err(|_| LlmError::new(LlmErrorKind::Transport, "device login failed: network error"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let kind = if status.is_server_error() { LlmErrorKind::Unavailable } else { LlmErrorKind::Auth };
+        return Err(LlmError::new(kind, format!("device login refused (HTTP {})", status.as_u16())));
     }
-    let body: Value = response.json().await.map_err(|_| auth_error("invalid device authorization response"))?;
-    let string =
-        |key| body.get(key).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| auth_error("invalid device authorization response"));
+    let body: Value = response.json().await.map_err(|_| LlmError::new(LlmErrorKind::Protocol, "invalid device login response"))?;
+    let text = |keys: &[&str]| keys.iter().find_map(|key| body.get(*key).and_then(Value::as_str)).map(str::to_owned);
+    let invalid = || LlmError::new(LlmErrorKind::Protocol, "invalid device login response");
+    // The server sends the interval as a number or a numeric string.
+    let interval = body.get("interval").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))).unwrap_or(5);
     Ok(DeviceChallenge {
         verification_url: format!("{}/codex/device", config.issuer),
-        user_code: string("user_code")?,
-        device_auth_id: Secret::new(string("device_auth_id")?),
-        interval: body
-            .get("interval")
-            .and_then(Value::as_u64)
-            .or_else(|| body.get("interval").and_then(Value::as_str).and_then(|s| s.parse().ok()))
-            .unwrap_or(5)
-            .max(1),
+        user_code: text(&["user_code", "usercode"]).ok_or_else(invalid)?,
+        device_auth_id: Secret::new(text(&["device_auth_id"]).ok_or_else(invalid)?),
+        interval: Duration::from_secs(interval.clamp(1, 60)),
         issuer: config.issuer.clone(),
         request_timeout: config.request_timeout,
         login_timeout: config.login_timeout,
     })
 }
 
-/// Polls until device authorization completes or the login window ends.
+/// Polls at the server's interval until the user approves, the code is refused, or the login
+/// window (15 minutes by default) ends; then exchanges the code. 403/404 mean "pending";
+/// network errors, 429 and 5xx are retried until the deadline.
 ///
 /// # Errors
-/// `Auth` on expiry, a failed poll or a rejected exchange.
+/// `Auth` on expiry, denial or a rejected exchange; `Transport`/`Unavailable` if the final
+/// exchange cannot reach the issuer.
 pub async fn finish_device_login(client: &Client, challenge: &DeviceChallenge) -> Result<Credentials, LlmError> {
     let deadline = Instant::now() + challenge.login_timeout;
     loop {
-        tokio::time::sleep(Duration::from_secs(challenge.interval)).await;
-        if Instant::now() >= deadline {
-            return Err(auth_error("device authorization timed out"));
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(auth_error("device login expired: the code was not approved in time"));
         }
-        let response = client
+        tokio::time::sleep(challenge.interval.min(left)).await;
+        let polled = client
             .post(format!("{}/api/accounts/deviceauth/token", challenge.issuer))
             .timeout(challenge.request_timeout)
             .json(&json!({"device_auth_id": challenge.device_auth_id.expose(), "user_code": challenge.user_code}))
             .send()
-            .await
-            .map_err(|_| auth_error("device authorization poll failed"))?;
-        if matches!(response.status().as_u16(), 403 | 404) {
+            .await;
+        let Ok(response) = polled else { continue };
+        let status = response.status();
+        if matches!(status.as_u16(), 403 | 404 | 429) || status.is_server_error() {
             continue;
         }
-        if !response.status().is_success() {
-            return Err(auth_error("device authorization rejected"));
+        if !status.is_success() {
+            return Err(auth_error(format!("device login refused (HTTP {}): the code was denied or has expired", status.as_u16())));
         }
-        let body: Value = response.json().await.map_err(|_| auth_error("invalid device authorization response"))?;
-        let code = body.get("authorization_code").and_then(Value::as_str).ok_or_else(|| auth_error("device authorization has no code"))?;
-        let verifier =
-            body.get("code_verifier").and_then(Value::as_str).ok_or_else(|| auth_error("device authorization has no verifier"))?;
+        let body: Value = response.json().await.map_err(|_| LlmError::new(LlmErrorKind::Protocol, "invalid device login response"))?;
+        let field = |key: &str| body.get(key).and_then(Value::as_str).filter(|v| !v.is_empty());
+        let (Some(code), Some(verifier)) = (field("authorization_code"), field("code_verifier")) else {
+            return Err(LlmError::new(LlmErrorKind::Protocol, "device login response has no authorization code"));
+        };
         let redirect = format!("{}/deviceauth/callback", challenge.issuer);
-        return exchange_code(client, &challenge.issuer, challenge.request_timeout, code, verifier, &redirect).await;
+        return exchange_code(client, &challenge.issuer, challenge.request_timeout, code, verifier, &redirect).await.map_err(
+            |mut error| {
+                error.message = format!("device login: {}", error.message);
+                error
+            },
+        );
     }
 }
 

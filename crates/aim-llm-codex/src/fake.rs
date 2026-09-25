@@ -36,6 +36,10 @@ impl Recorded {
     pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
+
+    pub(crate) fn form(&self, key: &str) -> Option<String> {
+        url::form_urlencoded::parse(&self.body).find(|(k, _)| k == key).map(|(_, v)| v.into_owned())
+    }
 }
 
 /// A scripted reply.
