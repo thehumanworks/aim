@@ -97,6 +97,11 @@ pub struct Request {
     /// Session id for provider-side affinity headers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Turn id within the session: every request of one agent turn (the model call and its
+    /// tool-result follow-ups) carries the same id. Providers scope per-turn affinity state
+    /// (e.g. codex `x-codex-turn-state`) to it and must not carry it across turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     /// Allow several tool calls in one response.
     #[serde(default)]
     pub parallel_tool_calls: bool,

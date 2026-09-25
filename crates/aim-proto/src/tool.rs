@@ -40,6 +40,25 @@ pub struct ToolAnnotations {
     pub location: ToolLocation,
 }
 
+/// How a tool takes its input.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolInput {
+    /// A JSON object matching `input_schema` (function tools).
+    #[default]
+    Json,
+    /// Free text, optionally constrained by a grammar (e.g. codex's `apply_patch`). The tool
+    /// receives the model's raw text as a JSON string.
+    Freeform {
+        /// Grammar syntax (e.g. `lark`), when constrained.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        syntax: Option<String>,
+        /// Grammar definition, when constrained.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        definition: Option<String>,
+    },
+}
+
 /// A tool as advertised to agents and models.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ToolSpec {
@@ -48,8 +67,11 @@ pub struct ToolSpec {
     /// What the tool does, written for a model. Versioned data: the self-improvement loop may
     /// tune it.
     pub description: String,
-    /// JSON Schema of the arguments object.
+    /// JSON Schema of the arguments object (for [`ToolInput::Json`]).
     pub input_schema: Value,
+    /// How the tool takes its input.
+    #[serde(default)]
+    pub input: ToolInput,
     /// Behavioural hints.
     #[serde(default)]
     pub annotations: ToolAnnotations,

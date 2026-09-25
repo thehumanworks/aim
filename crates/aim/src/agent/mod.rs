@@ -184,6 +184,7 @@ impl Agent {
             tier: self.config.tier.clone(),
             cache_key: self.config.cache_key.clone(),
             session_id: Some(self.config.session_id.clone()),
+            turn_id: None,
             parallel_tool_calls: self.config.parallel_tool_calls,
             max_output_tokens: None,
         }

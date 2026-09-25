@@ -40,8 +40,8 @@ pub struct PeerInfo {
 }
 
 /// How a network client proves its identity (unix-socket peers are identified by peer
-/// credentials and send nothing).
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+/// credentials and send nothing). `Debug` never prints the secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthProof {
     /// A scoped bearer token issued by the harness owner. Only ever sent over TLS or a local
@@ -50,6 +50,14 @@ pub enum AuthProof {
         /// The token.
         token: String,
     },
+}
+
+impl core::fmt::Debug for AuthProof {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Bearer { .. } => f.write_str("Bearer(***)"),
+        }
+    }
 }
 
 /// `initialize` parameters: the first request on every connection.
@@ -488,6 +496,141 @@ method!(
     FsRename = "fs.rename" (FsRenameParams) -> ()
 );
 
+/// `fs.read_many` parameters: several files in one round trip (search-heavy work over SSH).
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FsReadManyParams {
+    /// Workspace.
+    pub workspace: WorkspaceId,
+    /// Files to read.
+    pub paths: Vec<String>,
+    /// Most bytes returned per file (clamped to the harness's `max_read_bytes`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_file: Option<u64>,
+}
+
+/// The outcome for one file of `fs.read_many`.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReadManyEntry {
+    /// The file was read.
+    Ok {
+        /// Path as requested.
+        path: String,
+        /// Result.
+        read: FsReadResult,
+    },
+    /// The file could not be read.
+    Error {
+        /// Path as requested.
+        path: String,
+        /// Error code name (`not_found`, `denied`, …).
+        code: String,
+        /// Human-readable reason.
+        message: String,
+    },
+}
+
+/// `fs.read_many` result.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FsReadManyResult {
+    /// One entry per requested path, in order.
+    pub entries: Vec<ReadManyEntry>,
+}
+
+method!(
+    /// `fs.read_many` — read several files in one round trip.
+    FsReadMany = "fs.read_many" (FsReadManyParams) -> FsReadManyResult
+);
+
+/// `fs.copy` parameters.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FsCopyParams {
+    /// Workspace.
+    pub workspace: WorkspaceId,
+    /// Source path.
+    pub from: String,
+    /// Destination path.
+    pub to: String,
+    /// Replace an existing destination.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Copy a directory recursively.
+    #[serde(default)]
+    pub recursive: bool,
+    /// Retry safety.
+    pub idempotency_key: IdempotencyKey,
+}
+
+method!(
+    /// `fs.copy` — copy a file or directory.
+    FsCopy = "fs.copy" (FsCopyParams) -> ()
+);
+
+/// `watch.start` parameters.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WatchStartParams {
+    /// Workspace.
+    pub workspace: WorkspaceId,
+    /// Directory or file to watch (recursively for directories; `.gitignore` respected).
+    pub path: String,
+}
+
+/// `watch.start` result.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WatchStartResult {
+    /// The watch; events arrive as `watch.event` notifications.
+    pub watch: String,
+}
+
+method!(
+    /// `watch.start` — watch for file changes (requires `Caps.watch`).
+    WatchStart = "watch.start" (WatchStartParams) -> WatchStartResult
+);
+
+/// `watch.stop` parameters.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WatchStopParams {
+    /// The watch to stop.
+    pub watch: String,
+}
+
+method!(
+    /// `watch.stop` — stop a watch.
+    WatchStop = "watch.stop" (WatchStopParams) -> ()
+);
+
+/// What happened to a watched path.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchChange {
+    /// Created.
+    Created,
+    /// Modified.
+    Modified,
+    /// Removed.
+    Removed,
+    /// Events were dropped; rescan.
+    Overflow,
+}
+
+/// `watch.event` notification parameters.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WatchEventParams {
+    /// The watch.
+    pub watch: String,
+    /// Sequence number within the watch.
+    pub seq: u64,
+    /// What happened.
+    pub change: WatchChange,
+    /// Path, relative to the workspace root.
+    pub path: String,
+}
+
+notification!(
+    /// `watch.event` — a watched path changed.
+    WatchEvent = "watch.event" (WatchEventParams)
+);
+
 // ------------------------------------------------------------------------------------------------
 // exec
 // ------------------------------------------------------------------------------------------------
@@ -670,6 +813,8 @@ pub struct ExecWriteStdinParams {
     /// Close stdin afterwards.
     #[serde(default)]
     pub eof: bool,
+    /// Retry safety: a retried write does not send its bytes twice.
+    pub idempotency_key: IdempotencyKey,
 }
 
 method!(
@@ -715,6 +860,29 @@ pub struct ExecSignalParams {
 method!(
     /// `exec.signal` — signal a process group.
     ExecSignal = "exec.signal" (ExecSignalParams) -> ()
+);
+
+/// `exec.wait` parameters.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExecWaitParams {
+    /// Process.
+    pub proc: ProcId,
+    /// Give up after this long (the process keeps running).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// `exec.wait` result.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExecWaitResult {
+    /// How it ended, or `None` if the timeout elapsed first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<ExitStatus>,
+}
+
+method!(
+    /// `exec.wait` — wait for a process to end.
+    ExecWait = "exec.wait" (ExecWaitParams) -> ExecWaitResult
 );
 
 /// `exec.release` parameters.

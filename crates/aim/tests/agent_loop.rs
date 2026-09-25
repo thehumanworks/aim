@@ -75,6 +75,7 @@ impl ToolHost for Fake {
             name: "echo".into(),
             description: "echo".into(),
             input_schema: json!({"type": "object"}),
+            input: aim_proto::tool::ToolInput::default(),
             annotations: ToolAnnotations::default(),
         }]
     }
