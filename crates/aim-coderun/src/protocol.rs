@@ -23,7 +23,8 @@ pub struct Execute {
     pub timeout_ms: u64,
     /// `QuickJS` heap ceiling in bytes.
     pub memory_limit_bytes: usize,
-    /// Maximum UTF-8 bytes emitted by helpers in this cell.
+    /// Most output bytes this cell keeps, separators included ([`crate::budget`]). Output beyond
+    /// it is dropped and counted; it never fails the cell.
     pub output_limit_bytes: usize,
     /// Only these names can become host calls.
     pub tools: Vec<ToolSpec>,
@@ -35,12 +36,21 @@ pub struct Execute {
 /// Final cell state; streamed output may also have been sent as notifications.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ExecuteResult {
-    /// Explicit `text()` output plus a returned value when no `text()` was emitted.
+    /// Explicit `text()` output, or the returned value when no `text()` was emitted.
     pub output: String,
+    /// Whether `output` is the cell's returned value, which was never streamed.
+    #[serde(default)]
+    pub returned: bool,
     /// Whether the cell invoked `yield_control()`.
     pub yielded: bool,
     /// Updated JSON state for the next cell.
     pub store: HashMap<String, Value>,
+    /// Output bytes the budget dropped ([`crate::budget`]).
+    #[serde(default)]
+    pub dropped_bytes: u64,
+    /// Output calls the budget dropped.
+    #[serde(default)]
+    pub dropped_events: u64,
 }
 
 /// One nested tool call, always re-entering the parent's dispatcher.

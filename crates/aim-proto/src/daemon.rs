@@ -174,21 +174,28 @@ pub enum SessionUpdate {
     },
     /// A tool call started running.
     ToolStarted {
-        /// Provider call id.
+        /// Provider call id, or, for a nested call, an id unique in the session.
         call_id: String,
         /// Tool name.
         name: String,
         /// Raw arguments.
         arguments: String,
+        /// The call that made this one: the `run_code`, `exec` or `wait` call whose code cell
+        /// called this tool (ADR 0066). `None` for the model's own calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
     },
     /// A tool call finished (or was answered while winding down).
     ToolFinished {
-        /// Provider call id.
+        /// Provider call id, or, for a nested call, an id unique in the session.
         call_id: String,
         /// Tool name.
         name: String,
         /// Its result.
         result: ToolResult,
+        /// The call that made this one (ADR 0066); `None` for the model's own calls.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
     },
     /// Steering was accepted and will go with the next request.
     SteerQueued,

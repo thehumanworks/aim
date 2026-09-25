@@ -46,7 +46,7 @@ fn manifest_accepts_natural_json_schemas_from_tool_arguments() {
 
 fn store() -> (tempfile::TempDir, ProgramStore) {
     let directory = tempfile::tempdir().unwrap();
-    let store = ProgramStore::new(directory.path().join("user/programs"), Some(directory.path().join("project/.agents/programs")));
+    let store = ProgramStore::new(directory.path().join("user/programs"));
     (directory, store)
 }
 
@@ -73,16 +73,32 @@ fn git_save_load_and_content_trust() {
 }
 
 #[test]
-fn second_save_is_one_more_commit_and_project_is_separate() {
-    let (_directory, store) = store();
+fn second_save_is_one_more_commit_and_project_programs_never_touch_the_daemons_disk() {
+    let (directory, store) = store();
     store.save(ProgramScope::User, "find-files", &manifest(), "export default async function main() { return 1; }").unwrap();
     store.save(ProgramScope::User, "find-files", &manifest(), "export default async function main() { return 2; }").unwrap();
-    store.save(ProgramScope::Project, "find-files", &manifest(), "export default async function main() { return 3; }").unwrap();
+    // Project programs are read and written through the workspace (ADR 0066, REV13a L5).
+    let project = store.save(ProgramScope::Project, "find-files", &manifest(), "export default async function main() { return 3; }");
+    assert!(matches!(project, Err(ProgramError::Invalid(_))));
+    assert!(!directory.path().join("project").exists());
     let user = store.root(ProgramScope::User).unwrap();
     assert_eq!(super::git_output(user, &["rev-list", "--count", "HEAD"], "rev-list").unwrap(), "2");
-    let all = store.list().unwrap();
-    assert_eq!(all.len(), 2);
-    assert_eq!(all.first().unwrap().scope, ProgramScope::Project);
+    let all = store.list().unwrap().programs;
+    assert_eq!(all.len(), 1);
+    assert_eq!(all.first().unwrap().scope, ProgramScope::User);
+}
+
+#[test]
+fn one_malformed_program_does_not_hide_the_others() {
+    let (_directory, store) = store();
+    store.save(ProgramScope::User, "good", &manifest(), "export default async function main() { return 1; }").unwrap();
+    store.save(ProgramScope::User, "broken", &manifest(), "export default async function main() { return 2; }").unwrap();
+    let root = store.root(ProgramScope::User).unwrap();
+    std::fs::write(root.join("broken/program.toml"), "not = [valid").unwrap();
+    let listing = store.list().unwrap();
+    assert_eq!(listing.programs.iter().map(|program| program.slug.as_str()).collect::<Vec<_>>(), ["good"]);
+    assert_eq!(listing.problems.len(), 1);
+    assert!(listing.problems.first().unwrap().contains("broken"), "{:?}", listing.problems);
 }
 
 #[test]
@@ -129,7 +145,7 @@ fn concurrent_saves_keep_all_trust_hashes_and_commits() {
     for handle in handles {
         assert!(handle.join().unwrap().unwrap().trusted);
     }
-    let programs = store.list().unwrap();
+    let programs = store.list().unwrap().programs;
     assert_eq!(programs.len(), 4);
     assert!(programs.iter().all(|program| program.trusted));
 }

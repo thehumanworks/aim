@@ -133,7 +133,12 @@ impl Bridge {
             return;
         }
         self.started.insert(call_id.to_owned(), (name.to_owned(), arguments.to_owned()));
-        out.push(SessionUpdate::ToolStarted { call_id: call_id.to_owned(), name: name.to_owned(), arguments: arguments.to_owned() });
+        out.push(SessionUpdate::ToolStarted {
+            call_id: call_id.to_owned(),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+            parent: None,
+        });
     }
 
     fn finish(&mut self, call_id: &str, result: ToolResult, out: &mut Vec<SessionUpdate>) {
@@ -141,7 +146,7 @@ impl Bridge {
             return;
         }
         let name = self.started.get(call_id).map(|(name, _)| name.clone()).unwrap_or_default();
-        out.push(SessionUpdate::ToolFinished { call_id: call_id.to_owned(), name, result });
+        out.push(SessionUpdate::ToolFinished { call_id: call_id.to_owned(), name, result, parent: None });
     }
 }
 

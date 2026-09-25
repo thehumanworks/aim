@@ -435,8 +435,16 @@ impl Agent {
         dangling.len()
     }
 
-    /// Starts a complete tool call; returns its future (owned, so it runs concurrently).
-    fn start_call(&self, specs: &[ToolSpec], id: CallId, name: &str, arguments: &str) -> tools::BoxFuture<(CallId, ToolResult)> {
+    /// Starts a complete tool call; returns its future (owned, so it runs concurrently). The call
+    /// runs inside `context`, so a host can name it as the parent of calls it makes (ADR 0066).
+    fn start_call(
+        &self,
+        specs: &[ToolSpec],
+        id: CallId,
+        context: tools::ToolCallContext,
+        name: &str,
+        arguments: &str,
+    ) -> tools::BoxFuture<(CallId, ToolResult)> {
         // UUIDv7 keys carry their minting time, so the harness can age them out of its
         // idempotency horizon instead of ever re-running an old key (FIX4).
         let key = IdempotencyKey::new(uuid::Uuid::now_v7().simple().to_string());
@@ -448,14 +456,14 @@ impl Agent {
         };
         match args {
             Ok(args) => {
-                let call = self.tools.call(name.to_owned(), args, key);
-                Box::pin(async move {
+                let call = context.enter(|| self.tools.call(name.to_owned(), args, key));
+                Box::pin(context.scope(async move {
                     let result = match call.await {
                         Ok(result) => result,
                         Err(err) => ToolResult::error(format!("{}: {}", err.code, err.message)),
                     };
                     (id, result)
-                })
+                }))
             }
             Err(err) => {
                 let result = ToolResult::error(format!("the arguments are not valid JSON ({err}); call the tool again with a JSON object"));
@@ -476,7 +484,10 @@ impl Agent {
                 }
                 ToolResult::error(why)
             };
-            emit(events, AgentEvent::ToolFinished { call_id: call.call_id.clone(), name: call.name.clone(), result: result.clone() });
+            emit(
+                events,
+                AgentEvent::ToolFinished { call_id: call.call_id.clone(), name: call.name.clone(), result: result.clone(), parent: None },
+            );
             self.push(Item::ToolResult { call_id: call.call_id, result }, events);
         }
     }
@@ -544,8 +555,13 @@ impl Agent {
                                 if turn.apply(TurnEvent::CallComplete { id }).is_err() {
                                     return Ended::Failed(AgentError::Protocol(format!("tool call {call_id} arrived outside streaming")));
                                 }
-                                emit(ctx.events, AgentEvent::ToolStarted { call_id: call_id.clone(), name: name.clone(), arguments: arguments.clone() });
-                                response.running.push(self.start_call(specs, id, name, arguments));
+                                emit(ctx.events, AgentEvent::ToolStarted { call_id: call_id.clone(), name: name.clone(), arguments: arguments.clone(), parent: None });
+                                let context = tools::ToolCallContext {
+                                    call_id: call_id.clone(),
+                                    events: ctx.events.clone(),
+                                    cancel: ctx.cancel.clone(),
+                                };
+                                response.running.push(self.start_call(specs, id, context, name, arguments));
                                 response.dispatched.push(Dispatched { id, call_id: call_id.clone(), name: name.clone() });
                             }
                             let decide = matches!(&item, Item::ToolCall { .. }) && response.decision.is_none();

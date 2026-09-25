@@ -117,9 +117,61 @@ async fn store_and_program_args_and_return() {
 }
 
 #[tokio::test]
-async fn output_limit_is_enforced() {
-    let err = execute("text('too long')", None, 3, 2_000, 16 << 20).await.unwrap_err();
-    assert_eq!(err.code, ErrorCode::LimitExceeded);
+async fn output_over_the_limit_is_dropped_and_counted_not_failed() {
+    let (result, events) = execute("text('ok'); text('too long'); store('kept', 1); text('x')", None, 5, 2_000, 16 << 20).await.unwrap();
+    assert_eq!(result.output, "ok\n", "kept output is a prefix");
+    assert_eq!((result.dropped_events, result.dropped_bytes), (2, 9));
+    assert_eq!(result.store.get("kept"), Some(&json!(1)), "the store survives an output overflow (REV13a M8)");
+    assert_eq!(events.len(), 1);
+}
+
+#[tokio::test]
+async fn empty_text_calls_are_charged_against_the_limit() {
+    // REV13a M2: each empty text('') used to add an uncharged '\n', so a loop printed 1 MB.
+    let code = "for (let i = 0; i < 1000000; i++) { try { text('') } catch (e) {} }";
+    let (result, _) = execute(code, None, 40_000, 20_000, 16 << 20).await.unwrap();
+    assert!(result.output.len() <= 40_000, "{} bytes", result.output.len());
+    assert!(result.dropped_events > 900_000);
+}
+
+#[tokio::test]
+async fn zero_byte_notifications_are_bounded_and_coalesced() {
+    // REV13a M3: a notify('') flood grew the parent's memory without bound.
+    let code = "for (let i = 0; i < 200000; i++) { notify(''); yield_control(); } text('done')";
+    let (result, events) = execute(code, None, 40_000, 20_000, 16 << 20).await.unwrap();
+    assert!(events.len() <= aim_coderun::budget::MAX_EVENTS, "{} events reached the parent", events.len());
+    assert_eq!(events.len(), 2, "consecutive markers coalesce into one, then the text");
+    assert!(result.yielded);
+    assert_eq!(result.output, "done\n");
+}
+
+#[tokio::test]
+async fn distinct_notifications_stop_at_the_event_cap() {
+    let code = "for (let i = 0; i < 10000; i++) { notify(String(i % 10)); }";
+    let (result, events) = execute(code, None, 1_000_000, 20_000, 16 << 20).await.unwrap();
+    assert_eq!(events.len(), aim_coderun::budget::MAX_EVENTS);
+    assert_eq!(result.dropped_events, 10_000 - u64::try_from(aim_coderun::budget::MAX_EVENTS).unwrap());
+}
+
+#[tokio::test]
+async fn a_large_returned_value_is_cut_not_failed() {
+    let (result, _) = execute("return 'x'.repeat(100)", None, 10, 2_000, 16 << 20).await.unwrap();
+    assert_eq!(result.output, "x".repeat(10));
+    assert!(result.returned);
+    assert_eq!(result.dropped_bytes, 90);
+}
+
+#[tokio::test]
+async fn store_is_bounded_at_store_time_and_undefined_removes_a_key() {
+    let limit = aim_coderun::budget::MAX_STORE_BYTES;
+    let code = format!(
+        "store('a', 1); let refused = false; try {{ store('big', 'x'.repeat({limit})) }} catch (e) {{ refused = String(e.message).includes('store is limited') }} store('gone', 2); store('gone', undefined); text(refused)"
+    );
+    let (result, _) = execute(&code, None, 1024, 5_000, 64 << 20).await.unwrap();
+    assert_eq!(result.output, "true\n");
+    assert_eq!(result.store.get("a"), Some(&json!(1)));
+    assert!(!result.store.contains_key("big"));
+    assert!(!result.store.contains_key("gone"));
 }
 
 #[tokio::test]

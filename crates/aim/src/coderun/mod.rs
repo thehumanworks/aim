@@ -1,6 +1,14 @@
 //! Sandboxed JavaScript/TypeScript cells exposed as session-scoped agent tools.
+//!
+//! A session has one worker. Its cells are scheduled one at a time ([`scheduler`]), bound to the
+//! turn that observes them, and end with that turn's interrupt and with their session
+//! (ADR 0066). Their nested calls are shown and recorded as child tool events of the call that
+//! ran the cell.
 
+mod cells;
 mod programs;
+pub mod sandbox;
+pub mod scheduler;
 mod supervisor;
 mod types;
 
@@ -8,27 +16,47 @@ pub use programs::ProgramToolHost;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use aim_coderun::protocol::{CellOutput, Execute};
+use aim_coderun::budget::{dropped_note, truncate_middle};
+use aim_coderun::protocol::{Execute, ExecuteResult};
 use aim_llm::ModelInfo;
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolAnnotations, ToolInput, ToolLocation, ToolResult, ToolSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::Semaphore;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 use crate::agent::ToolHost;
-use crate::agent::tools::BoxFuture;
-use supervisor::Supervisor;
+use crate::agent::tools::{BoxFuture, ToolCallContext};
+use cells::{CellRecord, ExecCell, merge_store};
+use supervisor::{CellBridge, CellTicket, Observer, OutputSink, Supervisor};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_OUTPUT_BYTES: usize = 40_000;
 const MAX_OUTPUT_BYTES: usize = 64_000;
+/// Cells that may wait behind the running one (`REV13a` M9).
+const QUEUE_CAPACITY: usize = 4;
+/// How long a synchronous call (`run_code`, `run_program`) waits for a worker before it is told
+/// the session is busy, instead of waiting silently for minutes (`REV13a` M9).
+const ADMISSION_WAIT: Duration = Duration::from_secs(10);
+/// Program workers one session may run at once (`REV13a` M9).
+const PROGRAM_WORKERS: usize = 2;
+/// Finished `exec` cells kept for a later `wait` (`REV13a` L4).
+const FINISHED_CELLS: usize = 16;
+/// How long termination and close wait for a cell's task to end.
+const END_WAIT: Duration = Duration::from_secs(2);
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The tool shape selected from a model's catalog entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,86 +78,6 @@ impl CodeMode {
     }
 }
 
-struct CellProgress {
-    chunks: Vec<CellOutput>,
-    cursor: usize,
-    pending: String,
-    done: Option<Result<(), ProtoError>>,
-}
-
-struct CellRecord {
-    progress: Mutex<CellProgress>,
-    changed: Notify,
-}
-
-impl CellRecord {
-    fn new() -> Self {
-        Self {
-            progress: Mutex::new(CellProgress { chunks: Vec::new(), cursor: 0, pending: String::new(), done: None }),
-            changed: Notify::new(),
-        }
-    }
-
-    async fn push(&self, item: CellOutput) {
-        self.progress.lock().await.chunks.push(item);
-        self.changed.notify_waiters();
-    }
-
-    async fn finish(&self, result: Result<String, ProtoError>) {
-        let mut state = self.progress.lock().await;
-        match result {
-            Ok(final_output) => {
-                let streamed = joined_lines(state.chunks.iter().filter(|chunk| !chunk.immediate && !chunk.yielded));
-                if let Some(remainder) = final_output.strip_prefix(&streamed) {
-                    if !remainder.is_empty() {
-                        state.chunks.push(CellOutput {
-                            cell_id: String::new(),
-                            text: remainder.to_owned(),
-                            immediate: false,
-                            yielded: false,
-                        });
-                    }
-                } else if streamed.is_empty() && !final_output.is_empty() {
-                    state.chunks.push(CellOutput { cell_id: String::new(), text: final_output, immediate: false, yielded: false });
-                }
-                state.done = Some(Ok(()));
-            }
-            Err(error) => state.done = Some(Err(error)),
-        }
-        self.changed.notify_waiters();
-    }
-
-    async fn poll(&self, duration: Duration, max_bytes: usize) -> Result<(String, bool), ProtoError> {
-        let deadline = tokio::time::Instant::now() + duration;
-        loop {
-            let changed = self.changed.notified();
-            let mut progress = self.progress.lock().await;
-            let new = progress.chunks.get(progress.cursor..).unwrap_or_default();
-            let should_yield =
-                progress.done.is_some() || !progress.pending.is_empty() || new.iter().any(|chunk| chunk.immediate || chunk.yielded);
-            if should_yield || tokio::time::Instant::now() >= deadline {
-                let new_text = joined_lines(new.iter().filter(|chunk| !chunk.yielded));
-                let mut text = std::mem::take(&mut progress.pending);
-                text.push_str(&new_text);
-                progress.cursor = progress.chunks.len();
-                let done = progress.done.clone();
-                let (shown, pending) = split_output(&text, max_bytes);
-                progress.pending = pending;
-                let finished = done.is_some() && progress.pending.is_empty();
-                drop(progress);
-                if let Some(Err(error)) = done {
-                    return Err(error);
-                }
-                return Ok((shown, finished));
-            }
-            drop(progress);
-            if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                // The next iteration returns any output collected during the wait.
-            }
-        }
-    }
-}
-
 struct Shared {
     mode: CodeMode,
     session_id: String,
@@ -138,13 +86,58 @@ struct Shared {
     inner: Arc<dyn ToolHost>,
     supervisor: Supervisor,
     store: Mutex<HashMap<String, Value>>,
-    cells: Mutex<HashMap<String, Arc<CellRecord>>>,
+    cells: Mutex<HashMap<String, Arc<ExecCell>>>,
+    /// Cancelled when the session's code mode closes.
+    closed: CancellationToken,
+    /// The `exec` cells' tasks.
+    tasks: TaskTracker,
+    /// Limits concurrent program workers.
+    programs: Arc<Semaphore>,
+}
+
+/// Closes code mode when the last [`CodeToolHost`] handle goes: its cells end and the worker is
+/// killed, so no cell outlives its session (`REV13a` H2).
+struct HostGuard {
+    closer: CodeModeHandle,
+}
+
+impl Drop for HostGuard {
+    fn drop(&mut self) {
+        self.closer.close_now();
+    }
+}
+
+/// Ends a session's code mode: its cells, its worker and its program workers (ADR 0066). It does
+/// not keep the session's tools alive, so the workspace can shut down after it.
+#[derive(Clone)]
+pub struct CodeModeHandle {
+    closed: CancellationToken,
+    tasks: TaskTracker,
+    supervisor: Arc<Supervisor>,
+}
+
+impl CodeModeHandle {
+    fn close_now(&self) {
+        self.closed.cancel();
+        self.supervisor.close();
+        self.tasks.close();
+    }
+
+    /// Ends every cell and waits, at most `within`, for their tasks to finish. The session's
+    /// shutdown is never blocked longer than that.
+    pub async fn close(&self, within: Duration) {
+        self.close_now();
+        if tokio::time::timeout(within, self.tasks.wait()).await.is_err() {
+            tracing::warn!("code cells did not end within {} ms of their session", within.as_millis());
+        }
+    }
 }
 
 /// A `ToolHost` that exposes code mode and delegates every nested tool call to `inner`.
 #[derive(Clone)]
 pub struct CodeToolHost {
     shared: Arc<Shared>,
+    guard: Arc<HostGuard>,
 }
 
 impl CodeToolHost {
@@ -157,18 +150,29 @@ impl CodeToolHost {
     /// Bind a known turn number so saved-program provenance comes from the host.
     #[must_use]
     pub fn new_with_turn(inner: Arc<dyn ToolHost>, executable: PathBuf, session_id: impl Into<String>, turn: u64, mode: CodeMode) -> Self {
-        Self {
-            shared: Arc::new(Shared {
-                mode,
-                session_id: session_id.into(),
-                turn,
-                supervisor: Supervisor::new(executable.clone(), Arc::clone(&inner)),
-                executable,
-                inner,
-                store: Mutex::new(HashMap::new()),
-                cells: Mutex::new(HashMap::new()),
-            }),
-        }
+        let supervisor = Supervisor::new(executable.clone(), QUEUE_CAPACITY);
+        let closer =
+            CodeModeHandle { closed: CancellationToken::new(), tasks: TaskTracker::new(), supervisor: Arc::new(supervisor.closer()) };
+        let shared = Arc::new(Shared {
+            mode,
+            session_id: session_id.into(),
+            turn,
+            supervisor,
+            executable,
+            inner,
+            store: Mutex::new(HashMap::new()),
+            cells: Mutex::new(HashMap::new()),
+            closed: closer.closed.clone(),
+            tasks: closer.tasks.clone(),
+            programs: Arc::new(Semaphore::new(PROGRAM_WORKERS)),
+        });
+        Self { shared, guard: Arc::new(HostGuard { closer }) }
+    }
+
+    /// The handle that ends this session's code mode (for the session's shutdown).
+    #[must_use]
+    pub fn handle(&self) -> CodeModeHandle {
+        self.guard.closer.clone()
     }
 
     /// A compact prompt index of the tools callable inside a cell.
@@ -189,105 +193,197 @@ impl CodeToolHost {
             return Err(invalid("code must be nonempty"));
         }
         let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1, MAX_TIMEOUT_MS);
-        let request = self.request(args.code, timeout_ms, DEFAULT_OUTPUT_BYTES).await;
-        let (sender, _receiver) = mpsc::unbounded_channel();
-        let result = self.shared.supervisor.execute(request, sender).await?;
-        *self.shared.store.lock().await = result.store;
-        Ok(ToolResult::text(result.output))
+        // The deadline starts at admission, so time spent waiting for the worker counts (M9).
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let cell_id = Uuid::now_v7().to_string();
+        let mut ticket = self.shared.supervisor.enqueue(&cell_id)?;
+        ticket.until_running(deadline.min(Instant::now() + ADMISSION_WAIT)).await?;
+        let observer = Arc::new(Observer::new(ToolCallContext::current()));
+        let run = self.shared.run(&mut ticket, &cell_id, args.code, DEFAULT_OUTPUT_BYTES, None, observer, deadline);
+        let (result, store_note) = tokio::select! {
+            outcome = run => outcome?,
+            () = self.shared.closed.cancelled() => return Err(closed()),
+        };
+        drop(ticket);
+        let mut output = result.output;
+        for note in [dropped_note(result.dropped_bytes, result.dropped_events), store_note].into_iter().flatten() {
+            output.push_str(&note);
+            output.push('\n');
+        }
+        // Defense in depth: a compromised worker cannot hand the model more than the limit (M2).
+        Ok(ToolResult::text(truncate_middle(&output, DEFAULT_OUTPUT_BYTES)))
     }
 
     async fn exec(&self, arguments: Value) -> Result<ToolResult, ProtoError> {
         let source = arguments.as_str().ok_or_else(|| invalid("exec expects raw JavaScript source text"))?;
         let parsed = parse_exec_source(source)?;
         let yield_time_ms = parsed.yield_time_ms.unwrap_or(30_000).clamp(1, 120_000);
-        let max_output_bytes = parsed.max_output_tokens.unwrap_or(10_000).saturating_mul(4).clamp(1, MAX_OUTPUT_BYTES);
+        // `max_output_tokens` shapes each response; the cell itself keeps up to the full limit
+        // and never fails for its output (M8).
+        let response_bytes = response_bytes(parsed.max_output_tokens);
+        let deadline = Instant::now() + Duration::from_millis(MAX_TIMEOUT_MS);
         let cell_id = Uuid::now_v7().to_string();
-        let record = Arc::new(CellRecord::new());
-        self.shared.cells.lock().await.insert(cell_id.clone(), Arc::clone(&record));
-        let request = self.request_with_cell(cell_id.clone(), parsed.code, MAX_TIMEOUT_MS, max_output_bytes).await;
-        let shared = Arc::clone(&self.shared);
-        tokio::spawn(async move {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
-            let running = shared.supervisor.execute(request, sender);
-            tokio::pin!(running);
-            let result = loop {
-                tokio::select! {
-                    next = receiver.recv() => {
-                        if let Some(output) = next {
-                            record.push(output).await;
-                        }
-                    }
-                    done = &mut running => break done,
-                }
-            };
-            while let Ok(output) = receiver.try_recv() {
-                record.push(output).await;
-            }
-            match result {
-                Ok(result) => {
-                    *shared.store.lock().await = result.store;
-                    record.finish(Ok(result.output)).await;
-                }
-                Err(error) => record.finish(Err(error)).await,
-            }
+        self.prune_finished();
+        let ticket = self.shared.supervisor.enqueue(&cell_id)?;
+        let cell = Arc::new(ExecCell {
+            record: Arc::new(CellRecord::new(MAX_OUTPUT_BYTES)),
+            observer: Arc::new(Observer::new(ToolCallContext::current())),
+            cancel: CancellationToken::new(),
+            task: Mutex::new(None),
         });
-        let (output, done) = self.poll_cell(&cell_id, yield_time_ms, max_output_bytes).await?;
-        if done {
-            self.shared.cells.lock().await.remove(&cell_id);
-            Ok(ToolResult::text(output))
-        } else {
-            Ok(ToolResult::text(format!("{output}\nScript running with cell ID {cell_id}")))
-        }
+        locked(&self.shared.cells).insert(cell_id.clone(), Arc::clone(&cell));
+        let task =
+            self.shared.tasks.spawn(run_exec(Arc::clone(&self.shared), ticket, cell_id.clone(), parsed.code, Arc::clone(&cell), deadline));
+        cell.set_task(task);
+        self.answer(&cell_id, &cell, yield_time_ms, response_bytes).await
     }
 
     async fn wait(&self, arguments: Value) -> Result<ToolResult, ProtoError> {
         let args: WaitArgs = serde_json::from_value(arguments).map_err(|_| invalid("invalid wait arguments"))?;
+        let response_bytes = response_bytes(args.max_tokens);
         if args.terminate {
-            if self.shared.cells.lock().await.remove(&args.cell_id).is_none() {
-                return Err(ProtoError::new(ErrorCode::NotFound, "code cell not found"));
+            // Exactly the named cell ends (REV13a H1): its ticket leaves the queue, or its worker,
+            // which runs only it, is killed. Its task ends before the answer.
+            let cell = locked(&self.shared.cells).remove(&args.cell_id).ok_or_else(not_found)?;
+            cell.cancel.cancel();
+            if let Some(task) = cell.take_task()
+                && tokio::time::timeout(END_WAIT, task).await.is_err()
+            {
+                tracing::warn!(cell = %args.cell_id, "a terminated code cell did not end in time");
             }
-            self.shared.supervisor.terminate().await;
-            return Ok(ToolResult::text(format!("Script terminated: {}", args.cell_id)));
+            let output = cell.record.take_unread(response_bytes);
+            return Ok(ToolResult::text(format!("{output}Script terminated: {}", args.cell_id)));
         }
-        let max_bytes = args.max_tokens.unwrap_or(10_000).saturating_mul(4).clamp(1, MAX_OUTPUT_BYTES);
-        let (output, done) = self.poll_cell(&args.cell_id, args.yield_time_ms.unwrap_or(10_000).clamp(1, 120_000), max_bytes).await?;
+        let cell = locked(&self.shared.cells).get(&args.cell_id).cloned().ok_or_else(not_found)?;
+        // A cell left running by an earlier turn is observed by this one from now on.
+        cell.observer.rebind(ToolCallContext::current());
+        self.answer(&args.cell_id, &cell, args.yield_time_ms.unwrap_or(10_000).clamp(1, 120_000), response_bytes).await
+    }
+
+    async fn answer(&self, cell_id: &str, cell: &ExecCell, yield_time_ms: u64, response_bytes: usize) -> Result<ToolResult, ProtoError> {
+        let polled = cell.record.poll(Duration::from_millis(yield_time_ms), response_bytes).await;
+        let finished = !matches!(polled, Ok((_, false)));
+        if finished {
+            locked(&self.shared.cells).remove(cell_id);
+        }
+        let (output, done) = polled?;
         if done {
-            self.shared.cells.lock().await.remove(&args.cell_id);
-            Ok(ToolResult::text(output))
-        } else {
-            Ok(ToolResult::text(format!("{output}\nScript running with cell ID {}", args.cell_id)))
+            return Ok(ToolResult::text(output));
+        }
+        // A queued cell says so, instead of looking busy while it has not started (M9).
+        let queued = self
+            .shared
+            .supervisor
+            .queued_ahead(cell_id)
+            .map(|ahead| format!("\nQueued: {ahead} cell(s) ahead of it; it starts when they finish."))
+            .unwrap_or_default();
+        Ok(ToolResult::text(format!("{output}{queued}\nScript running with cell ID {cell_id}")))
+    }
+
+    /// Forgets finished cells nobody waited for, oldest first, beyond [`FINISHED_CELLS`] (L4).
+    fn prune_finished(&self) {
+        let mut cells = locked(&self.shared.cells);
+        let mut finished: Vec<(String, bool)> = Vec::new();
+        let stale = Instant::now().checked_sub(Duration::from_secs(600));
+        for (id, cell) in cells.iter() {
+            if cell.record.is_done() {
+                finished.push((id.clone(), stale.is_some_and(|cutoff| cell.record.finished_before(cutoff))));
+            }
+        }
+        // UUIDv7 ids sort by creation time.
+        finished.sort();
+        let excess = finished.len().saturating_sub(FINISHED_CELLS);
+        for (index, (id, stale)) in finished.into_iter().enumerate() {
+            if index < excess || stale {
+                cells.remove(&id);
+            }
         }
     }
+}
 
-    async fn poll_cell(&self, cell_id: &str, yield_time_ms: u64, max_bytes: usize) -> Result<(String, bool), ProtoError> {
-        let cell = self
-            .shared
-            .cells
-            .lock()
-            .await
-            .get(cell_id)
-            .cloned()
-            .ok_or_else(|| ProtoError::new(ErrorCode::NotFound, "code cell not found"))?;
-        cell.poll(Duration::from_millis(yield_time_ms), max_bytes).await
-    }
-
-    async fn request(&self, code: String, timeout_ms: u64, output_limit_bytes: usize) -> Execute {
-        self.request_with_cell(Uuid::now_v7().to_string(), code, timeout_ms, output_limit_bytes).await
-    }
-
-    async fn request_with_cell(&self, cell_id: String, code: String, timeout_ms: u64, output_limit_bytes: usize) -> Execute {
-        Execute {
-            session_id: self.shared.session_id.clone(),
-            cell_id,
+impl Shared {
+    /// Runs one admitted cell against the session's tools. The request is built only now, so the
+    /// cell sees the store as it is when it starts (L3), and its changes merge key by key.
+    #[expect(clippy::too_many_arguments, reason = "one cell's inputs, kept explicit")]
+    async fn run(
+        &self,
+        ticket: &mut CellTicket,
+        cell_id: &str,
+        code: String,
+        output_limit_bytes: usize,
+        output: Option<Arc<dyn OutputSink>>,
+        observer: Arc<Observer>,
+        deadline: Instant,
+    ) -> Result<(ExecuteResult, Option<String>), ProtoError> {
+        ticket.until_running(deadline).await?;
+        let tools = self.inner.specs();
+        let before = locked(&self.store).clone();
+        let request = Execute {
+            session_id: self.session_id.clone(),
+            cell_id: cell_id.to_owned(),
             code,
-            timeout_ms,
+            timeout_ms: 1,
             memory_limit_bytes: 64 * 1024 * 1024,
             output_limit_bytes,
-            tools: self.shared.inner.specs(),
-            store: self.shared.store.lock().await.clone(),
+            tools: tools.clone(),
+            store: before.clone(),
             program_args: None,
-        }
+        };
+        let bridge = CellBridge {
+            session_id: self.session_id.clone(),
+            allowed: tools.into_iter().map(|spec| spec.name).collect(),
+            host: Arc::clone(&self.inner),
+            output,
+            observer,
+        };
+        let mut result = ticket.run(request, bridge, deadline).await?;
+        let after = std::mem::take(&mut result.store);
+        let note = merge_store(&mut locked(&self.store), &before, after);
+        Ok((result, note))
     }
+}
+
+/// An `exec` cell's task. It ends when the cell finishes, is terminated, its bound turn is
+/// interrupted, or its session closes (`REV13a` H2); ending drops the ticket, which stops the cell.
+async fn run_exec(shared: Arc<Shared>, mut ticket: CellTicket, cell_id: String, code: String, cell: Arc<ExecCell>, deadline: Instant) {
+    let sink: Arc<dyn OutputSink> = Arc::clone(&cell.record) as Arc<dyn OutputSink>;
+    let outcome = {
+        let work = shared.run(&mut ticket, &cell_id, code, MAX_OUTPUT_BYTES, Some(sink), Arc::clone(&cell.observer), deadline);
+        tokio::pin!(work);
+        loop {
+            let rebound = cell.observer.rebound();
+            tokio::pin!(rebound);
+            rebound.as_mut().enable();
+            let turn = cell.observer.turn();
+            let interrupted = async {
+                match turn {
+                    Some(turn) => turn.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                outcome = &mut work => break outcome,
+                () = cell.cancel.cancelled() => break Err(ProtoError::new(ErrorCode::Cancelled, "code cell was terminated")),
+                () = shared.closed.cancelled() => break Err(closed()),
+                () = interrupted => break Err(ProtoError::new(ErrorCode::Cancelled, "code cell was interrupted with its turn")),
+                () = &mut rebound => {}
+            }
+        }
+    };
+    drop(ticket);
+    cell.record.finish(outcome);
+}
+
+fn response_bytes(tokens: Option<usize>) -> usize {
+    tokens.unwrap_or(10_000).saturating_mul(4).clamp(1, MAX_OUTPUT_BYTES)
+}
+
+fn not_found() -> ProtoError {
+    ProtoError::new(ErrorCode::NotFound, "code cell not found")
+}
+
+fn closed() -> ProtoError {
+    ProtoError::new(ErrorCode::Unavailable, "code mode is closed: its session ended")
 }
 
 impl ToolHost for CodeToolHost {
@@ -410,26 +506,4 @@ impl OptionNumber for Option<Option<u64>> {
 
 fn invalid(message: &str) -> ProtoError {
     ProtoError::new(ErrorCode::InvalidParams, message)
-}
-
-fn joined_lines<'a>(chunks: impl IntoIterator<Item = &'a CellOutput>) -> String {
-    let mut text = String::new();
-    for chunk in chunks {
-        text.push_str(&chunk.text);
-        text.push('\n');
-    }
-    text
-}
-
-fn split_output(output: &str, max_bytes: usize) -> (String, String) {
-    let mut shown = String::new();
-    let mut pending = String::new();
-    for character in output.chars() {
-        if pending.is_empty() && shown.len().saturating_add(character.len_utf8()) <= max_bytes {
-            shown.push(character);
-        } else {
-            pending.push(character);
-        }
-    }
-    (shown, pending)
 }

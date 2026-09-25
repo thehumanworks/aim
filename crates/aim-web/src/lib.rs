@@ -344,7 +344,7 @@ impl Client {
                     s.streaming.clear();
                 }
             }
-            SessionUpdate::ToolStarted { call_id, name, arguments } => {
+            SessionUpdate::ToolStarted { call_id, name, arguments, .. } => {
                 s.rows.push(Row::Tool { name, detail: format!("{call_id}\n{arguments}"), done: false });
             }
             SessionUpdate::ToolFinished { call_id, result, .. } => {

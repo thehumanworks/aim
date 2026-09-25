@@ -96,10 +96,15 @@ async fn turn(provider_id: &str, model: &str, effort: Option<&str>, code_mode: b
     let outcome = agent.run_turn(vec![Part::Text { text: prompt.to_owned() }], &events, &CancellationToken::new()).await;
     drop(events);
     let mut usage = Usage::default();
+    let mut children: Vec<(String, String)> = Vec::new();
     while let Some(event) = receiver.recv().await {
-        if let AgentEvent::Usage { usage: sample } = event {
-            usage.input_tokens = usage.input_tokens.saturating_add(sample.input_tokens);
-            usage.output_tokens = usage.output_tokens.saturating_add(sample.output_tokens);
+        match event {
+            AgentEvent::Usage { usage: sample } => {
+                usage.input_tokens = usage.input_tokens.saturating_add(sample.input_tokens);
+                usage.output_tokens = usage.output_tokens.saturating_add(sample.output_tokens);
+            }
+            AgentEvent::ToolStarted { name, parent: Some(parent), .. } => children.push((parent, name)),
+            _ => {}
         }
     }
     let calls = numbers.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
@@ -139,7 +144,8 @@ async fn turn(provider_id: &str, model: &str, effort: Option<&str>, code_mode: b
         let cell_ids: Vec<&str> = keys.iter().filter_map(|key| key.rsplit_once(':').map(|(cell, _)| cell)).collect();
         assert_eq!(cell_ids.len(), 2, "nested calls must have cell provenance");
         assert_eq!(cell_ids.first(), cell_ids.get(1), "both nested calls must share one cell");
-        eprintln!("live_coderun code_cells={code_calls}");
+        assert_children_of_run_code(agent.items(), &children);
+        eprintln!("live_coderun code_cells={code_calls} child_events={children:?}");
     }
     eprintln!(
         "live_coderun provider={provider_id} code_mode={code_mode} latency_ms={} input_tokens={} output_tokens={} tool_calls={}",
@@ -149,6 +155,19 @@ async fn turn(provider_id: &str, model: &str, effort: Option<&str>, code_mode: b
         calls.len()
     );
     Ok(())
+}
+
+/// ADR 0066: the nested calls are child tool events of the `run_code` call that made them.
+fn assert_children_of_run_code(items: &[Item], children: &[(String, String)]) {
+    let run_code_ids: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolCall { call_id, name, .. } if name == "run_code" => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(children.len(), 2, "one child event per nested call: {children:?}");
+    assert!(children.iter().all(|(parent, _)| run_code_ids.contains(&parent.as_str())), "{children:?} vs {run_code_ids:?}");
 }
 
 #[tokio::test]
@@ -163,4 +182,81 @@ async fn live_codex_two_tools_one_cell() -> Outcome {
 async fn live_openrouter_two_tools_one_cell() -> Outcome {
     turn("openrouter", "anthropic/claude-sonnet-5", None, false).await?;
     turn("openrouter", "anthropic/claude-sonnet-5", None, true).await
+}
+
+/// Codex's `exec`/`wait` contract with `terminate` (ADR 0066): the model starts a cell that never
+/// finishes, gets its id back, and terminates exactly that cell.
+#[tokio::test]
+#[ignore = "live: Codex credentials, network, and a built aim-coderun worker"]
+async fn live_codex_exec_wait_terminate() -> Outcome {
+    let (provider, resolved) = providers::build("codex", Some("gpt-6-sol"))?;
+    let numbers = Arc::new(Numbers::default());
+    let worker = worker_binary();
+    if !worker.exists() {
+        return Err(format!("worker binary missing at {}", worker.display()).into());
+    }
+    let session_id = format!("live-coderun-terminate-{}", uuid::Uuid::now_v7());
+    let tools: Arc<dyn ToolHost> =
+        Arc::new(CodeToolHost::new(Arc::clone(&numbers) as Arc<dyn ToolHost>, worker, &session_id, CodeMode::Codex));
+    let config = AgentConfig {
+        model: resolved,
+        instructions: "You drive a JavaScript code cell with the exec and wait tools. Follow the user's steps exactly.".to_owned(),
+        effort: Some("low".to_owned()),
+        tier: None,
+        session_id,
+        cache_key: None,
+        parallel_tool_calls: false,
+        max_requests: 6,
+    };
+    let mut agent = Agent::new(provider, tools, config);
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let start = Instant::now();
+    let prompt = "Step 1: call exec with exactly this source:\n// @exec: {\"yield_time_ms\": 500}\nfor (;;) { notify('tick'); await new Promise(r => setTimeout(r, 200)); }\nIt never finishes, so exec returns a line 'Script running with cell ID <id>'. Step 2: call wait with {\"cell_id\": \"<that id>\", \"terminate\": true}. Step 3: answer with the single word done.";
+    let outcome = agent.run_turn(vec![Part::Text { text: prompt.to_owned() }], &events, &CancellationToken::new()).await;
+    drop(events);
+    let mut usage = Usage::default();
+    while let Some(event) = receiver.recv().await {
+        if let AgentEvent::Usage { usage: sample } = event {
+            usage.input_tokens = usage.input_tokens.saturating_add(sample.input_tokens);
+            usage.output_tokens = usage.output_tokens.saturating_add(sample.output_tokens);
+        }
+    }
+    let mut calls = Vec::new();
+    let mut results = Vec::new();
+    for item in agent.items() {
+        match item {
+            Item::ToolCall { name, arguments, .. } => calls.push((name.clone(), arguments.clone())),
+            Item::ToolResult { result, .. } => results.push(
+                result
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        aim_proto::tool::ToolContent::Text { text } => Some(text.as_str()),
+                        aim_proto::tool::ToolContent::Image { .. } => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => {}
+        }
+    }
+    for (name, arguments) in &calls {
+        eprintln!("live diagnostic call={name} args={}", arguments.chars().take(200).collect::<String>());
+    }
+    for result in &results {
+        eprintln!("live diagnostic result={}", result.chars().take(200).collect::<String>());
+    }
+    outcome?;
+    assert!(calls.iter().any(|(name, _)| name == "exec"), "the model called exec");
+    let terminate = calls.iter().find(|(name, arguments)| name == "wait" && arguments.contains("terminate"));
+    assert!(terminate.is_some(), "the model called wait with terminate: {calls:?}");
+    assert!(results.iter().any(|result| result.contains("Script running with cell ID")), "exec yielded a cell id");
+    assert!(results.iter().any(|result| result.contains("Script terminated")), "the cell was terminated: {results:?}");
+    eprintln!(
+        "live_codex_exec_wait_terminate latency_ms={} input_tokens={} output_tokens={} tool_calls={}",
+        start.elapsed().as_millis(),
+        usage.input_tokens,
+        usage.output_tokens,
+        calls.len()
+    );
+    Ok(())
 }
