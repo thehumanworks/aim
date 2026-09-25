@@ -30,7 +30,7 @@ import tomllib
 from contextlib import contextmanager
 from pathlib import Path
 
-from live_tasks import grade, prepare
+from live_tasks import grade, graded_files, prepare
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench"
@@ -336,7 +336,7 @@ def path_map(args: argparse.Namespace) -> dict[str, Path]:
 
 def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], mode: str, model: str,
              effort: str | None, timeout: int, spend_cap_usd: float | None = None,
-             request_reserve_usd: float = 0.0) -> dict:
+             request_reserve_usd: float = 0.0, keep_outputs: Path | None = None) -> dict:
     base, _ = split_arm(harness)
     borrowed_auth = CODEX_AUTH / "auth.json"
     auth_before = executable_hash(borrowed_auth) if base == "aim_codex" and borrowed_auth.exists() else None
@@ -451,9 +451,20 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
             result["borrowed_codex_auth_unchanged"] = auth_before is not None and executable_hash(borrowed_auth) == auth_before
         if mode == "live":
             result["passed"] = process.returncode == 0 and not timed_out and grade(case["id"], workspace)
+            if keep_outputs is not None:
+                keep(keep_outputs / harness / f"{case['id']}-r{repetition}", case["id"], workspace)
         else:
             result["passed"] = process.returncode == 0 and len(rows) >= case.get("steps", 0) + 1
         return result
+
+
+def keep(target: Path, task_id: str, workspace: Path) -> None:
+    """Copy the files the grader reads, when present, for a human to check a grade."""
+    for name in graded_files(task_id):
+        source = workspace / name
+        if source.is_file() and not source.is_symlink() and source.stat().st_size <= 1_000_000:
+            (target / name).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target / name)
 
 
 def summary(runs: list[dict], harnesses: list[str]) -> list[dict]:
@@ -498,6 +509,8 @@ def main() -> None:
     parser.add_argument("--aim-coderun-bin", type=Path, help="measured code worker executable")
     parser.add_argument("--source-sha", help="source commit of an explicitly supplied baseline binary")
     parser.add_argument("--no-gate", action="store_true", help="record a diagnostic or immutable baseline without comparison")
+    parser.add_argument("--keep-outputs", type=Path, help="live: copy each trial's graded files here to diagnose a grade "
+                        "(model-written text: keep it out of committed results)")
     args = parser.parse_args()
     if args.source_sha and (not re.fullmatch(r"[0-9a-f]{40}", args.source_sha)
                             or any(getattr(args, f"{name}_bin") is None for name in ("aim", "aimx", "aim_coderun"))):
@@ -556,7 +569,7 @@ def main() -> None:
                 effort = tier["effort"] if args.tier == "wire" else tier["codex_effort"] if base == "aim_codex" else None
                 remaining = tier["max_spend_usd"] - budget_used if args.tier == "live" and base != "aim_codex" else None
                 row = run_once(harness, case, repetition, paths, args.tier, model, effort, tier.get("timeout_seconds", 90),
-                               spend_cap_usd=remaining, request_reserve_usd=reserve)
+                               spend_cap_usd=remaining, request_reserve_usd=reserve, keep_outputs=args.keep_outputs)
                 runs.append(row)
                 if args.tier == "live" and base != "aim_codex":
                     if row["missing_success_cost"]:

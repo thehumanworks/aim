@@ -179,6 +179,13 @@ class LiveTaskTests(unittest.TestCase):
         self.assertFalse(graded("doc_index", "\n".join(index).replace("Installing the tool", "Setup notes")))
         self.assertFalse(graded("doc_index", "\n".join(index).replace(": Changelog", ":")), "the path alone is no heading")
         self.assertFalse(graded("doc_index", "\n".join([*index, "- docs/notes.txt: Not a Markdown file"])))
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "work"
+            prepare("doc_index", workspace)
+            (workspace / "docs/INDEX.md").write_text("\n".join(index), encoding="utf-8")
+            self.assertTrue(grade("doc_index", workspace), "the report may sit in the directory the prompt names")
+            (workspace / "INDEX.md").write_text("", encoding="utf-8")
+            self.assertFalse(grade("doc_index", workspace), "the root report comes first")
 
     def test_grader_ignores_editable_visible_tests(self):
         with tempfile.TemporaryDirectory() as temp:

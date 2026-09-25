@@ -107,7 +107,11 @@ TASKS["doc_index"] = {
     "docs/notes.txt": "# Not a Markdown file\n",
 }
 
-OUTPUTS: dict[str, tuple[str, ...]] = {"todo_table": ("REPORT.md",), "callers": ("CALLERS.md",), "doc_index": ("INDEX.md",)}
+# Where each report may be written: the repository root, or the directory the prompt names (the
+# smoke found "Write INDEX.md listing every Markdown file under docs/" answered in docs/INDEX.md).
+# The first existing path is graded under the first name.
+OUTPUTS: dict[str, tuple[str, ...]] = {"todo_table": ("REPORT.md", "src/REPORT.md"), "callers": ("CALLERS.md",),
+                                       "doc_index": ("INDEX.md", "docs/INDEX.md")}
 
 _REPORT_TEST = """import re, unittest
 EXPECTED = {expected!r}
@@ -180,9 +184,16 @@ def grade(task_id: str, workspace: Path) -> bool:
         hidden = Path(temporary)
         home = hidden / "home"
         home.mkdir()
-        for name in graded_files(task_id):
+        def usable(source: Path) -> bool:
+            return not source.is_symlink() and source.is_file() and source.stat().st_size <= 1_000_000
+        if task_id in OUTPUTS:
+            reports = [workspace / name for name in OUTPUTS[task_id] if usable(workspace / name)]
+            if not reports:
+                return False
+            (hidden / OUTPUTS[task_id][0]).write_bytes(reports[0].read_bytes())
+        for name in [] if task_id in OUTPUTS else graded_files(task_id):
             source = workspace / name
-            if source.is_symlink() or not source.is_file() or source.stat().st_size > 1_000_000:
+            if not usable(source):
                 return False
             (hidden / name).write_bytes(source.read_bytes())
         test = HIDDEN_TESTS.get(task_id) or TASKS[task_id]["test_task.py"]
