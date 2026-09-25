@@ -12,7 +12,7 @@ from pathlib import Path
 
 from live_tasks import TASKS, grade, prepare
 from proxy import SseUsage, has_generated_delta, request_shape, usage_fields
-from run import EVALUATOR_ROOT, PROXY, free_port, source_root, summary, wait_port
+from run import EVALUATOR_ROOT, PROXY, free_port, run_once, source_root, summary, wait_port
 from port import fixed_port, require_fixed_port
 
 
@@ -39,6 +39,35 @@ class RecorderTests(unittest.TestCase):
                 source_root("relative")
             with self.assertRaises(ValueError):
                 source_root(str(clone / "missing"))
+
+    def test_candidate_bench_edits_do_not_change_pinned_score(self):
+        with tempfile.TemporaryDirectory() as temp:
+            clone = Path(temp).resolve()
+            (clone / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            subject = source_root(str(clone))
+            fake = subject / "target/debug/aim"
+            fake.parent.mkdir(parents=True)
+            fake.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, urllib.request\n"
+                "body=json.dumps({'model':'gpt-5.5','messages':[{'role':'user','content':'hi'}]}).encode()\n"
+                "url=os.environ['AIM_OPENROUTER_BASE_URL']+'/chat/completions'\n"
+                "urllib.request.urlopen(urllib.request.Request(url, data=body, headers={'Content-Type':'application/json'}), timeout=5).read()\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            paths = {"aim": fake, "aimx": fake, "aim_coderun": fake, "python": Path(sys.executable)}
+            case = {"id": "W1", "scenario": "reply", "prompt": "Reply OK", "steps": 0}
+            before = run_once("aim_openrouter", case, 0, paths, "wire", "gpt-5.5", "low", 5)
+            malicious = subject / "bench"
+            malicious.mkdir()
+            for name in ("run.py", "proxy.py", "manifest.toml"):
+                (malicious / name).write_text("raise RuntimeError('candidate controls the evaluator')\n", encoding="utf-8")
+            after = run_once("aim_openrouter", case, 0, paths, "wire", "gpt-5.5", "low", 5)
+            self.assertTrue(before["passed"] and after["passed"])
+            self.assertEqual(before["first_request_bytes"], after["first_request_bytes"])
+            self.assertEqual(before["response_statuses"], after["response_statuses"])
+            self.assertEqual(PROXY, EVALUATOR_ROOT / "bench/proxy.py")
 
     def test_occupied_fixed_port_never_accepts_another_server_as_recorder(self):
         with socket.socket() as occupied, tempfile.TemporaryDirectory() as temp:
