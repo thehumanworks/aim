@@ -3,6 +3,7 @@
 //! - `aim run [PROMPT]` — one headless turn in the current workspace (milestone M2a).
 //! - `aim sessions` — recent sessions.
 //! - `aim daemon` — serve local sessions over `aim-daemon/1`.
+//! - `aim search`, `aim image`, `aim transcribe` — Codex media services.
 #![expect(clippy::print_stderr, reason = "the CLI reports errors on stderr")]
 #![expect(clippy::print_stdout, reason = "daemon status reports to stdout")]
 
@@ -78,6 +79,30 @@ enum Command {
         /// The prompt (read from stdin when omitted or `-`).
         prompt: Vec<String>,
     },
+    /// Search the public web through Codex and print the answer and citations.
+    Search {
+        /// Search query.
+        query: String,
+    },
+    /// Generate an image through Codex and save it locally.
+    Image {
+        /// Image prompt.
+        prompt: String,
+        /// Destination image file.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Requested dimensions (service-supported size string).
+        #[arg(long)]
+        size: Option<String>,
+        /// Requested quality (service-supported quality string).
+        #[arg(long)]
+        quality: Option<String>,
+    },
+    /// Transcribe a WAV file through Codex (server retains the audio for 30 days).
+    Transcribe {
+        /// WAV file to send.
+        wav: PathBuf,
+    },
     /// Sign in to a provider.
     Login {
         #[command(subcommand)]
@@ -125,6 +150,31 @@ fn read_prompt(words: &[String]) -> Result<String, String> {
     Ok(joined)
 }
 
+async fn search_cli(query: &str) -> Result<i32, String> {
+    let media = aim_llm_codex::media::MediaClient::new().map_err(|error| error.to_string())?;
+    let answer = media.web_search(query).await.map_err(|error| error.to_string())?;
+    println!("{}", answer.text);
+    for citation in answer.citations {
+        println!("- {}: {}", citation.title, citation.url);
+    }
+    Ok(0)
+}
+
+async fn image_cli(prompt: &str, output: &PathBuf, size: Option<&str>, quality: Option<&str>) -> Result<i32, String> {
+    let media = aim_llm_codex::media::MediaClient::new().map_err(|error| error.to_string())?;
+    let image = media.generate_image(prompt, size, quality).await.map_err(|error| error.to_string())?;
+    std::fs::write(output, image.bytes).map_err(|error| format!("writing {}: {error}", output.display()))?;
+    println!("{}", output.display());
+    Ok(0)
+}
+
+async fn transcribe_cli(wav: &PathBuf) -> Result<i32, String> {
+    let bytes = std::fs::read(wav).map_err(|error| format!("reading {}: {error}", wav.display()))?;
+    let media = aim_llm_codex::media::MediaClient::new().map_err(|error| error.to_string())?;
+    println!("{}", media.transcribe(&bytes).await.map_err(|error| error.to_string())?);
+    Ok(0)
+}
+
 async fn main_async(args: Args) -> Result<i32, String> {
     match args.command {
         Command::Run { provider: p, model, effort, cwd, ssh, aimx, ephemeral, json, max_requests, prompt } => {
@@ -135,6 +185,9 @@ async fn main_async(args: Args) -> Result<i32, String> {
             let options = RunOptions { provider: p, model, effort, cwd, ssh, aimx, ephemeral, json, max_requests, prompt };
             cli::run(options, provider).await
         }
+        Command::Search { query } => search_cli(&query).await,
+        Command::Image { prompt, output, size, quality } => image_cli(&prompt, &output, size.as_deref(), quality.as_deref()).await,
+        Command::Transcribe { wav } => transcribe_cli(&wav).await,
         Command::Login { target } => {
             let mut say = |line: &str| eprintln!("{line}");
             match target {

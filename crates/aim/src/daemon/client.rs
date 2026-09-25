@@ -9,10 +9,10 @@ use std::task::{Context, Poll};
 
 use aim_proto::conversation::Part;
 use aim_proto::daemon::{
-    DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeParams, DaemonInitializeResult, DetachReason, PromptOutcome, SessionAttach,
-    SessionAttachResult, SessionCancel, SessionClose, SessionConfigParams, SessionCreate, SessionDetach, SessionDetachedParams,
-    SessionList, SessionListParams, SessionPrompt, SessionPromptParams, SessionRef, SessionSetConfig, SessionSpec, SessionSummary,
-    SessionUpdate, SessionUpdateParams,
+    DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeParams, DaemonInitializeResult, DetachReason, MAX_DAEMON_MESSAGE_BYTES,
+    MediaTranscribe, MediaTranscribeParams, MediaTranscribeResult, PromptOutcome, SessionAttach, SessionAttachResult, SessionCancel,
+    SessionClose, SessionConfigParams, SessionCreate, SessionDetach, SessionDetachedParams, SessionList, SessionListParams, SessionPrompt,
+    SessionPromptParams, SessionRef, SessionSetConfig, SessionSpec, SessionSummary, SessionUpdate, SessionUpdateParams,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{GenerationRange, PeerInfo};
@@ -144,7 +144,7 @@ impl DaemonClient {
             read,
             write,
             UpdateHandler { subscribers: Arc::clone(&subscribers), reasons: Arc::clone(&detach_reasons) },
-            PeerConfig::default(),
+            PeerConfig { max_message_bytes: MAX_DAEMON_MESSAGE_BYTES, ..PeerConfig::default() },
         );
         let (min, max) = DAEMON_GENERATIONS;
         let init = peer
@@ -273,6 +273,11 @@ impl Drop for AttachedUpdates {
 }
 
 impl SessionClient for DaemonClient {
+    fn transcribe(&self, params: MediaTranscribeParams) -> BoxFuture<Result<MediaTranscribeResult, ProtoError>> {
+        let peer = self.peer.clone();
+        Box::pin(async move { peer.call::<MediaTranscribe>(params).await })
+    }
+
     fn create(&self, spec: SessionSpec) -> BoxFuture<Result<SessionSummary, ProtoError>> {
         let peer = self.peer.clone();
         Box::pin(async move { peer.call::<SessionCreate>(spec).await })

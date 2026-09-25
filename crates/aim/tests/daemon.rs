@@ -14,10 +14,11 @@ use aim::daemon::{client::DaemonClient, server, socket_path, spawn};
 use aim::host::{BoxFuture, Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends};
 use aim::store::MemoryStore;
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, ModelInfo, ModelProvider, Request, StreamEvent};
+use aim_proto::content::Base64Bytes;
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
 use aim_proto::daemon::{
-    DaemonInitialize, DaemonInitializeParams, DetachReason, Location, Persistence, PromptOutcome, SessionAttachResult, SessionConfigParams,
-    SessionListParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
+    DaemonInitialize, DaemonInitializeParams, DetachReason, Location, MAX_DAEMON_MESSAGE_BYTES, MediaTranscribeParams, Persistence,
+    PromptOutcome, SessionAttachResult, SessionConfigParams, SessionListParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{GenerationRange, PeerInfo};
@@ -207,6 +208,25 @@ async fn initialize_guard_and_socket_permissions() {
         .unwrap();
     assert_eq!(ok.generation, 1);
     peer.close();
+    task.abort();
+}
+
+#[tokio::test]
+async fn transcription_contract_checks_session_privacy_before_provider_access() {
+    assert!(MAX_DAEMON_MESSAGE_BYTES > (25_usize * 1024 * 1024).div_ceil(3) * 4 + 1024);
+    let (dir, host, _, task) = started(1, Duration::ZERO).await;
+    let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
+    let session = client.create(spec()).await.unwrap().meta.id;
+    let params =
+        MediaTranscribeParams { audio: Base64Bytes(vec![1, 2, 3]), format: "wav".into(), accept_retention: false, session: Some(session) };
+    assert_eq!(serde_json::to_value(&params).unwrap()["audio"], "AQID");
+    assert_eq!(host.transcribe(params.clone()).await.unwrap_err().code, ErrorCode::Denied);
+    assert_eq!(client.transcribe(params.clone()).await.unwrap_err().code, ErrorCode::Denied);
+    let invalid = MediaTranscribeParams { format: "mp3".into(), ..params.clone() };
+    assert_eq!(client.transcribe(invalid).await.unwrap_err().code, ErrorCode::InvalidParams);
+    let missing = MediaTranscribeParams { session: Some("missing-session".into()), ..params };
+    assert_eq!(client.transcribe(missing).await.unwrap_err().code, ErrorCode::NotFound);
+    client.disconnect();
     task.abort();
 }
 

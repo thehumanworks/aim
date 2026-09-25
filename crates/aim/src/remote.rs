@@ -79,6 +79,10 @@ impl ToolHost for RemoteHarness {
     fn call(&self, name: String, arguments: Value, key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
         self.client.call(name, arguments, key)
     }
+
+    fn write_blob(&self, path: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        self.client.write_blob(path, bytes, key)
+    }
 }
 
 #[cfg(test)]

@@ -158,6 +158,7 @@ fn every_daemon_method_has_a_json_schema_and_updates_are_tagged() {
         schema::<daemon::SessionCancel>(),
         schema::<daemon::SessionSetConfig>(),
         schema::<daemon::SessionClose>(),
+        schema::<daemon::MediaTranscribe>(),
     ];
     let mut names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
     names.sort_unstable();

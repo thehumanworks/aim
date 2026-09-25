@@ -20,6 +20,7 @@ pub mod harness;
 pub mod host;
 pub mod jev;
 pub mod login;
+pub mod media;
 pub mod providers;
 pub mod remote;
 pub mod session;
