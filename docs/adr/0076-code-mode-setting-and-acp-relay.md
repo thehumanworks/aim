@@ -5,9 +5,8 @@
 - Baseline: 0018, 0056, 0066, 0012
 - Scope: Which tools a model is offered when code mode is off, on, or the only way to act: in
   native sessions, in `aim mcp`, and in strict `acp:claude` sessions. The model-visible code tool
-  description and nested results. The benchmark hook that selects a mode per arm. Not the choice
-  of the default itself (a benchmark decides it, below), and not `acp:claude-native`, whose tools
-  are Claude's own.
+  description and nested results. The benchmark hook that selects a mode per arm, and the default
+  that benchmark chose (§6). Not `acp:claude-native`, whose tools are Claude's own.
 
 ## Context
 
@@ -54,10 +53,9 @@ and also means the default.
 - **`only`:** the code tool(s) and the program tools alone. Every other tool is reachable only
   inside a cell, and calling one directly fails with "no tool named".
 
-**The default** is one named constant, `aim_kernel::code_mode::DEFAULT_MODE = On`, which is
-today's behavior. It is **provisional**: The benchmark cohort of task T4b (`docs/tasks.md`) (`bench/run.py` arms, §5) decides
-whether `only` (or `off`) replaces it. Changing it is a one-line change plus this ADR's
-successor.
+**The default** is one named constant, `aim_kernel::code_mode::DEFAULT_MODE = Off`. It was `On`
+provisionally until task T4b's pre-registered benchmark decided it (§6): code mode is opt-in.
+Changing it again is a one-line change plus this ADR's successor.
 
 ### 2. The decision is verified
 
@@ -174,7 +172,8 @@ turn observes them (ADR 0066 §2, "Direct callers").
   `tools.Write`).
 - A witness records its route, and it matches only a session with the same relay and route.
 
-`off`, or no worker, keeps `aimx mcp` exactly as before. `acp:claude-native` is unchanged.
+`off` (the default, §6), or no worker, keeps `aimx mcp` exactly as before. `acp:claude-native` is
+unchanged.
 
 **Timeouts.** `AimMcpServer` gives `run_code`, `exec`, `wait` and `run_program` at least a 330 s
 call timeout: a cell's 300 s maximum deadline plus a margin. Other tools in `aim mcp` keep 60 s.
@@ -190,7 +189,64 @@ once as `1e3` and once as `1e8`. So aim does not rely on it. `aimx mcp` sessions
 `AIM_CODE_MODE` for that run. An arm-less aim harness gets the caller's `AIM_CODE_MODE`. The
 legacy `AIM_BENCH_CODE_MODE=off` still means `off`, and nothing set means aim's default.
 `AIM_CODERUN` is always explicit, and the old missing-worker trick is gone. Arms are not in the
-committed wire baseline, so they are compared with `--no-gate`.
+committed wire baseline, so they are compared with `--no-gate`. The scripted mock sends a
+`run_code` cell for its shell steps when a request offers `run_code` but no direct `Bash`, so the
+wire tier measures `only` too.
+
+### 6. The default is `off`: a pre-registered benchmark found no efficiency gain
+
+The maintainer prefers code mode, provided a benchmark shows its effect on tool-calling efficiency
+first. T4b pre-registered the benchmark before any live run (`bench/plans/code-mode.md`, commit
+`7a788e5`): arms, tasks, metrics and a rule whose margins live in `bench/manifest.toml`
+`[code_mode]` and which `bench/code_mode.py` applies to the result files.
+
+**The rule.** `off` is the reference. `on` or `only` becomes the default only if all three hold:
+
+- (a) its pass rate over all nine tasks is at least `off`'s minus 8 points;
+- (b) on the three scripting tasks, its mean model requests per trial or its ITE per passed task
+  is at least 25% below `off`'s, and the other is at most 10% above;
+- (c) on the six existing tasks, its ITE per passed task is at most 10% above `off`'s.
+
+**The tasks.** The live tier's six fix-a-function tasks, and three new fan-out tasks that end in
+a report: count TODO/FIXME per file over ten files (`todo_table`), list every call site of
+`load_config` among eleven modules with decoys (`callers`), and index the first heading of ten
+Markdown files (`doc_index`). Hidden tests grade the reports.
+
+**Primary cohort** (decides): `openai/gpt-4.1-mini` on OpenRouter, three repetitions of all nine
+tasks per arm, arm order rotated (`bench/results/t4b-code-mode-openrouter-r{1,2,3}.json`):
+
+| Arm | Pass | Requests (scripting / existing) | ITE per passed (scripting / existing / all) | USD per passed | p50 wall |
+|---|---|---|---|---|---|
+| `off` | 23/27 | 6.22 / 6.83 | 13,113 / 5,770 / 7,367 | $0.0034 | 12.4 s |
+| `on` | 23/27 | 7.22 / 6.89 | 16,026 / 5,091 / 7,468 | $0.0035 | 13.5 s |
+| `only` | 15/27 | 12.0 / 13.39 | 218,307 / 21,982 / 35,071 | $0.0157 | 27.9 s |
+
+- **`on` fails (b):** on the scripting tasks it took 16% *more* requests and 22% more ITE per
+  passed task than `off`. gpt-4.1-mini called `run_code` in 1 of 27 `on` runs.
+- **`only` fails (a), (b) and (c):** 8 fewer passes, twice the requests, 4.8 times the ITE. Of
+  its 292 `run_code` calls, 97 failed (54 `ReferenceError`s, mostly `require`); it made 109
+  program-tool calls (`list_programs` against an empty store) and hit the 24-request cap 5 times.
+- **What the rule does not reward:** `on` spent 12% less ITE than `off` on the existing tasks.
+  That is its smaller prefix (ADR 0056's compact direct set and shorter `Read`/`Bash`/`LS`
+  descriptions), not code: no existing-task `on` run called `run_code`.
+
+**Secondary cohorts** (the three scripting tasks, two repetitions each):
+
+| Arm | Pass | Requests | Direct / nested calls | ITE per passed | p50 wall |
+|---|---|---|---|---|---|
+| `aim_codex@off` (gpt-6-sol, low) | 6/6 | 4.33 | 9.83 / 0 | 6,541 | 20.9 s |
+| `aim_codex@on` | 6/6 | 4.33 | 6.83 / 2.67 | 6,737 | 18.1 s |
+| `acp_claude@off` (sonnet) | 6/6 | 4.83 | 6.33 / — | 20,917 | 16.2 s |
+| `acp_claude@on` | 6/6 | 4.83 | 6.50 / — | 21,763 | 20.3 s |
+
+Codex used `exec` in 4 of its 6 `on` runs and Claude used `run_code` in 2 of 6, with the same
+request count as `off` and 3–4% more ITE. Neither cohort meets the per-provider bar the plan set
+(the rejected mode winning (b) there, or the chosen mode losing two passes), so there is no
+per-provider default. Claude's requests come from its own transcript; the relay's nested calls
+are not observable (§4).
+
+**Decision:** `DEFAULT_MODE = Off`. `on` and `only` remain available through `AIM_CODE_MODE` for
+native sessions, `aim mcp` and the `acp:claude` relay.
 
 ## Consequences
 
@@ -217,23 +273,23 @@ committed wire baseline, so they are compared with `--no-gate`.
   and `bench/run.py wire --harnesses aim_openrouter@off,aim_openrouter@on,aim_openrouter@only
   --cases W1 --repetitions 1 --no-gate`. The "before" column is the same wire run on `36f1bd8`.
 
-**The wire gate** (`mise run bench:wire`) fails on this branch. It failed before this change
-too, and for other reasons:
+These sizes were measured under macOS's `/var/folders/…/T/` TMPDIR; under the benchmark's fixed
+`/tmp` trial root they are 44 bytes smaller (7,745 for `on`).
 
-- The integration branch already offers 14 tools against the committed baseline's 10, because
-  of ADR 0064's UI tools.
-- Its W1 is 6,703 bytes, against the 6,000-byte ceiling.
-
-This change adds instruction characters and code-tool bytes, which the gate also reports. The
-baseline (`bench/results/w26-main-baseline.json`) and the manifest's aim ceilings need one
-acknowledged re-recording after the batch merges: this ADR, task T3's batching guidance and ADR 0064
-all change them. In `only`, the scripted W2 trajectory calls `Bash` directly and gets "no tool
-named", because the mock does not know the mode. The live cohort, not the mock, measures `only`.
+**The wire gate** (`mise run bench:wire`) failed on the integration branch, before and after this
+change. T4b repaired it and re-recorded the baseline on the decided default
+(`bench/results/t4b-main-baseline.json`; the attribution table is in `bench/README.md`, "Wire gate
+repair"). The mock now scripts a `run_code` cell for `only`, so every mode has a wire measurement.
 
 **Other consequences:**
 
 - **What `only` costs.** The model reaches every workspace tool through a cell, so a single
-  simple action costs a script. That is the tradeoff the benchmark weighs.
+  simple action costs a script. The benchmark measured it (§6).
+- **Code mode is opt-in.** With the default `off`, `aim mcp` offers no `run_code` and a strict
+  `acp:claude` session uses `aimx mcp`, as before this ADR; `AIM_CODE_MODE=on` or `only` selects
+  the code tool and the relay. A default `off` session still sends the system prompt's two-line
+  "# Code mode" section (241 bytes) and does not get ADR 0056's shorter `Read`/`Bash`/`LS`
+  descriptions, which only code-mode sessions apply: both are follow-ups.
 - **Allowlist warnings.** An allowlisted agent in `only` warns that its allowed direct tools are
   not offered (`AllowedTools::unknown`). This is cosmetic.
 - **`aim run` shows no warning.** It installs no tracing subscriber, so an invalid
@@ -242,8 +298,9 @@ named", because the mock does not know the mode. The live cohort, not the mock, 
 
 ## Verification
 
-**Proofs:** `mise run verify` (`crates/aim-kernel/src/code_mode.rs`, 21 obligations). Each spec
-is `DRAFT(ADR-0076)` until the benchmark settles the default.
+**Proofs:** `mise run verify` (`crates/aim-kernel/src/code_mode.rs`, 21 obligations). The
+theorems take the default as an input, so they hold for `Off`. The benchmark has settled the
+default; the specs stay `DRAFT(ADR-0076)` until the maintainer locks them.
 
 | Theorem | What it proves |
 |---|---|
@@ -319,8 +376,8 @@ private sshd; it spawns the `aim` binary, so the relay applies):
 - **`AIM_CODE_MODE=only`:** the SSH conformance write went through `run_code`, and Claude did the
   test's read, edit, glob, grep and run steps in two `mcp__aim__run_code` cells. The remote file
   changed and the local sentinel did not.
-- **The default (`on`):** Claude called `Read`, `Edit` and `Bash` directly, and `run_code` for
-  the hidden `Glob` and `Grep`.
+- **`on` (the default before §6):** Claude called `Read`, `Edit` and `Bash` directly, and
+  `run_code` for the hidden `Glob` and `Grep`.
 
 Both passed. The relay needs the adapter to pass its environment to MCP servers: `HOME`, `PATH`
 and `SSH_AUTH_SOCK` for `aimx serve --ssh`. The `aimx mcp` relay needs the same.

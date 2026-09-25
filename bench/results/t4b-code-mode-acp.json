@@ -1,0 +1,460 @@
+{
+  "binary_sha256": {
+    "aim": "46efeebea7f19c12cc7ad31cb0162089826550270c28923a1917d05a213c1b4f",
+    "aim_coderun": "dadb0f55ab3d56c06d2c20c83fd93cb43878bb6fff45ae0ee43b91719770c448",
+    "aimx": "65b6d2ffa8260f7289dde8855b0c97c1dcd666eed06153e507cd18413d341dac"
+  },
+  "finished_unix": 1790353338.695055,
+  "manifest_sha256": "6b2f0005f4923ae1e1b2c9014db935439981a31c99511be4e32d77a3d2165957",
+  "runs": [
+    {
+      "case": "todo_table",
+      "direct_tool_calls": 4,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__bash": 3,
+        "mcp__aim__write": 1
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "harness": "acp_claude@off",
+      "ite": 19609.95,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 0,
+      "requests": 5,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 7459,
+        "cache_read_input_tokens": 62962,
+        "input_tokens": 10,
+        "output_tokens": 796
+      },
+      "usage": {
+        "cache_write_tokens": 7459,
+        "cached_input_tokens": 62962,
+        "input_tokens": 70431,
+        "output_tokens": 796,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 15479.91
+    },
+    {
+      "case": "todo_table",
+      "direct_tool_calls": 4,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__Bash": 3,
+        "mcp__aim__Write": 1
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {
+        "mcp__aim__Bash": 1
+      },
+      "harness": "acp_claude@on",
+      "ite": 26084.7,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 0,
+      "requests": 5,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 13520,
+        "cache_read_input_tokens": 49047,
+        "input_tokens": 10,
+        "output_tokens": 854
+      },
+      "usage": {
+        "cache_write_tokens": 13520,
+        "cached_input_tokens": 49047,
+        "input_tokens": 62577,
+        "output_tokens": 854,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 21212.04
+    },
+    {
+      "case": "todo_table",
+      "direct_tool_calls": 3,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__Bash": 2,
+        "mcp__aim__Write": 1
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "harness": "acp_claude@on",
+      "ite": 16006.75,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 1,
+      "requests": 4,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 7105,
+        "cache_read_input_tokens": 41425,
+        "input_tokens": 8,
+        "output_tokens": 595
+      },
+      "usage": {
+        "cache_write_tokens": 7105,
+        "cached_input_tokens": 41425,
+        "input_tokens": 48538,
+        "output_tokens": 595,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 15813.72
+    },
+    {
+      "case": "todo_table",
+      "direct_tool_calls": 3,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__bash": 2,
+        "mcp__aim__write": 1
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {
+        "mcp__aim__bash": 1
+      },
+      "harness": "acp_claude@off",
+      "ite": 16824.2,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 1,
+      "requests": 4,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 7148,
+        "cache_read_input_tokens": 48562,
+        "input_tokens": 8,
+        "output_tokens": 605
+      },
+      "usage": {
+        "cache_write_tokens": 7148,
+        "cached_input_tokens": 48562,
+        "input_tokens": 55718,
+        "output_tokens": 605,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 15671.25
+    },
+    {
+      "case": "callers",
+      "direct_tool_calls": 14,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__Bash": 2,
+        "mcp__aim__Read": 11,
+        "mcp__aim__Write": 1
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "harness": "acp_claude@on",
+      "ite": 24569.0,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 0,
+      "requests": 5,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 9328,
+        "cache_read_input_tokens": 57040,
+        "input_tokens": 10,
+        "output_tokens": 1439
+      },
+      "usage": {
+        "cache_write_tokens": 9328,
+        "cached_input_tokens": 57040,
+        "input_tokens": 66378,
+        "output_tokens": 1439,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 19405.96
+    },
+    {
+      "case": "callers",
+      "direct_tool_calls": 8,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__grep": 1,
+        "mcp__aim__read": 5,
+        "mcp__aim__write": 2
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "harness": "acp_claude@off",
+      "ite": 21663.2,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 0,
+      "requests": 5,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 8160,
+        "cache_read_input_tokens": 64932,
+        "input_tokens": 10,
+        "output_tokens": 992
+      },
+      "usage": {
+        "cache_write_tokens": 8160,
+        "cached_input_tokens": 64932,
+        "input_tokens": 73102,
+        "output_tokens": 992,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 20663.31
+    },
+    {
+      "case": "callers",
+      "direct_tool_calls": 14,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__glob": 1,
+        "mcp__aim__grep": 6,
+        "mcp__aim__read": 6,
+        "mcp__aim__write": 1
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "harness": "acp_claude@off",
+      "ite": 29478.7,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 1,
+      "requests": 6,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 9368,
+        "cache_read_input_tokens": 81767,
+        "input_tokens": 12,
+        "output_tokens": 1916
+      },
+      "usage": {
+        "cache_write_tokens": 9368,
+        "cached_input_tokens": 81767,
+        "input_tokens": 91147,
+        "output_tokens": 1916,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 24574.51
+    },
+    {
+      "case": "callers",
+      "direct_tool_calls": 10,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__Bash": 2,
+        "mcp__aim__Read": 7,
+        "mcp__aim__Write": 1
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "harness": "acp_claude@on",
+      "ite": 22504.2,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 1,
+      "requests": 5,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 8664,
+        "cache_read_input_tokens": 55842,
+        "input_tokens": 10,
+        "output_tokens": 1216
+      },
+      "usage": {
+        "cache_write_tokens": 8664,
+        "cached_input_tokens": 55842,
+        "input_tokens": 64516,
+        "output_tokens": 1216,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 23069.53
+    },
+    {
+      "case": "doc_index",
+      "direct_tool_calls": 3,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__bash": 2,
+        "mcp__aim__write": 1
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "harness": "acp_claude@off",
+      "ite": 16780.35,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 0,
+      "requests": 4,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 7133,
+        "cache_read_input_tokens": 48611,
+        "input_tokens": 8,
+        "output_tokens": 599
+      },
+      "usage": {
+        "cache_write_tokens": 7133,
+        "cached_input_tokens": 48611,
+        "input_tokens": 55752,
+        "output_tokens": 599,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 13652.06
+    },
+    {
+      "case": "doc_index",
+      "direct_tool_calls": 4,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__Write": 1,
+        "mcp__aim__run_code": 3
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {
+        "mcp__aim__run_code": 1
+      },
+      "harness": "acp_claude@on",
+      "ite": 20807.5,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 0,
+      "requests": 5,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 7898,
+        "cache_read_input_tokens": 54300,
+        "input_tokens": 10,
+        "output_tokens": 1099
+      },
+      "usage": {
+        "cache_write_tokens": 7898,
+        "cached_input_tokens": 54300,
+        "input_tokens": 62208,
+        "output_tokens": 1099,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 18118.7
+    },
+    {
+      "case": "doc_index",
+      "direct_tool_calls": 4,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__Write": 1,
+        "mcp__aim__run_code": 3
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {
+        "mcp__aim__run_code": 1
+      },
+      "harness": "acp_claude@on",
+      "ite": 20603.6,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 1,
+      "requests": 5,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 7866,
+        "cache_read_input_tokens": 54261,
+        "input_tokens": 10,
+        "output_tokens": 1067
+      },
+      "usage": {
+        "cache_write_tokens": 7866,
+        "cached_input_tokens": 54261,
+        "input_tokens": 62137,
+        "output_tokens": 1067,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 24183.97
+    },
+    {
+      "case": "doc_index",
+      "direct_tool_calls": 6,
+      "direct_tool_calls_by_name": {
+        "mcp__aim__glob": 1,
+        "mcp__aim__grep": 1,
+        "mcp__aim__read": 3,
+        "mcp__aim__write": 1
+      },
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "harness": "acp_claude@off",
+      "ite": 21143.05,
+      "model": "sonnet",
+      "nested_tool_calls": 0,
+      "nested_tool_calls_by_name": {},
+      "passed": true,
+      "repetition": 1,
+      "requests": 5,
+      "terminal": "turn_ended",
+      "timed_out": false,
+      "transcript_usage": {
+        "cache_creation_input_tokens": 7919,
+        "cache_read_input_tokens": 63593,
+        "input_tokens": 10,
+        "output_tokens": 975
+      },
+      "usage": {
+        "cache_write_tokens": 7919,
+        "cached_input_tokens": 63593,
+        "input_tokens": 71522,
+        "output_tokens": 975,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 16710.05
+    }
+  ],
+  "source_sha": "6b1878f18d05f38990ab93fc28f0cb4195d34f66",
+  "started_unix": 1790353109.3139899,
+  "subscription_runs": 12,
+  "summary": [
+    {
+      "harness": "acp_claude@off",
+      "ite_per_passed": 20916.58,
+      "mean_direct_tool_calls": 6.33,
+      "mean_requests": 4.83,
+      "p50_wall_ms": 16190.65,
+      "pass_rate": 1.0,
+      "passed": 6,
+      "runs": 6
+    },
+    {
+      "harness": "acp_claude@on",
+      "ite_per_passed": 21762.62,
+      "mean_direct_tool_calls": 6.5,
+      "mean_requests": 4.83,
+      "p50_wall_ms": 20309.0,
+      "pass_rate": 1.0,
+      "passed": 6,
+      "runs": 6
+    }
+  ],
+  "tier": "acp_live"
+}

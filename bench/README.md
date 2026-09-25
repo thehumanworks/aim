@@ -133,3 +133,61 @@ mise exec -- python3 -B bench/acp_trials.py --cases todo_table,callers,doc_index
   --out bench/history/code-mode-acp.json
 python3 -B bench/code_mode.py bench/history/code-mode-*.json
 ```
+
+### Results and decision
+
+Pre-registered at `7a788e5`; the smoke led to one grader fix (`6b1878f`: a report may sit in the
+directory its prompt names, since every arm wrote `docs/INDEX.md`). Results, with no model text:
+`results/t4b-code-mode-openrouter-r{1,2,3}.json` (primary), `t4b-code-mode-codex.json`,
+`t4b-code-mode-acp.json` (secondary), the smoke files, and `t4b-spend-ledger.json`.
+`python3 -B bench/code_mode.py bench/results/t4b-code-mode-{openrouter-r1,openrouter-r2,openrouter-r3,codex,acp}.json`
+reproduces the tables and the verdict.
+
+Scripting tasks (`todo_table`, `callers`, `doc_index`); requests are model requests per trial,
+calls are per trial, ITE and USD are per passed task with failed runs in the numerator:
+
+| Arm | Runs | Pass | Requests | Direct calls | Nested calls | ITE/passed | $/passed | p50 wall s |
+|---|---|---|---|---|---|---|---|---|
+| `aim_openrouter@off` | 9 | 5/9 | 6.22 | 8.89 | 0 | 13,113 | 0.0060 | 10.7 |
+| `aim_openrouter@on` | 9 | 5/9 | 7.22 | 13.33 | 1.33 | 16,026 | 0.0073 | 11.1 |
+| `aim_openrouter@only` | 9 | 1/9 | 12.00 | 17.22 | 33.33 | 218,307 | 0.0939 | 34.8 |
+| `aim_codex@off` | 6 | 6/6 | 4.33 | 9.83 | 0 | 6,541 | — | 20.9 |
+| `aim_codex@on` | 6 | 6/6 | 4.33 | 6.83 | 2.67 | 6,737 | — | 18.1 |
+| `acp_claude@off` | 6 | 6/6 | 4.83 | 6.33 | — | 20,917 | — | 16.2 |
+| `acp_claude@on` | 6 | 6/6 | 4.83 | 6.50 | — | 21,763 | — | 20.3 |
+
+Existing tasks (six, OpenRouter only):
+
+| Arm | Runs | Pass | Requests | Direct calls | Nested calls | ITE/passed | $/passed | p50 wall s |
+|---|---|---|---|---|---|---|---|---|
+| `aim_openrouter@off` | 18 | 18/18 | 6.83 | 6.17 | 0 | 5,770 | 0.0027 | 12.9 |
+| `aim_openrouter@on` | 18 | 18/18 | 6.89 | 5.89 | 0 | 5,091 | 0.0024 | 16.3 |
+| `aim_openrouter@only` | 18 | 14/18 | 13.39 | 13.67 | 10.44 | 21,982 | 0.0102 | 27.1 |
+
+All nine OpenRouter tasks: `off` 23/27 passes, 7,367 ITE per passed task; `on` 23/27, 7,468;
+`only` 15/27, 35,071. The Wilson 95% interval for 23/27 is [0.68, 0.94]; these are small samples.
+
+**Verdict of the rule: `off`.** `on` passes (a) and (c) (12% *less* ITE on the existing tasks)
+but fails (b): 16% more requests and 22% more ITE on the scripting tasks. `only` fails all three.
+The secondary cohorts do not meet the per-provider bar: codex and Claude took the same number of
+requests in `on` as in `off`, with 3–4% more ITE. aim's `DEFAULT_MODE` is now `Off` (ADR 0076
+§6).
+
+What the runs show beyond the rule:
+
+- gpt-4.1-mini called `run_code` in 1 of 27 `on` runs; codex called `exec` in 4 of 6, Claude
+  `run_code` in 2 of 6. Where a model scripted, it did not save requests on these tasks.
+- In `only`, 97 of 292 `run_code` calls failed (54 `ReferenceError`s, mostly `require`), 109
+  calls went to the program tools against an empty store, and 5 runs hit the 24-request cap.
+- `on`'s lower existing-task ITE is its smaller prefix, not code: 7,745 bytes against `off`'s
+  8,353 in W1, from ADR 0056's compact direct set and shorter `Read`/`Bash`/`LS` descriptions,
+  which apply only in code-mode sessions. Giving `off` the shorter descriptions is a follow-up.
+- `doc_index` failed 9/9 on OpenRouter in every arm (the model takes `# Options` over the earlier
+  `## Command line usage`) and passed 8/8 on codex and Claude: it separates models, not arms.
+- In `only`, a cell that prints a nested `Bash` result shows the model 30,147 characters of the
+  W2 output where a direct `Bash` shows 11,191: ADR 0056's model view does not apply to nested
+  results (wire tier, `--harnesses aim_openrouter@only`).
+
+Spend: $0.5275 of the $3 OpenRouter budget across six invocations (three smoke, three primary;
+provider-reported, no transport errors), 12 of 12 codex subscription runs, 13 of 16 Claude
+subscription runs. `~/.codex/auth.json` hashed `7315f3c9…91b0` before and after the codex runs.
