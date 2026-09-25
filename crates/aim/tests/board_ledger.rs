@@ -367,6 +367,51 @@ async fn board_and_session_actors_share_one_wal_file() {
     assert_eq!(sessions.load("session".into()).await.unwrap().1.len(), 20);
 }
 
+#[expect(clippy::unwrap_used, reason = "fixture setup failures must fail the test")]
+async fn accepted_evidence_fixture(board: &Board) -> (String, Vec<String>) {
+    board.register_worker(RegisterWorkerParams { worker: "evidence".into(), capacity: 1 }).await.unwrap();
+    let mut run_id = None;
+    let mut accepted_ids = Vec::new();
+    for index in 0..200 {
+        let job = board
+            .post(PostParams { run_id: run_id.clone(), spec: spec("evidence", vec![], 0), idempotency_key: format!("accepted-{index}") })
+            .await
+            .unwrap()
+            .job;
+        run_id.get_or_insert_with(|| job.run_id.clone());
+        let claimed = board.claim(claim(&job.id, "evidence", 1)).await.unwrap();
+        let completed = board
+            .complete(CompleteParams {
+                job_id: job.id.clone(),
+                attempt_id: claimed.attempt.id.clone(),
+                claim_token: token(&job.id, "evidence"),
+                artifacts: vec![ArtifactInput {
+                    media_type: "application/octet-stream".into(),
+                    data: Base64Bytes(vec![u8::try_from(index).unwrap(); 1_048_576]),
+                }],
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        board.record_cleanup(job.id.clone(), claimed.attempt.id.clone(), token(&job.id, "evidence"), cleanup()).await.unwrap();
+        let cleaned = board.show(job.id.clone()).await.unwrap();
+        board
+            .review(ReviewParams {
+                job_id: job.id.clone(),
+                attempt_id: claimed.attempt.id,
+                reviewer: "lead".into(),
+                accepted: true,
+                evidence: vec![completed.artifacts.first().unwrap().id.clone()],
+                expected_version: cleaned.version,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        accepted_ids.push(job.id);
+    }
+    (run_id.unwrap(), accepted_ids)
+}
+
 #[tokio::test]
 async fn claims_stay_fast_with_200_mib_of_accepted_evidence_and_session_writes() {
     use std::time::{Duration, Instant};
@@ -389,57 +434,24 @@ async fn claims_stay_fast_with_200_mib_of_accepted_evidence_and_session_writes()
         })
         .await
         .unwrap();
-    board.register_worker(RegisterWorkerParams { worker: "evidence".into(), capacity: 1 }).await.unwrap();
     board.register_worker(RegisterWorkerParams { worker: "claimant".into(), capacity: 32 }).await.unwrap();
-    let mut run_id = None;
-    let mut accepted_ids = Vec::new();
-    for index in 0..200 {
-        let job = board
-            .post(PostParams { run_id: run_id.clone(), spec: spec("evidence", vec![], 0), idempotency_key: format!("accepted-{index}") })
-            .await
-            .unwrap()
-            .job;
-        run_id.get_or_insert_with(|| job.run_id.clone());
-        let claimed = board.claim(claim(&job.id, "evidence", 1)).await.unwrap();
-        let completed = board
-            .complete(CompleteParams {
-                job_id: job.id.clone(),
-                attempt_id: claimed.attempt.id.clone(),
-                claim_token: token(&job.id, "evidence"),
-                artifacts: vec![ArtifactInput {
-                    media_type: "application/octet-stream".into(),
-                    data: Base64Bytes(vec![index as u8; 1_048_576]),
-                }],
-                now_ms: 0,
-            })
-            .await
-            .unwrap();
-        board.record_cleanup(job.id.clone(), claimed.attempt.id.clone(), token(&job.id, "evidence"), cleanup()).await.unwrap();
-        let cleaned = board.show(job.id.clone()).await.unwrap();
-        board
-            .review(ReviewParams {
-                job_id: job.id.clone(),
-                attempt_id: claimed.attempt.id,
-                reviewer: "lead".into(),
-                accepted: true,
-                evidence: vec![completed.artifacts.first().unwrap().id.clone()],
-                expected_version: cleaned.version,
-                now_ms: 0,
-            })
-            .await
-            .unwrap();
-        accepted_ids.push(job.id);
-    }
+    let (run_id, accepted_ids) = accepted_evidence_fixture(&board).await;
     // A broken unrelated review must not block admission elsewhere in the ledger.
     let direct = rusqlite::Connection::open(&path).unwrap();
     direct.execute("UPDATE board_reviews SET evidence_json='malformed' WHERE job_id=?1", rusqlite::params![accepted_ids[199]]).unwrap();
     drop(direct);
+    let independent = board
+        .post(PostParams { run_id: None, spec: spec("independent", vec![], 0), idempotency_key: "independent".into() })
+        .await
+        .unwrap()
+        .job;
+    board.claim(claim(&independent.id, "claimant", 32)).await.unwrap();
     let mut candidates = Vec::new();
     for index in 0..20 {
         candidates.push(
             board
                 .post(PostParams {
-                    run_id: run_id.clone(),
+                    run_id: Some(run_id.clone()),
                     spec: spec("candidate", vec![accepted_ids[0].clone()], 0),
                     idempotency_key: format!("candidate-{index}"),
                 })
@@ -477,6 +489,7 @@ async fn claims_stay_fast_with_200_mib_of_accepted_evidence_and_session_writes()
     let (mut durations, ()) = tokio::join!(claims, append);
     durations.sort_unstable();
     let p95 = durations[18];
+    eprintln!("200 MiB accepted evidence: claim p95={p95:?}, max={:?}", durations[19]);
     assert!(p95 < Duration::from_millis(250), "claim p95 was {p95:?}");
     assert_eq!(sessions.load("session".into()).await.unwrap().1.len(), 40);
 }
