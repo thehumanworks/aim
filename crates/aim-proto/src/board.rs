@@ -117,6 +117,9 @@ pub struct JobSnapshot {
     pub attempt: Option<AttemptSummary>,
     /// Number of artifacts on the current successful attempt.
     pub artifact_count: u32,
+    /// Immutable artifact summaries for review and reconciliation.
+    #[serde(default)]
+    pub artifacts: Vec<ArtifactSummary>,
     /// Creation timestamp, Unix milliseconds.
     pub created_ms: u64,
     /// Last committed transition timestamp, Unix milliseconds.
