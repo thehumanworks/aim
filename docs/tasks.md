@@ -24,7 +24,7 @@ client still builds.
 | T0 | Base: merge FIX16 (`agent/claude/fix16-coderun`) and W26 (`agent/perf/tokens`) as-is (maintainer decision) | done | Merged (`eda6444`, `36f1bd8`); conflicts resolved in event.rs, session.rs, agent/mod.rs, agent/tools.rs, host.rs; clippy, xtask and 963/963 tests green | — | integration branch |
 | T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | in progress | Worker running | Review its report, merge | `agent/claude/tui-options` · `../aim-wt/tui-options` |
 | T2 | `/clear` clears the chat and starts fresh | todo | Folded into T1 (same files) | — | with T1 |
-| T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged; scheduler verified; live runs show overlapping calls (native and ACP) | — | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
+| T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | review | Merged; codex REV-T3: MERGE AFTER FIXES (B1: load-sensitive timing tests); worker fixing | Merge the fix commits | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | in progress | Worker running | Review its report, merge, then T4b | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | todo | Waits for T4a | Wire gate: 31 regressions on the merged base + 4 from T3's prompt | — |
 | T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | review | Merged; codex REV-T5: MERGE AFTER FIXES (B1–B5); worker fixing on the same branch | Merge the fix commits; re-check | `agent/claude/acp-models` · `../aim-wt/acp-models` |
@@ -86,3 +86,7 @@ client still builds.
   families picks one silently; B3 `AcpBackend::set_config` re-echoes the unredacted request;
   B4 option lookup and resolution depth classify options differently; B5 the `[1m]`/`-1m` variant
   syntax applies to every ACP profile (should be capability data). Sent back to the T5 worker.
+- 2026-09-25 — Codex REV-T3 (auth.json hash unchanged): MERGE AFTER FIXES. Kernel specs and shell
+  equivalence confirmed (272 verified). B1: 1.8 s ceilings for two 1 s calls are load-sensitive;
+  replace with a rendezvous proving both calls were in flight. The reviewer's code-cell failure was
+  its own sandbox refusing nested `sandbox-exec`, not the branch. Sent back to the T3 worker.
