@@ -123,3 +123,7 @@ client still builds.
 - 2026-09-25 — T1 follow-ups + REV-T1 fixes merged (`d3a31a0`): case-folded choices, `auto_effort`,
   generation-fenced option publishing, pinned candidate order, live summary model. Merged tree:
   clippy clean; aim lib 286/286, host 30/30, acp_bridge 5/5. Codex re-check of T1 started.
+- 2026-09-25 — Codex REV-T1b (re-check; auth.json unchanged): B1 and N1 confirmed fixed (323
+  verified). New B2: `announce` broadcasts ConfigChanged before updating the summary's model
+  (host.rs:1045/1050), so a concurrent attach can pair the old model with the new ladder. Sent
+  back to the T1 worker.
