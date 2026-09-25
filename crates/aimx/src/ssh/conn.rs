@@ -13,6 +13,7 @@ use tokio::process::Command;
 use super::quote;
 
 const ASKPASS_SOCKET: &str = "AIM_SSH_ASKPASS_SOCKET";
+const MAX_CHANNEL_OUTPUT: usize = 64 * 1024 * 1024;
 
 /// A prompt handler supplied by the embedding user interface.
 pub trait Prompter: Send + Sync {
@@ -200,11 +201,37 @@ impl Connection {
         command.arg(&self.options.destination).arg("--").arg(format!("sh -c {}", quote(script)));
         command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
         let mut child = command.spawn().map_err(|_| unavailable("cannot start ssh channel"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(input).await.map_err(|_| unavailable("SSH stdin failed"))?;
+        let mut stdin = child.stdin.take().ok_or_else(|| unavailable("SSH stdin unavailable"))?;
+        let input = input.to_vec();
+        let writer = tokio::spawn(async move { stdin.write_all(&input).await });
+        let mut stdout = child.stdout.take().ok_or_else(|| unavailable("SSH stdout unavailable"))?;
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let Ok(count) = stdout.read(&mut buffer).await else {
+                drop(child.start_kill());
+                drop(child.wait().await);
+                writer.abort();
+                return Err(unavailable("SSH stdout failed"));
+            };
+            if count == 0 {
+                break;
+            }
+            if output.len().saturating_add(count) > MAX_CHANNEL_OUTPUT {
+                drop(child.start_kill());
+                drop(child.wait().await);
+                writer.abort();
+                return Err(ProtoError::new(ErrorCode::LimitExceeded, "SSH channel output limit exceeded"));
+            }
+            output.extend_from_slice(buffer.get(..count).unwrap_or(&[]));
         }
-        let output = child.wait_with_output().await.map_err(|_| unavailable("SSH channel failed"))?;
-        Ok((output.status.code().unwrap_or(255), output.stdout))
+        let status = child.wait().await.map_err(|_| unavailable("SSH channel failed"))?;
+        if status.success() {
+            writer.await.map_err(|_| unavailable("SSH stdin task failed"))?.map_err(|_| unavailable("SSH stdin failed"))?;
+        } else {
+            writer.abort();
+        }
+        Ok((status.code().unwrap_or(255), output))
     }
 
     /// A channel command for a long-running remote process.
