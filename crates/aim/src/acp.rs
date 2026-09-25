@@ -510,6 +510,7 @@ fn authority_prompt(root: &str, location: &str, project: Option<&(String, String
             "Your workspace is remote ({location}) at {root}. File and shell operations use the aim MCP tools on that remote host. Your local ACP cwd is only a scratch directory."
         )
     };
+    prompt.push_str(" Put independent aim reads, searches and listings in one response: they run concurrently.");
     if let Some((name, text)) = project {
         let _ = write!(prompt, "\n\n# Project instructions ({name}, from the {location} workspace)\n\n{text}");
     }
@@ -655,5 +656,6 @@ mod tests {
         assert!(prompt.contains("workspace is remote (ssh:example) at /remote/work"));
         assert!(prompt.contains("AGENTS.md, from the ssh:example workspace"));
         assert!(prompt.contains("Use the project rules."));
+        assert!(prompt.contains("in one response"), "the batching guidance reaches ACP sessions too");
     }
 }

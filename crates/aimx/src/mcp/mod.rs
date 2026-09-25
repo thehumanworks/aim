@@ -429,6 +429,44 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Claude Code runs an MCP tool concurrently with others only when it is annotated
+    /// `readOnlyHint` (its `isConcurrencySafe`), so both names of each tool must carry aimx's
+    /// annotations, and only tools that never change the workspace may claim to be read-only.
+    #[tokio::test]
+    async fn both_names_of_each_tool_carry_the_same_mcp_annotations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_str().expect("UTF-8 temporary root");
+        let (mcp, server) = local(root).await;
+        let legacy = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+        let modern = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}});
+        for request in [legacy, modern] {
+            let list = mcp.dispatch(&request).await.expect("reply");
+            let tools = list["result"]["tools"].as_array().expect("tools array").clone();
+            let annotations =
+                |name: &str| tools.iter().find(|tool| tool["name"] == name).map_or(Value::Null, |tool| tool["annotations"].clone());
+            for spec in crate::tools::specs() {
+                let alias = super::alias(&spec.name).expect("every aimx tool has an MCP alias");
+                let expected = json!({"readOnlyHint":spec.annotations.read_only,"destructiveHint":spec.annotations.destructive,
+                    "idempotentHint":spec.annotations.idempotent,"openWorldHint":spec.annotations.open_world});
+                assert_eq!(annotations(&spec.name), expected, "{}", spec.name);
+                assert_eq!(annotations(alias), expected, "{alias}");
+            }
+            for name in ["Read", "Grep", "Glob", "LS", "read", "grep", "glob", "ls"] {
+                let hints = annotations(name);
+                assert_eq!(
+                    (&hints["readOnlyHint"], &hints["destructiveHint"], &hints["openWorldHint"]),
+                    (&json!(true), &json!(false), &json!(false)),
+                    "{name}"
+                );
+            }
+            for name in ["Bash", "Edit", "Write", "bash", "edit", "write"] {
+                assert_eq!(annotations(name)["readOnlyHint"], false, "{name} changes the workspace");
+            }
+            assert_eq!(annotations("bash")["openWorldHint"], true, "commands may reach the network");
+        }
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn protocol_and_tool_errors_are_reported_in_their_mcp_channels() {
         let dir = tempfile::tempdir().expect("tempdir");

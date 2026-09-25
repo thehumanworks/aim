@@ -95,8 +95,13 @@ References are to `codex-rs/core/src/tools/code_mode/mod.rs` in the reference cl
     cell is affected. `$/cancel` alone cannot stop a cell that is busy in JavaScript.
 - **Programs.** A session runs at most 2 `run_program` workers at once, with the same 10 s bounded
   wait.
-- **Kernel candidate.** The scheduler is a small pure state machine, `coderun::scheduler`, and is
-  listed for the kernel.
+- **Verified.** The scheduler's decision is `aim_kernel::cells`, a Verus spec with proofs
+  (`DRAFT(ADR-0066)`, not LOCKED); `coderun::scheduler` is a thin shell over it. Proved: at most
+  one cell runs; the queue is bounded, FIFO, duplicate-free and never holds the running cell;
+  `leave(t)` changes no other ticket except promoting the queue's head when `t` ran; a ticket that
+  left or was refused never runs under any later sequence of operations; a closed scheduler stays
+  empty and admits nothing. Tickets are never reused: after 2^64 − 1 the scheduler refuses as
+  closed.
 
 ### 4. Output and store limits never fail a cell
 
