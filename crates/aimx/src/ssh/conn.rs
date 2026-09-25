@@ -409,8 +409,10 @@ impl AskpassRelay {
                 let request = request.to_owned();
                 let reply =
                     tokio::time::timeout(Duration::from_secs(60), tokio::task::spawn_blocking(move || prompt.prompt(&request, echo))).await;
-                if let Ok(Ok(Some(reply))) = reply {
-                    drop(stream.write_all(reply.as_bytes()).await);
+                if let Ok(Ok(Some(reply))) = reply
+                    && reply.len() <= 8192
+                {
+                    drop(tokio::time::timeout(Duration::from_secs(60), stream.write_all(reply.as_bytes())).await);
                 }
             }
         });
@@ -561,6 +563,13 @@ mod tests {
             Some("answer".to_owned())
         }
     }
+
+    struct LongPrompter;
+    impl Prompter for LongPrompter {
+        fn prompt(&self, _: &str, _: bool) -> Option<String> {
+            Some("x".repeat(8193))
+        }
+    }
     #[test]
     fn parses_effective_configuration() {
         assert_eq!(config_value("host x\nserveraliveinterval 0\n", "serveraliveinterval"), Some("0"));
@@ -603,6 +612,13 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert!(started.elapsed() < std::time::Duration::from_millis(100), "prompt blocked the current-thread runtime");
         assert_eq!(client.await.expect("task").expect("answer"), Some("answer".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn askpass_discards_oversized_replies() {
+        let dir = tempfile::Builder::new().prefix("aimask").tempdir_in("/private/tmp").expect("tempdir");
+        let relay = AskpassRelay::start(dir.path(), Arc::new(LongPrompter)).expect("relay");
+        assert_eq!(askpass_client_at(&relay.socket, &relay.token, "Password:").await.expect("oversized reply"), None);
     }
 
     #[tokio::test]
