@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture, ToolHost};
-use aim::host::{Connected, HostConfig, NativeServices, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends_with};
+use aim::host::{
+    CodeConfig, Connected, HostConfig, NativeServices, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends_with,
+};
 use aim::media::MediaService;
 use aim::resources::files::{FileText, FilesFuture, Read};
 use aim::resources::{
@@ -1106,4 +1108,41 @@ async fn live_prefix(aimx: &Path, repo: &Path, agent: Option<&str>) -> String {
     harness.shutdown().await;
     let agent = agent.and_then(|name| catalog.agent(name));
     aim::context::instructions(&catalog, agent, instructions::DEFAULT_SKILL_BUDGET).text
+}
+
+/// REV12: code mode's program tools obey the agent's allowlist. An agent allowed `Read` and
+/// `run_code` gets code mode but not `save_program`/`run_program`/`list_programs`, and a direct
+/// `save_program` call is denied without touching the program repository.
+#[tokio::test]
+async fn program_tools_obey_the_agent_allowlist() {
+    let store = Arc::new(MemoryStore::default());
+    let tools = Arc::new(FakeTools::default());
+    let programs = tempfile::tempdir().unwrap();
+    let services = NativeServices {
+        media: None,
+        decider: None,
+        tools: Vec::new(),
+        code: Some(CodeConfig { worker: "/nonexistent/aim-coderun".into(), user_programs: programs.path().join("programs") }),
+    };
+    let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(reader_project(Some("Read, run_code"))));
+    let for_tools = Arc::clone(&tools);
+    let script = vec![vec![call("c1", "save_program"), completed(StopReason::ToolUse)], text("done")];
+    let f = fixture_on(Arc::clone(&store), Vec::new(), script, services, move |spec| Connected {
+        tools: Arc::clone(&for_tools) as Arc<dyn ToolHost>,
+        root: spec.workspace.clone(),
+        location: "local".into(),
+        project: Some(Arc::clone(&files)),
+        shutdown: Box::new(|| Box::pin(async {})),
+    });
+    let id = f.host.create(persistent("reader")).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    f.host.prompt(id, vec![Part::Text { text: "save a program".into() }]).await.unwrap();
+    let got = until_idle(&mut updates).await;
+    let offered: Vec<String> = f.provider.seen.lock().unwrap()[0].tools.iter().map(|t| t.name.clone()).collect();
+    assert_eq!(offered, ["Read", "run_code"], "program tools need their own permission");
+    assert!(
+        got.iter().any(|u| matches!(u, SessionUpdate::ToolFinished { name, result, .. } if name == "save_program" && result.is_error)),
+        "{got:?}"
+    );
+    assert!(!programs.path().join("programs").exists(), "nothing was committed");
 }

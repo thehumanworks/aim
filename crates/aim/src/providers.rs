@@ -128,36 +128,111 @@ fn code_mode() -> Option<crate::host::CodeConfig> {
 
 type SearchParts = (Arc<crate::search::SearchEngine>, Arc<crate::store::SqliteStore>);
 
-/// Conversation search tools (`search_sessions`, `read_session`, ADR 0035) over this user's session
-/// database, opened once per process on first use. Omitted when the index cannot be opened.
-fn search_tools() -> crate::host::ToolsFactory {
-    let opened: Arc<tokio::sync::OnceCell<Option<SearchParts>>> = Arc::new(tokio::sync::OnceCell::new());
-    Arc::new(move |spec: &aim_proto::daemon::SessionSpec| {
-        let opened = Arc::clone(&opened);
-        let persistence = spec.persistence;
+/// How long a search call waits for the index to open before answering "initializing".
+const SEARCH_READY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long after a failed open the next session may retry it.
+const SEARCH_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The process's search index: opened in the background (a first open may download the
+/// embedding model), never on a session's start path; a failed open is retried later.
+#[derive(Default)]
+struct SearchIndex {
+    ready: tokio::sync::watch::Sender<Option<SearchParts>>,
+    state: Mutex<SearchOpen>,
+}
+
+#[derive(Default)]
+enum SearchOpen {
+    #[default]
+    NotStarted,
+    Opening,
+    Open,
+    Failed(std::time::Instant),
+}
+
+impl SearchIndex {
+    /// Starts opening the index unless it is open, opening, or failed too recently.
+    fn ensure_opening(self: &Arc<Self>) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            match *state {
+                SearchOpen::Opening | SearchOpen::Open => return,
+                SearchOpen::Failed(at) if at.elapsed() < SEARCH_RETRY_AFTER => return,
+                SearchOpen::NotStarted | SearchOpen::Failed(_) => *state = SearchOpen::Opening,
+            }
+        }
+        let index = Arc::clone(self);
+        tokio::spawn(async move {
+            let database = crate::cli::aim_home().join("aim.db");
+            let engine = {
+                let database = database.clone();
+                tokio::task::spawn_blocking(move || crate::search::SearchEngine::open(&database)).await
+            };
+            let opened = if let (Ok(Ok(engine)), Ok(store)) = (engine, crate::store::SqliteStore::open(&database)) {
+                Some((Arc::new(engine), Arc::new(store)))
+            } else {
+                None
+            };
+            let mut state = index.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(parts) = opened {
+                *state = SearchOpen::Open;
+                index.ready.send_replace(Some(parts));
+            } else {
+                tracing::debug!("conversation search is unavailable; retrying later");
+                *state = SearchOpen::Failed(std::time::Instant::now());
+            }
+        });
+    }
+}
+
+/// Search tools that are offered at once and wait (bounded) for the index on their first call.
+struct LazySearch {
+    index: Arc<SearchIndex>,
+    persistence: aim_proto::daemon::Persistence,
+}
+
+impl crate::agent::ToolHost for LazySearch {
+    fn specs(&self) -> Vec<aim_proto::tool::ToolSpec> {
+        crate::search::tools::specs()
+    }
+
+    fn call(
+        &self,
+        name: String,
+        arguments: serde_json::Value,
+        key: aim_proto::ids::IdempotencyKey,
+    ) -> crate::agent::tools::BoxFuture<Result<aim_proto::tool::ToolResult, aim_proto::error::ProtoError>> {
+        self.index.ensure_opening();
+        let mut ready = self.index.ready.subscribe();
+        let persistence = self.persistence;
         Box::pin(async move {
-            let parts = opened
-                .get_or_init(|| async {
-                    let database = crate::cli::aim_home().join("aim.db");
-                    let engine = {
-                        let database = database.clone();
-                        tokio::task::spawn_blocking(move || crate::search::SearchEngine::open(&database)).await
-                    };
-                    if let (Ok(Ok(engine)), Ok(store)) = (engine, crate::store::SqliteStore::open(&database)) {
-                        Some((Arc::new(engine), Arc::new(store)))
-                    } else {
-                        tracing::debug!("conversation search is unavailable");
-                        None
-                    }
-                })
+            let parts = tokio::time::timeout(SEARCH_READY_WAIT, ready.wait_for(Option::is_some))
                 .await
-                .clone()?;
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|parts| parts.clone());
+            let Some((engine, store)) = parts else {
+                return Err(aim_proto::error::ProtoError::new(
+                    aim_proto::error::ErrorCode::Unavailable,
+                    "conversation search is still initializing; try again shortly",
+                ));
+            };
             let reranker = std::env::var_os("TYPESAFE_API_KEY")
                 .is_some_and(|value| !value.is_empty())
                 .then(|| Arc::new(crate::search::rerank::JevReranker) as Arc<dyn crate::search::tools::Reranker>);
-            let host = crate::search::tools::SearchToolHost::new(parts.0, parts.1, persistence, reranker);
-            Some(Arc::new(host) as Arc<dyn crate::agent::ToolHost>)
+            crate::search::tools::SearchToolHost::new(engine, store, persistence, reranker).call(name, arguments, key).await
         })
+    }
+}
+
+/// Conversation search tools (`search_sessions`, `read_session`, ADR 0035) over this user's session
+/// database. The index opens in the background, off every session's start path.
+fn search_tools() -> crate::host::ToolsFactory {
+    let index: Arc<SearchIndex> = Arc::new(SearchIndex::default());
+    Arc::new(move |spec: &aim_proto::daemon::SessionSpec| {
+        index.ensure_opening();
+        let host: Arc<dyn crate::agent::ToolHost> = Arc::new(LazySearch { index: Arc::clone(&index), persistence: spec.persistence });
+        Box::pin(async move { Some(host) })
     })
 }
 

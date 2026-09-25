@@ -310,7 +310,8 @@ pub fn native_backends_with(
                 None => (tools, None),
             };
             if let Some(code) = services.code.as_ref().filter(|_| code_permitted) {
-                tools = with_code_mode(tools, code, provider.as_ref(), &model, &session_id, &spec.location, &root).await;
+                let agent = agent.as_ref().map(|(agent, policy)| (agent, policy));
+                tools = with_code_mode(tools, code, agent, provider.as_ref(), &model, &session_id, &spec.location, &root).await;
             }
             let config = AgentConfig {
                 model: model.clone(),
@@ -353,9 +354,11 @@ async fn with_extra_tools(tools: Arc<dyn ToolHost>, factories: &[ToolsFactory], 
 
 /// Adds code mode and the saved-program tools over `tools`, the session's final (narrowed) set,
 /// so nested calls in a cell reach exactly the tools the session may use.
+#[expect(clippy::too_many_arguments, reason = "one session's composition inputs, kept explicit")]
 async fn with_code_mode(
     tools: Arc<dyn ToolHost>,
     code: &CodeConfig,
+    agent: Option<(&resources::agents::AgentDef, &ToolPolicy)>,
     provider: &dyn ModelProvider,
     model: &str,
     session_id: &str,
@@ -369,7 +372,20 @@ async fn with_code_mode(
     let project = matches!(location, Location::Local).then(|| PathBuf::from(root).join(".agents/programs"));
     let store = Arc::new(crate::programs::ProgramStore::new(code.user_programs.clone(), project));
     let programs: Arc<dyn ToolHost> = Arc::new(crate::coderun::ProgramToolHost::new(host, store));
-    Arc::new(crate::agent::tools::Compose::new(tools, vec![programs]))
+    let composed: Arc<dyn ToolHost> = Arc::new(crate::agent::tools::Compose::new(tools, vec![programs]));
+    // The model-visible code and program tools obey the agent's allowlist too: `save_program`,
+    // `run_program` and `list_programs` need their own permission; codex's `exec`/`wait` are
+    // `run_code` under another name.
+    match agent {
+        Some((agent, policy)) => {
+            let mut top = policy.clone();
+            if let Some(allow) = top.allow.as_mut() {
+                allow.extend(["exec".to_owned(), "wait".to_owned()]);
+            }
+            narrowed(composed, agent, &top)
+        }
+        None => composed,
+    }
 }
 
 fn narrowed(tools: Arc<dyn ToolHost>, agent: &resources::agents::AgentDef, policy: &ToolPolicy) -> Arc<dyn ToolHost> {
@@ -490,6 +506,9 @@ struct Live {
     transcript: Mutex<Vec<Item>>,
     updates: broadcast::Sender<SessionUpdate>,
     control: mpsc::UnboundedSender<Control>,
+    /// Set when a close is requested, before `Control::Close` is queued, so work settled before
+    /// the actor reads the close (a pending config change) is cancelled rather than awaited.
+    close_requested: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -651,7 +670,13 @@ impl SessionHost {
         };
         let (updates, _) = broadcast::channel(self.config.update_capacity.max(16));
         let (control, control_rx) = mpsc::unbounded_channel();
-        let live = Arc::new(Live { summary: Mutex::new(summary.clone()), transcript: Mutex::new(transcript), updates, control });
+        let live = Arc::new(Live {
+            summary: Mutex::new(summary.clone()),
+            transcript: Mutex::new(transcript),
+            updates,
+            control,
+            close_requested: AtomicBool::new(false),
+        });
         lock(&self.sessions).insert(meta.id.clone(), Arc::clone(&live));
         let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location, announced };
         let sessions = Arc::clone(&self.sessions);
@@ -807,6 +832,7 @@ impl Actor {
                     // Changes asked for during the turn apply now, before any later control, and
                     // each has an outcome on the stream (ADR 0038).
                     if let Some((model, effort)) = pending_config.take() {
+                        let closing = closing || self.live.close_requested.load(Ordering::SeqCst);
                         self.settle_pending(model, effort, closing).await;
                     }
                     if closing {
@@ -1140,6 +1166,10 @@ impl SessionClient for SessionHost {
 
     fn close(&self, session: String) -> BoxFuture<Result<(), ProtoError>> {
         let live = self.live(&session);
-        Box::pin(async move { live?.control.send(Control::Close).map_err(|_| err(ErrorCode::Unavailable, "session closed")) })
+        Box::pin(async move {
+            let live = live?;
+            live.close_requested.store(true, Ordering::SeqCst);
+            live.control.send(Control::Close).map_err(|_| err(ErrorCode::Unavailable, "session closed"))
+        })
     }
 }

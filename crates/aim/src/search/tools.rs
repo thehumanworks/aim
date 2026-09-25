@@ -63,7 +63,9 @@ struct ReadArgs {
     limit: Option<u32>,
 }
 
-fn specs() -> Vec<ToolSpec> {
+/// The search tools' specs (they do not depend on the index).
+#[must_use]
+pub fn specs() -> Vec<ToolSpec> {
     let annotations =
         ToolAnnotations { read_only: true, idempotent: true, location: ToolLocation::LocalService, ..ToolAnnotations::default() };
     vec![
