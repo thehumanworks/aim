@@ -439,6 +439,7 @@ mod tests {
                 model: "gpt-6-sol".into(),
                 title: None,
                 parent: None,
+                agent: None,
             },
             state,
             persistence: Persistence::Persistent,

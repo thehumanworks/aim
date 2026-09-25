@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::content::Base64Bytes;
 use crate::conversation::{Item, Part, RateLimits, StopReason, Usage};
-use crate::event::SessionMeta;
+use crate::event::{EffortSource, SessionMeta};
 use crate::harness::{AuthProof, GenerationRange, PeerInfo};
 use crate::ids::IdempotencyKey;
 use crate::tool::ToolResult;
@@ -212,13 +212,29 @@ pub enum SessionUpdate {
         /// Its logged inputs, advice and output.
         decision: crate::event::DecisionRecord,
     },
-    /// Model or effort changed.
+    /// Model or effort changed: the configuration now in force.
     ConfigChanged {
         /// Model id.
         model: String,
         /// Effort, if set.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        /// Who chooses the effort from now on (ADR 0038).
+        #[serde(default, skip_serializing_if = "EffortSource::is_explicit")]
+        effort_source: EffortSource,
+    },
+    /// A configuration change accepted while a turn ran was not applied when the turn ended: the
+    /// backend refused it, or the session closed first (ADR 0038). Nothing changed unless a
+    /// `ConfigChanged` precedes it; it is not recorded in the session log.
+    ConfigRejected {
+        /// The model asked for (later requests merged field by field).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The effort asked for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        /// Why (no secrets).
+        message: String,
     },
     /// The model's context was compacted: its first `replaced` items were replaced by `items`
     /// (a provider compaction item or a summary). The user's transcript keeps everything.
@@ -343,14 +359,21 @@ pub struct SessionConfigParams {
     /// New model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// New effort.
+    /// New effort: a level from the model's catalog, or [`AUTO_EFFORT`] to hand the choice back
+    /// to aim (ADR 0038).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
 }
 
+/// The `effort` value that makes a session's effort automatic again (ADR 0038). Reserved: a
+/// catalog level with this name cannot be pinned through `session.set_config`.
+pub const AUTO_EFFORT: &str = "auto";
+
 method!(
-    /// `session.set_config` — change model or effort: now when idle, from the next turn when a turn
-    /// is running.
+    /// `session.set_config` — change model or effort. When idle it applies at once and a refusal is
+    /// the error (`invalid_params`; a storage failure is `internal` and closes the session). While
+    /// a turn runs it is accepted and applies as the turn ends; its outcome is then a
+    /// `ConfigChanged` or a `ConfigRejected` update (ADR 0038).
     SessionSetConfig = "session.set_config" (SessionConfigParams) -> ()
 );
 

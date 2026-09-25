@@ -18,7 +18,7 @@ use aim_proto::daemon::{
     Location, Persistence, PromptOutcome, SessionConfigParams, SessionListParams, SessionSpec, SessionState, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::event::{SessionEvent, SessionMeta};
+use aim_proto::event::{EffortSource, SessionEvent, SessionMeta};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolAnnotations, ToolResult, ToolSpec};
 use futures_util::StreamExt as _;
@@ -265,7 +265,10 @@ async fn set_config_applies_when_idle_and_after_a_running_turn() {
     let params = |model: &str| SessionConfigParams { session: id.clone(), model: Some(model.into()), effort: Some("high".into()) };
     f.host.set_config(params("m2")).await.unwrap();
     let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
-    assert_eq!(got.last(), Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("high".into()) }));
+    assert_eq!(
+        got.last(),
+        Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("high".into()), effort_source: EffortSource::Explicit })
+    );
     f.host.prompt(id.clone(), user("go")).await.unwrap();
     until(&mut updates, |u| matches!(u, SessionUpdate::ToolStarted { .. })).await;
     f.host.set_config(params("m3")).await.unwrap();
@@ -368,7 +371,11 @@ async fn config_changes_during_a_turn_merge_field_by_field() {
     f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m2".into()), effort: None }).await.unwrap();
     f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("high".into()) }).await.unwrap();
     let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
-    assert_eq!(got.last(), Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("high".into()) }), "neither change lost");
+    assert_eq!(
+        got.last(),
+        Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("high".into()), effort_source: EffortSource::Explicit }),
+        "neither change lost"
+    );
     f.host.prompt(id, user("next")).await.unwrap();
     until(&mut updates, is_idle).await;
     let last = f.provider.seen.lock().unwrap().last().cloned().unwrap();

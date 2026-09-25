@@ -26,7 +26,7 @@ use aim_proto::daemon::{
     SessionListParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::event::{EventBody, SessionEvent, SessionMeta};
+use aim_proto::event::{EffortSource, EventBody, SessionEvent, SessionMeta};
 use futures_core::Stream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -433,6 +433,7 @@ impl SessionHost {
                 model,
                 title: None,
                 parent: None,
+                agent: None,
             };
             let created = Recorder::create(Arc::clone(&store), meta.clone()).await;
             match created {
@@ -440,7 +441,10 @@ impl SessionHost {
                     // Record the configuration in force, so a resumed session continues with the
                     // same model and effort (Recorder::resume and last_config read it back).
                     match backend.set_config(None, None).await {
-                        Ok((model, effort)) => recorder.record(EventBody::ConfigChanged { model, effort }).await.map(|()| (meta, recorder)),
+                        Ok((model, effort)) => recorder
+                            .record(EventBody::ConfigChanged { model, effort, effort_source: EffortSource::Explicit })
+                            .await
+                            .map(|()| (meta, recorder)),
                         Err(message) => {
                             tracing::warn!(%message, "the backend could not report its configuration");
                             Ok((meta, recorder))
@@ -523,7 +527,7 @@ fn last_config(meta: &SessionMeta, events: &[SessionEvent]) -> (String, Option<S
         .iter()
         .rev()
         .find_map(|e| match &e.body {
-            EventBody::ConfigChanged { model, effort } => Some((model.clone(), effort.clone())),
+            EventBody::ConfigChanged { model, effort, .. } => Some((model.clone(), effort.clone())),
             _ => None,
         })
         .unwrap_or_else(|| (meta.model.clone(), None))
@@ -619,7 +623,13 @@ impl Actor {
     /// Applies a config change and announces what is now in force.
     async fn apply_config(&mut self, model: Option<String>, effort: Option<String>) -> Result<(), String> {
         let (model, effort) = self.backend.set_config(model, effort).await?;
-        publish(&self.live, &mut self.recorder, &mut self.broken, SessionUpdate::ConfigChanged { model, effort }).await;
+        publish(
+            &self.live,
+            &mut self.recorder,
+            &mut self.broken,
+            SessionUpdate::ConfigChanged { model, effort, effort_source: EffortSource::Explicit },
+        )
+        .await;
         Ok(())
     }
 

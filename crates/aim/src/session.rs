@@ -110,9 +110,9 @@ impl Recorder {
             AgentEvent::Decision { decision } => EventBody::Decision { decision: decision.clone() },
             AgentEvent::TurnEnded { stop } => EventBody::TurnEnded { stop: stop.clone() },
             AgentEvent::TurnFailed { message } => EventBody::TurnFailed { message: message.clone() },
-            AgentEvent::ConfigChanged { model, effort } => {
+            AgentEvent::ConfigChanged { model, effort, effort_source } => {
                 self.model.clone_from(model);
-                EventBody::ConfigChanged { model: model.clone(), effort: effort.clone() }
+                EventBody::ConfigChanged { model: model.clone(), effort: effort.clone(), effort_source: *effort_source }
             }
             AgentEvent::Compacted { replaced, items, .. } => EventBody::Compacted { replaced: *replaced, items: items.clone() },
             AgentEvent::StateChanged { .. }
@@ -124,7 +124,9 @@ impl Recorder {
             | AgentEvent::ToolFinished { .. }
             | AgentEvent::SteerQueued
             | AgentEvent::SteerDelivered { .. }
-            | AgentEvent::SteersReturned { .. } => return Ok(()),
+            | AgentEvent::SteersReturned { .. }
+            // A rejection changes nothing: the log keeps state, not requests (ADR 0038).
+            | AgentEvent::ConfigRejected { .. } => return Ok(()),
         };
         self.record(body).await
     }

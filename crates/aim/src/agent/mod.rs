@@ -25,7 +25,7 @@ use aim_kernel::effort::{Input as EffortInput, next as next_effort};
 use aim_kernel::turn::{CallId, Event as TurnEvent, Phase, Turn};
 use aim_llm::{EventStream, LlmError, LlmErrorKind, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason};
-use aim_proto::event::DecisionRecord;
+use aim_proto::event::{DecisionRecord, EffortSource};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolInput, ToolResult, ToolSpec};
 use futures_util::StreamExt as _;
@@ -323,7 +323,14 @@ impl Agent {
         } else {
             if let Some(effort) = ladder.get(output as usize) {
                 self.config.effort = Some(effort.clone());
-                emit(events, AgentEvent::ConfigChanged { model: self.config.model.clone(), effort: self.config.effort.clone() });
+                emit(
+                    events,
+                    AgentEvent::ConfigChanged {
+                        model: self.config.model.clone(),
+                        effort: self.config.effort.clone(),
+                        effort_source: EffortSource::Auto,
+                    },
+                );
             }
             self.decisions_since_change = 0;
         }

@@ -249,6 +249,7 @@ async fn seed(store: &MemoryStore, spec: &SessionSpec, items: usize) -> Result<S
         model: "scripted-model".into(),
         title: Some("seeded".into()),
         parent: None,
+        agent: None,
     };
     store.create(meta).await.map_err(|e| e.to_string())?;
     let events: Vec<SessionEvent> = (0..items)

@@ -4,6 +4,7 @@
 - Date: 2026-09-25
 - Baseline: 0007, 0013
 - Scope: Durable Jev effort decision evidence and session updates.
+- Amended by: [0038](0038-session-authority-effort-source-and-config-outcomes.md)
 
 ## Context
 

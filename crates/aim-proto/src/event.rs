@@ -35,6 +35,44 @@ pub struct SessionMeta {
     /// For a fork: the parent session and the last parent event the fork shares.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ForkPoint>,
+    /// The named agent definition the session runs as, with the tool ceiling in force when it was
+    /// created. A resumed session applies the agent again and can only narrow that ceiling
+    /// (ADR 0038). Absent for the default agent and in logs written before ADR 0038.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<SessionAgent>,
+}
+
+/// A session's named agent and its tool ceiling, as recorded at creation (ADR 0038).
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionAgent {
+    /// The agent's name (`SessionSpec::agent`).
+    pub name: String,
+    /// Only these tools may be offered or called (`None`: every tool the session offers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+    /// These tools are never offered or called.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+/// Who chooses a session's reasoning effort (ADR 0038).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortSource {
+    /// The user (or the agent definition) set it; it stays until changed. Records written before
+    /// ADR 0038 read as this.
+    #[default]
+    Explicit,
+    /// aim chooses it: a persistent session's Jev decisions adapt it (ADR 0013, 0028).
+    Auto,
+}
+
+impl EffortSource {
+    /// Whether the effort was set explicitly (the default, left out of serialized records).
+    #[must_use]
+    pub const fn is_explicit(&self) -> bool {
+        matches!(self, Self::Explicit)
+    }
 }
 
 /// Where a fork branched off.
@@ -106,6 +144,9 @@ pub enum EventBody {
         /// Effort, if set.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        /// Who chooses the effort from now on (ADR 0038); a resumed session restores it.
+        #[serde(default, skip_serializing_if = "EffortSource::is_explicit")]
+        effort_source: EffortSource,
     },
     /// The model's context was compacted: its first `replaced` items (as rebuilt from the log so
     /// far) were replaced by `items`. Readers rebuilding the model's context apply it; the full

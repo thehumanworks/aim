@@ -4,6 +4,7 @@
 - Date: 2026-09-25
 - Baseline: 0007, 0031
 - Scope: how the session host reacts to a failed append to a persistent session's log, and what `set_config` promises its caller; not store durability itself (SQLite, ADR 0007) or ephemeral sessions (their memory store cannot fail).
+- Amended by: [0038](0038-session-authority-effort-source-and-config-outcomes.md)
 
 ## Context
 

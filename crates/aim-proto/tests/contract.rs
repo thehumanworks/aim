@@ -189,3 +189,31 @@ fn unknown_session_events_are_preserved_not_rejected() {
     let event: SessionEvent = serde_json::from_value(known).unwrap();
     assert_eq!(event.body, EventBody::TurnStarted);
 }
+
+#[test]
+fn adr_0038_fields_are_additive_and_old_records_read_as_explicit() {
+    use aim_proto::daemon::SessionUpdate;
+    use aim_proto::event::{EffortSource, EventBody, SessionAgent, SessionMeta};
+    // A log written before ADR 0038: no effort source (explicit), no agent.
+    let old: EventBody = serde_json::from_value(json!({"kind": "config_changed", "model": "m", "effort": "low"})).unwrap();
+    assert_eq!(old, EventBody::ConfigChanged { model: "m".into(), effort: Some("low".into()), effort_source: EffortSource::Explicit });
+    assert_eq!(
+        serde_json::to_value(&old).unwrap(),
+        json!({"kind": "config_changed", "model": "m", "effort": "low"}),
+        "explicit is left out"
+    );
+    let auto = EventBody::ConfigChanged { model: "m".into(), effort: None, effort_source: EffortSource::Auto };
+    assert_eq!(serde_json::to_value(&auto).unwrap(), json!({"kind": "config_changed", "model": "m", "effort_source": "auto"}));
+    let meta = json!({"id": "s", "created_ms": 1, "workspace": "/w", "location": "local", "provider": "p", "model": "m"});
+    let parsed: SessionMeta = serde_json::from_value(meta.clone()).unwrap();
+    assert_eq!(parsed.agent, None);
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), meta, "a session without an agent serializes as before");
+    let with_agent =
+        SessionMeta { agent: Some(SessionAgent { name: "reader".into(), allow: Some(vec!["Read".into()]), deny: Vec::new() }), ..parsed };
+    let wire = serde_json::to_value(&with_agent).unwrap();
+    assert_eq!(wire["agent"], json!({"name": "reader", "allow": ["Read"]}));
+    assert_eq!(serde_json::from_value::<SessionMeta>(wire).unwrap(), with_agent);
+    let rejected = SessionUpdate::ConfigRejected { model: None, effort: Some("ultra".into()), message: "not offered".into() };
+    assert_eq!(serde_json::to_value(&rejected).unwrap(), json!({"type": "config_rejected", "effort": "ultra", "message": "not offered"}));
+    assert_eq!(aim_proto::daemon::AUTO_EFFORT, "auto");
+}
