@@ -351,7 +351,12 @@ async fn live_acp_claude_session_with_model_alias() {
     };
     let refused = host.create(spec("gpt-6")).await.unwrap_err();
     eprintln!("live acp model: gpt-6 refused: {}", refused.message);
-    assert!(refused.message.contains("model `gpt-6` is not offered") && refused.message.contains("`opus[1m]`"), "{}", refused.message);
+    assert!(
+        refused.message.contains("the requested model is not offered") && refused.message.contains("`opus[1m]`"),
+        "{}",
+        refused.message
+    );
+    assert!(!refused.message.contains("gpt-6"), "the request is never repeated: {}", refused.message);
 
     let started = std::time::Instant::now();
     let summary = host.create(spec("opus")).await.unwrap();

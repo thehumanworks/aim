@@ -10,6 +10,10 @@
 //! the request names when the request has no variant and the value has one. Only tiers down to a
 //! caller-chosen depth are tried. The best tier with any match decides: one match resolves, two
 //! or more are ambiguous (never a silent pick), none at all is unknown.
+//!
+//! Before the family tiers, the family must be unambiguous: a request whose words name two
+//! advertised families, or that names no generation while the values of its family span two
+//! generations, is a conflict and resolves to nothing at a family tier.
 use vstd::prelude::*;
 
 verus! {
@@ -80,6 +84,14 @@ pub enum Unresolved {
         /// Index of the second value in the tie.
         second: usize,
     },
+    /// Nothing matches at a better tier, and the family tiers do not apply: the request names two
+    /// advertised families, or names no generation while its family comes in two.
+    Conflict {
+        /// Index of the first conflicting value.
+        first: usize,
+        /// Index of the second conflicting value.
+        second: usize,
+    },
 }
 
 /// The first two matches among a prefix of the advertised values.
@@ -148,6 +160,59 @@ pub open spec fn matches_at(r: Request, words: Seq<u64>, c: Candidate, t: Tier) 
     }
 }
 
+/// Whether `c` matches the request at either family tier.
+pub open spec fn family_match(r: Request, words: Seq<u64>, c: Candidate) -> bool {
+    matches_at(r, words, c, Tier::Family) || matches_at(r, words, c, Tier::FamilyAnyVariant)
+}
+
+/// DRAFT(ADR-0075): two advertised values that make a family request unclear: the request's
+/// words name both of their (different) families, or the request names no generation and both
+/// match it at a family tier with different generations.
+pub open spec fn conflicts(r: Request, words: Seq<u64>, a: Candidate, b: Candidate) -> bool {
+    (names_family(words, a) && names_family(words, b) && a.family != b.family) || (
+    r.generation is None && family_match(r, words, a) && family_match(r, words, b) && a.generation
+        != b.generation)
+}
+
+/// The first value before index `i` that conflicts with value `j`.
+pub open spec fn partner(r: Request, words: Seq<u64>, cs: Seq<Candidate>, j: int, i: int) -> Option<
+    usize,
+>
+    decreases i,
+{
+    if i <= 0 {
+        None
+    } else {
+        match partner(r, words, cs, j, i - 1) {
+            Some(p) => Some(p),
+            None => if conflicts(r, words, cs[i - 1], cs[j]) {
+                Some((i - 1) as usize)
+            } else {
+                None
+            },
+        }
+    }
+}
+
+/// The first conflicting pair among the first `n` values, ordered by its second index.
+pub open spec fn conflict(r: Request, words: Seq<u64>, cs: Seq<Candidate>, n: int) -> Option<
+    (usize, usize),
+>
+    decreases n,
+{
+    if n <= 0 {
+        None
+    } else {
+        match conflict(r, words, cs, n - 1) {
+            Some(pair) => Some(pair),
+            None => match partner(r, words, cs, n - 1, n - 1) {
+                Some(p) => Some((p, (n - 1) as usize)),
+                None => None,
+            },
+        }
+    }
+}
+
 /// The first two values among the first `n` that match at tier `t`.
 pub open spec fn found(r: Request, words: Seq<u64>, cs: Seq<Candidate>, t: Tier, n: int) -> Found
     decreases n,
@@ -169,7 +234,7 @@ pub open spec fn found(r: Request, words: Seq<u64>, cs: Seq<Candidate>, t: Tier,
 }
 
 /// DRAFT(ADR-0075): the tiers from rank `k` down to `deepest`, in order; the first tier with a
-/// match decides.
+/// match decides. On reaching the family tiers, a conflicting pair decides first.
 pub open spec fn resolve_from(
     r: Request,
     words: Seq<u64>,
@@ -182,12 +247,19 @@ pub open spec fn resolve_from(
     if k > rank(deepest) {
         Err(Unresolved::Unknown)
     } else {
-        match found(r, words, cs, tier_at(k), cs.len() as int) {
-            Found::None => resolve_from(r, words, cs, deepest, k + 1),
-            Found::One(i) => Ok(Resolved { index: i, tier: tier_at(k) }),
-            Found::Two(i, j) => Err(
-                Unresolved::Ambiguous { tier: tier_at(k), first: i, second: j },
-            ),
+        match (if k == 2 {
+            conflict(r, words, cs, cs.len() as int)
+        } else {
+            None
+        }) {
+            Some((first, second)) => Err(Unresolved::Conflict { first, second }),
+            None => match found(r, words, cs, tier_at(k), cs.len() as int) {
+                Found::None => resolve_from(r, words, cs, deepest, k + 1),
+                Found::One(i) => Ok(Resolved { index: i, tier: tier_at(k) }),
+                Found::Two(i, j) => Err(
+                    Unresolved::Ambiguous { tier: tier_at(k), first: i, second: j },
+                ),
+            },
         }
     }
 }
@@ -222,6 +294,105 @@ proof fn lemma_found(r: Request, words: Seq<u64>, cs: Seq<Candidate>, t: Tier, n
     }
 }
 
+proof fn lemma_partner(r: Request, words: Seq<u64>, cs: Seq<Candidate>, j: int, i: int)
+    requires
+        0 <= i <= j < cs.len(),
+        cs.len() <= usize::MAX,
+    ensures
+        match partner(r, words, cs, j, i) {
+            None => forall|p: int| 0 <= p < i ==> !#[trigger] conflicts(r, words, cs[p], cs[j]),
+            Some(p) => 0 <= p < i && conflicts(r, words, cs[p as int], cs[j]),
+        },
+    decreases i,
+{
+    if i > 0 {
+        lemma_partner(r, words, cs, j, i - 1);
+    }
+}
+
+proof fn lemma_conflict(r: Request, words: Seq<u64>, cs: Seq<Candidate>, n: int)
+    requires
+        0 <= n <= cs.len(),
+        cs.len() <= usize::MAX,
+    ensures
+        match conflict(r, words, cs, n) {
+            None => forall|p: int, q: int|
+                0 <= p < q < n ==> !#[trigger] conflicts(r, words, cs[p], cs[q]),
+            Some((p, q)) => 0 <= p < q < n && conflicts(r, words, cs[p as int], cs[q as int]),
+        },
+    decreases n,
+{
+    if n > 0 {
+        lemma_conflict(r, words, cs, n - 1);
+        lemma_partner(r, words, cs, n - 1, n - 1);
+        if conflict(r, words, cs, n) is None {
+            assert forall|p: int, q: int| 0 <= p < q < n implies !#[trigger] conflicts(
+                r,
+                words,
+                cs[p],
+                cs[q],
+            ) by {
+                if q == n - 1 {
+                    assert(partner(r, words, cs, n - 1, n - 1) is None);
+                }
+            }
+        }
+    }
+}
+
+proof fn lemma_partner_stable(
+    r: Request,
+    words: Seq<u64>,
+    cs: Seq<Candidate>,
+    j: int,
+    m: int,
+    n: int,
+)
+    requires
+        0 <= m <= n,
+        partner(r, words, cs, j, m) is Some,
+    ensures
+        partner(r, words, cs, j, n) == partner(r, words, cs, j, m),
+    decreases n - m,
+{
+    if n > m {
+        lemma_partner_stable(r, words, cs, j, m, n - 1);
+    }
+}
+
+proof fn lemma_conflict_stable(r: Request, words: Seq<u64>, cs: Seq<Candidate>, m: int, n: int)
+    requires
+        0 <= m <= n,
+        conflict(r, words, cs, m) is Some,
+    ensures
+        conflict(r, words, cs, n) == conflict(r, words, cs, m),
+    decreases n - m,
+{
+    if n > m {
+        lemma_conflict_stable(r, words, cs, m, n - 1);
+    }
+}
+
+/// A conflicting pair anywhere in the list, in either order, means the scan finds one.
+proof fn lemma_some_conflict(r: Request, words: Seq<u64>, cs: Seq<Candidate>, i: int, j: int)
+    requires
+        cs.len() <= usize::MAX,
+        0 <= i < cs.len(),
+        0 <= j < cs.len(),
+        conflicts(r, words, cs[i], cs[j]),
+    ensures
+        conflict(r, words, cs, cs.len() as int) is Some,
+{
+    lemma_conflict(r, words, cs, cs.len() as int);
+    assert(conflicts(r, words, cs[j], cs[i]));
+    assert(i != j);
+    if i < j {
+        assert(conflicts(r, words, cs[i], cs[j]));
+    } else {
+        assert(conflicts(r, words, cs[j], cs[i]));
+    }
+}
+
 proof fn lemma_ranks()
     ensures
         forall|t: Tier| #[trigger] tier_at(rank(t)) == t && rank(t) <= 3,
@@ -234,33 +405,50 @@ proof fn lemma_resolve_from(r: Request, words: Seq<u64>, cs: Seq<Candidate>, dee
         cs.len() <= usize::MAX,
     ensures
         match resolve_from(r, words, cs, deepest, k) {
-            Ok(res) => k <= rank(res.tier) <= rank(deepest) && found(
-                r,
-                words,
-                cs,
-                res.tier,
-                cs.len() as int,
-            ) == Found::One(res.index) && forall|m: nat|
-                k <= m < rank(res.tier) ==> #[trigger] found(
-                    r,
-                    words,
-                    cs,
-                    tier_at(m),
-                    cs.len() as int,
-                ) == Found::None,
-            Err(Unresolved::Ambiguous { tier, first, second }) => k <= rank(tier) <= rank(deepest)
-                && found(r, words, cs, tier, cs.len() as int) == Found::Two(first, second)
-                && forall|m: nat|
-                k <= m < rank(tier) ==> #[trigger] found(r, words, cs, tier_at(m), cs.len() as int)
-                    == Found::None,
-            Err(Unresolved::Unknown) => forall|m: nat|
-                k <= m <= rank(deepest) ==> #[trigger] found(
-                    r,
-                    words,
-                    cs,
-                    tier_at(m),
-                    cs.len() as int,
-                ) == Found::None,
+            Ok(res) => {
+                &&& k <= rank(res.tier) <= rank(deepest)
+                &&& found(r, words, cs, res.tier, cs.len() as int) == Found::One(res.index)
+                &&& forall|m: nat|
+                    k <= m < rank(res.tier) ==> #[trigger] found(
+                        r,
+                        words,
+                        cs,
+                        tier_at(m),
+                        cs.len() as int,
+                    ) == Found::None
+                &&& (k <= 2 <= rank(res.tier) ==> conflict(r, words, cs, cs.len() as int) is None)
+            },
+            Err(Unresolved::Ambiguous { tier, first, second }) => {
+                &&& k <= rank(tier) <= rank(deepest)
+                &&& found(r, words, cs, tier, cs.len() as int) == Found::Two(first, second)
+                &&& forall|m: nat|
+                    k <= m < rank(tier) ==> #[trigger] found(
+                        r,
+                        words,
+                        cs,
+                        tier_at(m),
+                        cs.len() as int,
+                    ) == Found::None
+                &&& (k <= 2 <= rank(tier) ==> conflict(r, words, cs, cs.len() as int) is None)
+            },
+            Err(Unresolved::Conflict { first, second }) => {
+                &&& k <= 2 <= rank(deepest)
+                &&& conflict(r, words, cs, cs.len() as int) == Some((first, second))
+                &&& forall|m: nat|
+                    k <= m < 2 ==> #[trigger] found(r, words, cs, tier_at(m), cs.len() as int)
+                        == Found::None
+            },
+            Err(Unresolved::Unknown) => {
+                &&& forall|m: nat|
+                    k <= m <= rank(deepest) ==> #[trigger] found(
+                        r,
+                        words,
+                        cs,
+                        tier_at(m),
+                        cs.len() as int,
+                    ) == Found::None
+                &&& (k <= 2 <= rank(deepest) ==> conflict(r, words, cs, cs.len() as int) is None)
+            },
         },
     decreases 4 - k,
 {
@@ -271,7 +459,8 @@ proof fn lemma_resolve_from(r: Request, words: Seq<u64>, cs: Seq<Candidate>, dee
 }
 
 /// A resolved index is in bounds and matches at its tier, which is within `deepest`; it is the
-/// only match at that tier, and nothing matches at a better tier.
+/// only match at that tier, nothing matches at a better tier, and a family-tier answer has no
+/// conflicting pair.
 pub proof fn theorem_resolved_is_the_unique_best(
     r: Request,
     words: Seq<u64>,
@@ -295,12 +484,15 @@ pub proof fn theorem_resolved_is_the_unique_best(
                         cs[k],
                         t,
                     )
+                &&& (rank(res.tier) >= 2 ==> forall|p: int, q: int|
+                    0 <= p < q < cs.len() ==> !#[trigger] conflicts(r, words, cs[p], cs[q]))
             },
             _ => true,
         },
 {
     lemma_ranks();
     lemma_resolve_from(r, words, cs, deepest, 0);
+    lemma_conflict(r, words, cs, cs.len() as int);
     if let Ok(res) = resolve_spec(r, words, cs, deepest) {
         lemma_found(r, words, cs, res.tier, cs.len() as int);
         assert forall|k: int, t: Tier|
@@ -356,6 +548,101 @@ pub proof fn theorem_ambiguity_is_a_tie_at_the_best_tier(
     }
 }
 
+/// A conflict is real: two distinct in-bounds values conflict for the request, the family tiers
+/// were within `deepest`, and nothing matches at a better tier.
+pub proof fn theorem_conflict_is_real(
+    r: Request,
+    words: Seq<u64>,
+    cs: Seq<Candidate>,
+    deepest: Tier,
+)
+    requires
+        cs.len() <= usize::MAX,
+    ensures
+        match resolve_spec(r, words, cs, deepest) {
+            Err(Unresolved::Conflict { first, second }) => {
+                &&& first < second < cs.len()
+                &&& conflicts(r, words, cs[first as int], cs[second as int])
+                &&& 2 <= rank(deepest)
+                &&& forall|k: int, t: Tier|
+                    0 <= k < cs.len() && rank(t) < 2 ==> !matches_at(r, words, cs[k], t)
+            },
+            _ => true,
+        },
+{
+    lemma_ranks();
+    lemma_resolve_from(r, words, cs, deepest, 0);
+    lemma_conflict(r, words, cs, cs.len() as int);
+    if let Err(Unresolved::Conflict { first, second }) = resolve_spec(r, words, cs, deepest) {
+        assert forall|k: int, t: Tier| 0 <= k < cs.len() && rank(t) < 2 implies !matches_at(
+            r,
+            words,
+            cs[k],
+            t,
+        ) by {
+            assert(found(r, words, cs, tier_at(rank(t)), cs.len() as int) == Found::None);
+            lemma_found(r, words, cs, t, cs.len() as int);
+        }
+    }
+}
+
+/// A request that names no generation never resolves at a family tier while two values it
+/// matches there differ in generation (`opus` with both Opus 4.5 and Opus 5.5 offered).
+pub proof fn theorem_unqualified_family_never_picks_a_generation(
+    r: Request,
+    words: Seq<u64>,
+    cs: Seq<Candidate>,
+    deepest: Tier,
+    i: int,
+    j: int,
+)
+    requires
+        cs.len() <= usize::MAX,
+        0 <= i < cs.len(),
+        0 <= j < cs.len(),
+        r.generation is None,
+        family_match(r, words, cs[i]),
+        family_match(r, words, cs[j]),
+        cs[i].generation != cs[j].generation,
+    ensures
+        match resolve_spec(r, words, cs, deepest) {
+            Ok(res) => rank(res.tier) < 2,
+            Err(Unresolved::Ambiguous { tier, .. }) => rank(tier) < 2,
+            _ => true,
+        },
+{
+    lemma_some_conflict(r, words, cs, i, j);
+    lemma_resolve_from(r, words, cs, deepest, 0);
+}
+
+/// A request whose words name two different advertised families never resolves at a family
+/// tier (`opus sonnet`).
+pub proof fn theorem_two_families_never_resolve(
+    r: Request,
+    words: Seq<u64>,
+    cs: Seq<Candidate>,
+    deepest: Tier,
+    i: int,
+    j: int,
+)
+    requires
+        cs.len() <= usize::MAX,
+        0 <= i < cs.len(),
+        0 <= j < cs.len(),
+        names_family(words, cs[i]),
+        names_family(words, cs[j]),
+        cs[i].family != cs[j].family,
+    ensures
+        match resolve_spec(r, words, cs, deepest) {
+            Ok(res) => rank(res.tier) < 2,
+            Err(Unresolved::Ambiguous { tier, .. }) => rank(tier) < 2,
+            _ => true,
+        },
+{
+    lemma_some_conflict(r, words, cs, i, j);
+    lemma_resolve_from(r, words, cs, deepest, 0);
+}
+
 /// `Unknown` means no advertised value matches at any tier tried.
 pub proof fn theorem_unknown_means_no_match(
     r: Request,
@@ -387,7 +674,8 @@ pub proof fn theorem_unknown_means_no_match(
 }
 
 /// Resolution depends only on which values match at which tier, not on their order: a value that
-/// is the only match at the best tier with any match (within `deepest`) is the answer.
+/// is the only match at the best tier with any match (within `deepest`) is the answer, provided
+/// no pair conflicts when that tier is a family tier.
 pub proof fn theorem_unique_best_is_resolved(
     r: Request,
     words: Seq<u64>,
@@ -404,6 +692,8 @@ pub proof fn theorem_unique_best_is_resolved(
         forall|j: int| 0 <= j < cs.len() && j != k ==> !matches_at(r, words, cs[j], t),
         forall|j: int, u: Tier|
             0 <= j < cs.len() && rank(u) < rank(t) ==> !matches_at(r, words, cs[j], u),
+        rank(t) >= 2 ==> forall|p: int, q: int|
+            0 <= p < q < cs.len() ==> !#[trigger] conflicts(r, words, cs[p], cs[q]),
     ensures
         resolve_spec(r, words, cs, deepest) == Ok::<Resolved, Unresolved>(
             Resolved { index: k as usize, tier: t },
@@ -412,6 +702,7 @@ pub proof fn theorem_unique_best_is_resolved(
     lemma_ranks();
     lemma_resolve_from(r, words, cs, deepest, 0);
     lemma_found(r, words, cs, t, cs.len() as int);
+    lemma_conflict(r, words, cs, cs.len() as int);
     match resolve_spec(r, words, cs, deepest) {
         Ok(res) => {
             lemma_found(r, words, cs, res.tier, cs.len() as int);
@@ -428,6 +719,13 @@ pub proof fn theorem_unique_best_is_resolved(
             }
             assert(rank(tier) == rank(t));
             assert(tier == t);
+        },
+        Err(Unresolved::Conflict { first, second }) => {
+            if rank(t) < 2 {
+                assert(found(r, words, cs, tier_at(rank(t)), cs.len() as int) == Found::None);
+            } else {
+                assert(conflicts(r, words, cs[first as int], cs[second as int]));
+            }
         },
         Err(Unresolved::Unknown) => {
             assert(found(r, words, cs, tier_at(rank(t)), cs.len() as int) == Found::None);
@@ -452,6 +750,7 @@ pub proof fn theorem_exact_wins(
         match resolve_spec(r, words, cs, deepest) {
             Ok(res) => res.tier == Tier::Exact && cs[res.index as int].value == r.value,
             Err(Unresolved::Ambiguous { tier, .. }) => tier == Tier::Exact,
+            Err(Unresolved::Conflict { .. }) => false,
             Err(Unresolved::Unknown) => false,
         },
         (forall|j: int| 0 <= j < cs.len() && j != k ==> cs[j].value != r.value) ==> resolve_spec(
@@ -465,6 +764,7 @@ pub proof fn theorem_exact_wins(
     lemma_found(r, words, cs, Tier::Exact, cs.len() as int);
     theorem_resolved_is_the_unique_best(r, words, cs, deepest);
     theorem_ambiguity_is_a_tie_at_the_best_tier(r, words, cs, deepest);
+    theorem_conflict_is_real(r, words, cs, deepest);
     theorem_unknown_means_no_match(r, words, cs, deepest);
     assert(matches_at(r, words, cs[k], Tier::Exact));
     if forall|j: int| 0 <= j < cs.len() && j != k ==> cs[j].value != r.value {
@@ -562,6 +862,67 @@ fn matches(r: Request, words: &[u64], c: Candidate, t: Tier) -> (m: bool)
     }
 }
 
+fn conflicts_exec(r: Request, words: &[u64], a: Candidate, b: Candidate) -> (c: bool)
+    ensures
+        c == conflicts(r, words@, a, b),
+{
+    let families = names_family_exec(words, a) && names_family_exec(words, b) && !same(
+        a.family,
+        b.family,
+    );
+    let a_family = matches(r, words, a, Tier::Family) || matches(
+        r,
+        words,
+        a,
+        Tier::FamilyAnyVariant,
+    );
+    let b_family = matches(r, words, b, Tier::Family) || matches(
+        r,
+        words,
+        b,
+        Tier::FamilyAnyVariant,
+    );
+    families || (r.generation.is_none() && a_family && b_family && !same(
+        a.generation,
+        b.generation,
+    ))
+}
+
+fn find_conflict(r: Request, words: &[u64], cs: &[Candidate]) -> (out: Option<(usize, usize)>)
+    ensures
+        out == conflict(r, words@, cs@, cs@.len() as int),
+{
+    let mut j: usize = 0;
+    while j < cs.len()
+        invariant
+            j <= cs.len(),
+            conflict(r, words@, cs@, j as int) is None,
+        decreases cs.len() - j,
+    {
+        let mut i: usize = 0;
+        while i < j
+            invariant
+                i <= j < cs.len(),
+                conflict(r, words@, cs@, j as int) is None,
+                partner(r, words@, cs@, j as int, i as int) is None,
+            decreases j - i,
+        {
+            if conflicts_exec(r, words, cs[i], cs[j]) {
+                proof {
+                    assert(partner(r, words@, cs@, j as int, i + 1) == Some(i));
+                    lemma_partner_stable(r, words@, cs@, j as int, i + 1, j as int);
+                    assert(conflict(r, words@, cs@, j + 1) == Some((i, j)));
+                    lemma_conflict_stable(r, words@, cs@, j + 1, cs@.len() as int);
+                }
+                return Some((i, j));
+            }
+            i += 1;
+        }
+        j += 1;
+    }
+    None
+}
+
 fn scan(r: Request, words: &[u64], cs: &[Candidate], t: Tier) -> (f: Found)
     ensures
         f == found(r, words@, cs@, t, cs@.len() as int),
@@ -619,7 +980,8 @@ fn tier_of(k: u8) -> (t: Tier)
 ///
 /// # Errors
 /// [`Unresolved::Unknown`] when nothing matches, [`Unresolved::Ambiguous`] when the best tier with
-/// a match has more than one.
+/// a match has more than one, [`Unresolved::Conflict`] when the family tiers are reached with a
+/// conflicting pair.
 pub fn resolve(request: Request, words: &[u64], candidates: &[Candidate], deepest: Tier) -> (out:
     Result<Resolved, Unresolved>)
     ensures
@@ -642,6 +1004,14 @@ pub fn resolve(request: Request, words: &[u64], candidates: &[Candidate], deepes
         decreases last + 1 - k,
     {
         let tier = tier_of(k);
+        let conflict = if k == 2 {
+            find_conflict(request, words, candidates)
+        } else {
+            None
+        };
+        if let Some((first, second)) = conflict {
+            return Err(Unresolved::Conflict { first, second });
+        }
         match scan(request, words, candidates, tier) {
             Found::None => {},
             Found::One(index) => {
@@ -688,5 +1058,32 @@ mod tests {
             resolve(request, &[50], &[opus, sonnet, opus], Tier::FamilyAnyVariant),
             Err(Unresolved::Ambiguous { tier: Tier::Family, first: 0, second: 2 })
         );
+    }
+
+    #[test]
+    fn unclear_families_conflict_before_the_family_tiers() {
+        let opus_1m = candidate(1, Some(50), Some(5005), Some(60));
+        let sonnet = candidate(2, Some(51), Some(5000), None);
+        let old_opus = candidate(4, Some(50), Some(4005), None);
+        let request = Request { value: 9, folded: 109, generation: None, variant: None };
+        // `opus` while Opus 5.5 and Opus 4.5 are both offered: no silent pick of either.
+        assert_eq!(
+            resolve(request, &[50], &[opus_1m, sonnet, old_opus], Tier::FamilyAnyVariant),
+            Err(Unresolved::Conflict { first: 0, second: 2 })
+        );
+        // Naming the generation settles it.
+        let opus_5_5 = Request { generation: Some(5005), ..request };
+        assert_eq!(
+            resolve(opus_5_5, &[50], &[opus_1m, sonnet, old_opus], Tier::FamilyAnyVariant),
+            Ok(Resolved { index: 0, tier: Tier::FamilyAnyVariant })
+        );
+        // `opus sonnet` names two families.
+        assert_eq!(
+            resolve(request, &[50, 51], &[opus_1m, sonnet], Tier::FamilyAnyVariant),
+            Err(Unresolved::Conflict { first: 0, second: 1 })
+        );
+        // An exact value still wins over any conflict.
+        let exact = Request { value: 2, ..request };
+        assert_eq!(resolve(exact, &[50, 51], &[opus_1m, sonnet], Tier::FamilyAnyVariant), Ok(Resolved { index: 1, tier: Tier::Exact }));
     }
 }

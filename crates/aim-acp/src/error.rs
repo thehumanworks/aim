@@ -86,23 +86,24 @@ pub enum AcpError {
         key: String,
     },
     /// The requested value does not resolve to any of the option's advertised values
-    /// (docs/adr/0075).
+    /// (docs/adr/0075). Its display never repeats the request, which may be a mistyped secret.
     ConfigValueRejected {
         /// The option id.
         id: String,
-        /// The requested value.
+        /// The requested value (redacted).
         value: String,
         /// The advertised values (value and display name, redacted).
         allowed: Vec<ConfigValue>,
     },
-    /// The requested value matches more than one advertised value equally well, so aim picks
-    /// none of them (docs/adr/0075).
+    /// The requested value matches more than one advertised value equally well, or names more
+    /// than one family or generation of them, so aim picks none (docs/adr/0075). Its display
+    /// never repeats the request.
     ConfigValueAmbiguous {
         /// The option id.
         id: String,
-        /// The requested value.
+        /// The requested value (redacted).
         value: String,
-        /// Two of the advertised values it matches (redacted).
+        /// Two of the advertised values it matches or names (redacted).
         matches: Vec<ConfigValue>,
         /// The advertised values (value and display name, redacted).
         allowed: Vec<ConfigValue>,
@@ -174,11 +175,11 @@ impl core::fmt::Display for AcpError {
             Self::UnknownAuthMethod { .. } => f.write_str("the agent advertises no matching login method"),
             Self::NotTerminalAuth { .. } => f.write_str("the login method is not a terminal login"),
             Self::ConfigUnavailable { .. } => f.write_str("the session has no matching configuration option"),
-            Self::ConfigValueRejected { id, value, allowed } => {
-                write!(f, "{id} `{value}` is not offered; the agent offers {}", Offered(allowed))
+            Self::ConfigValueRejected { id, allowed, .. } => {
+                write!(f, "the requested {id} is not offered; the agent offers {}", Offered(allowed))
             }
-            Self::ConfigValueAmbiguous { id, value, matches, allowed } => {
-                write!(f, "{id} `{value}` is ambiguous: it matches {}; the agent offers {}", Offered(matches), Offered(allowed))
+            Self::ConfigValueAmbiguous { id, matches, allowed, .. } => {
+                write!(f, "the requested {id} is ambiguous: it matches {}; the agent offers {}", Offered(matches), Offered(allowed))
             }
             Self::ConfigNotApplied { .. } => f.write_str("the agent did not apply the configuration value"),
             Self::TurnStillRunning => f.write_str("the previous turn is still running after cancellation"),

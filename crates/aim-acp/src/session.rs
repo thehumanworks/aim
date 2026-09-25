@@ -54,6 +54,7 @@ impl AcpSession {
         new_session_result: Value,
         events: SessionInbox,
     ) -> Self {
+        let config_options = config_options::with_model_variants(config_options, &shared.config.model_variants);
         Self {
             shared,
             id,
@@ -175,7 +176,8 @@ impl AcpSession {
             object.insert("sessionId".into(), Value::String(self.id.clone()));
         }
         let result = self.shared.request("session/set_config_option", params, Some(self.shared.request_timeout)).await?;
-        let options = parse_config_options(result.get("configOptions"));
+        let options =
+            config_options::with_model_variants(parse_config_options(result.get("configOptions")), &self.shared.config.model_variants);
         config_options::confirm(&options, &id, &resolved)?;
         self.config_options = options;
         Ok(&self.config_options)
@@ -247,7 +249,7 @@ impl AcpSession {
     fn update_event(&mut self, raw: Value) -> AcpEvent {
         let update = parse_update(&raw, &mut self.tool_calls);
         if let Update::ConfigOptions { options } = &update {
-            self.config_options.clone_from(options);
+            self.config_options = config_options::with_model_variants(options.clone(), &self.shared.config.model_variants);
         }
         AcpEvent::Update { update, raw }
     }
