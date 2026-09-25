@@ -19,6 +19,21 @@ adr = "0048"
 sha256 = "7e4b1b2b01200080dbfb81132454d9d6ab65cf43c9c8ea601adf620fa68dc988"
 
 [[locked]]
+decision = "dedup::begin_decision"
+adr = "0050"
+sha256 = "e60ab42ace9937eb33cd533d0aca0437a1e65a65c4fe390008204bfe90f8de2d"
+
+[[locked]]
+decision = "discovery::budget_wf"
+adr = "0050"
+sha256 = "90a1146b758b36757d9f3d044cd808baf4a7ddfbcb210a19d315ce13cc063d76"
+
+[[locked]]
+decision = "discovery::charged"
+adr = "0050"
+sha256 = "6433d26f1082345ecf52591c376e97fcd8fb106ff9570eaea21cbaf2d6186c7d"
+
+[[locked]]
 decision = "job::claim_is_current"
 adr = "0048"
 sha256 = "8b711f3800839822d4d028de4aba977c49ab777134dc483608168ed93c2a5cc8"
@@ -34,9 +49,24 @@ adr = "0025"
 sha256 = "7ea77f5ce46dc0ba5713501029c62ac29f497d4697cc9ff0ca4617aebc543cb0"
 
 [[locked]]
+decision = "dedup::dedup_next"
+adr = "0050"
+sha256 = "844a94b90b62e09adeae5d3952e1647cad1a7bd871967435c022da96e58559ea"
+
+[[locked]]
 decision = "policy::effective_ok"
 adr = "0027"
 sha256 = "61f9bd7b83a55b6ec478c9161287b38aede21202d9d6c4cb059b422e1acf78df"
+
+[[locked]]
+decision = "dedup::eviction_phase"
+adr = "0050"
+sha256 = "515a5e34191e50f0d14c3bd2d6943ac34cc91bcb821347943085d73fcfb34f21"
+
+[[locked]]
+decision = "dedup::finish_phase"
+adr = "0050"
+sha256 = "a9a761ade0c8ad95d7f914a358ab0dc7cff63aff537849aa11e58438a892a4cb"
 
 [[locked]]
 decision = "job::fresh"
@@ -72,3 +102,23 @@ sha256 = "02ff049196e212714de9e4499158bdc8001682389faf312e96e743576695d5d9"
 decision = "compaction::plan_ok"
 adr = "0025"
 sha256 = "e2a78dbf038d98aa155d8e80f6d803b7f82a18922041c12a35bed2e5cb313b64"
+
+[[locked]]
+decision = "discovery::reservable"
+adr = "0050"
+sha256 = "160e96c68f81f7da6d290b27a2cc3f419994ce049892c263bfdb4300ed922713"
+
+[[locked]]
+decision = "agent_tools::tool_intersection_ok"
+adr = "0050"
+sha256 = "853bf7da4d4b0ad4a9891f6abcfdd8a653519baae8df8958e69b1b519e397d76"
+
+[[locked]]
+decision = "agent_tools::tool_permits"
+adr = "0050"
+sha256 = "336fdd4677cc8e5dd3d7fe3c6c38162e35c71bfc66db5ad7471e694fe74bc7c2"
+
+[[locked]]
+decision = "agent_tools::unrestricted"
+adr = "0050"
+sha256 = "2653c875c66542afe9bab5ca13b375b680b7e521b4dcca5b8c7f07c67dcebb49"

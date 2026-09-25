@@ -12,8 +12,9 @@
 //! *not importable* — listed with the reason, refused if selected. Fields that would only add
 //! (MCP servers) or that name another harness's models are reported and ignored.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use aim_kernel::agent_tools::ToolPolicy as KernelToolPolicy;
 use aim_proto::event::SessionAgent;
 
 use super::files::FileText;
@@ -44,29 +45,76 @@ pub struct ToolPolicy {
     pub deny: BTreeSet<String>,
 }
 
+/// Collision-free ids for the exact names participating in one policy operation.
+struct ToolIds {
+    by_name: BTreeMap<String, u64>,
+    by_id: Vec<String>,
+}
+
+impl ToolIds {
+    fn new(policies: &[&ToolPolicy], requested: Option<&str>) -> Self {
+        let mut names = BTreeSet::new();
+        for policy in policies {
+            if let Some(allow) = &policy.allow {
+                names.extend(allow.iter().cloned());
+            }
+            names.extend(policy.deny.iter().cloned());
+        }
+        if let Some(requested) = requested {
+            names.insert(requested.to_owned());
+        }
+        let by_id: Vec<String> = names.into_iter().collect();
+        // A host cannot allocate more than usize::MAX entries; supported targets have usize <= u64.
+        let by_name = by_id.iter().enumerate().map(|(index, name)| (name.clone(), u64::try_from(index).unwrap_or(u64::MAX))).collect();
+        Self { by_name, by_id }
+    }
+
+    fn encode(&self, policy: &ToolPolicy) -> Option<KernelToolPolicy> {
+        let allow = match &policy.allow {
+            Some(names) => Some(names.iter().map(|name| self.by_name.get(name).copied()).collect::<Option<Vec<_>>>()?),
+            None => None,
+        };
+        let deny = policy.deny.iter().map(|name| self.by_name.get(name).copied()).collect::<Option<Vec<_>>>()?;
+        Some(KernelToolPolicy::new(allow, deny))
+    }
+
+    fn decode(&self, policy: KernelToolPolicy) -> Option<ToolPolicy> {
+        let (allow, deny) = policy.into_parts();
+        let name = |id: u64| self.by_id.get(usize::try_from(id).ok()?).cloned();
+        let allow = match allow {
+            Some(ids) => Some(ids.into_iter().map(&name).collect::<Option<BTreeSet<_>>>()?),
+            None => None,
+        };
+        let deny = deny.into_iter().map(name).collect::<Option<BTreeSet<_>>>()?;
+        Some(ToolPolicy { allow, deny })
+    }
+}
+
 impl ToolPolicy {
     /// Whether tool `name` is permitted.
     #[must_use]
     pub fn permits(&self, name: &str) -> bool {
-        !self.deny.contains(name) && self.allow.as_ref().is_none_or(|allow| allow.contains(name))
+        let ids = ToolIds::new(&[self], Some(name));
+        ids.encode(self).is_some_and(|policy| ids.by_name.get(name).is_some_and(|id| policy.permits(*id)))
     }
 
     /// Whether every tool is permitted.
     #[must_use]
     pub fn is_unrestricted(&self) -> bool {
-        self.allow.is_none() && self.deny.is_empty()
+        ToolIds::new(&[self], None).encode(self).is_some_and(|policy| policy.is_unrestricted())
     }
 
     /// What both policies permit: allowlists intersect and denylists unite, so the result never
     /// permits a tool either refuses (a resumed session's ceiling, ADR 0038).
     #[must_use]
     pub fn intersect(&self, other: &Self) -> Self {
-        let allow = match (&self.allow, &other.allow) {
-            (None, None) => None,
-            (Some(only), None) | (None, Some(only)) => Some(only.clone()),
-            (Some(a), Some(b)) => Some(a.intersection(b).cloned().collect()),
-        };
-        Self { allow, deny: self.deny.union(&other.deny).cloned().collect() }
+        let ids = ToolIds::new(&[self, other], None);
+        match (ids.encode(self), ids.encode(other)) {
+            (Some(left), Some(right)) => {
+                ids.decode(left.intersect(&right)).unwrap_or_else(|| Self { allow: Some(BTreeSet::new()), deny: BTreeSet::new() })
+            }
+            _ => Self { allow: Some(BTreeSet::new()), deny: BTreeSet::new() },
+        }
     }
 
     /// This policy as recorded for agent `name` in the session's metadata (ADR 0038).
@@ -411,6 +459,23 @@ mod tests {
                 assert_eq!(ToolPolicy::recorded(&both.record("x")), both, "the record round-trips");
             }
         }
+    }
+
+    #[test]
+    fn name_registry_is_exact_for_unicode_and_colliding_prefixes() {
+        let policy = ToolPolicy {
+            allow: Some(["Read", "ReadMore", "λ-edit"].into_iter().map(str::to_owned).collect()),
+            deny: ["ReadMore"].into_iter().map(str::to_owned).collect(),
+        };
+        let ids = ToolIds::new(&[&policy], Some("λ-edit-extra"));
+        for (name, id) in &ids.by_name {
+            assert_eq!(ids.by_id.get(usize::try_from(*id).unwrap()), Some(name));
+        }
+        assert!(policy.permits("Read"));
+        assert!(!policy.permits("ReadMore"));
+        assert!(policy.permits("λ-edit"));
+        assert!(!policy.permits("λ-edit-extra"));
+        assert!(!policy.permits("read"));
     }
 
     fn file(text: &str) -> FileText {
