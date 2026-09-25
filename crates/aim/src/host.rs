@@ -918,6 +918,16 @@ async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<Strin
         let _unwatched = live.updates.send(update);
         return;
     }
+    if let SessionUpdate::ConfigChanged { model, .. } = &update {
+        // The summary and the stream change in one step under the transcript lock that `attach`
+        // takes to snapshot and subscribe: an attach sees the old model and then this update, or
+        // the new model and not this update, never the old model and then the new model's options
+        // (ADR 0074, REV-T1b B2).
+        let _ordered = lock(&live.transcript);
+        lock(&live.summary).meta.model.clone_from(model);
+        let _unwatched = live.updates.send(update);
+        return;
+    }
     let _unwatched = live.updates.send(update);
 }
 
@@ -1063,8 +1073,6 @@ impl Actor {
         if let Some(why) = &self.broken {
             return Err(why.clone());
         }
-        // A client attaching later is told the model in force, not the one the session began with.
-        lock(&self.live.summary).meta.model.clone_from(&in_force.model);
         self.announced = Some(in_force);
         self.refresh_options(model_changed);
         Ok(())
@@ -1349,18 +1357,22 @@ impl SessionClient for SessionHost {
 
 #[cfg(test)]
 mod tests {
-    use aim_proto::daemon::{ChoiceValue, Persistence, SessionOptions, SessionState, SessionSummary, SessionUpdate};
-    use aim_proto::event::SessionMeta;
+    use std::time::Duration;
 
-    use super::{Arc, Live, lock, next_options_generation, publish_options};
+    use aim_proto::daemon::{ChoiceValue, Persistence, SessionOptions, SessionState, SessionSummary, SessionUpdate};
+    use aim_proto::event::{EffortSource, SessionEvent, SessionMeta};
+
+    use super::{Arc, BoxFuture, Live, Mutex, PoisonError, lock, next_options_generation, publish, publish_options};
+    use crate::session::Recorder;
+    use crate::store::{MemoryStore, SessionStore, StoreError, StoredSessionSummary};
 
     fn options(model: &str) -> SessionOptions {
         let level = ChoiceValue { value: format!("{model}-level"), name: None, description: None };
         SessionOptions { models: Vec::new(), efforts: vec![level], auto_effort: None }
     }
 
-    fn live() -> Arc<Live> {
-        let meta = SessionMeta {
+    fn meta() -> SessionMeta {
+        SessionMeta {
             id: "s".into(),
             created_ms: 0,
             workspace: "/w".into(),
@@ -1370,7 +1382,11 @@ mod tests {
             title: None,
             parent: None,
             agent: None,
-        };
+        }
+    }
+
+    fn live() -> Arc<Live> {
+        let meta = meta();
         let summary =
             SessionSummary { meta, state: SessionState::Idle, persistence: Persistence::Ephemeral, last_activity_ms: 0, turns: 0 };
         Live::new(summary, Vec::new(), 16, Arc::new(crate::ui::SessionUi::restore("s", &[]))).0
@@ -1406,5 +1422,71 @@ mod tests {
         assert_eq!(lock(&live.options).latest, Some(options("m2")));
         next_options_generation(&live, true);
         assert_eq!(lock(&live.options).latest, None);
+    }
+
+    /// A memory store that says when an append went through.
+    struct Signaling {
+        inner: MemoryStore,
+        appended: Mutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl SessionStore for Signaling {
+        fn create(&self, meta: SessionMeta) -> BoxFuture<Result<(), StoreError>> {
+            self.inner.create(meta)
+        }
+
+        fn append(&self, session: String, events: Vec<SessionEvent>) -> BoxFuture<Result<(), StoreError>> {
+            let appended = self.appended.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            let written = self.inner.append(session, events);
+            Box::pin(async move {
+                let result = written.await;
+                // The test is gone when this fails.
+                let _gone = appended.send(());
+                result
+            })
+        }
+
+        fn load(&self, session: String) -> BoxFuture<Result<(SessionMeta, Vec<SessionEvent>), StoreError>> {
+            self.inner.load(session)
+        }
+
+        fn list(&self, limit: u32) -> BoxFuture<Result<Vec<SessionMeta>, StoreError>> {
+            self.inner.list(limit)
+        }
+
+        fn summarize(&self, limit: u32) -> BoxFuture<Result<Vec<StoredSessionSummary>, StoreError>> {
+            self.inner.summarize(limit)
+        }
+    }
+
+    /// REV-T1b B2: a model change reaches the summary and the stream in one step under the lock an
+    /// attach snapshots and subscribes under. While an attach holds it, the change is logged but
+    /// neither in the summary nor on the stream; once it lets go, it is in both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_change_reaches_the_summary_and_the_stream_in_one_step() {
+        let live = live();
+        let (appended, logged) = std::sync::mpsc::channel();
+        let store: Arc<dyn SessionStore> = Arc::new(Signaling { inner: MemoryStore::default(), appended: Mutex::new(appended) });
+        let mut recorder = Recorder::create(store, meta()).await.unwrap();
+        // An attach in progress: it holds the transcript lock while it snapshots and subscribes.
+        let attach = lock(&live.transcript);
+        let mut updates = live.updates.subscribe();
+        let changed = {
+            let live = Arc::clone(&live);
+            tokio::spawn(async move {
+                let mut broken = None;
+                let update = SessionUpdate::ConfigChanged { model: "m2".into(), effort: None, effort_source: EffortSource::Explicit };
+                publish(&live, &mut recorder, &mut broken, update).await;
+            })
+        };
+        logged.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Time for the rest of the transition, were it not waiting for the attach to finish.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(lock(&live.summary).meta.model, "m1", "the attach sees the old model");
+        assert!(updates.try_recv().is_err(), "and gets the change on its stream, not before its snapshot");
+        drop(attach);
+        changed.await.unwrap();
+        assert_eq!(lock(&live.summary).meta.model, "m2");
+        assert!(matches!(updates.try_recv(), Ok(SessionUpdate::ConfigChanged { .. })));
     }
 }

@@ -1301,3 +1301,48 @@ async fn options_say_what_auto_does_in_an_advised_session() {
     };
     assert_eq!(options.auto_effort.as_deref(), Some("Jev picks the effort per request"));
 }
+
+/// REV-T1b B2: clients attaching while the model keeps changing never see a model next to another
+/// model's ladder, whether from their snapshot or from the updates that follow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attaches_racing_model_changes_never_pair_a_model_with_another_ladder() {
+    let m2 = ModelInfo { id: "m2".into(), display_name: "m2".into(), efforts: vec!["minimal".into(), "max".into()], ..ladder_model() };
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, Vec::new(), vec![ladder_model(), m2]);
+    let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+    let ladder_of =
+        |options: &aim_proto::daemon::SessionOptions| if values(&options.efforts) == ["low", "medium", "high"] { "m1" } else { "m2" };
+    let switcher = {
+        let (host, id) = (f.host.clone(), id.clone());
+        tokio::spawn(async move {
+            for round in 0..40 {
+                let model = if round % 2 == 0 { "m2" } else { "m1" };
+                host.set_config(SessionConfigParams { session: id.clone(), model: Some(model.into()), effort: None }).await.unwrap();
+            }
+        })
+    };
+    let mut attaches = Vec::new();
+    for _ in 0..40 {
+        let (host, id) = (f.host.clone(), id.clone());
+        attaches.push(tokio::spawn(async move { host.attach(id).await.unwrap() }));
+        tokio::task::yield_now().await;
+    }
+    switcher.await.unwrap();
+    // Let the last lookup land, then end every stream.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    f.host.close(id).await.unwrap();
+    for attach in attaches {
+        let (snapshot, mut updates) = attach.await.unwrap();
+        let mut model = snapshot.summary.meta.model.clone();
+        if let Some(options) = &snapshot.options {
+            assert_eq!(ladder_of(options), model, "the snapshot pairs its model with its own ladder");
+        }
+        for update in until(&mut updates, |u| matches!(u, SessionUpdate::StateChanged { state: SessionState::Closed })).await {
+            match update {
+                SessionUpdate::ConfigChanged { model: now, .. } => model = now,
+                SessionUpdate::Options { options } => assert_eq!(ladder_of(&options), model, "options follow their model"),
+                _ => {}
+            }
+        }
+    }
+}
