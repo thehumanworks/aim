@@ -37,14 +37,141 @@ TASKS: dict[str, dict[str, str]] = {
 }
 
 
+# Scripting tasks (T4b, bench/plans/code-mode.md): fan-out over many files, then one written
+# answer. Their tests are hidden from the workspace (the answer is in them) and grade the report
+# the model writes; the fixture files are never copied to the grader.
+
+def _source(name: str, todo: int, fixme: int) -> str:
+    comment = "#" if name.endswith((".py", ".sh")) else "//"
+    lines = [f"{comment} {name}: part of the sample service"]
+    body = {
+        ".py": ["def handler(event):", "    return {'ok': True, 'event': event}"],
+        ".sh": ["set -eu", "echo \"starting\""],
+        ".js": ["export function handler(event) {", "  return { ok: true, event };", "}"],
+        ".rs": ["pub fn handler(event: &str) -> String {", "    event.to_owned()", "}"],
+        ".go": ["package sample", "", "func Handler(event string) string {", "\treturn event", "}"],
+    }[Path(name).suffix]
+    notes = [f"{comment} TODO: handle case {index} before release" for index in range(todo)]
+    notes += [f"{comment} FIXME: this breaks when input {index} is empty" for index in range(fixme)]
+    # Interleave the notes with the code so no single read of the file's head finds them all.
+    for index, note in enumerate(notes):
+        lines.append(note)
+        lines.append(body[index % len(body)] if index < len(body) else f"{comment} step {index}")
+    lines.extend(body)
+    return "\n".join(lines) + "\n"
+
+
+TODO_COUNTS: dict[str, tuple[int, int]] = {
+    "src/alpha.py": (3, 1), "src/beta.py": (0, 2), "src/gamma.js": (2, 0), "src/delta.js": (1, 1),
+    "src/epsilon.rs": (4, 0), "src/zeta.rs": (0, 0), "src/eta.go": (1, 3), "src/theta.go": (2, 2),
+    "src/iota.sh": (0, 1), "src/kappa.py": (5, 0),
+}
+
+CALLS: list[tuple[str, int, str]] = [
+    ("app/cli.py", 6, "main"), ("app/server.py", 5, "start_server"), ("app/server.py", 10, "reload"),
+    ("app/jobs/nightly.py", 5, "run_nightly"), ("app/worker.py", 7, "setup"),
+]
+
+HEADINGS: dict[str, str] = {
+    "docs/README.md": "Project docs", "docs/setup.md": "Installing the tool", "docs/usage.md": "Command line usage",
+    "docs/faq.md": "Frequently asked questions", "docs/changelog.md": "Changelog", "docs/api/index.md": "API overview",
+    "docs/api/auth.md": "Authentication", "docs/api/errors.md": "Error codes", "docs/guides/deploy.md": "Deploying to production",
+    "docs/guides/testing.md": "Writing tests",
+}
+
+TASKS["todo_table"] = {name: _source(Path(name).name, *counts) for name, counts in TODO_COUNTS.items()}
+TASKS["callers"] = {
+    "app/__init__.py": "",
+    "app/config.py": "import json\n\n\ndef load_config(path):\n    with open(path) as stream:\n        return json.load(stream)\n\n\ndef load_config_file(path):\n    with open(path) as stream:\n        return stream.read()\n",
+    "app/cli.py": "import sys\nfrom app.config import load_config\n\n\ndef main():\n    settings = load_config(sys.argv[1])\n    print(settings)\n",
+    "app/server.py": "from app.config import load_config\n\n\ndef start_server(path):\n    settings = load_config(path)\n    return settings['port']\n\n\ndef reload(path):\n    return load_config(path)\n",
+    "app/jobs/__init__.py": "",
+    "app/jobs/nightly.py": "from app import config\n\n\ndef run_nightly():\n    settings = config.load_config('nightly.json')\n    return settings.get('jobs', [])\n",
+    "app/worker.py": "from app.config import load_config\n\n\nclass Worker:\n    def setup(self, path):\n        self.path = path\n        self.settings = load_config(path)\n        return self\n",
+    "app/legacy.py": "from app.config import load_config_file\n\n\ndef old_loader(path):\n    return load_config_file(path)\n",
+    "app/helpers.py": "def describe():\n    \"\"\"Settings come from load_config(path); see app/config.py.\"\"\"\n    return 'settings'\n\n\ndef helper():\n    # load_config() is called by main, not here.\n    return describe()\n",
+    "app/models.py": "class Settings:\n    def __init__(self, port):\n        self.port = port\n",
+    "app/utils.py": "def merge(left, right):\n    merged = dict(left)\n    merged.update(right)\n    return merged\n",
+}
+TASKS["doc_index"] = {
+    "docs/README.md": "# Project docs\n\nStart here.\n\n## Contents\n\nSee the other pages.\n",
+    "docs/setup.md": "---\ntitle: Setup notes\n---\n\n# Installing the tool\n\nRun the installer.\n",
+    "docs/usage.md": "The tool reads its input from standard input.\n\n## Command line usage\n\n    tool run FILE\n\n# Options\n",
+    "docs/faq.md": "# Frequently asked questions\n\n## Is it fast?\n\nYes.\n",
+    "docs/changelog.md": "# Changelog\n\n## 1.2.0\n\n- Faster startup.\n",
+    "docs/api/index.md": "# API overview\n\nThe API is JSON over HTTP.\n",
+    "docs/api/auth.md": "# Authentication\n\nSend a bearer token.\n",
+    "docs/api/errors.md": "Errors use standard status codes.\n\n# Error codes\n\n## 4xx\n\nClient errors.\n",
+    "docs/guides/deploy.md": "# Deploying to production\n\n## Checklist\n",
+    "docs/guides/testing.md": "# Writing tests\n\nUse the test runner.\n",
+    "docs/notes.txt": "# Not a Markdown file\n",
+}
+
+OUTPUTS: dict[str, tuple[str, ...]] = {"todo_table": ("REPORT.md",), "callers": ("CALLERS.md",), "doc_index": ("INDEX.md",)}
+
+_REPORT_TEST = """import re, unittest
+EXPECTED = {expected!r}
+class TestTask(unittest.TestCase):
+    def test_counts(self):
+        rows = [line for line in open('REPORT.md', encoding='utf-8').read().splitlines() if '|' in line]
+        for path, (todo, fixme) in EXPECTED.items():
+            name = re.compile(r'(?<![\\w-])' + re.escape(path.rsplit('/', 1)[-1]) + r'(?![\\w.])')
+            matching = [line for line in rows if name.search(line)]
+            self.assertTrue(matching, path)
+            numbers = [int(value) for value in re.findall(r'\\d+', matching[0][name.search(matching[0]).end():])]
+            self.assertEqual(numbers[:2], [todo, fixme], path)
+"""
+
+_CALLERS_TEST = """import re, unittest
+EXPECTED = {expected!r}
+class TestTask(unittest.TestCase):
+    def test_callers(self):
+        lines = open('CALLERS.md', encoding='utf-8').read().splitlines()
+        for path, line, name in EXPECTED:
+            site = f'{{path}}:{{line}}'
+            self.assertTrue(any(site in text and re.search(rf'\\b{{name}}\\b', text) for text in lines), site)
+        wanted = {{f'{{path}}:{{line}}' for path, line, _ in EXPECTED}}
+        for text in lines:
+            for path, line in re.findall(r'([\\w./-]+\\.py):(\\d+)', text):
+                found = f'{{path}}:{{line}}'
+                self.assertTrue(any(found == site or found.endswith('/' + site) for site in wanted),
+                                'not a call of load_config: ' + text)
+"""
+
+_INDEX_TEST = """import unittest
+EXPECTED = {expected!r}
+class TestTask(unittest.TestCase):
+    def test_index(self):
+        lines = open('INDEX.md', encoding='utf-8').read().splitlines()
+        for path, heading in EXPECTED.items():
+            relative = path.removeprefix('docs/')
+            matching = [line.split(relative, 1)[1] for line in lines if relative in line]
+            self.assertTrue(matching, path)
+            self.assertTrue(any(heading.lower() in rest.lower() for rest in matching), path)
+        self.assertFalse(any('notes.txt' in line for line in lines), 'notes.txt is not Markdown')
+"""
+
+HIDDEN_TESTS: dict[str, str] = {
+    "todo_table": _REPORT_TEST.format(expected=TODO_COUNTS),
+    "callers": _CALLERS_TEST.format(expected=CALLS),
+    "doc_index": _INDEX_TEST.format(expected=HEADINGS),
+}
+
 def prepare(task_id: str, workspace: Path) -> None:
     """Create the same fresh fixture for each harness/repetition."""
     if task_id not in TASKS:
         raise ValueError(f"unknown task {task_id}")
     workspace.mkdir(parents=True)
     for name, content in TASKS[task_id].items():
-        (workspace / name).write_text(content, encoding="utf-8")
+        path = workspace / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+
+
+def graded_files(task_id: str) -> list[str]:
+    """The workspace files the grader copies: a scripting task's report, else the edited modules."""
+    return list(OUTPUTS.get(task_id) or (name for name in TASKS[task_id] if name != "test_task.py"))
 
 
 def grade(task_id: str, workspace: Path) -> bool:
@@ -53,14 +180,13 @@ def grade(task_id: str, workspace: Path) -> bool:
         hidden = Path(temporary)
         home = hidden / "home"
         home.mkdir()
-        for name in TASKS[task_id]:
-            if name == "test_task.py":
-                continue
+        for name in graded_files(task_id):
             source = workspace / name
             if source.is_symlink() or not source.is_file() or source.stat().st_size > 1_000_000:
                 return False
             (hidden / name).write_bytes(source.read_bytes())
-        (hidden / "test_task.py").write_text(TASKS[task_id]["test_task.py"], encoding="utf-8")
+        test = HIDDEN_TESTS.get(task_id) or TASKS[task_id]["test_task.py"]
+        (hidden / "test_task.py").write_text(test, encoding="utf-8")
         env = {"HOME": str(home), "TMPDIR": str(home), "PYTHONDONTWRITEBYTECODE": "1", "LANG": "C.UTF-8"}
         try:
             result = subprocess.run([sys.executable, "-I", "-B", "-m", "unittest", "discover", "-s", str(hidden), "-q"],

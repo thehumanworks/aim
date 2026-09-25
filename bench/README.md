@@ -116,3 +116,20 @@ records a read-only live catalog GET and ETag revalidation without a generation 
 `results/w26-spend-ledger.json` totals every W26 paid invocation, including superseded
 diagnostics and the two unpriced transport reserves. The one direct Sonnet 5 smoke has a
 conservative price bound from its numeric token usage and the published model rates.
+
+## Code-mode cohort (T4b)
+
+`plans/code-mode.md` pre-registers the benchmark that sets aim's default `AIM_CODE_MODE`
+(ADR 0076): arms, tasks, metrics and the decision rule, whose margins live in the manifest's
+`[code_mode]`. It adds three scripting tasks to the live tier (`todo_table`, `callers`,
+`doc_index`; hidden report graders in `live_tasks.py`), so this manifest starts a new cohort.
+`acp_trials.py` runs `acp:claude` trials, whose model requests bypass the proxy, and
+`code_mode.py` tabulates result files and applies the rule:
+
+```sh
+python3 -B bench/run.py live --harnesses aim_openrouter@off,aim_openrouter@on,aim_openrouter@only \
+  --repetitions 1 --out bench/history/code-mode-r1.json
+mise exec -- python3 -B bench/acp_trials.py --cases todo_table,callers,doc_index --max-runs 12 \
+  --out bench/history/code-mode-acp.json
+python3 -B bench/code_mode.py bench/history/code-mode-*.json
+```
