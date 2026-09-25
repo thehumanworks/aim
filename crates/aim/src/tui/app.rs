@@ -746,7 +746,8 @@ impl App {
                 return Vec::new();
             };
             let (name, arg) = (command.name, arg.to_owned());
-            if self.composer.remember(&raw) && self.config.spec.persistence == Persistence::Persistent {
+            // Commands with an argument are worth recalling; `/quit` and friends are not.
+            if command.takes_argument() && self.composer.remember(&raw) && self.config.spec.persistence == Persistence::Persistent {
                 effects.push(Effect::SaveHistory(raw));
             }
             self.composer.clear();

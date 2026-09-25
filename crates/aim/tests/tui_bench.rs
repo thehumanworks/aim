@@ -36,7 +36,10 @@ fn tui_first_paint() {
         ready.push(idle);
         tui.quit();
     }
-    println!("first paint samples (ms): {:?}", paint.iter().map(|d| d.as_secs_f64() * 1_000.0).map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>());
+    println!(
+        "first paint samples (ms): {:?}",
+        paint.iter().map(|d| d.as_secs_f64() * 1_000.0).map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>()
+    );
     paint.sort();
     ready.sort();
     println!(

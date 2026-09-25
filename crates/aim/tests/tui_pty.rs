@@ -31,7 +31,7 @@ fn inline_scrollback_preserved() {
     std::thread::sleep(Duration::from_millis(150));
     tui.resize(24, 100);
     std::thread::sleep(Duration::from_millis(150));
-    tui.resize(24, 90);
+    tui.resize(24, 60);
     tui.wait("the turn to end", Duration::from_secs(15), |s| s.contains("idle") && !s.contains("running"));
     // A completion popup, then an overlay on the alternate screen.
     tui.send("@");
@@ -143,4 +143,104 @@ fn completion_stale_result_fenced() {
     tui.send("\t");
     tui.wait_for("› @src/main.rs");
     tui.quit();
+}
+
+/// Typing while a tool runs steers the turn: a queued chip, then the text in the transcript, and an
+/// empty composer afterwards.
+#[test]
+fn steering_while_a_tool_runs() {
+    let script = json!({"responses": [
+        [{"kind": "call", "name": "echo", "arguments": {"text": "slow", "delay_ms": 1200}}],
+        [text("Steered answer.", 1, 0)]
+    ]});
+    let tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    tui.type_text("start");
+    tui.send("\r");
+    tui.wait_for("running…");
+    tui.type_text("also this");
+    tui.send("\r");
+    tui.wait_for("⧗ queued also this");
+    tui.wait("the turn to end", Duration::from_secs(15), |s| s.contains("Steered answer.") && s.contains("idle"));
+    let rows = tui.quit();
+    let tool = rows.iter().position(|r| r.starts_with("⏺ echo")).unwrap();
+    let steer = rows.iter().position(|r| r == "› also this").unwrap();
+    let answer = rows.iter().position(|r| r == "Steered answer.").unwrap();
+    assert!(tool < steer && steer < answer, "{rows:?}");
+    assert_eq!(count(&rows, "also this"), 1, "the chip left no trace in scrollback");
+}
+
+/// A large bracketed paste collapses into a chip in the composer and is sent in full.
+#[test]
+fn a_large_paste_is_a_chip_and_sends_in_full() {
+    let script = json!({"responses": [[text("Got it.", 1, 0)]]});
+    let tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    let pasted: Vec<String> = (1..=15).map(|n| format!("pasted row {n}")).collect();
+    tui.type_text("see: ");
+    tui.send(&format!("\x1b[200~{}\x1b[201~", pasted.join("\r\n")));
+    tui.wait_for("› see: [pasted 15 lines]");
+    tui.send("\r");
+    tui.wait_for("Got it.");
+    let rows = tui.quit();
+    assert!(rows.iter().any(|r| r == "› see: pasted row 1"), "{rows:?}");
+    assert!(rows.iter().any(|r| r == "  pasted row 15"), "every pasted row was sent and echoed");
+}
+
+/// Prompts are kept in `AIM_HOME/history` and come back with Up after a restart; ephemeral runs
+/// neither read nor write it.
+#[test]
+fn history_survives_a_restart_unless_ephemeral() {
+    let home = std::env::temp_dir().join(format!("aim-tui-history-{}", std::process::id()));
+    let _fresh = std::fs::remove_dir_all(&home);
+    let home_env = home.to_string_lossy().into_owned();
+    let script = json!({"responses": [[text("ok", 1, 0)]]});
+    let env = [("AIM_HOME", home_env.as_str())];
+    let tui = Tui::start(&script, &Start { env: &env, ..Start::default() });
+    tui.wait_for("idle");
+    tui.type_text("remember me");
+    tui.send("\r");
+    tui.wait_for("ok");
+    tui.quit();
+    assert_eq!(std::fs::read_to_string(home.join("history")).unwrap(), "remember me\n");
+
+    let tui = Tui::start(&script, &Start { env: &env, ..Start::default() });
+    tui.wait_for("idle");
+    tui.send("\x1b[A");
+    tui.wait_for("› remember me");
+    tui.quit();
+
+    let tui = Tui::start(&script, &Start { env: &env, args: &["--ephemeral"], ..Start::default() });
+    tui.wait_for("idle");
+    tui.send("\x1b[A");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!tui.screen().contains("› remember me"), "ephemeral runs do not read history");
+    tui.type_text("secret");
+    tui.send("\r");
+    tui.wait_for("ok");
+    tui.quit();
+    assert_eq!(std::fs::read_to_string(home.join("history")).unwrap(), "remember me\n", "nor write it");
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+/// Ctrl+C cancels a running turn; the partial answer stays, marked interrupted.
+#[test]
+fn ctrl_c_cancels_the_running_turn() {
+    let long = (0..400).fold(String::new(), |mut text, i| {
+        text.push_str("word");
+        text.push_str(&i.to_string());
+        text.push(' ');
+        text
+    });
+    let script = json!({"responses": [[text(&long, 400, 10)]]});
+    let tui = Tui::start(&script, &Start::default());
+    tui.wait_for("idle");
+    tui.type_text("talk");
+    tui.send("\r");
+    tui.wait_for("word20");
+    tui.send("\x03");
+    tui.wait("the cancel", Duration::from_secs(10), |s| s.contains("· cancelled") && s.contains("idle"));
+    let rows = tui.quit();
+    assert!(rows.iter().any(|r| r == "(interrupted)"), "{rows:?}");
+    assert!(!rows.iter().any(|r| r.contains("word399")), "the stream stopped");
 }

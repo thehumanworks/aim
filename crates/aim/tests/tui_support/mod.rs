@@ -83,17 +83,29 @@ fn replies(data: &[u8], parser: &vt100::Parser) -> Vec<u8> {
 }
 
 impl Tui {
+    /// The TUI on a scripted provider and a fake workspace (`--script`).
     pub fn start(script: &Value, start: &Start<'_>) -> Self {
         let dir = temp_dir();
+        let script_path = dir.join("script.json");
+        std::fs::write(&script_path, serde_json::to_vec(script).unwrap()).unwrap();
+        Self::spawn(dir, Some(&script_path), start)
+    }
+
+    /// The real TUI: real providers and the real `aimx` (pass `--aimx`, provider flags in `args`).
+    pub fn start_live(start: &Start<'_>) -> Self {
+        Self::spawn(temp_dir(), None, start)
+    }
+
+    fn spawn(dir: PathBuf, script: Option<&Path>, start: &Start<'_>) -> Self {
         let workspace = dir.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         self::workspace(&workspace);
-        let script_path = dir.join("script.json");
-        std::fs::write(&script_path, serde_json::to_vec(script).unwrap()).unwrap();
         let pty = native_pty_system().openpty(PtySize { rows: start.rows, cols: start.cols, pixel_width: 0, pixel_height: 0 }).unwrap();
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_aim"));
-        cmd.arg("--script");
-        cmd.arg(&script_path);
+        if let Some(script) = script {
+            cmd.arg("--script");
+            cmd.arg(script);
+        }
         cmd.arg("-C");
         cmd.arg(&workspace);
         for arg in start.args {
