@@ -5,7 +5,7 @@
 use aim::board::{Board, CleanupReceipt, Error};
 use aim::store::{SessionStore as _, SqliteStore};
 use aim_proto::board::{
-    ArtifactInput, ClaimParams, CompleteParams, JobSpec, JobState, PostParams, RegisterWorkerParams, RetryParams, ReviewParams,
+    ArtifactInput, ClaimParams, CompleteParams, FailParams, JobSpec, JobState, PostParams, RegisterWorkerParams, RetryParams, ReviewParams,
 };
 use aim_proto::content::Base64Bytes;
 use aim_proto::event::{EVENT_SCHEMA, EventBody, SessionEvent, SessionMeta};
@@ -105,6 +105,20 @@ async fn accepted_evidence_opens_dependency_gate_and_survives_reopen() {
             .await,
         Err(Error::Conflict(_))
     ));
+    assert!(matches!(
+        board
+            .review(ReviewParams {
+                job_id: first.id.clone(),
+                attempt_id: receipt.attempt.id.clone(),
+                reviewer: " W1 ".into(),
+                accepted: true,
+                evidence: vec![artifact_id.clone()],
+                expected_version: cleaned.version,
+                now_ms: 0
+            })
+            .await,
+        Err(Error::Conflict(_))
+    ));
     let reviewed = board
         .review(ReviewParams {
             job_id: first.id.clone(),
@@ -126,6 +140,86 @@ async fn accepted_evidence_opens_dependency_gate_and_survives_reopen() {
         reopened.poll(aim_proto::board::PollParams { run_id: first.run_id, after_seq: 0, limit: 100, after_job: None }).await.unwrap();
     assert_eq!(polled.events.len(), 7);
     assert!(polled.events.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+}
+
+#[tokio::test]
+async fn duplicate_dependency_is_an_invalid_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = Board::open(&dir.path().join(".aim/aim.db")).unwrap();
+    let first = board.post(PostParams { run_id: None, spec: spec("first", vec![], 0), idempotency_key: "first".into() }).await.unwrap().job;
+    let result = board
+        .post(PostParams {
+            run_id: Some(first.run_id),
+            spec: spec("second", vec![first.id.clone(), first.id], 0),
+            idempotency_key: "second".into(),
+        })
+        .await;
+    assert!(matches!(result, Err(Error::Invalid(_))));
+}
+
+#[tokio::test]
+async fn early_cleanup_receipt_is_confirmable_after_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = Board::open(&dir.path().join(".aim/aim.db")).unwrap();
+    board.register_worker(RegisterWorkerParams { worker: "worker".into(), capacity: 1 }).await.unwrap();
+    let job = board.post(PostParams { run_id: None, spec: spec("one", vec![], 1), idempotency_key: "one".into() }).await.unwrap().job;
+    let mut request = claim(&job.id, "worker", 1);
+    request.lease_ms = 1;
+    let claimed = board.claim(request).await.unwrap();
+    board.record_cleanup(job.id.clone(), claimed.attempt.id.clone(), token(&job.id, "worker"), cleanup()).await.unwrap();
+    assert!(!board.show(job.id.clone()).await.unwrap().attempt.unwrap().cleanup_confirmed);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let failed = board
+        .fail(FailParams {
+            job_id: job.id.clone(),
+            attempt_id: claimed.attempt.id.clone(),
+            claim_token: token(&job.id, "worker"),
+            reason: "after-lease".into(),
+            now_ms: 0,
+        })
+        .await;
+    assert_eq!(failed, Err(Error::StaleClaim));
+    let expired = board.expire(job.id.clone(), claimed.job.version).await.unwrap();
+    assert!(!expired.attempt.unwrap().cleanup_confirmed);
+    board.record_cleanup(job.id.clone(), claimed.attempt.id, token(&job.id, "worker"), cleanup()).await.unwrap();
+    let confirmed = board.show(job.id.clone()).await.unwrap();
+    assert!(confirmed.attempt.unwrap().cleanup_confirmed);
+    let retried = board.retry(RetryParams { job_id: job.id, expected_version: confirmed.version, now_ms: 0 }).await.unwrap();
+    assert_eq!(retried.generation, 1);
+}
+
+#[tokio::test]
+async fn complete_uses_receipt_recorded_while_attempt_was_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let board = Board::open(&dir.path().join(".aim/aim.db")).unwrap();
+    board.register_worker(RegisterWorkerParams { worker: "worker".into(), capacity: 1 }).await.unwrap();
+    let job = board.post(PostParams { run_id: None, spec: spec("one", vec![], 0), idempotency_key: "one".into() }).await.unwrap().job;
+    let claimed = board.claim(claim(&job.id, "worker", 1)).await.unwrap();
+    board.record_cleanup(job.id.clone(), claimed.attempt.id.clone(), token(&job.id, "worker"), cleanup()).await.unwrap();
+    let completed = board
+        .complete(CompleteParams {
+            job_id: job.id.clone(),
+            attempt_id: claimed.attempt.id.clone(),
+            claim_token: token(&job.id, "worker"),
+            artifacts: vec![ArtifactInput { media_type: "text/plain".into(), data: Base64Bytes(b"evidence".to_vec()) }],
+            now_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert!(completed.attempt.unwrap().cleanup_confirmed);
+    let reviewed = board
+        .review(ReviewParams {
+            job_id: job.id,
+            attempt_id: claimed.attempt.id,
+            reviewer: "lead".into(),
+            accepted: true,
+            evidence: vec![completed.artifacts.first().unwrap().id.clone()],
+            expected_version: completed.version,
+            now_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(reviewed.review, aim_proto::board::ReviewState::Accepted);
 }
 
 #[tokio::test]
@@ -271,6 +365,120 @@ async fn board_and_session_actors_share_one_wal_file() {
     tokio::join!(post, append);
     assert_eq!(board.list(aim_proto::board::ListParams { run_id: None, limit: Some(50), after_job: None }).await.unwrap().jobs.len(), 20);
     assert_eq!(sessions.load("session".into()).await.unwrap().1.len(), 20);
+}
+
+#[tokio::test]
+async fn claims_stay_fast_with_200_mib_of_accepted_evidence_and_session_writes() {
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".aim/aim.db");
+    let board = Board::open(&path).unwrap();
+    let sessions = SqliteStore::open(&path).unwrap();
+    sessions
+        .create(SessionMeta {
+            id: "session".into(),
+            created_ms: 1,
+            workspace: "/w".into(),
+            location: "local".into(),
+            provider: "codex".into(),
+            model: "model".into(),
+            title: None,
+            parent: None,
+            agent: None,
+        })
+        .await
+        .unwrap();
+    board.register_worker(RegisterWorkerParams { worker: "evidence".into(), capacity: 1 }).await.unwrap();
+    board.register_worker(RegisterWorkerParams { worker: "claimant".into(), capacity: 32 }).await.unwrap();
+    let mut run_id = None;
+    let mut accepted_ids = Vec::new();
+    for index in 0..200 {
+        let job = board
+            .post(PostParams { run_id: run_id.clone(), spec: spec("evidence", vec![], 0), idempotency_key: format!("accepted-{index}") })
+            .await
+            .unwrap()
+            .job;
+        run_id.get_or_insert_with(|| job.run_id.clone());
+        let claimed = board.claim(claim(&job.id, "evidence", 1)).await.unwrap();
+        let completed = board
+            .complete(CompleteParams {
+                job_id: job.id.clone(),
+                attempt_id: claimed.attempt.id.clone(),
+                claim_token: token(&job.id, "evidence"),
+                artifacts: vec![ArtifactInput {
+                    media_type: "application/octet-stream".into(),
+                    data: Base64Bytes(vec![index as u8; 1_048_576]),
+                }],
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        board.record_cleanup(job.id.clone(), claimed.attempt.id.clone(), token(&job.id, "evidence"), cleanup()).await.unwrap();
+        let cleaned = board.show(job.id.clone()).await.unwrap();
+        board
+            .review(ReviewParams {
+                job_id: job.id.clone(),
+                attempt_id: claimed.attempt.id,
+                reviewer: "lead".into(),
+                accepted: true,
+                evidence: vec![completed.artifacts.first().unwrap().id.clone()],
+                expected_version: cleaned.version,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        accepted_ids.push(job.id);
+    }
+    // A broken unrelated review must not block admission elsewhere in the ledger.
+    let direct = rusqlite::Connection::open(&path).unwrap();
+    direct.execute("UPDATE board_reviews SET evidence_json='malformed' WHERE job_id=?1", rusqlite::params![accepted_ids[199]]).unwrap();
+    drop(direct);
+    let mut candidates = Vec::new();
+    for index in 0..20 {
+        candidates.push(
+            board
+                .post(PostParams {
+                    run_id: run_id.clone(),
+                    spec: spec("candidate", vec![accepted_ids[0].clone()], 0),
+                    idempotency_key: format!("candidate-{index}"),
+                })
+                .await
+                .unwrap()
+                .job,
+        );
+    }
+    let claims = async {
+        let mut durations = Vec::new();
+        for candidate in candidates {
+            let started = Instant::now();
+            board.claim(claim(&candidate.id, "claimant", 32)).await.unwrap();
+            durations.push(started.elapsed());
+        }
+        durations
+    };
+    let append = async {
+        for seq in 1..=40 {
+            sessions
+                .append(
+                    "session".into(),
+                    vec![SessionEvent {
+                        schema: EVENT_SCHEMA,
+                        seq,
+                        turn: seq,
+                        ts_ms: i64::try_from(seq).unwrap(),
+                        body: EventBody::TurnStarted,
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let (mut durations, ()) = tokio::join!(claims, append);
+    durations.sort_unstable();
+    let p95 = durations[18];
+    assert!(p95 < Duration::from_millis(250), "claim p95 was {p95:?}");
+    assert_eq!(sessions.load("session".into()).await.unwrap().1.len(), 40);
 }
 
 #[test]

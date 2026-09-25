@@ -9,17 +9,19 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use aim_proto::board::BoardEvent;
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior};
 use tokio::sync::{broadcast, oneshot};
 
 use super::Error;
 
 type Task = Box<dyn FnOnce(&mut Connection, &broadcast::Sender<BoardEvent>) + Send>;
+const QUEUE_CAPACITY: usize = 256;
+const BOARD_SCHEMA_VERSION: i64 = 1;
 
 /// One board actor with one SQLite connection, sharing the session store's WAL file.
 #[derive(Clone)]
 pub(super) struct Ledger {
-    tx: mpsc::Sender<Task>,
+    tx: mpsc::SyncSender<Task>,
 }
 
 impl core::fmt::Debug for Ledger {
@@ -68,6 +70,9 @@ const SCHEMA: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = FULL;
     PRAGMA foreign_keys = ON;
+    CREATE TABLE IF NOT EXISTS board_schema (
+        version INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS board_runs (
         id TEXT PRIMARY KEY,
         owner_session TEXT NOT NULL,
@@ -124,6 +129,8 @@ const SCHEMA: &str = "
         UNIQUE(job_id, claim_id)
     ) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS board_attempts_by_job ON board_attempts(job_id, generation DESC);
+    CREATE INDEX IF NOT EXISTS board_attempts_by_worker_hold ON board_attempts(assignee, job_id, generation)
+        WHERE cleanup_state != 'confirmed';
     CREATE TABLE IF NOT EXISTS board_messages (
         id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL REFERENCES board_runs(id),
@@ -199,6 +206,33 @@ const SCHEMA: &str = "
     ) WITHOUT ROWID;
 ";
 
+// Version 1 is additive: the previous binary ignores board_schema and the worker-hold index,
+// and still finds the claim_key column and its unique index after an upgraded store is opened.
+fn migrate(conn: &mut Connection) -> Result<(), Error> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(backend)?;
+    let version: Option<i64> =
+        tx.query_row("SELECT version FROM board_schema LIMIT 1", [], |row| row.get(0)).optional().map_err(backend)?;
+    match version {
+        Some(BOARD_SCHEMA_VERSION) => {}
+        None => {
+            let mut columns = tx.prepare("PRAGMA table_info(board_attempts)").map_err(backend)?;
+            let names =
+                columns.query_map([], |row| row.get::<_, String>(1)).map_err(backend)?.collect::<Result<Vec<_>, _>>().map_err(backend)?;
+            drop(columns);
+            if !names.iter().any(|name| name == "claim_key") {
+                tx.execute_batch("ALTER TABLE board_attempts ADD COLUMN claim_key TEXT NOT NULL DEFAULT ''").map_err(backend)?;
+            }
+            tx.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS board_attempts_by_claim_key ON board_attempts(claim_key) WHERE claim_key != ''",
+            )
+            .map_err(backend)?;
+            tx.execute("INSERT INTO board_schema (version) VALUES (?1)", [BOARD_SCHEMA_VERSION]).map_err(backend)?;
+        }
+        Some(other) => return Err(Error::Storage(format!("unsupported board schema version {other}"))),
+    }
+    tx.commit().map_err(backend)
+}
+
 #[cfg(unix)]
 fn private_files(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -261,32 +295,20 @@ impl Ledger {
     pub(super) fn open_with_events(path: &Path, events: broadcast::Sender<BoardEvent>) -> Result<Self, Error> {
         private_files(path)?;
         let _schema_lock = crate::store::schema_lock(path).map_err(backend)?;
-        let conn = Connection::open(path).map_err(backend)?;
+        let mut conn = Connection::open(path).map_err(backend)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(backend)?;
         conn.execute_batch(SCHEMA).map_err(backend)?;
-        // Two cold daemon starts can reach this migration before the singleton lock. Keep
-        // column inspection and ALTER together so only one connection applies the upgrade.
-        conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
-        let mut columns = conn.prepare("PRAGMA table_info(board_attempts)").map_err(backend)?;
-        let names =
-            columns.query_map([], |row| row.get::<_, String>(1)).map_err(backend)?.collect::<Result<Vec<_>, _>>().map_err(backend)?;
-        drop(columns);
-        if !names.iter().any(|name| name == "claim_key") {
-            conn.execute_batch("ALTER TABLE board_attempts ADD COLUMN claim_key TEXT NOT NULL DEFAULT ''").map_err(backend)?;
-        }
-        conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS board_attempts_by_claim_key ON board_attempts(claim_key) WHERE claim_key != ''",
-        )
-        .map_err(backend)?;
-        conn.execute_batch("COMMIT").map_err(backend)?;
+        migrate(&mut conn)?;
         private_files(path)?;
-        let (tx, rx) = mpsc::channel::<Task>();
+        let (tx, rx) = mpsc::sync_channel::<Task>(QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("aim-board-db".into())
             .spawn(move || {
                 let mut conn = conn;
                 while let Ok(task) = rx.recv() {
-                    task(&mut conn, &events);
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(&mut conn, &events))).is_err() {
+                        tracing::error!("board database task panicked; transaction rolled back");
+                    }
                 }
             })
             .map_err(backend)?;
@@ -299,7 +321,7 @@ impl Ledger {
     ) -> Result<T, Error> {
         let (reply, answer) = oneshot::channel();
         self.tx
-            .send(Box::new(move |conn, events| {
+            .try_send(Box::new(move |conn, events| {
                 let result = (|| {
                     let before: i64 =
                         conn.query_row("SELECT COALESCE(MAX(seq),0) FROM board_outbox", [], |row| row.get(0)).map_err(backend)?;
@@ -318,7 +340,10 @@ impl Ledger {
                 })();
                 drop(reply.send(result));
             }))
-            .map_err(|_| Error::Storage("board database thread stopped".into()))?;
+            .map_err(|err| match err {
+                mpsc::TrySendError::Full(_) => Error::Storage("board database queue full".into()),
+                mpsc::TrySendError::Disconnected(_) => Error::Storage("board database thread stopped".into()),
+            })?;
         answer.await.map_err(|_| Error::Storage("board database thread dropped the request".into()))?
     }
 }
@@ -367,6 +392,22 @@ mod tests {
         let mut columns = conn.prepare("PRAGMA table_info(board_attempts)").unwrap();
         let names = columns.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(names.iter().filter(|name| *name == "claim_key").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn additive_schema_version_and_actor_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".aim/aim.db");
+        let ledger = Ledger::open(&path).unwrap();
+        let version = ledger
+            .transact(|tx| tx.query_row("SELECT version FROM board_schema", [], |row| row.get::<_, i64>(0)).map_err(backend))
+            .await
+            .unwrap();
+        assert_eq!(version, BOARD_SCHEMA_VERSION);
+        let failed: Result<(), Error> = ledger.transact(|_| panic!("injected actor task panic")).await;
+        assert!(failed.is_err());
+        let alive = ledger.transact(|tx| tx.query_row("SELECT 1", [], |row| row.get::<_, i64>(0)).map_err(backend)).await.unwrap();
+        assert_eq!(alive, 1);
     }
 
     #[tokio::test]
