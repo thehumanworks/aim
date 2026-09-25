@@ -13,12 +13,43 @@ use serde::{Deserialize, Serialize};
 
 use crate::conversation::{Item, Part, RateLimits, StopReason, Usage};
 use crate::event::SessionMeta;
+use crate::harness::{AuthProof, GenerationRange, PeerInfo};
 use crate::ids::IdempotencyKey;
 use crate::tool::ToolResult;
 use crate::{method, notification};
 
 /// Protocol generations of `aim-daemon` this build can speak (inclusive range).
 pub const DAEMON_GENERATIONS: (u32, u32) = (1, 1);
+
+/// `initialize` parameters: the first request on every daemon connection.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonInitializeParams {
+    /// Generations the client speaks.
+    pub generations: GenerationRange,
+    /// The client.
+    pub client: PeerInfo,
+    /// Credentials for network transports (unix-socket peers are identified by peer credentials).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthProof>,
+}
+
+/// `initialize` result.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DaemonInitializeResult {
+    /// The negotiated generation.
+    pub generation: u32,
+    /// The daemon.
+    pub server: PeerInfo,
+    /// The daemon's process id (clients use it to tell a restarted daemon apart).
+    pub pid: u32,
+    /// Largest JSON-RPC message accepted, in bytes.
+    pub max_message_bytes: u64,
+}
+
+method!(
+    /// `initialize` — negotiate the generation (newest common, ADR 0005) and authenticate.
+    DaemonInitialize = "initialize" (DaemonInitializeParams) -> DaemonInitializeResult
+);
 
 /// Where a session's workspace lives.
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]

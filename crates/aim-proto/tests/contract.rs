@@ -143,6 +143,34 @@ fn every_harness_method_has_a_json_schema() {
 }
 
 #[test]
+fn every_daemon_method_has_a_json_schema_and_updates_are_tagged() {
+    use aim_proto::daemon;
+    fn schema<M: Method>() -> (String, serde_json::Value) {
+        (M::NAME.to_owned(), serde_json::to_value(schemars::schema_for!(M::Params)).unwrap())
+    }
+    let all = [
+        schema::<daemon::DaemonInitialize>(),
+        schema::<daemon::SessionCreate>(),
+        schema::<daemon::SessionList>(),
+        schema::<daemon::SessionAttach>(),
+        schema::<daemon::SessionDetach>(),
+        schema::<daemon::SessionPrompt>(),
+        schema::<daemon::SessionCancel>(),
+        schema::<daemon::SessionSetConfig>(),
+        schema::<daemon::SessionClose>(),
+    ];
+    let mut names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), all.len(), "method names must be unique");
+    let update = daemon::SessionUpdateParams {
+        session: "s".into(),
+        update: daemon::SessionUpdate::StateChanged { state: daemon::SessionState::Running },
+    };
+    assert_eq!(serde_json::to_value(&update).unwrap(), json!({"session": "s", "update": {"type": "state_changed", "state": "running"}}));
+}
+
+#[test]
 fn unknown_session_events_are_preserved_not_rejected() {
     use aim_proto::event::{EventBody, SessionEvent};
     let wire = json!({"schema": 9, "seq": 4, "turn": 2, "ts_ms": 1, "body": {"kind": "from_the_future", "x": [1, 2]}});
