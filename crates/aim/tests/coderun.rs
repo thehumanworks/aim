@@ -157,14 +157,14 @@ async fn a_zero_token_exec_response_still_fits_its_truncation_notice() {
     let (_, host) = host(CodeMode::Codex);
     let first =
         exec(&host, "// @exec: {\"yield_time_ms\": 5000, \"max_output_tokens\": 0}\ntext('a'.repeat(1000));").await.expect("the cell runs");
-    assert!(first.len() <= 256, "{} bytes: {first}", first.len());
+    assert!(first.len() <= 100, "{} bytes: {first}", first.len());
     assert!(first.contains("bytes truncated"), "{first}");
     let running = exec(&host, "// @exec: {\"yield_time_ms\": 1}\nawait new Promise(r => setTimeout(r, 300)); text('b'.repeat(1000));")
         .await
         .expect("the cell runs");
     if running.contains("Script running") {
         let waited = wait(&host, &cell_id(&running), json!({"yield_time_ms": 5000, "max_tokens": 0})).await.expect("the cell finishes");
-        assert!(waited.len() <= 256 && waited.contains("bytes truncated"), "{} bytes: {waited}", waited.len());
+        assert!(waited.len() <= 100 && waited.contains("bytes truncated"), "{} bytes: {waited}", waited.len());
     }
 }
 
