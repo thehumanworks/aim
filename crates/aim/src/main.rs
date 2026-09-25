@@ -24,6 +24,7 @@ use aim::host::{HostConfig, SessionClient, SessionHost};
 use aim::mcp::{config as mcp_config, server as mcp_server, services::AimServices, trust as mcp_trust};
 use aim::resources::HarnessFiles;
 use aim::store::{SessionStore, SqliteStore};
+use aim::workflows::cli::{self as workflow_cli, WorkflowAction};
 use aim_llm::ModelProvider;
 use aim_proto::daemon::SessionListParams;
 use clap::{Parser, Subcommand};
@@ -133,6 +134,12 @@ enum Command {
         /// Board action.
         #[command(subcommand)]
         action: board_cli::BoardAction,
+    },
+    /// Run trusted project workflows through the board ledger.
+    Workflow {
+        /// Workflow action.
+        #[command(subcommand)]
+        action: WorkflowAction,
     },
     /// Inspect and trust user MCP servers, or serve aim's tools to an MCP client.
     Mcp {
@@ -476,6 +483,7 @@ async fn main_async(args: Args) -> Result<i32, String> {
             search_sessions_command(reindex, limit, workspace, json, query).await
         }
         Command::Board { action } => Box::pin(board_cli::run(&cli::aim_home(), action)).await,
+        Command::Workflow { action } => Box::pin(workflow_cli::run(&cli::aim_home(), action)).await,
         Command::Mcp { stdio, cwd, ssh, aimx, action } => mcp_command(stdio, cwd, ssh, aimx, action).await,
         Command::Daemon {
             socket,
@@ -555,6 +563,7 @@ async fn main_async(args: Args) -> Result<i32, String> {
                         backends: aim::providers::backends(cli::find_aimx(None), 64),
                         update_capacity: 1024,
                     }));
+                    let _workflow_driver = tokio::spawn(aim::workflows::runner::serve(home.clone(), cli::find_aimx(None)));
                     let on_shutdown = {
                         let host = Arc::clone(&host);
                         async move { host.shutdown().await }

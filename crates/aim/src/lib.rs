@@ -38,3 +38,4 @@ pub mod session;
 pub mod store;
 pub mod tui;
 pub mod workers;
+pub mod workflows;
