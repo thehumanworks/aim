@@ -1,0 +1,82 @@
+package aim:plugin@0.1.0;
+
+interface types {
+  type json = string;
+  enum level { trace, debug, info, warn, error }
+  variant error { denied(string), invalid(string), unavailable(string), timeout, failed(string) }
+  record event { name: string, schema: u16, seq: u64, session: option<string>, payload: json }
+  record tool-result { content: json, is-error: bool, details: option<json> }
+  enum permission-decision { allow-once, deny, abstain }
+  record ext-action { kind: string, payload: json }
+  variant action {
+    none, context(string), stop(string), continue-turn,
+    prompt-transform(string), prompt-block(string),
+    tool-rewrite(json), tool-deny(string), permission(permission-decision),
+    tool-annotate(string), tool-result-replace(tool-result), entry(json),
+    ui(list<json>), ext(ext-action),
+  }
+  record tool-spec { name: string, description: string, input-schema: json, sensitive: bool }
+  record command-spec { name: string, description: string, args-hint: option<string> }
+  record keybinding { chord: string, command: string, when: option<string> }
+  record registration {
+    subscriptions: list<string>, tools: list<tool-spec>, commands: list<command-spec>,
+    keybindings: list<keybinding>, themes: list<json>, renders: list<string>,
+  }
+}
+
+interface host {
+  use types.{level};
+  log: func(l: level, msg: string);
+  capability: func(key: string) -> string;
+  now-ms: func() -> u64;
+}
+
+interface kv {
+  use types.{error};
+  get: func(k: string) -> result<option<list<u8>>, error>;
+  set: func(k: string, v: list<u8>) -> result<_, error>;
+  delete: func(k: string) -> result<_, error>;
+  %list: func(prefix: string) -> result<list<string>, error>;
+}
+
+interface tools {
+  use types.{json, tool-result, error};
+  call: func(name: string, args: json) -> result<tool-result, error>;
+}
+
+interface session {
+  use types.{json, error};
+  query: func(q: json) -> result<json, error>;
+}
+
+interface ui {
+  use types.{json, error};
+  apply: func(msgs: list<json>) -> result<_, error>;
+  notify: func(level: string, text: string);
+  ask: func(dialog: json) -> result<option<json>, error>;
+}
+
+interface bus {
+  use types.{json, error};
+  publish: func(topic: string, msg: json) -> result<_, error>;
+}
+
+interface plugin {
+  use types.{event, action, registration, json, tool-result, error};
+  init: func(config: json) -> result<registration, error>;
+  on-event: func(ev: event) -> list<action>;
+  call-tool: func(name: string, call-id: string, args: json) -> result<tool-result, error>;
+  run-command: func(name: string, args: string) -> result<list<action>, error>;
+  complete: func(kind: string, prefix: string) -> list<json>;
+  shutdown: func(reason: string);
+}
+
+world extension {
+  import host;
+  import kv;
+  import tools;
+  import session;
+  import ui;
+  import bus;
+  export plugin;
+}

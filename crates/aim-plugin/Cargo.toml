@@ -1,0 +1,24 @@
+[package]
+name = "aim-plugin"
+description = "Capability-scoped WebAssembly component host for aim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+aim-proto = { path = "../aim-proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1.53", features = ["fs", "sync", "time", "macros", "rt"] }
+toml = "0.9"
+wasmtime = { version = "=48.0.3", default-features = false, features = ["component-model", "cranelift", "pooling-allocator", "runtime", "async"] }
+wasmtime-wasi = { version = "=48.0.3", default-features = false, features = ["p2"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
