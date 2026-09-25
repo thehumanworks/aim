@@ -106,6 +106,13 @@ impl Scheduler {
         self.queue.contains(&ticket)
     }
 
+    /// How many cells are ahead of a queued `ticket`, the running one included.
+    #[must_use]
+    pub fn ahead(&self, ticket: Ticket) -> Option<usize> {
+        let position = self.queue.iter().position(|queued| *queued == ticket)?;
+        Some(position.saturating_add(usize::from(self.running.is_some())))
+    }
+
     /// How many cells wait.
     #[must_use]
     pub fn queued(&self) -> usize {
@@ -162,6 +169,8 @@ mod tests {
         let (a, first) = scheduler.admit();
         let (b, second) = scheduler.admit();
         assert_eq!((first, second), (Admission::Running, Admission::Queued { ahead: 1 }));
+        assert_eq!(scheduler.ahead(b), Some(1));
+        assert_eq!(scheduler.ahead(a), None);
         assert_eq!(scheduler.leave(b), Left::Queued);
         assert!(scheduler.is_running(a), "the running cell is untouched (REV13a H1)");
         assert_eq!(scheduler.leave(a), Left::Running { next: None });

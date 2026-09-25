@@ -247,6 +247,7 @@ async fn terminating_a_queued_cell_ends_only_it_and_it_never_runs() {
     let (scripted, host) = host(CodeMode::Codex);
     let a = exec(&host, "// @exec: {\"yield_time_ms\": 300}\nawait new Promise(r => setTimeout(r, 1500)); text('A done');").await.unwrap();
     let b = exec(&host, "// @exec: {\"yield_time_ms\": 300}\nawait tools.side_effect({}); text('B done');").await.unwrap();
+    assert!(b.contains("Queued: 1 cell(s) ahead"), "a queued cell says so: {b}");
     let terminated = wait(&host, &cell_id(&b), json!({"terminate": true})).await.unwrap();
     assert!(terminated.contains("Script terminated"), "{terminated}");
     let waited = wait(&host, &cell_id(&a), json!({"yield_time_ms": 5000})).await;
@@ -616,4 +617,154 @@ async fn project_programs_are_plain_files_written_through_the_workspace() {
     if let Ok(harness) = Arc::try_unwrap(harness) {
         harness.shutdown().await;
     }
+}
+
+// REV13a H2 and M7 through a real session: the actor, its recorder, and its shutdown.
+
+/// A provider that replays one scripted response per request and offers one Codex-style model.
+struct ScriptedModel {
+    responses: Mutex<std::collections::VecDeque<Vec<Result<aim_llm::StreamEvent, aim_llm::LlmError>>>>,
+}
+
+impl aim_llm::ModelProvider for ScriptedModel {
+    fn id(&self) -> &'static str {
+        "scripted"
+    }
+
+    fn catalog(&self) -> aim_llm::BoxFuture<'_, Result<Vec<aim_llm::ModelInfo>, aim_llm::LlmError>> {
+        Box::pin(async {
+            Ok(vec![aim_llm::ModelInfo {
+                id: "m1".into(),
+                display_name: "m1".into(),
+                context_window: Some(100_000),
+                efforts: Vec::new(),
+                default_effort: None,
+                tiers: Vec::new(),
+                tools: true,
+                images: false,
+                hidden: false,
+                native: Some(json!({"tool_mode": "code_mode"})),
+            }])
+        })
+    }
+
+    fn stream(&self, _request: aim_llm::Request) -> aim_llm::BoxFuture<'_, Result<aim_llm::EventStream, aim_llm::LlmError>> {
+        let next = self.responses.lock().unwrap_or_else(PoisonError::into_inner).pop_front();
+        Box::pin(async move {
+            let events = next.ok_or_else(|| aim_llm::LlmError::new(aim_llm::LlmErrorKind::InvalidRequest, "script exhausted"))?;
+            let stream: aim_llm::EventStream = Box::pin(futures_util::stream::iter(events));
+            Ok(stream)
+        })
+    }
+}
+
+fn completed(stop: aim_proto::conversation::StopReason) -> aim_llm::StreamEvent {
+    aim_llm::StreamEvent::Completed { response_id: None, usage: aim_proto::conversation::Usage::default(), stop }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_ends_its_turn_while_a_cell_runs_and_closes_it_with_the_session() {
+    use aim::host::{CodeConfig, Connected, HostConfig, NativeServices, SessionClient as _, SessionHost, native_backends_with};
+    use aim::resources::ResourceConfig;
+    use aim::store::{MemoryStore, SessionStore as _};
+    use aim_llm::StreamEvent;
+    use aim_proto::conversation::{Item, Part, StopReason};
+    use aim_proto::daemon::{Location, Persistence, SessionSpec, SessionState};
+    use aim_proto::event::EventBody;
+    use futures_util::StreamExt as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let scripted = Arc::new(Scripted::default());
+    let workspace_closed = Arc::new(AtomicBool::new(false));
+    let code = "// @exec: {\"yield_time_ms\": 300}\nfor (;;) { await tools.side_effect({}); await new Promise(r => setTimeout(r, 50)); }";
+    let exec = Item::ToolCall { call_id: "call-exec".into(), name: "exec".into(), arguments: code.into(), native: None };
+    let answer = Item::Assistant { id: None, parts: vec![Part::Text { text: "started".into() }], native: None };
+    let provider = Arc::new(ScriptedModel {
+        responses: Mutex::new(
+            vec![
+                vec![Ok(StreamEvent::ItemDone { item: exec }), Ok(completed(StopReason::ToolUse))],
+                vec![Ok(StreamEvent::ItemDone { item: answer }), Ok(completed(StopReason::EndTurn))],
+            ]
+            .into(),
+        ),
+    });
+    let store = Arc::new(MemoryStore::default());
+    let (tools, closed) = (Arc::clone(&scripted), Arc::clone(&workspace_closed));
+    let workspaces: aim::host::WorkspaceFactory = Arc::new(move |spec: &SessionSpec| {
+        let closed = Arc::clone(&closed);
+        let connected = Connected {
+            tools: Arc::clone(&tools) as Arc<dyn ToolHost>,
+            root: spec.workspace.clone(),
+            location: "local".into(),
+            project: None,
+            shutdown: Box::new(move || Box::pin(async move { closed.store(true, Ordering::SeqCst) })),
+        };
+        Box::pin(async move { Ok(connected) })
+    });
+    let programs = tempfile::tempdir().expect("temporary programs");
+    let services = NativeServices {
+        media: None,
+        decider: None,
+        tools: Vec::new(),
+        code: Some(CodeConfig { worker: worker(), user_programs: programs.path().join("programs") }),
+    };
+    let for_factory = Arc::clone(&provider);
+    let host = SessionHost::new(HostConfig {
+        store: Arc::clone(&store) as Arc<dyn aim::store::SessionStore>,
+        backends: native_backends_with(
+            Arc::new(move |_name, _model| Ok((Arc::clone(&for_factory) as Arc<dyn aim_llm::ModelProvider>, "m1".to_owned()))),
+            workspaces,
+            8,
+            ResourceConfig::default(),
+            services,
+        ),
+        update_capacity: 1024,
+    });
+    let spec = SessionSpec {
+        workspace: "/w".into(),
+        location: Location::Local,
+        provider: "scripted".into(),
+        model: None,
+        effort: None,
+        agent: None,
+        persistence: Persistence::Persistent,
+    };
+    let id = host.create(spec).await.expect("session").meta.id;
+    let (_, mut updates) = host.attach(id.clone()).await.expect("attached");
+    host.prompt(id.clone(), vec![Part::Text { text: "start a cell".into() }]).await.expect("prompted");
+    // The turn ends (the model answered) although its exec cell still runs: the cell does not
+    // hold the turn's event channel open.
+    let mut got = Vec::new();
+    loop {
+        let update = tokio::time::timeout(Duration::from_secs(5), updates.next()).await.expect("the turn ends").expect("an update");
+        let idle = matches!(update, SessionUpdate::StateChanged { state: SessionState::Idle });
+        got.push(update);
+        if idle {
+            break;
+        }
+    }
+    assert!(got.iter().any(|update| matches!(update, SessionUpdate::TurnEnded { .. })));
+    let children = got
+        .iter()
+        .filter(|update| matches!(update, SessionUpdate::ToolStarted { name, parent: Some(parent), .. } if name == "side_effect" && parent == "call-exec"))
+        .count();
+    assert!(children >= 1, "nested calls are child events of the exec call: {got:?}");
+    // Between turns the cell is unobserved, so it makes no further calls.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let between = scripted.count("side_effect");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(scripted.count("side_effect"), between, "no nested call runs unobserved between turns");
+    // The session log keeps the nested calls under their parent.
+    let (_, logged) = store.load(id.clone()).await.expect("log");
+    assert!(logged.iter().any(
+        |event| matches!(&event.body, EventBody::NestedToolStarted { parent, name, .. } if parent == "call-exec" && name == "side_effect")
+    ));
+    // Closing the session ends the cell and then the workspace, promptly.
+    let started = Instant::now();
+    host.close(id).await.expect("closed");
+    eventually("the workspace to shut down", || workspace_closed.load(Ordering::SeqCst)).await;
+    assert!(started.elapsed() < Duration::from_secs(4), "shutdown took {:?}", started.elapsed());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(scripted.count("side_effect"), between, "no nested call after close");
+    eventually("the session's tools to be released", || Arc::strong_count(&scripted) <= 2).await;
 }

@@ -21,6 +21,7 @@ use aim_proto::tool::ToolResult;
 use aim_rpc::{Peer, PeerConfig, Router};
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
+use tokio::sync::mpsc::{self, UnboundedSender, WeakUnboundedSender};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -42,10 +43,37 @@ pub trait OutputSink: Send + Sync {
     fn push(&self, output: CellOutput);
 }
 
+/// The turn a cell is bound to: its call and the turn's events, held weakly. A strong sender
+/// would keep the turn's event channel open after the turn, and the session drains that channel
+/// to its end before it goes idle.
+#[derive(Clone)]
+struct Binding {
+    call_id: String,
+    events: WeakUnboundedSender<SessionUpdate>,
+    cancel: CancellationToken,
+}
+
+impl Binding {
+    fn of(context: ToolCallContext) -> Self {
+        Self { call_id: context.call_id, events: context.events.downgrade(), cancel: context.cancel }
+    }
+
+    /// The turn's events while the turn is live: someone holds its sender and reads it.
+    fn live(&self) -> Option<UnboundedSender<SessionUpdate>> {
+        self.events.upgrade().filter(|events| !events.is_closed())
+    }
+
+    fn send(&self, update: SessionUpdate) {
+        if let Some(events) = self.live() {
+            drop(events.send(update));
+        }
+    }
+}
+
 /// Which turn observes a cell, so its nested calls can be shown and recorded under that turn's
 /// call (ADR 0066). A cell is bound when it starts, and a later `wait` rebinds it.
 pub struct Observer {
-    bound: Mutex<Option<ToolCallContext>>,
+    bound: Mutex<Option<Binding>>,
     rebound: Notify,
 }
 
@@ -53,15 +81,15 @@ impl Observer {
     /// Bound to `context`, or unobserved (`None`, outside the agent loop).
     #[must_use]
     pub fn new(context: Option<ToolCallContext>) -> Self {
-        Self { bound: Mutex::new(context), rebound: Notify::new() }
+        Self { bound: Mutex::new(context.map(Binding::of)), rebound: Notify::new() }
     }
 
     /// Binds the cell to `context` when its current turn is over, or when it had none.
     pub fn rebind(&self, context: Option<ToolCallContext>) {
         let Some(context) = context else { return };
         let mut bound = locked(&self.bound);
-        if bound.as_ref().is_none_or(|current| current.events.is_closed()) {
-            *bound = Some(context);
+        if bound.as_ref().is_none_or(|current| current.live().is_none()) {
+            *bound = Some(Binding::of(context));
             drop(bound);
             self.rebound.notify_waiters();
         }
@@ -70,7 +98,7 @@ impl Observer {
     /// The cancel token of the turn the cell is bound to.
     #[must_use]
     pub fn turn(&self) -> Option<CancellationToken> {
-        locked(&self.bound).as_ref().map(|context| context.cancel.clone())
+        locked(&self.bound).as_ref().map(|binding| binding.cancel.clone())
     }
 
     /// Resolves when the cell is rebound. Enable it before reading [`Observer::turn`].
@@ -78,17 +106,17 @@ impl Observer {
         self.rebound.notified()
     }
 
-    /// The live context a nested call runs under. It waits while the bound turn is over, until a
+    /// The live turn a nested call runs under. It waits while the bound turn is over, until a
     /// rebind, so a nested call never runs unobserved. An unobserved cell (no context) runs its
     /// calls without events.
-    async fn live(&self) -> Option<ToolCallContext> {
+    async fn live(&self) -> Option<Binding> {
         loop {
             let rebound = self.rebound.notified();
             tokio::pin!(rebound);
             rebound.as_mut().enable();
             match locked(&self.bound).as_ref() {
                 None => return None,
-                Some(context) if !context.events.is_closed() => return Some(context.clone()),
+                Some(binding) if binding.live().is_some() => return Some(binding.clone()),
                 Some(_) => {}
             }
             rebound.await;
@@ -199,27 +227,22 @@ async fn nested_call(bridges: Arc<Bridges>, call: ToolCall) -> Result<ToolCallRe
     if bridges.get(&call.cell_id).is_none() {
         return Err(ProtoError::new(ErrorCode::Denied, "cell is not active"));
     }
-    // `<cell UUIDv7>:<n>` keeps the mint time that aimx's dedup horizon reads (REV13a L8).
+    // `<cell UUIDv7>:<n>` keeps the mint time that aimx's dedup horizon reads (`REV13a` L8).
     let call_id = format!("{}:{}", call.cell_id, call.call_id);
-    let mut finished = observer.map(|context| {
-        drop(context.events.send(SessionUpdate::ToolStarted {
+    let mut finished = observer.map(|binding| {
+        binding.send(SessionUpdate::ToolStarted {
             call_id: call_id.clone(),
             name: call.name.clone(),
             arguments: call.arguments.to_string(),
-            parent: Some(context.call_id.clone()),
-        }));
-        Finished { context, call_id: call_id.clone(), name: call.name.clone(), result: None }
+            parent: Some(binding.call_id.clone()),
+        });
+        Finished { binding, call_id: call_id.clone(), name: call.name.clone(), result: None }
     });
     let span = tracing::info_span!("code_nested_tool", cell_id = %call.cell_id, call_id = call.call_id, tool = %call.name);
-    // The nested call runs as a call of its own turn, so a host that makes further calls (a
-    // subagent) names this one as their parent.
-    let child = finished.as_ref().map(|finished| ToolCallContext {
-        call_id: call_id.clone(),
-        events: finished.context.events.clone(),
-        cancel: finished.context.cancel.clone(),
-    });
-    let key = IdempotencyKey::new(call_id);
-    let result = match child {
+    let key = IdempotencyKey::new(call_id.clone());
+    let result = match finished.as_ref().map(|finished| relayed(call_id, &finished.binding)) {
+        // The nested call runs as a call of its own, so a host that makes further calls (a
+        // subagent) names this one as their parent.
         Some(child) => {
             let future = child.enter(|| bridge.host.call(call.name, call.arguments, key));
             child.scope(future.instrument(span)).await
@@ -236,9 +259,23 @@ async fn nested_call(bridges: Arc<Bridges>, call: ToolCall) -> Result<ToolCallRe
     Ok(ToolCallResult { result: result? })
 }
 
+/// A context for a nested call whose events reach the turn through a relay. The relay holds the
+/// turn's sender only weakly, so a long nested call never keeps the turn's channel open after
+/// the turn; it ends with the call.
+fn relayed(call_id: String, binding: &Binding) -> ToolCallContext {
+    let (events, mut relay) = mpsc::unbounded_channel::<SessionUpdate>();
+    let turn = binding.clone();
+    tokio::spawn(async move {
+        while let Some(update) = relay.recv().await {
+            turn.send(update);
+        }
+    });
+    ToolCallContext { call_id, events, cancel: binding.cancel.clone() }
+}
+
 /// Emits a nested call's `ToolFinished` when it ends, including when the cell is killed first.
 struct Finished {
-    context: ToolCallContext,
+    binding: Binding,
     call_id: String,
     name: String,
     result: Option<ToolResult>,
@@ -247,12 +284,12 @@ struct Finished {
 impl Drop for Finished {
     fn drop(&mut self) {
         let result = self.result.take().unwrap_or_else(|| ToolResult::error("the code cell ended before this call finished"));
-        drop(self.context.events.send(SessionUpdate::ToolFinished {
+        self.binding.send(SessionUpdate::ToolFinished {
             call_id: std::mem::take(&mut self.call_id),
             name: std::mem::take(&mut self.name),
             result,
-            parent: Some(self.context.call_id.clone()),
-        }));
+            parent: Some(self.binding.call_id.clone()),
+        });
     }
 }
 
@@ -292,6 +329,14 @@ impl Supervisor {
         state.names.insert(ticket, cell_id.to_owned());
         drop(state);
         Ok(CellTicket { inner: Arc::clone(&self.inner), ticket, cell_id: cell_id.to_owned(), in_flight: false })
+    }
+
+    /// How many cells are ahead of `cell_id` while it waits to run.
+    #[must_use]
+    pub fn queued_ahead(&self, cell_id: &str) -> Option<usize> {
+        let state = locked(&self.inner.state);
+        let ticket = state.names.iter().find(|(_, name)| *name == cell_id).map(|(ticket, _)| *ticket)?;
+        state.scheduler.ahead(ticket)
     }
 
     /// Ends every cell and the worker; later admissions are refused.

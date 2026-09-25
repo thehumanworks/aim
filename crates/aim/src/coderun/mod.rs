@@ -267,7 +267,17 @@ impl CodeToolHost {
             locked(&self.shared.cells).remove(cell_id);
         }
         let (output, done) = polled?;
-        if done { Ok(ToolResult::text(output)) } else { Ok(ToolResult::text(format!("{output}\nScript running with cell ID {cell_id}"))) }
+        if done {
+            return Ok(ToolResult::text(output));
+        }
+        // A queued cell says so, instead of looking busy while it has not started (M9).
+        let queued = self
+            .shared
+            .supervisor
+            .queued_ahead(cell_id)
+            .map(|ahead| format!("\nQueued: {ahead} cell(s) ahead of it; it starts when they finish."))
+            .unwrap_or_default();
+        Ok(ToolResult::text(format!("{output}{queued}\nScript running with cell ID {cell_id}")))
     }
 
     /// Forgets finished cells nobody waited for, oldest first, beyond [`FINISHED_CELLS`] (L4).
