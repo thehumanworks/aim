@@ -207,3 +207,4 @@ client still builds.
   (nothing else of this batch running): `mise run check` green — 1,044 tests passed, 0 failed,
   107 ignored (live); wire gate passed; `mise run verify`: 364 verified, 0 errors. Batch closed;
   PR opened against `main`.
+- 2026-09-25 — PR: https://github.com/thehumanworks/aim/pull/2
