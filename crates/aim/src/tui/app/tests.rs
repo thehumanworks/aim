@@ -917,7 +917,7 @@ fn choice(value: &str, name: Option<&str>) -> aim_proto::daemon::ChoiceValue {
 fn options(models: &[&str], efforts: &[&str]) -> SessionUpdate {
     SessionUpdate::Options {
         options: SessionOptions {
-            models: models.iter().map(|m| choice(m, Some(&m.to_uppercase()))).collect(),
+            models: models.iter().map(|m| choice(m, Some(&format!("Model {m}")))).collect(),
             efforts: efforts.iter().map(|e| choice(e, None)).collect(),
         },
     }
@@ -1051,7 +1051,7 @@ fn options_replace_seen_values_and_never_leak_across_providers() {
     // The session's options replace them, with details.
     update_on(&mut app, "o1", options(&["openai/gpt-4.1-mini", "anthropic/claude-sonnet-5"], &["low", "medium", "high"]));
     let models = hints_for(&mut app, "/model ");
-    assert_eq!(models[1], ("anthropic/claude-sonnet-5".to_owned(), "ANTHROPIC/CLAUDE-SONNET-5".to_owned()));
+    assert_eq!(models[1], ("anthropic/claude-sonnet-5".to_owned(), "Model anthropic/claude-sonnet-5".to_owned()));
     assert_eq!(values_for(&mut app, "/effort "), ["low", "medium", "high", "auto"]);
     // Switching providers: nothing of openrouter's is offered, codex's seen model is.
     typed(&mut app, "/provider codex");

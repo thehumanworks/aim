@@ -103,9 +103,16 @@ pub fn effort_offered(ladder: &[ChoiceValue], requested: &str) -> bool {
     switch::effort_sent(&ids, request)
 }
 
-/// What the popup says about a choice: its name and description.
+/// What the popup says about a choice: its name and description, without repeating the value
+/// (`low`, "Low") or a name the description starts with ("Fable 5.1", "Fable 5.1 · Most capable…").
 fn detail(choice: &ChoiceValue) -> String {
-    [choice.name.as_deref(), choice.description.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" · ")
+    let description = choice.description.as_deref().filter(|d| !d.is_empty());
+    let name = choice
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case(&choice.value))
+        .filter(|name| description.is_none_or(|d| !d.starts_with(name)));
+    [name, description].into_iter().flatten().collect::<Vec<_>>().join(" · ")
 }
 
 /// `/effort` candidates: the ladder's levels (or, before the session said, values seen for its
@@ -220,6 +227,18 @@ mod tests {
         assert!(effort_offered(&ladder, AUTO_EFFORT));
         assert!(!effort_offered(&ladder, "ultra"));
         assert!(effort_offered(&[], "ultra"), "an unknown ladder leaves the decision to the session");
+    }
+
+    #[test]
+    fn details_do_not_repeat_the_value_or_the_name() {
+        let with = |value: &str, name: Option<&str>, description: Option<&str>| {
+            detail(&ChoiceValue { value: value.into(), name: name.map(Into::into), description: description.map(Into::into) })
+        };
+        assert_eq!(with("low", Some("Low"), None), "");
+        assert_eq!(with("claude-fable-5-1[1m]", Some("Fable 5.1"), Some("Fable 5.1 · Most capable")), "Fable 5.1 · Most capable");
+        assert_eq!(with("opus[1m]", Some("Opus 5.5"), Some("Opus 5.5 with 1M context")), "Opus 5.5 with 1M context");
+        assert_eq!(with("default", Some("Default (recommended)"), Some("Opus (1M context)")), "Default (recommended) · Opus (1M context)");
+        assert_eq!(with("gpt-6-sol", Some("GPT-6-Sol"), Some("272k context")), "272k context", "a name that only differs in case");
     }
 
     #[test]
