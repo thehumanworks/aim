@@ -296,6 +296,52 @@ method!(
     SessionAttach = "session.attach" (SessionRef) -> SessionAttachResult
 );
 
+/// A bounded snapshot reply for clients that can page transcripts larger than one RPC frame.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SessionAttachPagedResult {
+    /// State at the snapshot boundary.
+    pub summary: SessionSummary,
+    /// Opaque token for this connection's immutable transcript snapshot.
+    pub snapshot_id: String,
+    /// Length of the serialized `Vec<Item>` in bytes.
+    pub total_bytes: u64,
+    /// First bounded chunk of the serialized transcript.
+    pub first_chunk: Base64Bytes,
+}
+
+method!(
+    /// `session.attach_paged` — attach with a bounded first transcript chunk; updates follow the
+    /// reply, and `session.transcript` retrieves the rest of this immutable snapshot.
+    SessionAttachPaged = "session.attach_paged" (SessionRef) -> SessionAttachPagedResult
+);
+
+/// Request another byte chunk from an immutable attached transcript snapshot.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SessionTranscriptParams {
+    /// The attached session.
+    pub session: String,
+    /// Token returned by `session.attach_paged` on this connection.
+    pub snapshot_id: String,
+    /// Next byte offset, starting at the length of the first chunk.
+    pub offset: u64,
+}
+
+/// One bounded chunk of a serialized transcript snapshot.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SessionTranscriptResult {
+    /// Bytes from `offset` through `next_offset`.
+    pub chunk: Base64Bytes,
+    /// Byte offset to request next; equals `total_bytes` after the final chunk.
+    pub next_offset: u64,
+    /// Constant snapshot length for consistency checks.
+    pub total_bytes: u64,
+}
+
+method!(
+    /// `session.transcript` — read another bounded byte chunk of an attached snapshot.
+    SessionTranscript = "session.transcript" (SessionTranscriptParams) -> SessionTranscriptResult
+);
+
 method!(
     /// `session.detach` — stop receiving a session's updates (the session keeps running).
     SessionDetach = "session.detach" (SessionRef) -> ()
