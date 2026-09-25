@@ -177,6 +177,13 @@ impl AcpSession {
         self.shared.notify("session/cancel", json!({"sessionId": self.id}))
     }
 
+    /// A handle that cancels this session's running turn from another task (the turn stream
+    /// borrows the session).
+    #[must_use]
+    pub fn canceller(&self) -> CancelHandle {
+        CancelHandle { shared: Arc::clone(&self.shared), session_id: self.id.clone() }
+    }
+
     /// Takes the updates that arrived since the last turn ended (titles, commands, config
     /// changes). Updates not taken this way are delivered at the start of the next turn.
     pub fn take_idle_events(&mut self) -> Vec<AcpEvent> {
@@ -256,6 +263,30 @@ impl AcpSession {
 impl Drop for AcpSession {
     fn drop(&mut self) {
         self.shared.router.unregister(&self.id);
+    }
+}
+
+/// Cancels a session's running turn; cheap to clone and send to other tasks.
+#[derive(Clone)]
+pub struct CancelHandle {
+    shared: Arc<Shared>,
+    session_id: String,
+}
+
+impl core::fmt::Debug for CancelHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CancelHandle").field("session_id", &self.session_id).finish_non_exhaustive()
+    }
+}
+
+impl CancelHandle {
+    /// Sends `session/cancel`; the turn then ends with a cancelled stop.
+    ///
+    /// # Errors
+    ///
+    /// A connection error.
+    pub fn cancel(&self) -> Result<(), AcpError> {
+        self.shared.notify("session/cancel", json!({"sessionId": self.session_id}))
     }
 }
 

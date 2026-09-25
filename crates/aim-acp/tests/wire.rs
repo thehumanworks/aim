@@ -349,6 +349,18 @@ async fn an_agent_vanishing_mid_turn_ends_the_stream_with_an_error() {
 }
 
 #[test]
+fn handles_can_move_across_tasks() {
+    fn send<T: Send>() {}
+    fn sync<T: Sync>() {}
+    send::<AcpClient>();
+    sync::<AcpClient>();
+    send::<aim_acp::AcpSession>();
+    send::<aim_acp::Turn<'static>>();
+    send::<aim_acp::CancelHandle>();
+    sync::<aim_acp::CancelHandle>();
+}
+
+#[test]
 fn aim_tool_authority_meta_is_the_documented_recipe() {
     let mut options = SessionOptions::new("/w");
     options.persist = false;

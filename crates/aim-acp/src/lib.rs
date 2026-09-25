@@ -56,4 +56,4 @@ pub use permission::{
 };
 pub use probe::{ProbeReport, Requirement};
 pub use process::{MAX_LINE_BYTES, STDERR_TAIL_BYTES, WireDirection, WireTap};
-pub use session::{ABANDONED_TURN_GRACE, AcpSession, Turn};
+pub use session::{ABANDONED_TURN_GRACE, AcpSession, CancelHandle, Turn};

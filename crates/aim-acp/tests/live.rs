@@ -349,6 +349,20 @@ async fn live_aim_tools_mode_start() {
     let start = Instant::now();
     let mut session = client.new_session(options).await.unwrap();
     println!("[live_aim_tools_mode_start] session/new (aim tools) {} ms", start.elapsed().as_millis());
+    // Does Claude Code connect the session's MCP servers before any prompt? (Lets a probe verify
+    // the spawn without a model call.)
+    let mut listed_before_prompt = false;
+    for _ in 0..30 {
+        if std::fs::read_to_string(&log).is_ok_and(|text| text.contains("tools/list")) {
+            listed_before_prompt = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!(
+        "[live_aim_tools_mode_start] MCP server spawned and listed before the first prompt: {listed_before_prompt} ({} ms after session/new was sent)",
+        start.elapsed().as_millis()
+    );
 
     let prompt = format!("Call the mcp__aim__echo tool with text \"{nonce}\", then reply with exactly the text it returned.");
     let (events, reply, elapsed) = run_turn(&mut session, &prompt).await;

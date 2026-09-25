@@ -80,9 +80,20 @@ impl AcpClient {
     /// Only when the probe session cannot be created (including [`AcpError::NeedsLogin`]); a
     /// missing capability is reported, not an error.
     pub async fn probe(&self, cwd: &Path) -> Result<ProbeReport, AcpError> {
-        let start = Instant::now();
         let mut options = SessionOptions::new(cwd);
         options.persist = false;
+        self.probe_with(options).await
+    }
+
+    /// [`Self::probe`] with a caller-chosen probe session, e.g. aim-tools options carrying aim's MCP
+    /// server: Claude Code connects session MCP servers while it creates the session, before any
+    /// prompt (observed live on 0.81.2), so aim's server itself can confirm it was spawned.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::probe`].
+    pub async fn probe_with(&self, options: SessionOptions) -> Result<ProbeReport, AcpError> {
+        let start = Instant::now();
         let mut session = self.new_session(options).await?;
         let session_new_ms = elapsed_ms(start);
         let config = session.config_options().to_vec();
