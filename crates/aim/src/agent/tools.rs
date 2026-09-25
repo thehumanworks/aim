@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use aim_proto::error::ProtoError;
+use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolResult, ToolSpec};
 use serde_json::Value;
@@ -26,4 +26,10 @@ pub trait ToolHost: Send + Sync {
     /// A returned `Err` is a protocol-level failure (denied, unavailable, …); the loop shows it to
     /// the model as a failed tool result rather than aborting the turn.
     fn call(&self, name: String, arguments: Value, key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>>;
+
+    /// Writes generated binary content through the bound harness. The harness enforces workspace
+    /// grants and idempotency, including when the workspace is on an SSH host.
+    fn write_blob(&self, _path: String, _bytes: Vec<u8>, _key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        Box::pin(async { Err(ProtoError::new(ErrorCode::Unavailable, "workspace does not support binary writes")) })
+    }
 }

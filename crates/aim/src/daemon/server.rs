@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 
 use aim_kernel::negotiate::{Generations, negotiate};
 use aim_proto::daemon::{
-    DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeResult, DetachReason, PromptOutcome, SessionAttach, SessionCancel, SessionClose,
-    SessionConfigParams, SessionCreate, SessionDetach, SessionDetachedNotification, SessionDetachedParams, SessionList, SessionListResult,
-    SessionPrompt, SessionPromptParams, SessionSetConfig, SessionState, SessionUpdate, SessionUpdateNotification, SessionUpdateParams,
+    DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeResult, DetachReason, MAX_DAEMON_MESSAGE_BYTES, MediaTranscribe, PromptOutcome,
+    SessionAttach, SessionCancel, SessionClose, SessionConfigParams, SessionCreate, SessionDetach, SessionDetachedNotification,
+    SessionDetachedParams, SessionList, SessionListResult, SessionPrompt, SessionPromptParams, SessionSetConfig, SessionState,
+    SessionUpdate, SessionUpdateNotification, SessionUpdateParams,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::PeerInfo;
@@ -206,7 +207,7 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
                 generation,
                 server: PeerInfo { name: "aim".into(), version: env!("CARGO_PKG_VERSION").into() },
                 pid: std::process::id(),
-                max_message_bytes: u64::try_from(aim_rpc::DEFAULT_MAX_MESSAGE_BYTES).unwrap_or(u64::MAX),
+                max_message_bytes: u64::try_from(MAX_DAEMON_MESSAGE_BYTES).unwrap_or(u64::MAX),
             })
         })
         .method::<SessionCreate, _, _>(|state, _, spec| async move { state.host.create(spec).await })
@@ -253,7 +254,8 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
         .method::<SessionPrompt, _, _>(|state, _, params| async move { state.dedup.prompt(Arc::clone(&state.host), params).await })
         .method::<SessionCancel, _, _>(|state, _, reference| async move { state.host.cancel(reference.session).await })
         .method::<SessionSetConfig, _, _>(|state, _, params: SessionConfigParams| async move { state.host.set_config(params).await })
-        .method::<SessionClose, _, _>(|state, _, reference| async move { state.host.close(reference.session).await });
+        .method::<SessionClose, _, _>(|state, _, reference| async move { state.host.close(reference.session).await })
+        .method::<MediaTranscribe, _, _>(|state, _, params| async move { state.host.transcribe(params).await });
     GuardedRouter { connection, router }
 }
 
@@ -323,7 +325,7 @@ fn serve_connection(stream: UnixStream, host: Arc<dyn SessionClient>, dedup: Arc
         dedup,
     });
     let (read, write) = stream.into_split();
-    Ok(Peer::spawn(read, write, routes(connection), PeerConfig::default()))
+    Ok(Peer::spawn(read, write, routes(connection), PeerConfig { max_message_bytes: MAX_DAEMON_MESSAGE_BYTES, ..PeerConfig::default() }))
 }
 
 /// Serves a supplied session host until a signal or optional idle timeout.

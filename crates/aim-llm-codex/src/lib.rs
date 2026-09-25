@@ -8,6 +8,7 @@
 pub mod auth;
 mod errors;
 mod limits;
+pub mod media;
 mod stream;
 mod turn_state;
 mod wire;

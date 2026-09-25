@@ -11,6 +11,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::content::Base64Bytes;
 use crate::conversation::{Item, Part, RateLimits, StopReason, Usage};
 use crate::event::SessionMeta;
 use crate::harness::{AuthProof, GenerationRange, PeerInfo};
@@ -20,6 +21,9 @@ use crate::{method, notification};
 
 /// Protocol generations of `aim-daemon` this build can speak (inclusive range).
 pub const DAEMON_GENERATIONS: (u32, u32) = (1, 1);
+
+/// Daemon frame limit, large enough for 25 MiB of base64-encoded transcription audio.
+pub const MAX_DAEMON_MESSAGE_BYTES: usize = 36 * 1024 * 1024;
 
 /// `initialize` parameters: the first request on every daemon connection.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
@@ -353,6 +357,35 @@ method!(
 method!(
     /// `session.close` — stop the session's agent; the log remains.
     SessionClose = "session.close" (SessionRef) -> ()
+);
+
+/// `media.transcribe` parameters. Audio is sent to ChatGPT, which retains it for 30 days
+/// (docs/research/live-probes.md); private and ephemeral sessions require explicit consent.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MediaTranscribeParams {
+    /// WAV audio bytes, encoded as base64 on the wire (at most 25 MiB decoded).
+    pub audio: Base64Bytes,
+    /// Audio format; currently only `wav` is supported.
+    pub format: String,
+    /// Explicit consent to the provider's 30-day audio retention for private sessions.
+    #[serde(default)]
+    pub accept_retention: bool,
+    /// Session whose persistence policy applies; absent for a standalone transcription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+/// `media.transcribe` result.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MediaTranscribeResult {
+    /// Recognized speech.
+    pub text: String,
+}
+
+method!(
+    /// `media.transcribe` — transcribe WAV audio through ChatGPT. The provider retains audio for
+    /// 30 days; private and ephemeral sessions must set `accept_retention` to `true`.
+    MediaTranscribe = "media.transcribe" (MediaTranscribeParams) -> MediaTranscribeResult
 );
 
 /// `session.update` notification parameters.

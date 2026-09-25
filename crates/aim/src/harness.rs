@@ -10,11 +10,12 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use aim_proto::content::Content;
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{
-    BackendSpec, ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, ExecRead, ExecReadParams, ExecReadResult, GenerationRange,
-    Initialize, InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams, ToolsList, ToolsListParams, WatchEvent,
-    WatchEventParams, WorkspaceInfo, WorkspaceOpen, WorkspaceOpenParams,
+    BackendSpec, ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, ExecRead, ExecReadParams, ExecReadResult, FsWrite,
+    FsWriteParams, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, Precondition, ToolsCall, ToolsCallParams,
+    ToolsList, ToolsListParams, WatchEvent, WatchEventParams, WorkspaceInfo, WorkspaceOpen, WorkspaceOpenParams,
 };
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::rpc::Notification as _;
@@ -253,5 +254,22 @@ impl ToolHost for HarnessClient {
         let peer = self.peer.clone();
         let workspace = self.workspace.id.clone();
         Box::pin(async move { peer.call::<ToolsCall>(ToolsCallParams { workspace, name, arguments, idempotency_key: Some(key) }).await })
+    }
+
+    fn write_blob(&self, path: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        let peer = self.peer.clone();
+        let workspace = self.workspace.id.clone();
+        Box::pin(async move {
+            peer.call::<FsWrite>(FsWriteParams {
+                workspace,
+                path,
+                content: Content::from_bytes(bytes),
+                precondition: Precondition::IfAbsent,
+                create_dirs: true,
+                idempotency_key: key,
+            })
+            .await
+            .map(|_| ())
+        })
     }
 }

@@ -18,11 +18,12 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use aim_llm::ModelProvider;
+use aim_llm::{LlmErrorKind, ModelProvider};
+use aim_llm_codex::media::{MediaClient, MediaConfig};
 use aim_proto::conversation::{Item, Part};
 use aim_proto::daemon::{
-    Location, Persistence, PromptOutcome, SessionAttachResult, SessionConfigParams, SessionListParams, SessionSpec, SessionState,
-    SessionSummary, SessionUpdate,
+    Location, MediaTranscribeParams, MediaTranscribeResult, Persistence, PromptOutcome, SessionAttachResult, SessionConfigParams,
+    SessionListParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::event::{EventBody, SessionEvent, SessionMeta};
@@ -38,7 +39,7 @@ use crate::resources::backend::WithSkills;
 use crate::resources::tools::AllowedTools;
 use crate::resources::{self, Files, HarnessFiles, ResourceConfig};
 use crate::session::{self, Recorder};
-use crate::store::{MemoryStore, SessionStore};
+use crate::store::{MemoryStore, SessionStore, StoreError};
 
 /// A boxed, sendable, owned future.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -231,7 +232,16 @@ pub fn native_backends_with(
                 Some(agent) => format!("aim:{root}:agent:{}", agent.meta.name),
                 None => format!("aim:{root}"),
             };
-            let Connected { tools, location, shutdown, .. } = workspace;
+            let Connected { mut tools, location, shutdown, .. } = workspace;
+            // Codex media services are credential-local and can be offered to any native provider.
+            // A missing credential omits the tools rather than making every call fail at runtime.
+            // They are composed before the agent's allowlist, which then applies to them too.
+            if let Ok(codex) = crate::providers::codex() {
+                let media = MediaClient::with_provider(codex, MediaConfig::default());
+                if media.has_credentials().await {
+                    tools = Arc::new(crate::media::Dispatcher::new(tools, Arc::new(media)));
+                }
+            }
             let tools: Arc<dyn ToolHost> = match &agent {
                 Some(agent) if !agent.tools.is_unrestricted() => {
                     let allowed = AllowedTools::new(tools, agent.tools.clone(), agent.meta.name.clone());
@@ -299,6 +309,11 @@ pub trait SessionClient: Send + Sync {
     fn set_config(&self, params: SessionConfigParams) -> BoxFuture<Result<(), ProtoError>>;
     /// Stops the session's agent; the log remains.
     fn close(&self, session: String) -> BoxFuture<Result<(), ProtoError>>;
+    /// Transcribes WAV audio. ChatGPT retains audio for 30 days. An ephemeral session requires
+    /// `accept_retention: true`; the host checks this before contacting the provider.
+    fn transcribe(&self, _params: MediaTranscribeParams) -> BoxFuture<Result<MediaTranscribeResult, ProtoError>> {
+        Box::pin(async { Err(ProtoError::new(ErrorCode::Unavailable, "transcription is unavailable")) })
+    }
 }
 
 /// Host settings.
@@ -738,6 +753,48 @@ fn updates_of(rx: broadcast::Receiver<SessionUpdate>) -> UpdateStream {
 }
 
 impl SessionClient for SessionHost {
+    fn transcribe(&self, params: MediaTranscribeParams) -> BoxFuture<Result<MediaTranscribeResult, ProtoError>> {
+        let host = self.clone();
+        Box::pin(async move {
+            if params.format != "wav" {
+                return Err(err(ErrorCode::InvalidParams, "transcription requires wav audio"));
+            }
+            if params.audio.0.is_empty() {
+                return Err(err(ErrorCode::InvalidParams, "audio is empty"));
+            }
+            if params.audio.0.len() > 25 * 1024 * 1024 {
+                return Err(err(ErrorCode::LimitExceeded, "audio exceeds 25 MiB"));
+            }
+            if let Some(session) = &params.session {
+                let persistence = if let Ok(live) = host.live(session) {
+                    lock(&live.summary).persistence
+                } else {
+                    // Only persistent sessions reach the durable store. Do not resume an
+                    // agent just to decide whether audio can leave the machine.
+                    host.config.store.load(session.clone()).await.map_err(|e| match e {
+                        StoreError::NotFound(_) => err(ErrorCode::NotFound, "session not found"),
+                        _ => err(ErrorCode::Internal, "cannot read session privacy"),
+                    })?;
+                    Persistence::Persistent
+                };
+                if persistence == Persistence::Ephemeral && !params.accept_retention {
+                    return Err(err(ErrorCode::Denied, "private audio requires accept_retention=true (ChatGPT retains audio for 30 days)"));
+                }
+            }
+            let provider = crate::providers::codex().map_err(|_| err(ErrorCode::Unavailable, "transcription service unavailable"))?;
+            let media = MediaClient::with_provider(provider, MediaConfig::default());
+            let text = media.transcribe(&params.audio.0).await.map_err(|e| {
+                let code = match e.kind {
+                    LlmErrorKind::Auth => ErrorCode::Unauthenticated,
+                    LlmErrorKind::InvalidRequest => ErrorCode::InvalidParams,
+                    _ => ErrorCode::Unavailable,
+                };
+                err(code, "transcription failed")
+            })?;
+            Ok(MediaTranscribeResult { text })
+        })
+    }
+
     fn create(&self, spec: SessionSpec) -> BoxFuture<Result<SessionSummary, ProtoError>> {
         let host = self.clone();
         Box::pin(async move { host.start(spec, None).await })
