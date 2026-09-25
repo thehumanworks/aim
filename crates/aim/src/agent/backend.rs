@@ -85,6 +85,7 @@ impl Backend for Agent {
             // `auto` hands the effort back to aim: the level in force is where decisions start.
             let auto = effort.as_deref() == Some(AUTO_EFFORT);
             let effort = if auto { None } else { effort };
+            let mut start = None;
             if model.is_some() || effort.is_some() {
                 // Capabilities are data: check the change against the provider's catalog before
                 // anything changes. Without a catalog (it failed, or lists nothing) the change is
@@ -102,6 +103,7 @@ impl Backend for Agent {
                     {
                         return Err(format!("effort `{effort}` is not offered by `{target}` (offers: {})", info.efforts.join(", ")));
                     }
+                    start = super::ladder_start(info);
                 }
             }
             if auto {
@@ -112,9 +114,15 @@ impl Backend for Agent {
             if model.is_some() {
                 self.forget_window();
             }
+            // An advised automatic session that switches models starts from the new model's ladder,
+            // so its requests carry the level its decisions record (REV9-m1).
+            let restart = !self.explicit_effort && self.decider.is_some() && effort.is_none();
             let config = self.config_mut();
             if let Some(model) = model {
                 config.model = model;
+                if restart {
+                    config.effort = start;
+                }
             }
             if effort.is_some() {
                 config.effort = effort;

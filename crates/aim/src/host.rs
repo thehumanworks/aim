@@ -247,10 +247,13 @@ pub fn native_backends_with(
             if resources.skill_budget.is_none() && model != guess {
                 window = context::context_window(provider.as_ref(), &model).await;
             }
-            // Automatic unless the session or its agent set an effort; a resume keeps its source.
-            let effort_source = recorded
-                .as_ref()
-                .map_or(if effort.is_some() { EffortSource::Explicit } else { EffortSource::Auto }, |recorded| recorded.effort_source);
+            // An effort that is not set is automatic. A set one is explicit for a new session, and
+            // keeps its recorded source on resume (older logs, with no source, resume as they did).
+            let effort_source = match (&effort, &recorded) {
+                (None, _) => EffortSource::Auto,
+                (Some(_), Some(recorded)) => recorded.effort_source,
+                (Some(_), None) => EffortSource::Explicit,
+            };
             // Advice is for persistent sessions only (ADR 0013). The decider is attached whatever
             // the source, so `effort: "auto"` can hand the effort back later.
             let decider = if spec.persistence == Persistence::Persistent { services.decider.clone() } else { None };
@@ -308,11 +311,7 @@ pub fn native_backends_with(
 /// its lowest level (some catalogs omit a default; guessing what the endpoint would choose for
 /// `effort: None` would give the controller no real index).
 async fn starting_effort(provider: &dyn ModelProvider, model: &str) -> Option<String> {
-    let entry = provider.catalog().await.ok()?.into_iter().find(|entry| entry.id == model)?;
-    if !(2..=10).contains(&entry.efforts.len()) {
-        return None;
-    }
-    entry.default_effort.filter(|default| entry.efforts.contains(default)).or_else(|| entry.efforts.first().cloned())
+    crate::agent::ladder_start(&provider.catalog().await.ok()?.into_iter().find(|entry| entry.id == model)?)
 }
 
 /// `tools` narrowed to `policy`, the ceiling of `agent`.

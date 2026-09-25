@@ -885,3 +885,63 @@ async fn shutdown_is_bounded_while_a_backend_is_still_starting() {
     assert!(host.list(SessionListParams::default()).await.unwrap().is_empty(), "no session went live");
     assert_eq!(host.create(spec(Persistence::Ephemeral)).await.map_err(|e| e.code).err(), Some(ErrorCode::Unavailable));
 }
+
+#[tokio::test]
+async fn a_log_from_before_adr_0038_resumes_as_it_did() {
+    // Such a log records no effort source: an unset effort was automatic, a set one explicit.
+    for (effort, advice) in [(None, 1), (Some("high"), 0)] {
+        let store = Arc::new(MemoryStore::default());
+        let meta = SessionMeta {
+            id: "old".into(),
+            created_ms: 1,
+            workspace: "/w".into(),
+            location: "local".into(),
+            provider: "scripted".into(),
+            model: "m1".into(),
+            title: None,
+            parent: None,
+            agent: None,
+        };
+        store.create(meta).await.unwrap();
+        let body: EventBody = serde_json::from_value(json!({"kind": "config_changed", "model": "m1", "effort": effort})).unwrap();
+        store.append("old".into(), vec![SessionEvent { schema: 1, seq: 1, turn: 0, ts_ms: 1, body }]).await.unwrap();
+        let counting = Arc::new(Counting::default());
+        let f = fixture_services(
+            Arc::clone(&store) as Arc<dyn SessionStore>,
+            store,
+            vec![slow_call("a", 100), text("done")],
+            vec![ladder_model()],
+            advised(&counting),
+        );
+        let (_, mut updates) = f.host.attach("old".into()).await.unwrap();
+        turn(&f, &mut updates, "old", "go").await;
+        assert_eq!(counting.calls.load(Ordering::SeqCst), advice, "recorded effort {effort:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_automatic_session_switching_models_starts_from_the_new_ladder() {
+    // REV9-m1: the switch left the effort unset while decisions recorded a ladder index.
+    let counting = Arc::new(Counting::default());
+    let m2 = ModelInfo { id: "m2".into(), display_name: "m2".into(), default_effort: Some("medium".into()), ..ladder_model() };
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_services(
+        Arc::clone(&memory) as Arc<dyn SessionStore>,
+        memory,
+        vec![text("one"), text("two")],
+        vec![ladder_model(), m2],
+        advised(&counting),
+    );
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    turn(&f, &mut updates, &id, "one").await;
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m2".into()), effort: None }).await.unwrap();
+    let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
+    assert_eq!(
+        got.last(),
+        Some(&SessionUpdate::ConfigChanged { model: "m2".into(), effort: Some("medium".into()), effort_source: EffortSource::Auto })
+    );
+    turn(&f, &mut updates, &id, "two").await;
+    let efforts: Vec<Option<String>> = f.provider.seen.lock().unwrap().iter().map(|r| r.effort.clone()).collect();
+    assert_eq!(efforts, [Some("low".to_owned()), Some("medium".to_owned())], "each model's ladder start");
+}

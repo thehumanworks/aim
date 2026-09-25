@@ -28,10 +28,11 @@ The codex review REV8 (`scratchpad/reviews/REV8.md`) and Claude's review REV9 (`
 - ACP sessions refuse a named agent (`unavailable`): the ACP bridge cannot enforce its tool ceiling yet.
 
 **Effort has a recorded source.** `EventBody::ConfigChanged` and `SessionUpdate::ConfigChanged` carry `effort_source: explicit | auto`. It is additive, and a missing value reads as `explicit`, so older logs resume exactly as before.
-- A new session's effort is `auto` when neither the session nor its agent definition sets one. Otherwise it is `explicit`.
+- An effort that is not set is `auto`: a new session whose spec and agent definition name none, and any record without a level. A set effort is `explicit` for a new session. On resume it keeps its recorded source, so older logs resume as they did.
 - Jev decisions (0028) announce `auto`. A `set_config` with an effort announces `explicit`.
 - `set_config` with `effort: "auto"` (`aim_proto::daemon::AUTO_EFFORT`, reserved) returns a native session to `auto`. The level in force is where Jev starts. ACP agents offer no automatic effort and refuse it, unless the agent itself advertises such a level.
 - A resume restores the source. For `auto`, the recorded level is the starting point, and the decider is attached again when the session is persistent and one is configured.
+- An advised `auto` session that switches models starts from the new model's ladder: its catalog default, else its lowest level (REV9-m1). Requests and decision records then agree on the index.
 
 **Every config change has an outcome the requester can see** (amends 0036's "a refusal at that point is logged").
 - **Idle.** The change is applied at once. A refusal is the call's `invalid_params` error. If its `ConfigChanged` cannot be appended, the call fails with `internal`, nothing is broadcast, and the session closes (0036).
@@ -42,6 +43,8 @@ The codex review REV8 (`scratchpad/reviews/REV8.md`) and Claude's review REV9 (`
 
   `ConfigRejected` is not recorded, because a rejection changes no state.
 - **Partial changes.** `Backend::set_config` may fail after changing something, for example ACP's model step followed by a refused effort step. After any refusal the host asks the backend what is in force (`set_config(None, None)`). If that differs from what was last announced, the host records and publishes `ConfigChanged` before it reports the refusal. The ACP backend has no read method, so it reports the options the agent last returned: those of the successful model step, plus any `config_option_update` notifications that arrived since.
+
+**Shutdown is bounded.** `SessionHost::shutdown_within(deadline)` (`shutdown` is 10 s) refuses new starts at once. Its deadline covers waiting for starts in flight, closing sessions, and their workspace shutdowns. A start that finishes after shutdown began tears itself down and returns `unavailable`, never going live (REV8-7).
 
 **Services are injected.** `native_backends_with` takes `NativeServices { media, decider }`.
 - Tests pass none or fakes.
@@ -68,19 +71,27 @@ Bytes read are charged afterwards, including a `CLAUDE.md` that loses to `AGENTS
 
 ## Verification
 
+Each test below failed against the code before its fix: run red first (REV8-6), or checked by reverting the fix and re-running.
+
 - `crates/aim-proto/tests/contract.rs`: `adr_0038_fields_are_additive_and_old_records_read_as_explicit`.
+- `crates/aim/tests/resources.rs`:
+  - `a_resumed_named_agent_keeps_its_tool_ceiling`: after a restart, Write and a media tool are neither offered nor reachable, and a widened definition does not widen the session;
+  - `a_resumed_agent_session_is_refused_when_its_definition_is_gone` (missing, and not importable);
+  - `the_skill_budget_follows_the_agent_model`;
+  - `fixed_and_listed_files_share_one_admission_budget`;
+  - `a_fifo_memory_index_never_blocks_discovery_or_exit`;
+  - `real_aimx_keeps_a_project_instruction_split_at_the_byte_limit`.
 - `crates/aim/tests/host.rs`:
-  - `a_resumed_named_agent_keeps_its_tool_ceiling`;
-  - `a_resumed_agent_session_is_refused_when_its_definition_is_gone`;
   - `automatic_effort_survives_a_restart_and_explicit_effort_can_return_to_auto`;
+  - `a_log_from_before_adr_0038_resumes_as_it_did`;
+  - `an_automatic_session_switching_models_starts_from_the_new_ladder`;
   - `a_private_session_never_calls_the_decider`;
   - `without_media_services_only_workspace_tools_are_offered`;
   - `a_deferred_config_refusal_reaches_the_stream`;
   - `a_partial_config_change_is_reconciled_and_announced`;
   - `an_idle_config_change_the_log_cannot_keep_is_an_error`;
   - `a_pending_config_is_cancelled_when_the_session_closes`;
-  - `shutdown_is_bounded_while_a_backend_is_still_starting`;
-  - `the_skill_budget_follows_the_agent_model`.
-- `crates/aim/src/acp.rs`: `a_failed_effort_step_reports_the_changed_model`, with a scripted ACP agent whose effort options depend on the model.
-- `crates/aim/tests/resources.rs` and `crates/aim/src/resources/files.rs`: the admission budget, FIFO and bounded-listing tests, and the split-character harness read.
+  - `shutdown_is_bounded_while_a_backend_is_still_starting`.
+- `crates/aim/src/acp.rs`: `a_failed_effort_step_reports_the_changed_model` (a scripted ACP agent whose effort options depend on the model). `crates/aim/tests/acp_bridge.rs`: `acp_sessions_require_authority_and_persistence_gates` covers the named-agent refusal.
+- `crates/aim/src/resources/agents.rs`: `intersected_policies_permit_exactly_what_both_permit`, an enumeration over policies and tools. `crates/aim/src/resources/files.rs`: `harness_reads_keep_the_text_before_a_split_character`, `listing_stops_at_its_limit` and `a_fifo_is_refused_without_blocking`.
 - Live, run for this change: `acp_bridge`, `compaction` and `resources` (`-- --ignored live_`).

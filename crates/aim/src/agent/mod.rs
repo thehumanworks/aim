@@ -148,6 +148,15 @@ enum Compaction {
     Cancelled,
 }
 
+/// Where automatic effort starts on `model`'s ladder: its default, else its lowest level. `None`
+/// when the catalog gives no usable ladder (2 to 10 levels).
+pub(crate) fn ladder_start(model: &aim_llm::ModelInfo) -> Option<String> {
+    if !(2..=10).contains(&model.efforts.len()) {
+        return None;
+    }
+    model.default_effort.clone().filter(|default| model.efforts.contains(default)).or_else(|| model.efforts.first().cloned())
+}
+
 /// What the agent knows about its model's context window.
 #[derive(Clone, Copy, Debug)]
 enum Window {
