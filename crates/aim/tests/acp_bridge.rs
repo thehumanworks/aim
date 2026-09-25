@@ -229,7 +229,8 @@ async fn acp_sessions_require_authority_and_persistence_gates() {
     assert_eq!(refuse(native_ssh, Vec::new()).await, Some(ErrorCode::Unavailable));
     // A named agent's ceiling cannot be enforced over ACP yet: refused before anything starts.
     let named = SessionSpec { agent: Some("reader".into()), ..base.clone() };
-    let refused = factory(BackendRequest { spec: named, session_id: "s".into(), transcript: Vec::new(), recorded: None }).await.err().unwrap();
+    let refused =
+        factory(BackendRequest { spec: named, session_id: "s".into(), transcript: Vec::new(), recorded: None }).await.err().unwrap();
     assert_eq!(refused.code, ErrorCode::Unavailable);
     assert!(refused.message.contains("named agents"), "{}", refused.message);
     let ephemeral = SessionSpec { persistence: Persistence::Ephemeral, ..base.clone() };

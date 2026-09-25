@@ -539,7 +539,9 @@ pub fn with_acp_at(native: BackendFactory, aimx: PathBuf) -> BackendFactory {
             }
             if spec.agent.is_some() {
                 // Fail closed: nothing here would enforce the agent's tool ceiling (ADR 0038).
-                return Err(unavailable("named agents cannot be applied to Claude Code sessions yet; their tool ceiling would not be enforced"));
+                return Err(unavailable(
+                    "named agents cannot be applied to Claude Code sessions yet; their tool ceiling would not be enforced",
+                ));
             }
             if !transcript.is_empty() {
                 return Err(unavailable(

@@ -10,16 +10,16 @@ use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture, ToolHost};
 use aim::agent::{AgentError, Backend, BackendFuture, InForce};
+use aim::host::{
+    BackendFactory, BackendRequest, Built, Connected, HostConfig, NativeServices, SessionClient, SessionHost, UpdateStream,
+    WorkspaceFactory, native_backends_with,
+};
 use aim::jev::{Advice, Bundle, Decider, DecisionFuture};
 use aim::media::MediaService;
-use aim_llm_codex::media::{Image, SearchAnswer};
-use aim::host::{
-    BackendFactory, BackendRequest, Built, Connected, HostConfig, NativeServices, SessionClient, SessionHost, UpdateStream, WorkspaceFactory,
-    native_backends_with,
-};
 use aim::resources::{MemoryFiles, ResourceConfig};
 use aim::store::{MemoryStore, SessionStore, StoreError, StoredSessionSummary};
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, StreamEvent};
+use aim_llm_codex::media::{Image, SearchAnswer};
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
 use aim_proto::daemon::{
     Location, Persistence, PromptOutcome, SessionConfigParams, SessionListParams, SessionSpec, SessionState, SessionUpdate,
@@ -29,9 +29,9 @@ use aim_proto::event::{EffortSource, EventBody, SessionEvent, SessionMeta};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolAnnotations, ToolResult, ToolSpec};
 use futures_util::StreamExt as _;
+use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
-use serde_json::{Value, json};
 
 struct Scripted {
     responses: Mutex<VecDeque<Vec<Result<StreamEvent, LlmError>>>>,
@@ -721,7 +721,8 @@ fn two_efforts() -> ModelInfo {
 #[tokio::test]
 async fn a_deferred_config_refusal_reaches_the_stream() {
     let memory = Arc::new(MemoryStore::default());
-    let f = fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, vec![slow_call("a", 100), text("done")], vec![two_efforts()]);
+    let f =
+        fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, vec![slow_call("a", 100), text("done")], vec![two_efforts()]);
     let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
     let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
     f.host.prompt(id.clone(), user("go")).await.unwrap();
@@ -807,8 +808,11 @@ async fn a_partial_config_change_is_reconciled_and_announced() {
     let (_, mut updates) = host.attach(id.clone()).await.unwrap();
     // The model step applies, the effort step fails: the host announces what is in force, then
     // reports the refusal (REV8-3).
-    let refused =
-        host.set_config(SessionConfigParams { session: id.clone(), model: Some("B".into()), effort: Some("high".into()) }).await.err().unwrap();
+    let refused = host
+        .set_config(SessionConfigParams { session: id.clone(), model: Some("B".into()), effort: Some("high".into()) })
+        .await
+        .err()
+        .unwrap();
     assert_eq!(refused.code, ErrorCode::InvalidParams);
     let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
     assert!(matches!(got.last(), Some(SessionUpdate::ConfigChanged { model, .. }) if model == "B"), "{got:?}");
@@ -850,7 +854,8 @@ async fn a_pending_config_is_cancelled_when_the_session_closes() {
     f.provider.stall_catalog.store(true, Ordering::SeqCst);
     f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("high".into()) }).await.unwrap();
     f.host.close(id).await.unwrap();
-    let rest: Vec<SessionUpdate> = tokio::time::timeout(Duration::from_secs(5), updates.collect()).await.expect("the session closed promptly");
+    let rest: Vec<SessionUpdate> =
+        tokio::time::timeout(Duration::from_secs(5), updates.collect()).await.expect("the session closed promptly");
     assert!(
         rest.iter().any(|u| matches!(u, SessionUpdate::ConfigRejected { message, .. } if message.starts_with("cancelled"))),
         "{rest:?}"

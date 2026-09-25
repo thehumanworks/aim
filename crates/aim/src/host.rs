@@ -248,10 +248,9 @@ pub fn native_backends_with(
                 window = context::context_window(provider.as_ref(), &model).await;
             }
             // Automatic unless the session or its agent set an effort; a resume keeps its source.
-            let effort_source = recorded.as_ref().map_or(
-                if effort.is_some() { EffortSource::Explicit } else { EffortSource::Auto },
-                |recorded| recorded.effort_source,
-            );
+            let effort_source = recorded
+                .as_ref()
+                .map_or(if effort.is_some() { EffortSource::Explicit } else { EffortSource::Auto }, |recorded| recorded.effort_source);
             // Advice is for persistent sessions only (ADR 0013). The decider is attached whatever
             // the source, so `effort: "auto"` can hand the effort back later.
             let decider = if spec.persistence == Persistence::Persistent { services.decider.clone() } else { None };
@@ -342,7 +341,10 @@ fn session_agent(
         (Some(name), None) => name,
         (Some(name), Some(recorded)) if recorded.name == name => name,
         (_, Some(recorded)) => {
-            return Err(err(ErrorCode::InvalidParams, format!("the session was created as agent `{}` and resumes only as it", recorded.name)));
+            return Err(err(
+                ErrorCode::InvalidParams,
+                format!("the session was created as agent `{}` and resumes only as it", recorded.name),
+            ));
         }
     };
     let resumed = if recorded.is_some() { "; the session was created as this agent and cannot resume without it" } else { "" };
