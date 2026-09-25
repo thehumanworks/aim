@@ -226,13 +226,18 @@ pub fn block(app: &App, width: u16, max_rows: u16) -> Block {
     } else {
         composer
     };
-    // The status line, then the composer (keeping the cursor's row visible), then the rule.
+    // The status line, then the composer (keeping the cursor's row visible), then the separators.
+    // Layout keeps rewrappable rows below the cursor: above the composer there is only a blank row
+    // (it never rewraps), and the rule sits under it, over the status line. A terminal that rewraps
+    // the block before the app learns of a resize then cannot shift where the next erase starts.
     let visible = composer.len().min(COMPOSER_ROWS).min(max - 1).max(1);
     let first = cursor_row.saturating_sub(visible - 1).min(composer.len().saturating_sub(visible));
     let composer: Vec<Row> = composer.into_iter().skip(first).take(visible).collect();
     let mut room = max - 1 - composer.len();
     let rule = room > 0;
     room = room.saturating_sub(usize::from(rule));
+    let gap = room > 0;
+    room = room.saturating_sub(usize::from(gap));
     let popup: Vec<Row> = popup_rows(app, w).into_iter().take(room).collect();
     room = room.saturating_sub(popup.len());
     let chips: Vec<Row> = chip_rows(app, w).into_iter().take(room).collect();
@@ -246,12 +251,15 @@ pub fn block(app: &App, width: u16, max_rows: u16) -> Block {
     rows.extend(lines(&live));
     rows.extend(lines(&tools));
     rows.extend(lines(&chips));
-    if rule {
-        rows.push(Line::styled("─".repeat(w), theme.muted));
+    if gap {
+        rows.push(Line::default());
     }
     let composer_top = rows.len();
     rows.extend(lines(&composer));
     rows.extend(lines(&popup));
+    if rule {
+        rows.push(Line::styled("─".repeat(w), theme.muted));
+    }
     rows.push(status_line);
     let cursor = if app.picker.is_some() {
         None
@@ -530,10 +538,11 @@ mod tests {
                 "⏺ exec cargo test",
                 "  ⎿ running…",
                 "⧗ queued steer me",
-                "─────────────────────────────────────────────────",
+                "",
                 "› @sr",
                 "  src/",
                 "  src/main.rs",
+                "─────────────────────────────────────────────────",
                 "running 0s · request 1 · gpt-6-sol · low · ~/aim",
             ]
         );
@@ -578,13 +587,14 @@ mod tests {
         let mut cache = RowCache::default();
         let rows = draw(50, 12, |area, buf| {
             let (_, limit) = fullscreen(&app, &mut cache, area, buf);
-            assert_eq!(limit, 60 - 9, "30 entries of two rows; 12 rows less a 3-row block");
+            assert_eq!(limit, 60 - 8, "30 entries of two rows; 12 rows less a 4-row block");
         });
-        assert_eq!(rows[1], "› prompt 26");
-        assert_eq!(rows[7], "› prompt 29");
-        assert_eq!(rows[9], "─".repeat(49));
+        assert_eq!(rows[0], "› prompt 26");
+        assert_eq!(rows[6], "› prompt 29");
+        assert_eq!(rows[9], "› ask anything · / commands · @ files · $ skills");
+        assert_eq!(rows[10], "─".repeat(49));
         app.scroll.offset = 10;
-        app.scroll.limit = 51;
+        app.scroll.limit = 52;
         let rows = draw(50, 12, |area, buf| {
             fullscreen(&app, &mut cache, area, buf);
         });

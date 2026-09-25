@@ -18,7 +18,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use super::app::{App, AppConfig, Effect, Input, Layout};
 use super::complete::{Broker, Completed, Sources};
 use super::history;
-use super::inline::{self, Inline, Reflow};
+use super::inline::{self, Caret, Inline, Reflow};
 use super::schedule::{Frame, Scheduler};
 use super::text::encode;
 use super::theme::Theme;
@@ -56,6 +56,42 @@ fn hyperlinks() -> bool {
     }
     let term = env("TERM").unwrap_or_default();
     !(term == "dumb" || term == "linux" || env("TERM_PROGRAM").as_deref() == Some("Apple_Terminal"))
+}
+
+/// Debugging aids for terminal behaviour, read once from the environment:
+/// `AIM_TUI_TRACE=<file>` logs each frame's erase decision and resize event;
+/// `AIM_TUI_TRACE_BYTES=<dir>` records every byte written, in one chunk per resize event
+/// (`chunk-NNN.bin`, sizes in `resizes.txt`), so a run can be replayed into another terminal.
+struct Trace {
+    log: Option<String>,
+    bytes: Option<String>,
+    resizes: std::sync::atomic::AtomicUsize,
+}
+
+fn tracing() -> &'static Trace {
+    static TRACE: std::sync::OnceLock<Trace> = std::sync::OnceLock::new();
+    TRACE.get_or_init(|| Trace { log: env("AIM_TUI_TRACE"), bytes: env("AIM_TUI_TRACE_BYTES"), resizes: 0.into() })
+}
+
+fn append(path: &str, bytes: &[u8]) {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ignored = file.write_all(bytes);
+    }
+}
+
+fn trace(line: &str) {
+    if let Some(path) = &tracing().log {
+        append(path, format!("{} {line}\n", crate::session::now_ms()).as_bytes());
+    }
+}
+
+fn trace_resize(width: u16, height: u16) {
+    let t = tracing();
+    let chunk = t.resizes.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    trace(&format!("resize event {width}x{height}"));
+    if let Some(dir) = &t.bytes {
+        append(&format!("{dir}/resizes.txt"), format!("{} {chunk} {width}\n", crate::session::now_ms()).as_bytes());
+    }
 }
 
 const RESTORE: &str = "\x1b[?2026l\x1b[0m\x1b[?1049l\x1b[?2004l\x1b[?7h\x1b[?25h";
@@ -115,6 +151,11 @@ struct Screen {
 }
 
 fn write_out(bytes: &str) -> std::io::Result<()> {
+    let t = tracing();
+    if let Some(dir) = &t.bytes {
+        let chunk = t.resizes.load(std::sync::atomic::Ordering::Relaxed);
+        append(&format!("{dir}/chunk-{chunk:03}.bin"), bytes.as_bytes());
+    }
     let mut out = std::io::stdout().lock();
     out.write_all(bytes.as_bytes())?;
     out.flush()
@@ -139,6 +180,15 @@ impl Screen {
             self.inline.invalidate();
             self.cache.clear();
         }
+        // The terminal may already have reflowed the block for a resize whose event has not
+        // arrived yet (a stream frame racing a window drag): ask for the size (an ioctl, no
+        // round trip) right before erasing, so the erase follows the rows as they are now.
+        if let Ok((width, height)) = crossterm::terminal::size()
+            && (width, height) != self.size
+        {
+            self.resize(width, height);
+            app.handle(Input::Resize(width, height));
+        }
         let (width, height) = self.size;
         let history = app.take_history(usize::from(width));
         let block_width = width.saturating_sub(1).max(1);
@@ -146,9 +196,24 @@ impl Screen {
         let rows = u16::try_from(block.rows.len()).unwrap_or(height);
         let mut buf = Buffer::empty(Rect::new(0, 0, block_width, rows));
         view::draw_rows(&block.rows, buf.area, &mut buf);
+        // While a turn streams, the hardware cursor parks at the block's top and the composer
+        // shows a drawn cursor instead (see `Caret::Parked`).
+        let caret = match block.cursor {
+            Some((x, y)) if !app.running() => Caret::At(x, y),
+            Some(position) => {
+                if let Some(cell) = buf.cell_mut(position) {
+                    cell.modifier.insert(ratatui::style::Modifier::REVERSED);
+                }
+                Caret::Parked
+            }
+            None => Caret::Parked,
+        };
         let encoded = inline::encode_buffer(&buf);
         let mut out = String::new();
-        self.inline.paint(&mut out, &history, &encoded, block.cursor);
+        self.inline.paint(&mut out, &history, &encoded, caret);
+        if tracing().log.is_some() {
+            trace(&format!("paint size={:?} caret={caret:?} rows={} {}", self.size, encoded.len(), self.inline.last_erase()));
+        }
         write_out(&out)
     }
 
@@ -390,6 +455,7 @@ async fn event_loop(
                     scheduler.urgent(Instant::now());
                 }
                 Some(Ok(Event::Resize(width, height))) => {
+                    trace_resize(width, height);
                     app.handle(Input::Resize(width, height));
                     screen.resize(width, height);
                     scheduler.resize(Instant::now());

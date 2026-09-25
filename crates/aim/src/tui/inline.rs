@@ -114,12 +114,30 @@ pub fn encode_buffer(buf: &Buffer) -> Vec<Encoded> {
     rows
 }
 
+/// Clears from the cursor's row down. Not a bare `ED 0`: when the block's top sits at the screen's
+/// top-left (after a reflow scrolled it there), tmux's `scroll-on-clear` takes `ED 0` for a full
+/// clear and copies the screen, block included, into scrollback. Clearing the row with `EL 2`, then
+/// `ED 0` one row down (cursor saved and restored around it) erases the same cells without that.
+pub const ERASE_BELOW: &str = "\x1b[2K\x1b7\x1b[1B\x1b[J\x1b8";
+
 fn move_rows(out: &mut String, from: usize, to: usize) {
     let _infallible = match to.cmp(&from) {
         core::cmp::Ordering::Greater => write!(out, "\x1b[{}B", to - from),
         core::cmp::Ordering::Less => write!(out, "\x1b[{}A", from - to),
         core::cmp::Ordering::Equal => Ok(()),
     };
+}
+
+/// Where the hardware cursor goes after a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Caret {
+    /// In the composer at `(column, row)` of the block, visible (idle: IME and screen readers
+    /// follow it).
+    At(u16, u16),
+    /// Hidden at the block's top-left while frames stream. Nothing of the block is above it, so a
+    /// terminal that rewraps the block before the app learns of a resize (tmux reflows before
+    /// its `SIGWINCH`) cannot shift where the next erase starts.
+    Parked,
 }
 
 /// The block on the terminal and the cursor inside it.
@@ -133,12 +151,23 @@ pub struct Inline {
     reflow: Reflow,
     hyperlinks: bool,
     dirty: bool,
+    last_erase: String,
 }
 
 impl Inline {
     /// A writer for a terminal `width` columns wide.
     pub fn new(width: u16, reflow: Reflow, hyperlinks: bool) -> Self {
-        Self { rows: Vec::new(), cursor_row: 0, cursor_col: 0, width, narrowed_from: None, reflow, hyperlinks, dirty: true }
+        Self {
+            rows: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            width,
+            narrowed_from: None,
+            reflow,
+            hyperlinks,
+            dirty: true,
+            last_erase: String::new(),
+        }
     }
 
     /// The terminal is now `width` columns wide.
@@ -148,6 +177,11 @@ impl Inline {
         }
         self.width = width;
         self.dirty = true;
+    }
+
+    /// What the last erase did (for `AIM_TUI_TRACE`).
+    pub fn last_erase(&self) -> &str {
+        &self.last_erase
     }
 
     /// The next paint redraws the whole block (after the alternate screen, for instance).
@@ -164,11 +198,19 @@ impl Inline {
             }
             None => self.cursor_row,
         };
+        self.last_erase = format!(
+            "erase up={up} cursor=({},{}) narrowed_from={:?} width={} rows={:?}",
+            self.cursor_row,
+            self.cursor_col,
+            self.narrowed_from,
+            self.width,
+            self.rows.iter().map(|r| r.width).collect::<Vec<_>>()
+        );
         out.push('\r');
         if up > 0 {
             let _infallible = write!(out, "\x1b[{up}A");
         }
-        out.push_str("\x1b[J");
+        out.push_str(ERASE_BELOW);
         self.rows.clear();
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -176,7 +218,7 @@ impl Inline {
     }
 
     /// Prints `history` into scrollback and repaints the block (`cursor` is `(column, row)`).
-    pub fn paint(&mut self, out: &mut String, history: &[Row], block: &[Encoded], cursor: Option<(u16, u16)>) {
+    pub fn paint(&mut self, out: &mut String, history: &[Row], block: &[Encoded], caret: Caret) {
         out.push_str("\x1b[?2026h\x1b[?25l\x1b[?7l");
         let full = self.dirty || !history.is_empty() || block.len() != self.rows.len();
         let mut at;
@@ -205,20 +247,20 @@ impl Inline {
                 }
             }
         }
-        if let Some((column, row)) = cursor {
-            let row = usize::from(row).min(block.len().saturating_sub(1));
-            move_rows(out, at, row);
-            out.push('\r');
-            if column > 0 {
-                let _infallible = write!(out, "\x1b[{column}C");
-            }
-            out.push_str("\x1b[?25h");
-            self.cursor_row = row;
-            self.cursor_col = usize::from(column);
-        } else {
-            self.cursor_row = at;
-            self.cursor_col = block.get(at).map_or(0, |r| r.width);
+        let (row, column, visible) = match caret {
+            Caret::At(column, row) => (usize::from(row).min(block.len().saturating_sub(1)), column, true),
+            Caret::Parked => (0, 0, false),
+        };
+        move_rows(out, at, row);
+        out.push('\r');
+        if column > 0 {
+            let _infallible = write!(out, "\x1b[{column}C");
         }
+        if visible {
+            out.push_str("\x1b[?25h");
+        }
+        self.cursor_row = row;
+        self.cursor_col = usize::from(column);
         out.push_str("\x1b[?7h\x1b[?2026l");
         self.rows = block.to_vec();
         self.dirty = false;
@@ -266,8 +308,8 @@ mod tests {
     fn the_first_paint_prints_the_block_and_parks_the_cursor() {
         let mut inline = Inline::new(20, Reflow::Truncates, false);
         let mut out = String::new();
-        inline.paint(&mut out, &[], &encoded(&["one", "two"]), Some((3, 0)));
-        assert!(out.starts_with("\x1b[?2026h\x1b[?25l\x1b[?7l\r\x1b[J"));
+        inline.paint(&mut out, &[], &encoded(&["one", "two"]), Caret::At(3, 0));
+        assert!(out.starts_with(&format!("\x1b[?2026h\x1b[?25l\x1b[?7l\r{ERASE_BELOW}")));
         assert!(out.contains("one\x1b[0m\r\n"));
         assert!(out.ends_with("\x1b[1A\r\x1b[3C\x1b[?25h\x1b[?7h\x1b[?2026l"));
     }
@@ -276,9 +318,9 @@ mod tests {
     fn unchanged_rows_are_not_rewritten() {
         let mut inline = Inline::new(20, Reflow::Truncates, false);
         let mut out = String::new();
-        inline.paint(&mut out, &[], &encoded(&["one", "two", "three"]), Some((0, 2)));
+        inline.paint(&mut out, &[], &encoded(&["one", "two", "three"]), Caret::At(0, 2));
         out.clear();
-        inline.paint(&mut out, &[], &encoded(&["one", "TWO", "three"]), Some((0, 2)));
+        inline.paint(&mut out, &[], &encoded(&["one", "TWO", "three"]), Caret::At(0, 2));
         assert!(!out.contains("one") && !out.contains("three"));
         assert!(out.contains("\x1b[1A\r\x1b[0mTWO"), "{out:?}");
     }
@@ -287,20 +329,32 @@ mod tests {
     fn history_goes_above_the_block_after_erasing_it() {
         let mut inline = Inline::new(20, Reflow::Truncates, false);
         let mut out = String::new();
-        inline.paint(&mut out, &[], &encoded(&["block a", "block b"]), Some((0, 1)));
+        inline.paint(&mut out, &[], &encoded(&["block a", "block b"]), Caret::At(0, 1));
         out.clear();
-        inline.paint(&mut out, &[Row::plain("said", Style::new())], &encoded(&["block a", "block b"]), Some((0, 1)));
-        assert!(out.contains("\r\x1b[1A\x1b[J\x1b[0msaid\x1b[0m\r\n\x1b[0mblock a"), "{out:?}");
+        inline.paint(&mut out, &[Row::plain("said", Style::new())], &encoded(&["block a", "block b"]), Caret::At(0, 1));
+        assert!(out.contains(&format!("\r\x1b[1A{ERASE_BELOW}\x1b[0msaid\x1b[0m\r\n\x1b[0mblock a")), "{out:?}");
+    }
+
+    #[test]
+    fn a_parked_caret_erases_from_the_top_whatever_the_reflow() {
+        let mut inline = Inline::new(40, Reflow::Rewraps, false);
+        let mut out = String::new();
+        inline.paint(&mut out, &[], &encoded(&[&"x".repeat(30), "composer"]), Caret::Parked);
+        assert!(out.ends_with("\x1b[1A\r\x1b[?7h\x1b[?2026l"), "parked at the top, hidden: {out:?}");
+        inline.resized(10);
+        out.clear();
+        inline.paint(&mut out, &[], &encoded(&["x", "composer"]), Caret::Parked);
+        assert!(out.contains(&format!("\x1b[?7l\r{ERASE_BELOW}")), "no rows above the caret to account for: {out:?}");
     }
 
     #[test]
     fn a_narrower_terminal_erases_the_rewrapped_block() {
         let mut inline = Inline::new(40, Reflow::Rewraps, false);
         let mut out = String::new();
-        inline.paint(&mut out, &[], &encoded(&[&"x".repeat(30), "composer"]), Some((4, 1)));
+        inline.paint(&mut out, &[], &encoded(&[&"x".repeat(30), "composer"]), Caret::At(4, 1));
         inline.resized(20);
         out.clear();
-        inline.paint(&mut out, &[], &encoded(&["x", "composer"]), Some((4, 1)));
-        assert!(out.contains("\r\x1b[2A\x1b[J"), "the 30-column row now takes two rows: {out:?}");
+        inline.paint(&mut out, &[], &encoded(&["x", "composer"]), Caret::At(4, 1));
+        assert!(out.contains(&format!("\r\x1b[2A{ERASE_BELOW}")), "the 30-column row now takes two rows: {out:?}");
     }
 }
