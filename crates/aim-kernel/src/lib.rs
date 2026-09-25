@@ -33,6 +33,7 @@ pub mod compaction;
 pub mod dedup;
 pub mod discovery;
 pub mod effort;
+pub mod gate;
 pub mod job;
 pub mod negotiate;
 pub mod path;
