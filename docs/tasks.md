@@ -24,9 +24,9 @@ client still builds.
 | T0 | Base: merge FIX16 (`agent/claude/fix16-coderun`) and W26 (`agent/perf/tokens`) as-is (maintainer decision) | done | Merged (`eda6444`, `36f1bd8`); conflicts resolved in event.rs, session.rs, agent/mod.rs, agent/tools.rs, host.rs; clippy, xtask and 963/963 tests green | — | integration branch |
 | T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | in progress | Worker running | Review its report, merge | `agent/claude/tui-options` · `../aim-wt/tui-options` |
 | T2 | `/clear` clears the chat and starts fresh | todo | Folded into T1 (same files) | — | with T1 |
-| T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | in progress | Worker running | Review its report, merge | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
+| T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged; scheduler verified; live runs show overlapping calls (native and ACP) | — | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | in progress | Worker running | Review its report, merge, then T4b | `agent/claude/code-mode` · `../aim-wt/code-mode` |
-| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default | todo | Waits for T4a | — | — |
+| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | todo | Waits for T4a | Wire gate: 31 regressions on the merged base + 4 from T3's prompt | — |
 | T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | done | Merged; kernel 263 verified; live: `-m opus` → `opus[1m]`, usage `claude-opus-5-5` | Open: adapter resets mode/effort when switching model (see log) | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
 | T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
@@ -71,3 +71,13 @@ client still builds.
   Open (adapter behaviour, not aim): switching to `haiku` flipped `mode` to `acceptEdits` and dropped
   the effort/fast options; back on `opus`, effort returned at `medium`. Worth a follow-up so
   `/model` after `/effort` keeps the effort and aim re-asserts its permission mode.
+- 2026-09-25 — T3 done (`2c19fc6`, merged). Kernel `cells` (FIX16 scheduler, DRAFT(ADR-0066)).
+  aimx MCP already sent readOnlyHint etc. (now tested). New e2e timing tests (session, MCP,
+  Promise.all cell). Live: gpt-4.1-mini issued 3 Reads in one response (also with the old prompt);
+  `acp:claude` overlapped two `mcp__aim__grep` calls. Claude Code (SDK 0.3.280) treats an MCP tool
+  as concurrency-safe iff `readOnlyHint` (read from the bundled binary).
+- 2026-09-25 — Wire gate (`bench:wire`, part of `mise run check`) fails on the merged base: 31
+  regressions from merging W26 (14 advertised tools vs 10 expected, W1 6703 B vs a 6000 B budget,
+  every codex/pi row), plus 4 from T3's prompt (+139 B/request). Belongs to T4b.
+- 2026-09-25 — `mise run verify` recipe now tags target/verus (fresh-worktree failure). Merged tree
+  (base + T5 + T3): 302 verified, 0 errors.
