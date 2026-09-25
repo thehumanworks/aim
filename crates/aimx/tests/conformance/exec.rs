@@ -15,6 +15,7 @@ use crate::common::{Client, env, env_with, key, session, text};
 
 fn spec(ws: &WorkspaceId, command: Command) -> ExecSpawnParams {
     ExecSpawnParams {
+        scope: None,
         workspace: ws.clone(),
         command,
         cwd: None,
@@ -35,7 +36,7 @@ async fn spawn(client: &Client, params: ExecSpawnParams) -> ProcId {
 }
 
 async fn read(client: &Client, proc: &ProcId, after_seq: u64, wait_ms: u64) -> aim_proto::harness::ExecReadResult {
-    client.peer.call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq, max_bytes: None, wait_ms }).await.unwrap()
+    client.peer.call::<ExecRead>(ExecReadParams { scope: None, proc: proc.clone(), after_seq, max_bytes: None, wait_ms }).await.unwrap()
 }
 
 /// Reads until the process exits; returns every chunk and the exit status.
@@ -135,15 +136,15 @@ async fn signals_reach_the_group() {
     let proc = spawn(&client, spec(&ws, sh("sleep 30 & echo $!; wait"))).await;
     let first = read(&client, &proc, 0, 5000).await;
     let grandchild: i32 = String::from_utf8(first.chunks[0].data.clone().into_bytes()).unwrap().trim().parse().unwrap();
-    client.peer.call::<ExecSignal>(ExecSignalParams { proc: proc.clone(), signal: Signal::Terminate }).await.unwrap();
+    client.peer.call::<ExecSignal>(ExecSignalParams { scope: None, proc: proc.clone(), signal: Signal::Terminate }).await.unwrap();
     let (_, exit) = run_to_exit(&client, &proc).await;
     assert_eq!(exit, ExitStatus::Signaled { signal: 15 });
     assert!(!alive(grandchild));
     // Signalling an exited process is a no-op.
-    client.peer.call::<ExecSignal>(ExecSignalParams { proc: proc.clone(), signal: Signal::Kill }).await.unwrap();
+    client.peer.call::<ExecSignal>(ExecSignalParams { scope: None, proc: proc.clone(), signal: Signal::Kill }).await.unwrap();
 
     let proc = spawn(&client, spec(&ws, sh("sleep 30"))).await;
-    client.peer.call::<ExecSignal>(ExecSignalParams { proc: proc.clone(), signal: Signal::Interrupt }).await.unwrap();
+    client.peer.call::<ExecSignal>(ExecSignalParams { scope: None, proc: proc.clone(), signal: Signal::Interrupt }).await.unwrap();
     let (_, exit) = run_to_exit(&client, &proc).await;
     assert_eq!(exit, ExitStatus::Signaled { signal: 2 });
 }
@@ -156,7 +157,7 @@ async fn stdin_pipes() {
     params.stdin = true;
     let proc = spawn(&client, params).await;
     let write = |data: &str, eof: bool| {
-        let params = ExecWriteStdinParams { proc: proc.clone(), data: text(data), eof, idempotency_key: key() };
+        let params = ExecWriteStdinParams { scope: None, proc: proc.clone(), data: text(data), eof, idempotency_key: key() };
         let peer = client.peer.clone();
         async move { peer.call::<ExecWriteStdin>(params).await }
     };
@@ -184,7 +185,13 @@ async fn pty_processes() {
     assert!(first.chunks.iter().all(|c| c.stream == OutputStream::Pty));
     client
         .peer
-        .call::<ExecWriteStdin>(ExecWriteStdinParams { proc: proc.clone(), data: text("hello\n"), eof: false, idempotency_key: key() })
+        .call::<ExecWriteStdin>(ExecWriteStdinParams {
+            scope: None,
+            proc: proc.clone(),
+            data: text("hello\n"),
+            eof: false,
+            idempotency_key: key(),
+        })
         .await
         .unwrap();
     let (chunks, exit) = run_to_exit(&client, &proc).await;
@@ -197,20 +204,24 @@ async fn pty_processes() {
     let mut params = spec(&ws, sh("sleep 0.5; stty size"));
     params.pty = Some(PtySize { rows: 24, cols: 80 });
     let proc = spawn(&client, params).await;
-    client.peer.call::<ExecResize>(ExecResizeParams { proc: proc.clone(), size: PtySize { rows: 30, cols: 120 } }).await.unwrap();
+    client
+        .peer
+        .call::<ExecResize>(ExecResizeParams { scope: None, proc: proc.clone(), size: PtySize { rows: 30, cols: 120 } })
+        .await
+        .unwrap();
     let (chunks, _) = run_to_exit(&client, &proc).await;
     assert!(joined(&chunks, OutputStream::Pty).contains("30 120"));
 
     let mut params = spec(&ws, sh("sleep 30"));
     params.pty = Some(PtySize { rows: 24, cols: 80 });
     let proc = spawn(&client, params).await;
-    client.peer.call::<ExecSignal>(ExecSignalParams { proc: proc.clone(), signal: Signal::Kill }).await.unwrap();
+    client.peer.call::<ExecSignal>(ExecSignalParams { scope: None, proc: proc.clone(), signal: Signal::Kill }).await.unwrap();
     let (_, exit) = run_to_exit(&client, &proc).await;
     assert_eq!(exit, ExitStatus::Signaled { signal: 9 });
 
     // Resizing a pipe process is a conflict.
     let proc = spawn(&client, spec(&ws, sh("true"))).await;
-    let err = client.peer.call::<ExecResize>(ExecResizeParams { proc, size: PtySize { rows: 1, cols: 1 } }).await.unwrap_err();
+    let err = client.peer.call::<ExecResize>(ExecResizeParams { scope: None, proc, size: PtySize { rows: 1, cols: 1 } }).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict);
 }
 
@@ -232,13 +243,17 @@ async fn read_after_seq_catches_up() {
     assert!(done.chunks.is_empty());
     assert_eq!(done.exit, Some(ExitStatus::Exited { code: 0 }));
     // `exit` is withheld while unread output remains.
-    let partial =
-        client.peer.call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: 0, max_bytes: Some(1), wait_ms: 0 }).await.unwrap();
+    let partial = client
+        .peer
+        .call::<ExecRead>(ExecReadParams { scope: None, proc: proc.clone(), after_seq: 0, max_bytes: Some(1), wait_ms: 0 })
+        .await
+        .unwrap();
     assert_eq!(partial.chunks.len(), 1);
     assert_eq!(partial.exit, None);
 
-    client.peer.call::<ExecRelease>(ExecReleaseParams { proc: proc.clone() }).await.unwrap();
-    let gone = client.peer.call::<ExecRead>(ExecReadParams { proc, after_seq: 0, max_bytes: None, wait_ms: 0 }).await.unwrap_err();
+    client.peer.call::<ExecRelease>(ExecReleaseParams { scope: None, proc: proc.clone() }).await.unwrap();
+    let gone =
+        client.peer.call::<ExecRead>(ExecReadParams { scope: None, proc, after_seq: 0, max_bytes: None, wait_ms: 0 }).await.unwrap_err();
     assert_eq!(gone.code, ErrorCode::NotFound);
 }
 
@@ -306,9 +321,9 @@ async fn release_kills_a_running_process() {
     let proc = spawn(&client, spec(&ws, sh("echo $$; sleep 30"))).await;
     let first = read(&client, &proc, 0, 5000).await;
     let pid: i32 = String::from_utf8(first.chunks[0].data.clone().into_bytes()).unwrap().trim().parse().unwrap();
-    client.peer.call::<ExecRelease>(ExecReleaseParams { proc: proc.clone() }).await.unwrap();
+    client.peer.call::<ExecRelease>(ExecReleaseParams { scope: None, proc: proc.clone() }).await.unwrap();
     assert!(!alive(pid));
-    let err = client.peer.call::<ExecRelease>(ExecReleaseParams { proc }).await.unwrap_err();
+    let err = client.peer.call::<ExecRelease>(ExecReleaseParams { scope: None, proc }).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
 }
 
@@ -319,9 +334,9 @@ async fn wait_for_exit() {
     let env = env().await;
     let (client, _, ws) = session(&env).await;
     let proc = spawn(&client, spec(&ws, sh("sleep 0.4; echo unread; exit 7"))).await;
-    let early = client.peer.call::<ExecWait>(ExecWaitParams { proc: proc.clone(), timeout_ms: Some(50) }).await.unwrap();
+    let early = client.peer.call::<ExecWait>(ExecWaitParams { scope: None, proc: proc.clone(), timeout_ms: Some(50) }).await.unwrap();
     assert_eq!(early.exit, None, "the timeout elapsed first; the process keeps running");
-    let done = client.peer.call::<ExecWait>(ExecWaitParams { proc: proc.clone(), timeout_ms: None }).await.unwrap();
+    let done = client.peer.call::<ExecWait>(ExecWaitParams { scope: None, proc: proc.clone(), timeout_ms: None }).await.unwrap();
     assert_eq!(done.exit, Some(ExitStatus::Exited { code: 7 }));
     // Its output is still there to read.
     let (chunks, _) = run_to_exit(&client, &proc).await;

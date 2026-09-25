@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use aim_proto::content::Content;
 use aim_proto::error::ErrorCode;
 use aim_proto::harness::{
-    BackendSpec, ExecRead, ExecReadParams, ExecRelease, ExecReleaseParams, ExecSpawn, ExecSpawnParams, FsRead, FsReadParams, FsWrite,
-    FsWriteParams, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams, WorkspaceOpen,
-    WorkspaceOpenParams,
+    BackendSpec, CallScope, ExecRead, ExecReadParams, ExecRelease, ExecReleaseParams, ExecSpawn, ExecSpawnParams, FsRead, FsReadParams,
+    FsWrite, FsWriteParams, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams,
+    WorkspaceOpen, WorkspaceOpenParams,
 };
 use aim_proto::harness::{CaseMode, Command as RemoteCommand, ExactEdit, ExitStatus, Precondition};
 use aim_proto::ids::IdempotencyKey;
@@ -109,6 +109,7 @@ fn tool_text(result: &ToolResult) -> &str {
 async fn tool(peer: &Peer, workspace: &WorkspaceId, name: &str, arguments: serde_json::Value, key: &str) -> ToolResult {
     let result = peer
         .call::<ToolsCall>(ToolsCallParams {
+            scope: None,
             workspace: workspace.clone(),
             name: name.to_owned(),
             arguments,
@@ -1501,13 +1502,18 @@ async fn live_ssh_resident_resume_two_proxies_and_idle_exit() {
     let init = initialize(&peer, None).await;
     assert!(!init.resumed);
     let workspace = peer
-        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_string_lossy().into_owned(), backend: BackendSpec::Local })
+        .call::<WorkspaceOpen>(WorkspaceOpenParams {
+            ceiling: None,
+            root: root.to_string_lossy().into_owned(),
+            backend: BackendSpec::Local,
+        })
         .await
         .expect("resident workspace");
     assert!(workspace.caps.resumable);
     eprintln!("resident_handshake_ms={}", started.elapsed().as_millis());
     let path = root.join("different.txt").to_string_lossy().into_owned();
     peer.call::<FsWrite>(FsWriteParams {
+        scope: None,
         workspace: workspace.id.clone(),
         path: path.clone(),
         content: Content::Utf8 { text: "remote".to_owned() },
@@ -1517,6 +1523,38 @@ async fn live_ssh_resident_resume_two_proxies_and_idle_exit() {
     })
     .await
     .expect("resident write");
+    let read_only = CallScope {
+        roots: vec![root.to_string_lossy().into_owned()],
+        ops: vec!["read".into()],
+        deny_write: Vec::new(),
+        max_processes: None,
+        max_output_bytes: None,
+    };
+    let scoped_read = peer
+        .call::<FsRead>(FsReadParams {
+            workspace: workspace.id.clone(),
+            path: path.clone(),
+            range: None,
+            scope: Some(read_only.clone()),
+            hash: false,
+        })
+        .await
+        .expect("read-only scope permits SSH read");
+    assert_eq!(scoped_read.content.into_bytes(), b"remote");
+    assert!(scoped_read.hash.is_none());
+    let denied = peer
+        .call::<FsWrite>(FsWriteParams {
+            workspace: workspace.id.clone(),
+            path: path.clone(),
+            content: Content::Utf8 { text: "blocked".to_owned() },
+            precondition: Precondition::Any,
+            create_dirs: false,
+            idempotency_key: IdempotencyKey::new("resident-scoped-write"),
+            scope: Some(read_only),
+        })
+        .await
+        .expect_err("read-only scope denies SSH write");
+    assert_eq!(denied.code, ErrorCode::Denied);
     assert_eq!(std::fs::read_to_string(&path).expect("remote file"), "remote");
     sshd.assert_local_denied(&root.join("different.txt"));
     assert_eq!(std::fs::read_to_string(local.join("different.txt")).expect("local file"), "local");
@@ -1544,6 +1582,7 @@ async fn resume_two_proxies(
 
     let process = peer
         .call::<ExecSpawn>(ExecSpawnParams {
+            scope: None,
             workspace: workspace.clone(),
             command: RemoteCommand::Shell { script: "printf 'first'; sleep 1; printf 'second'".to_owned() },
             cwd: Some(root.to_string_lossy().into_owned()),
@@ -1559,7 +1598,7 @@ async fn resume_two_proxies(
     let mut first_seq = 0;
     for _ in 0..8 {
         let read = peer
-            .call::<ExecRead>(ExecReadParams { proc: process.clone(), after_seq: 0, max_bytes: Some(1024), wait_ms: 500 })
+            .call::<ExecRead>(ExecReadParams { scope: None, proc: process.clone(), after_seq: 0, max_bytes: Some(1024), wait_ms: 500 })
             .await
             .expect("read first output");
         if let Some(chunk) = read.chunks.first() {
@@ -1577,7 +1616,7 @@ async fn resume_two_proxies(
     let mut cursor = first_seq;
     for _ in 0..8 {
         let read = resumed_peer
-            .call::<ExecRead>(ExecReadParams { proc: process.clone(), after_seq: cursor, max_bytes: Some(1024), wait_ms: 500 })
+            .call::<ExecRead>(ExecReadParams { scope: None, proc: process.clone(), after_seq: cursor, max_bytes: Some(1024), wait_ms: 500 })
             .await
             .expect("read resumed output");
         for chunk in read.chunks {
@@ -1589,7 +1628,7 @@ async fn resume_two_proxies(
         }
     }
     assert_eq!(remaining, b"second");
-    resumed_peer.call::<ExecRelease>(ExecReleaseParams { proc: process }).await.expect("release");
+    resumed_peer.call::<ExecRelease>(ExecReleaseParams { scope: None, proc: process }).await.expect("release");
     resumed_peer.close();
     peer_two.close();
     resumed_child.kill().await.expect("stop resumed proxy");
@@ -1619,12 +1658,17 @@ async fn live_ssh_agentless_stdio_fallback() {
     let (peer, mut child) = spawn_forward(&sshd, &root, "never");
     initialize(&peer, None).await;
     let workspace = peer
-        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_string_lossy().into_owned(), backend: BackendSpec::Local })
+        .call::<WorkspaceOpen>(WorkspaceOpenParams {
+            ceiling: None,
+            root: root.to_string_lossy().into_owned(),
+            backend: BackendSpec::Local,
+        })
         .await
         .expect("agentless workspace");
     assert!(!workspace.caps.resumable);
     let path = root.join("fallback.txt").to_string_lossy().into_owned();
     peer.call::<FsWrite>(FsWriteParams {
+        scope: None,
         workspace: workspace.id.clone(),
         path: path.clone(),
         content: Content::Utf8 { text: "remote-only".to_owned() },
@@ -1634,7 +1678,10 @@ async fn live_ssh_agentless_stdio_fallback() {
     })
     .await
     .expect("agentless write");
-    let read = peer.call::<FsRead>(FsReadParams { workspace: workspace.id.clone(), path, range: None }).await.expect("agentless read");
+    let read = peer
+        .call::<FsRead>(FsReadParams { scope: None, hash: true, workspace: workspace.id.clone(), path, range: None })
+        .await
+        .expect("agentless read");
     assert_eq!(read.content.into_bytes(), b"remote-only");
     sshd.assert_local_denied(&root.join("fallback.txt"));
     assert_eq!(std::fs::read_to_string(local.join("fallback.txt")).expect("local sentinel"), "local sentinel");
@@ -1651,11 +1698,16 @@ async fn live_ssh_transparent_reconnect_after_channel_killed() {
     let (peer, mut child) = spawn_forward(&sshd, &root, "auto");
     initialize(&peer, None).await;
     let workspace = peer
-        .call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_string_lossy().into_owned(), backend: BackendSpec::Local })
+        .call::<WorkspaceOpen>(WorkspaceOpenParams {
+            ceiling: None,
+            root: root.to_string_lossy().into_owned(),
+            backend: BackendSpec::Local,
+        })
         .await
         .expect("open");
     let proc = peer
         .call::<ExecSpawn>(ExecSpawnParams {
+            scope: None,
             workspace: workspace.id,
             command: RemoteCommand::Shell { script: "printf first; sleep 2; printf second".to_owned() },
             cwd: Some(root.to_string_lossy().into_owned()),
@@ -1669,7 +1721,7 @@ async fn live_ssh_transparent_reconnect_after_channel_killed() {
         .expect("spawn")
         .proc;
     let first = peer
-        .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: 0, max_bytes: Some(1024), wait_ms: 1000 })
+        .call::<ExecRead>(ExecReadParams { scope: None, proc: proc.clone(), after_seq: 0, max_bytes: Some(1024), wait_ms: 1000 })
         .await
         .expect("first output");
     let first_seq = first.chunks.first().expect("first chunk").seq;
@@ -1680,7 +1732,7 @@ async fn live_ssh_transparent_reconnect_after_channel_killed() {
     let mut rest = Vec::new();
     for _ in 0..8 {
         let read = peer
-            .call::<ExecRead>(ExecReadParams { proc: proc.clone(), after_seq: cursor, max_bytes: Some(1024), wait_ms: 1000 })
+            .call::<ExecRead>(ExecReadParams { scope: None, proc: proc.clone(), after_seq: cursor, max_bytes: Some(1024), wait_ms: 1000 })
             .await
             .expect("read through reconnection");
         for chunk in read.chunks {
@@ -1694,7 +1746,7 @@ async fn live_ssh_transparent_reconnect_after_channel_killed() {
     assert_eq!(rest, b"second");
     assert!(child.try_wait().expect("forwarder status").is_none(), "local aimx stream must stay alive");
     eprintln!("transparent_reconnect_ms={}", started.elapsed().as_millis());
-    peer.call::<ExecRelease>(ExecReleaseParams { proc }).await.expect("release");
+    peer.call::<ExecRelease>(ExecReleaseParams { scope: None, proc }).await.expect("release");
     peer.close();
     child.kill().await.expect("stop forwarder");
 }
