@@ -8,6 +8,7 @@
 //! No I/O happens here; canonicalising roots is the server's job.
 
 pub mod confine;
+pub mod identity;
 
 use std::sync::Arc;
 
@@ -161,6 +162,9 @@ impl Grant {
     /// `denied` outside the root, for mutations by a read-only principal, on protected paths and
     /// for removing or moving the root itself; `invalid_params` for malformed paths.
     pub fn path(&self, user_path: &str, access: Access) -> Result<String, ProtoError> {
+        // TODO(ADR-per-call-scope): intersect with the caller's per-call ceiling (REV4-A finding 4,
+        // ADR 0008/0021 narrow-only delegation) once the protocol carries one; until then only the
+        // principal's own authority is enforced here and in `mutation`/`exec`.
         let path = self.confine(user_path)?;
         match access {
             Access::Read => {}

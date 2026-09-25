@@ -3,6 +3,8 @@
 //! `aim_rpc::Peer`, plus the spawned binary over `--unix` and `--stdio`.
 
 #[cfg(test)]
+mod aliases;
+#[cfg(test)]
 mod binary;
 #[cfg(test)]
 mod common;

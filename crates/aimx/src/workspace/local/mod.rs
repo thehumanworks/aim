@@ -9,6 +9,7 @@
 
 mod exec;
 mod fs;
+mod protect;
 mod search;
 mod walk;
 
@@ -22,6 +23,7 @@ use tokio::sync::Semaphore;
 
 use self::exec::LocalExec;
 use self::fs::LocalFs;
+use self::protect::Protector;
 use self::search::LocalSearch;
 use self::walk::{Follow, Loc, Root, WalkError};
 use super::{Exec, Fs, Outcome, Search, Workspace};
@@ -79,8 +81,13 @@ impl LocalWorkspace {
     pub async fn open(root: &str, config: LocalConfig) -> Outcome<Self> {
         let canonical = canonical_root(root).await?;
         let path = PathBuf::from(&canonical);
-        let root = blocking(move || Root::open(&path).map_err(|err| io_error(&err, &path.to_string_lossy()))).await?;
-        let base = Arc::new(Base { root, protected: config.protected });
+        let protected = config.protected;
+        let base = blocking(move || {
+            let root = Root::open(&path).map_err(|err| io_error(&err, &path.to_string_lossy()))?;
+            Ok(Base { protector: Protector::new(protected, &path), root })
+        })
+        .await?;
+        let base = Arc::new(base);
         Ok(Self {
             caps: Caps { max_concurrency: config.max_concurrency, ..local_caps() },
             fs: LocalFs::new(Arc::clone(&base)),
@@ -150,11 +157,11 @@ impl Workspace for LocalWorkspace {
     }
 }
 
-/// What every part of the backend shares: the root (held open) and the protected set.
+/// What every part of the backend shares: the root (held open) and the protected-path check.
 #[derive(Debug)]
 struct Base {
     root: Root,
-    protected: Arc<ProtectedPaths>,
+    protector: Protector,
 }
 
 impl Base {
@@ -182,11 +189,20 @@ impl Base {
         loc.real_path(&self.root.path)
     }
 
-    /// Refuses mutations whose real location is protected.
+    /// Refuses a mutation of a resolved target that is (or lies inside, or for `tree` operations
+    /// contains) a protected path, compared by filesystem identity ([`protect`]). A check that
+    /// cannot be made refuses too.
     fn check_protected(&self, loc: &Loc, tree: bool) -> Outcome<()> {
-        let real = path_string(&self.real(loc))?;
-        let hit = if tree { self.protected.guards_tree(&real) } else { self.protected.guards(&real) };
-        if hit { Err(ProtoError::new(ErrorCode::Denied, format!("`{real}` is a protected path"))) } else { Ok(()) }
+        let real = self.real(loc);
+        match self.protector.hit(loc, tree) {
+            Ok(None) => Ok(()),
+            Ok(Some(protected)) => {
+                Err(ProtoError::new(ErrorCode::Denied, format!("`{}` is the protected path `{protected}` (or affects it)", real.display())))
+            }
+            Err(err) => {
+                Err(ProtoError::new(ErrorCode::Denied, format!("cannot check `{}` against the protected paths: {err}", real.display())))
+            }
+        }
     }
 
     /// `real` relative to the root, for results (`""` for the root).
