@@ -54,6 +54,8 @@ seen values (wrong across providers).
    (nothing borrowed from the backend). The host spawns it after the session is live and again after
    every announced configuration, aborting an older lookup, and publishes the answer under the
    transcript lock (so an attach sees it in its snapshot or on its stream, never both or neither).
+   An unchanged answer is not sent again, except after a model change: clients treat the ladder as
+   unknown from a model's `ConfigChanged` until the next `Options`.
    Native sessions answer from the catalog W26 fetched at start (codex) or from one bounded
    background fetch (the gateways' catalog is cached by the provider), without hidden models, with
    the current model's ladder and the default effort marked. ACP sessions answer from the agent's
@@ -90,6 +92,22 @@ seen values (wrong across providers).
   `switches_keep_place_and_privacy`, `effort_candidates_are_the_ladder_and_auto` (with the exec
   fns' `ensures`: no duplicates, exactly ladder ∪ {auto}), `effort_sent_only_if_offered`.
 - Contract: `crates/aim-proto/tests/contract.rs::adr_0074_session_options_are_additive`.
-- Host: options are published and replayed on attach (`crates/aim/tests/host.rs`); TUI unit and PTY
-  tests (`crates/aim/src/tui/app/tests.rs`, `crates/aim/tests/tui_pty.rs`); live evidence recorded in
-  the worker report for this change.
+- Host and daemon: `crates/aim/tests/host.rs::options_are_published_replayed_on_attach_and_follow_the_model`,
+  `a_session_without_a_catalog_sends_no_options_and_is_not_held_up`,
+  `crates/aim/tests/daemon.rs::session_options_reach_daemon_clients_on_attach_and_on_the_stream`;
+  ACP: `crates/aim/src/acp.rs::claude_agent_acp_models_and_efforts_become_options` (the recorded
+  0.81.2 answer) and `advertised_options_follow_the_agents_answers`.
+- TUI: unit tests in `crates/aim/src/tui/app/tests.rs` and `crates/aim/src/tui/choices.rs`; PTY tests
+  in `crates/aim/tests/tui_pty.rs` (`provider_popup_lists_the_known_providers`,
+  `model_popup_lists_the_scripted_catalog_and_efforts_follow_the_model`,
+  `clear_wipes_the_screen_and_starts_a_new_session`,
+  `clear_in_fullscreen_leaves_no_old_rows_on_either_screen`); the scrollback purge in tmux
+  (`crates/aim/tests/tui_tmux.rs::tmux_clear_purges_the_scrollback`, ignored: needs tmux).
+- Live, 2026-09-25, release build in tmux: on `codex`, `/model ` listed the real catalog
+  (`gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-*`, … with 272k windows) and `/effort ` the
+  `gpt-6-sol` ladder `low … ultra` with `medium` marked default, plus `auto`; `/effort bogus` was
+  refused locally; `/provider openrouter` started a session on `anthropic/claude-sonnet-5` (the
+  gateway default, no codex model carried) whose `/model ` listed OpenRouter's catalog; on
+  `acp:claude`, `/model ` listed `default`, `opus[1m]`, `claude-fable-5-1[1m]`, `sonnet`, `haiku` and
+  `/effort ` `default … max`, and after `/model haiku` the adapter advertised no effort option, so
+  only `auto` was offered.
