@@ -132,6 +132,8 @@ impl Human {
                 writeln!(out).and_then(|()| writeln!(err, "⏺ {name} {}", one_line(arguments, 120)))
             }
             AgentEvent::ToolFinished { result, .. } => writeln!(err, "  ⎿ {}", result_summary(result)),
+            AgentEvent::SubagentStarted { child_session, description, .. } => writeln!(err, "  ↳ agent {child_session}: {description}"),
+            AgentEvent::SubagentStopped { child_session, status, .. } => writeln!(err, "  ↳ agent {child_session}: {status:?}"),
             AgentEvent::RequestStarted { index } => {
                 self.requests = *index;
                 Ok(())

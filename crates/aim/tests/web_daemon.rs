@@ -38,6 +38,8 @@ fn summary() -> SessionSummary {
             model: "probe".into(),
             title: None,
             parent: None,
+            subagent_parent: None,
+            subagent_ceiling: None,
             agent: None,
         },
         state: SessionState::Idle,

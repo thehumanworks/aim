@@ -87,6 +87,8 @@ impl SessionClient for Scripted {
                     model: spec.model.unwrap_or_else(|| "scripted".into()),
                     title: None,
                     parent: None,
+                    subagent_parent: None,
+                    subagent_ceiling: None,
                     agent: None,
                 },
                 state: SessionState::Idle,

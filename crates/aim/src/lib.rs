@@ -36,5 +36,6 @@ pub mod resources;
 pub mod search;
 pub mod session;
 pub mod store;
+pub mod subagents;
 pub mod tui;
 pub mod workers;

@@ -108,6 +108,12 @@ impl Recorder {
             AgentEvent::Usage { usage } => EventBody::Usage { usage: usage.clone(), model: self.model.clone() },
             AgentEvent::RateLimits { limits } => EventBody::RateLimits { limits: limits.clone() },
             AgentEvent::Decision { decision } => EventBody::Decision { decision: decision.clone() },
+            AgentEvent::SubagentStarted { parent_session, call_id, child_session, description } => EventBody::SubagentStarted {
+                parent_session: parent_session.clone(), call_id: call_id.clone(), child_session: child_session.clone(), description: description.clone(),
+            },
+            AgentEvent::SubagentStopped { parent_session, call_id, child_session, description, status } => EventBody::SubagentStopped {
+                parent_session: parent_session.clone(), call_id: call_id.clone(), child_session: child_session.clone(), description: description.clone(), status: *status,
+            },
             AgentEvent::TurnEnded { stop } => EventBody::TurnEnded { stop: stop.clone() },
             AgentEvent::TurnFailed { message } => EventBody::TurnFailed { message: message.clone() },
             AgentEvent::ConfigChanged { model, effort, effort_source } => {

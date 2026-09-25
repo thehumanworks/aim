@@ -12,7 +12,7 @@
 //! [`SessionClient`] is what UIs program against; the host implements it in process, and the
 //! daemon client implements it over `aim-daemon/1`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -28,7 +28,7 @@ use aim_proto::daemon::{
     SessionListParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::event::{EffortSource, EventBody, SessionAgent, SessionEvent, SessionMeta};
+use aim_proto::event::{EffortSource, EventBody, SessionAgent, SessionEvent, SessionMeta, SessionToolCeiling};
 use futures_core::Stream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -45,6 +45,7 @@ use crate::resources::tools::AllowedTools;
 use crate::resources::{self, Files, HarnessFiles, ResourceConfig};
 use crate::session::{self, Recorder};
 use crate::store::{MemoryStore, SessionStore, StoreError};
+use crate::subagents::{self, ChildStart, SpawnContext};
 
 /// A boxed, sendable, owned future.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -144,6 +145,8 @@ pub struct BackendRequest {
     pub transcript: Vec<Item>,
     /// What a resumed session recorded; `None` for a new session.
     pub recorded: Option<Recorded>,
+    /// Native child-session tools for this session (absent in direct factory probes).
+    pub subagents: Option<SpawnContext>,
 }
 
 /// What a resumed session recorded, which its backend must honour again (ADR 0038).
@@ -210,7 +213,7 @@ pub struct CodeConfig {
 }
 
 /// Offers a session extra tools, or none (see [`NativeServices::tools`]).
-pub type ToolsFactory = Arc<dyn Fn(&SessionSpec) -> BoxFuture<Option<Arc<dyn ToolHost>>> + Send + Sync>;
+pub type ToolsFactory = Arc<dyn Fn(&SessionSpec, Option<SpawnContext>) -> BoxFuture<Option<Arc<dyn ToolHost>>> + Send + Sync>;
 
 /// The native loop: a provider from `providers` and tools from a workspace `workspaces`
 /// connects, with aim's instructions, the session's resources (the project's through the
@@ -233,6 +236,10 @@ pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory,
 ///   session applies its recorded agent again and never widens the ceiling it recorded;
 /// - `$skill` mentions in prompts inject the skill into the user turn ([`WithSkills`]).
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "native backend construction keeps discovery, effective ceilings and tool composition in one ordered flow"
+)]
 pub fn native_backends_with(
     providers: ProviderFactory,
     workspaces: WorkspaceFactory,
@@ -245,7 +252,7 @@ pub fn native_backends_with(
         let (providers, workspaces, resources, services) =
             (Arc::clone(&providers), Arc::clone(&workspaces), Arc::clone(&resources), services.clone());
         Box::pin(async move {
-            let BackendRequest { spec, session_id, transcript, recorded } = request;
+            let BackendRequest { spec, session_id, transcript, recorded, subagents } = request;
             let (provider, default_model) =
                 providers(&spec.provider, spec.model.as_deref()).map_err(|e| err(ErrorCode::InvalidParams, e))?;
             let workspace = workspaces(&spec).await?;
@@ -274,9 +281,21 @@ pub fn native_backends_with(
                     if let Some(note) = &defaults.note {
                         tracing::warn!("{note}");
                     }
-                    (defaults.model.unwrap_or(default_model), defaults.effort)
+                    (
+                        defaults
+                            .model
+                            .or_else(|| subagents.as_ref().and_then(|context| context.parent_model.clone()))
+                            .unwrap_or(default_model),
+                        defaults.effort,
+                    )
                 }
-                None => (spec.model.clone().unwrap_or(default_model), spec.effort.clone()),
+                None => (
+                    spec.model
+                        .clone()
+                        .or_else(|| subagents.as_ref().and_then(|context| context.parent_model.clone()))
+                        .unwrap_or(default_model),
+                    spec.effort.clone(),
+                ),
             };
             // The skill budget is a share of the window of the model the session runs, which an
             // agent may have chosen (REV8-15).
@@ -321,8 +340,12 @@ pub fn native_backends_with(
             }
             let mut tools_spec = spec.clone();
             tools_spec.workspace = root.clone();
-            tools = with_extra_tools(tools, &services.tools, &tools_spec).await;
-            let code_permitted = agent.as_ref().is_none_or(|(_, policy)| policy.permits("run_code"));
+            let definition_policy = agent.as_ref().map_or_else(ToolPolicy::default, |(_, policy)| policy.clone());
+            let effective_policy =
+                subagents.as_ref().map_or_else(|| definition_policy.clone(), |context| context.ceiling.intersect(&definition_policy));
+            let subagents = subagents.map(|context| context.effective(&definition_policy, model.clone(), root.clone()));
+            tools = with_extra_tools(tools, &services.tools, &tools_spec, subagents).await;
+            let code_permitted = effective_policy.permits("run_code");
             let (mut tools, record) = match &agent {
                 Some((agent, policy)) => (narrowed(tools, agent, policy), Some(policy.record(&agent.meta.name))),
                 None => (tools, None),
@@ -330,6 +353,9 @@ pub fn native_backends_with(
             if let Some(code) = services.code.as_ref().filter(|_| code_permitted) {
                 let agent = agent.as_ref().map(|(agent, policy)| (agent, policy));
                 tools = with_code_mode(tools, code, agent, provider.as_ref(), &model, &session_id, &spec.location, &root).await;
+            }
+            if !effective_policy.is_unrestricted() {
+                tools = Arc::new(AllowedTools::new(tools, effective_policy, "inherited subagent ceiling"));
             }
             let config = AgentConfig {
                 model: model.clone(),
@@ -360,10 +386,15 @@ async fn starting_effort(provider: &dyn ModelProvider, model: &str) -> Option<St
 
 /// `tools` narrowed to `policy`, the ceiling of `agent`.
 /// Composes the per-session extra tools after `tools` (whose names take precedence).
-async fn with_extra_tools(tools: Arc<dyn ToolHost>, factories: &[ToolsFactory], spec: &SessionSpec) -> Arc<dyn ToolHost> {
+async fn with_extra_tools(
+    tools: Arc<dyn ToolHost>,
+    factories: &[ToolsFactory],
+    spec: &SessionSpec,
+    context: Option<SpawnContext>,
+) -> Arc<dyn ToolHost> {
     let mut extra = Vec::new();
     for factory in factories {
-        if let Some(host) = factory(spec).await {
+        if let Some(host) = factory(spec, context.clone()).await {
             extra.push(host);
         }
     }
@@ -498,6 +529,8 @@ pub struct HostConfig {
     pub update_capacity: usize,
 }
 
+type EphemeralChildLogs = Arc<Mutex<HashMap<String, (String, Arc<dyn SessionStore>)>>>;
+
 enum Control {
     Prompt(Vec<Part>, oneshot::Sender<PromptOutcome>),
     Cancel,
@@ -527,6 +560,9 @@ struct Live {
     /// Cancelled before `Control::Close` is queued, so a config change already in progress
     /// cannot keep the actor from reading the close.
     close_requested: CancellationToken,
+    /// Child turns charge these quotas, from the root through this session.
+    child_quotas: Vec<Arc<Mutex<u32>>>,
+    is_child: bool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -554,6 +590,10 @@ pub struct SessionHost {
     /// Held (read) by each start until its session is live or abandoned, so shutdown (write) can
     /// wait for starts in flight within its deadline.
     starting: Arc<tokio::sync::RwLock<()>>,
+    /// Live child ids by parent, used for cancellation even if a tool future is dropped.
+    children: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// Private child logs remain in memory for `read_session` until the root closes.
+    ephemeral_children: EphemeralChildLogs,
 }
 
 impl SessionHost {
@@ -566,6 +606,8 @@ impl SessionHost {
             resuming: Arc::new(tokio::sync::Mutex::new(())),
             closing: Arc::new(AtomicBool::new(false)),
             starting: Arc::new(tokio::sync::RwLock::new(())),
+            children: Arc::new(Mutex::new(HashMap::new())),
+            ephemeral_children: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -605,7 +647,92 @@ impl SessionHost {
         lock(&self.sessions).get(id).cloned().ok_or_else(|| err(ErrorCode::NotFound, format!("no live session {id}")))
     }
 
-    async fn start(&self, spec: SessionSpec, resume: Option<Resume>) -> Result<SessionSummary, ProtoError> {
+    pub(crate) fn current_model(&self, id: &str) -> Option<String> {
+        self.live(id).ok().map(|live| lock(&live.summary).meta.model.clone())
+    }
+
+    /// Reads a private child log while its root session remains live. The log never touches the
+    /// persistent store or search index.
+    pub(crate) async fn read_ephemeral_child(&self, requester: &str, id: &str) -> Option<(SessionMeta, Vec<SessionEvent>)> {
+        let store = {
+            let logs = lock(&self.ephemeral_children);
+            let mut cursor = id;
+            loop {
+                let (parent, store) = logs.get(cursor)?;
+                if parent == requester {
+                    break Arc::clone(store);
+                }
+                cursor = parent;
+            }
+        };
+        store.load(id.to_owned()).await.ok()
+    }
+
+    fn forget_ephemeral_descendants(&self, root: &str) {
+        let mut logs = lock(&self.ephemeral_children);
+        let mut roots = vec![root.to_owned()];
+        while let Some(parent) = roots.pop() {
+            let children: Vec<String> = logs.iter().filter(|(_, (owner, _))| owner == &parent).map(|(id, _)| id.clone()).collect();
+            for child in children {
+                logs.remove(&child);
+                roots.push(child);
+            }
+        }
+    }
+
+    /// Starts a child with the same bound workspace and a narrowing inherited ceiling.
+    pub(crate) async fn create_child(&self, spec: SessionSpec, child: ChildStart) -> Result<SessionSummary, ProtoError> {
+        let parent = self.live(&child.parent.session)?;
+        let parent_summary = lock(&parent.summary).clone();
+        let bound = parent_summary.meta;
+        let location = match &spec.location {
+            Location::Local => "local".to_owned(),
+            Location::Ssh { destination } => format!("ssh:{destination}"),
+            Location::Remote { url } => format!("remote:{url}"),
+        };
+        if parent.close_requested.is_cancelled()
+            || spec.workspace != bound.workspace
+            || location != bound.location
+            || spec.persistence != parent_summary.persistence
+        {
+            return Err(err(ErrorCode::Denied, "child must use its live parent's workspace, location and persistence"));
+        }
+        self.start(spec, None, Some(child)).await
+    }
+
+    pub(crate) fn register_child(&self, parent: &str, child: &str) {
+        lock(&self.children).entry(parent.to_owned()).or_default().insert(child.to_owned());
+    }
+
+    pub(crate) fn unregister_child(&self, parent: &str, child: &str) {
+        let mut registry = lock(&self.children);
+        if let Some(children) = registry.get_mut(parent) {
+            children.remove(child);
+            if children.is_empty() {
+                registry.remove(parent);
+            }
+        }
+    }
+
+    fn cancel_children(&self, parent: &str) {
+        let mut todo = vec![parent.to_owned()];
+        while let Some(parent) = todo.pop() {
+            let children: Vec<String> =
+                lock(&self.children).get(&parent).into_iter().flat_map(|children| children.iter().cloned()).collect();
+            for id in children {
+                if let Ok(child) = self.live(&id) {
+                    let _ignored = child.control.send(Control::Cancel);
+                    todo.push(id);
+                }
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "session creation keeps backend startup, metadata and actor publication in one failure-atomic flow"
+    )]
+    async fn start(&self, spec: SessionSpec, resume: Option<Resume>, child: Option<ChildStart>) -> Result<SessionSummary, ProtoError> {
         if self.closing.load(Ordering::SeqCst) {
             return Err(shutting_down());
         }
@@ -618,7 +745,13 @@ impl SessionHost {
         let transcript = resume.as_ref().map(|r| items_of(&r.events)).unwrap_or_default();
         let context = resume.as_ref().map(|r| model_items_of(&r.events)).unwrap_or_default();
         let prior = resume.as_ref().map(|r| Recorded { agent: r.meta.agent.clone(), effort_source: last_config(&r.meta, &r.events).2 });
-        let request = BackendRequest { spec: spec.clone(), session_id: session_id.clone(), transcript: context, recorded: prior };
+        let child_quotas = child.as_ref().map_or_else(Vec::new, |child| child.quotas.clone());
+        let subagents = Some(match &child {
+            Some(child) => SpawnContext::child(self.clone(), session_id.clone(), spec.clone(), child),
+            None => SpawnContext::root(self.clone(), session_id.clone(), spec.clone()),
+        });
+        let request =
+            BackendRequest { spec: spec.clone(), session_id: session_id.clone(), transcript: context, recorded: prior, subagents };
         let Built { mut backend, model, root, location, agent, shutdown } = (self.config.backends)(request).await?;
 
         let store: Arc<dyn SessionStore> = match spec.persistence {
@@ -638,6 +771,11 @@ impl SessionHost {
                 model,
                 title: None,
                 parent: None,
+                subagent_parent: child.as_ref().map(|child| child.parent.clone()),
+                subagent_ceiling: child.as_ref().map(|child| SessionToolCeiling {
+                    allow: child.ceiling.allow.as_ref().map(|allow| allow.iter().cloned().collect()),
+                    deny: child.ceiling.deny.iter().cloned().collect(),
+                }),
                 agent,
             };
             let created = Recorder::create(Arc::clone(&store), meta.clone()).await;
@@ -694,14 +832,27 @@ impl SessionHost {
             updates,
             control,
             close_requested: CancellationToken::new(),
+            child_quotas,
+            is_child: child.is_some(),
         });
         lock(&self.sessions).insert(meta.id.clone(), Arc::clone(&live));
+        if spec.persistence == Persistence::Ephemeral
+            && let Some(parent) = &meta.subagent_parent
+        {
+            lock(&self.ephemeral_children).insert(meta.id.clone(), (parent.session.clone(), Arc::clone(&store)));
+        }
         let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location, announced };
         let sessions = Arc::clone(&self.sessions);
+        let host = self.clone();
+        let root_session = child.is_none();
         let id = meta.id.clone();
         tokio::spawn(async move {
             actor.run(control_rx).await;
+            host.cancel_children(&id);
             shutdown().await;
+            if root_session {
+                host.forget_ephemeral_descendants(&id);
+            }
             let mut sessions = lock(&sessions);
             if sessions.get(&id).is_some_and(|l| Arc::ptr_eq(l, &live)) {
                 sessions.remove(&id);
@@ -736,7 +887,13 @@ impl SessionHost {
             agent: meta.agent.as_ref().map(|agent| agent.name.clone()),
             persistence: Persistence::Persistent,
         };
-        self.start(spec, Some(Resume { meta, events })).await?;
+        if meta.subagent_parent.is_some() {
+            return Err(err(
+                ErrorCode::Unavailable,
+                "a child session can be read with read_session but cannot resume without its live parent budget",
+            ));
+        }
+        self.start(spec, Some(Resume { meta, events }), None).await?;
         self.live(id)
     }
 }
@@ -822,6 +979,9 @@ async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<Strin
         (Some(_), SessionUpdate::ConfigChanged { .. }) => return,
         (_, update) => update,
     };
+    if let SessionUpdate::ConfigChanged { model, .. } = &update {
+        lock(&live.summary).meta.model.clone_from(model);
+    }
     if let SessionUpdate::ItemAdded { item } = &update {
         let mut transcript = lock(&live.transcript);
         transcript.push(item.clone());
@@ -946,6 +1106,12 @@ impl Actor {
         pending_config: &mut Option<(Option<String>, Option<String>)>,
     ) -> bool {
         let Self { live, backend, recorder, broken, root, location, announced } = self;
+        if live.is_child
+            && let Err(error) = subagents::charge_turn(&live.child_quotas)
+        {
+            let _ignored = live.updates.send(SessionUpdate::TurnFailed { message: error.message });
+            return true;
+        }
         if let Err(e) = recorder.begin_turn().await {
             // Nothing ran: report the failure as this turn's only terminal event and close.
             let why = format!("store: the session log could not be written ({e}); the session is closed");
@@ -1124,7 +1290,7 @@ impl SessionClient for SessionHost {
 
     fn create(&self, spec: SessionSpec) -> BoxFuture<Result<SessionSummary, ProtoError>> {
         let host = self.clone();
-        Box::pin(async move { host.start(spec, None).await })
+        Box::pin(async move { host.start(spec, None, None).await })
     }
 
     fn list(&self, params: SessionListParams) -> BoxFuture<Result<Vec<SessionSummary>, ProtoError>> {
@@ -1178,8 +1344,13 @@ impl SessionClient for SessionHost {
     }
 
     fn cancel(&self, session: String) -> BoxFuture<Result<(), ProtoError>> {
+        let host = self.clone();
         let live = self.live(&session);
-        Box::pin(async move { live?.control.send(Control::Cancel).map_err(|_| err(ErrorCode::Unavailable, "session closed")) })
+        Box::pin(async move {
+            live?.control.send(Control::Cancel).map_err(|_| err(ErrorCode::Unavailable, "session closed"))?;
+            host.cancel_children(&session);
+            Ok(())
+        })
     }
 
     fn set_config(&self, params: SessionConfigParams) -> BoxFuture<Result<(), ProtoError>> {
@@ -1200,11 +1371,147 @@ impl SessionClient for SessionHost {
     }
 
     fn close(&self, session: String) -> BoxFuture<Result<(), ProtoError>> {
+        let host = self.clone();
         let live = self.live(&session);
         Box::pin(async move {
             let live = live?;
             live.close_requested.cancel();
-            live.control.send(Control::Close).map_err(|_| err(ErrorCode::Unavailable, "session closed"))
+            live.control.send(Control::Close).map_err(|_| err(ErrorCode::Unavailable, "session closed"))?;
+            host.cancel_children(&session);
+            Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod subagent_tests {
+    use super::*;
+    use crate::agent::{AgentError, BackendFuture};
+    use aim_proto::conversation::StopReason;
+    use futures_util::StreamExt as _;
+
+    struct Waiting;
+
+    impl Backend for Waiting {
+        fn run_turn<'a>(
+            &'a mut self,
+            input: Vec<Part>,
+            events: &'a mpsc::UnboundedSender<SessionUpdate>,
+            cancel: &'a CancellationToken,
+            _steer: &'a mut mpsc::UnboundedReceiver<Vec<Part>>,
+        ) -> BackendFuture<'a, Result<StopReason, AgentError>> {
+            Box::pin(async move {
+                let _ignored = events.send(SessionUpdate::ItemAdded { item: Item::User { parts: input } });
+                cancel.cancelled().await;
+                let _ignored = events.send(SessionUpdate::TurnEnded { stop: StopReason::Cancelled });
+                Ok(StopReason::Cancelled)
+            })
+        }
+
+        fn set_config(&mut self, _model: Option<String>, _effort: Option<String>) -> BackendFuture<'_, Result<InForce, String>> {
+            Box::pin(async { Ok(InForce { model: "m".to_owned(), effort: None, effort_source: EffortSource::Explicit }) })
+        }
+    }
+
+    fn spec(persistence: Persistence) -> SessionSpec {
+        SessionSpec {
+            workspace: "/w".to_owned(),
+            location: Location::Local,
+            provider: "scripted".to_owned(),
+            model: None,
+            effort: None,
+            agent: None,
+            persistence,
+        }
+    }
+
+    fn host() -> SessionHost {
+        SessionHost::new(HostConfig {
+            store: Arc::new(MemoryStore::default()),
+            backends: Arc::new(|request| {
+                Box::pin(async move {
+                    Ok(Built {
+                        backend: Box::new(Waiting),
+                        model: "m".to_owned(),
+                        root: request.spec.workspace,
+                        location: "local".to_owned(),
+                        agent: None,
+                        shutdown: Box::new(|| Box::pin(async {})),
+                    })
+                })
+            }),
+            update_capacity: 32,
+        })
+    }
+
+    #[tokio::test]
+    async fn cancelling_or_closing_parent_cascades_to_registered_child() {
+        for close in [false, true] {
+            let host = host();
+            let parent = host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
+            let parent_id = parent.clone();
+            let child_start = ChildStart {
+                parent: aim_proto::event::SubagentParent { session: parent.clone(), call_id: "call".to_owned() },
+                ceiling: ToolPolicy::default(),
+                depth: 1,
+                quotas: vec![Arc::new(Mutex::new(8)), Arc::new(Mutex::new(8))],
+                parent_model: "m".to_owned(),
+            };
+            assert_eq!(
+                host.create_child(spec(Persistence::Persistent), child_start.clone()).await.err().map(|error| error.code),
+                Some(ErrorCode::Denied)
+            );
+            let child = host.create_child(spec(Persistence::Ephemeral), child_start).await.unwrap();
+            assert_eq!(child.persistence, Persistence::Ephemeral);
+            assert_eq!(child.meta.subagent_parent.as_ref().map(|parent| parent.session.as_str()), Some(parent.as_str()));
+            host.register_child(&parent, &child.meta.id);
+            let (_, mut updates) = host.attach(child.meta.id.clone()).await.unwrap();
+            host.prompt(child.meta.id.clone(), vec![Part::Text { text: "wait".to_owned() }]).await.unwrap();
+            while !matches!(updates.next().await, Some(SessionUpdate::TurnStarted { .. })) {}
+            if close {
+                host.close(parent).await.unwrap();
+            } else {
+                host.cancel(parent).await.unwrap();
+            }
+            let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(SessionUpdate::TurnEnded { stop }) = updates.next().await {
+                        break stop;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(terminal, StopReason::Cancelled);
+            let child_id = child.meta.id;
+            host.close(child_id.clone()).await.unwrap();
+            if !close {
+                let (meta, _) = host.read_ephemeral_child(&parent_id, &child_id).await.unwrap();
+                assert_eq!(meta.id, child_id);
+                assert!(host.read_ephemeral_child("unrelated", &child_id).await.is_none());
+                let parent_spec = spec(Persistence::Ephemeral);
+                let tools = crate::providers::search_tools()(
+                    &parent_spec,
+                    Some(SpawnContext::root(host.clone(), parent_id.clone(), parent_spec.clone())),
+                )
+                .await
+                .unwrap();
+                let result = tools
+                    .call(
+                        "read_session".to_owned(),
+                        serde_json::json!({"session": child_id}),
+                        aim_proto::ids::IdempotencyKey::new("read-child"),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    result
+                        .content
+                        .iter()
+                        .any(|part| matches!(part, aim_proto::tool::ToolContent::Text { text } if text.contains(&child_id)))
+                );
+                host.close(parent_id).await.unwrap();
+            }
+        }
     }
 }

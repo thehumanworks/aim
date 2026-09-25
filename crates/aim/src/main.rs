@@ -364,7 +364,9 @@ async fn list_sessions(limit: u32) -> Result<i32, String> {
     let store = SqliteStore::open(&cli::aim_home().join("aim.db")).map_err(|e| e.to_string())?;
     let sessions = store.list(limit).await.map_err(|e| e.to_string())?;
     for s in sessions {
-        eprintln!("{}  {}  {}/{}  {}", s.id, s.created_ms, s.provider, s.model, s.workspace);
+        let parent =
+            s.subagent_parent.as_ref().map_or_else(String::new, |parent| format!("  child of {} call {}", parent.session, parent.call_id));
+        eprintln!("{}  {}  {}/{}  {}{parent}", s.id, s.created_ms, s.provider, s.model, s.workspace);
     }
     Ok(0)
 }

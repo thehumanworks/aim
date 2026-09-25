@@ -10,6 +10,38 @@ use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolResult, ToolSpec};
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
+
+use aim_proto::daemon::SessionUpdate;
+
+tokio::task_local! {
+    static TOOL_CALL_CONTEXT: ToolCallContext;
+}
+
+/// Context of the provider call currently driving a tool future.
+#[derive(Clone, Debug)]
+pub struct ToolCallContext {
+    /// The provider's call id, distinct from the harness idempotency key.
+    pub call_id: String,
+    /// The parent turn's ordered update stream.
+    pub events: UnboundedSender<SessionUpdate>,
+    /// Cancellation of the parent turn.
+    pub cancel: CancellationToken,
+}
+
+impl ToolCallContext {
+    /// The current call, if invoked inside an agent tool future.
+    #[must_use]
+    pub fn current() -> Option<Self> {
+        TOOL_CALL_CONTEXT.try_with(Clone::clone).ok()
+    }
+
+    /// Runs one future with this context attached to its task.
+    pub fn scope<F: Future>(self, future: F) -> impl Future<Output = F::Output> {
+        TOOL_CALL_CONTEXT.scope(self, future)
+    }
+}
 
 /// A boxed, sendable, owned future.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;

@@ -239,6 +239,8 @@ async fn board_and_session_actors_share_one_wal_file() {
             model: "model".into(),
             title: None,
             parent: None,
+            subagent_parent: None,
+            subagent_ceiling: None,
             agent: None,
         })
         .await

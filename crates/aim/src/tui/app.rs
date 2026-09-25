@@ -766,6 +766,17 @@ impl App {
                 self.turn_seconds = 0;
                 self.pending_deliveries = 0;
             }
+            SessionUpdate::SubagentStarted { description, child_session, .. } => {
+                self.notice(Level::Info, format!("subagent started: {description} ({child_session})"));
+            }
+            SessionUpdate::SubagentStopped { description, child_session, status, .. } => {
+                let (level, state) = match status {
+                    aim_proto::event::SubagentStatus::Completed => (Level::Info, "completed"),
+                    aim_proto::event::SubagentStatus::Failed => (Level::Error, "failed"),
+                    aim_proto::event::SubagentStatus::Cancelled => (Level::Warn, "cancelled"),
+                };
+                self.notice(level, format!("subagent {state}: {description} ({child_session})"));
+            }
             SessionUpdate::RequestStarted { index } => self.request = index,
             SessionUpdate::TextDelta { delta } => self.live_text.push_str(&delta),
             SessionUpdate::ReasoningDelta { delta } => self.live_reasoning.push_str(&delta),

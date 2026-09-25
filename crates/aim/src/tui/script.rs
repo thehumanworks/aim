@@ -249,6 +249,8 @@ async fn seed(store: &MemoryStore, spec: &SessionSpec, items: usize) -> Result<S
         model: "scripted-model".into(),
         title: Some("seeded".into()),
         parent: None,
+        subagent_parent: None,
+        subagent_ceiling: None,
         agent: None,
     };
     store.create(meta).await.map_err(|e| e.to_string())?;

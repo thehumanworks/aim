@@ -22,7 +22,7 @@ use aim::resources::files::{FileText, FilesFuture, Read};
 use aim::resources::{
     self, Bounds, Catalog, Files, HarnessFiles, LocalFiles, MemoryFiles, Problem, ResourceConfig, Scope, Source, Trust, instructions,
 };
-use aim::store::{MemoryStore, SessionStore as _};
+use aim::store::{MemoryStore, SessionStore as _, SqliteStore};
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_llm_codex::media::{Image, SearchAnswer};
 use aim_proto::content::Content;
@@ -678,6 +678,144 @@ fn local_fixture(script: Vec<Vec<Result<StreamEvent, LlmError>>>, tools: Arc<Fak
     })
 }
 
+#[tokio::test]
+async fn child_session_inherits_read_only_ceiling_and_persistence() {
+    let tools = Arc::new(FakeTools::default());
+    let observed_tools = Arc::clone(&tools);
+    let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(
+        project().into_iter().chain([
+            (
+                ".agents/agents/lead.md",
+                "---\nschema: aim.agent/v1\nname: lead\ndescription: Can delegate and read.\ntools: [agent, Read]\n---\nDelegate safely.\n"
+                    .to_owned(),
+            ),
+            (
+                ".agents/agents/writer.md",
+                "---\nschema: aim.agent/v1\nname: writer\ndescription: Requests Read and Write.\ntools: [Read, Write]\n---\nWork.\n"
+                    .to_owned(),
+            ),
+        ]),
+    ));
+    let parent_call = Ok(StreamEvent::ItemDone {
+        item: Item::ToolCall {
+            call_id: "spawn-reader".into(),
+            name: "agent".into(),
+            arguments: json!({"prompt":"Try to write x, then report the outcome.","agent":"writer","description":"Narrowed child"})
+                .to_string(),
+            native: None,
+        },
+    });
+    let script = vec![
+        vec![parent_call, completed(StopReason::ToolUse)],
+        vec![call("try-write", "Write"), completed(StopReason::ToolUse)],
+        text("I cannot write."),
+        text("The child was read-only."),
+    ];
+    let store = Arc::new(MemoryStore::default());
+    let f = fixture_on(
+        Arc::clone(&store),
+        Vec::new(),
+        script,
+        NativeServices { tools: vec![aim::subagents::tools_factory()], ..NativeServices::default() },
+        move |spec| Connected {
+            tools: Arc::clone(&tools) as Arc<dyn ToolHost>,
+            root: spec.workspace.clone(),
+            location: "local".into(),
+            project: Some(Arc::clone(&files)),
+            shutdown: Box::new(|| Box::pin(async {})),
+        },
+    );
+    let mut parent = spec(Some("lead"));
+    parent.persistence = Persistence::Persistent;
+    let parent_id = f.host.create(parent).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(parent_id.clone()).await.unwrap();
+    f.host.prompt(parent_id.clone(), vec![Part::Text { text: "Delegate.".into() }]).await.unwrap();
+    let got = until_idle(&mut updates).await;
+    let child_id = got
+        .iter()
+        .find_map(|update| match update {
+            SessionUpdate::SubagentStarted { parent_session, call_id, child_session, .. }
+                if parent_session == &parent_id && call_id == "spawn-reader" =>
+            {
+                Some(child_session.clone())
+            }
+            _ => None,
+        })
+        .expect("child start event");
+    assert!(got.iter().any(|update| matches!(update, SessionUpdate::SubagentStopped { child_session, status: aim_proto::event::SubagentStatus::Completed, .. } if child_session == &child_id)));
+    assert!(
+        got.iter().any(|update| matches!(update, SessionUpdate::ToolFinished { name, result, .. } if name == "agent" && !result.is_error))
+    );
+    let (meta, child_events) = store.load(child_id).await.unwrap();
+    assert_eq!(meta.subagent_parent.unwrap().session, parent_id);
+    assert_eq!(meta.subagent_ceiling.unwrap().allow, Some(vec!["Read".to_owned(), "agent".to_owned()]));
+    assert!(child_events.iter().any(
+        |event| matches!(&event.body, aim_proto::event::EventBody::Item { item: Item::ToolResult { result, .. } } if result.is_error)
+    ));
+    let (_, parent_events) = store.load(parent_id).await.unwrap();
+    assert_eq!(parent_events.iter().filter(|event| matches!(event.body, aim_proto::event::EventBody::SubagentStarted { .. })).count(), 1);
+    assert_eq!(parent_events.iter().filter(|event| matches!(event.body, aim_proto::event::EventBody::SubagentStopped { .. })).count(), 1);
+    let seen = f.provider.seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|request| request.tools.iter().any(|tool| tool.name == "Read") && !request.tools.iter().any(|tool| tool.name == "Write"))
+    );
+    assert!(!observed_tools.calls.lock().unwrap().iter().any(|name| name == "Write"));
+}
+
+#[tokio::test]
+async fn two_child_sessions_from_one_model_response_complete() {
+    let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(project()));
+    let child_call = |id: &str| {
+        Ok(StreamEvent::ItemDone {
+            item: Item::ToolCall {
+                call_id: id.into(),
+                name: "agent".into(),
+                arguments: json!({"prompt":"Report done.","description":id}).to_string(),
+                native: None,
+            },
+        })
+    };
+    let script = vec![
+        vec![child_call("one"), child_call("two"), completed(StopReason::ToolUse)],
+        text("child complete"),
+        text("child complete"),
+        text("parent complete"),
+    ];
+    let f = fixture_on(
+        Arc::new(MemoryStore::default()),
+        Vec::new(),
+        script,
+        NativeServices { tools: vec![aim::subagents::tools_factory()], ..NativeServices::default() },
+        move |spec| Connected {
+            tools: Arc::new(FakeTools::default()),
+            root: spec.workspace.clone(),
+            location: "local".into(),
+            project: Some(Arc::clone(&files)),
+            shutdown: Box::new(|| Box::pin(async {})),
+        },
+    );
+    let id = f.host.create(spec(None)).await.unwrap().meta.id;
+    let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
+    f.host.prompt(id, vec![Part::Text { text: "Delegate twice.".into() }]).await.unwrap();
+    let got = until_idle(&mut updates).await;
+    let started: BTreeSet<_> = got
+        .iter()
+        .filter_map(|update| match update {
+            SessionUpdate::SubagentStarted { child_session, .. } => Some(child_session.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started.len(), 2, "two distinct child sessions: {got:?}");
+    assert_eq!(got.iter().filter(|update| matches!(update, SessionUpdate::SubagentStopped { .. })).count(), 2);
+    assert_eq!(
+        got.iter()
+            .filter(|update| matches!(update, SessionUpdate::ToolFinished { name, result, .. } if name == "agent" && !result.is_error))
+            .count(),
+        2
+    );
+}
+
 fn spec(agent: Option<&str>) -> SessionSpec {
     SessionSpec {
         workspace: "/w".into(),
@@ -987,6 +1125,66 @@ fn live_repo() -> tempfile::TempDir {
     );
     write(dir.path(), "notes.txt", "Pelican is the first word of this file.\n");
     dir
+}
+
+#[tokio::test]
+#[ignore = "live: needs OPENROUTER_API_KEY, network and a built aimx"]
+async fn live_openrouter_spawns_two_children_with_read_only_ceiling() {
+    assert!(std::env::var_os("OPENROUTER_API_KEY").is_some(), "OpenRouter key required");
+    let aimx = aimx().expect("aimx next to aim");
+    let repo = live_repo();
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(SqliteStore::open(&home.path().join(".aim/aim.db")).unwrap());
+    let host = SessionHost::new(HostConfig {
+        store: Arc::clone(&store) as Arc<dyn aim::store::SessionStore>,
+        backends: native_backends_with(
+            Arc::new(aim::providers::build),
+            aim::host::aimx_workspaces(aimx),
+            8,
+            ResourceConfig::user(home.path()),
+            NativeServices { tools: vec![aim::subagents::tools_factory()], ..NativeServices::default() },
+        ),
+        update_capacity: 4096,
+    });
+    let mut parent = spec(None);
+    parent.workspace = repo.path().canonicalize().unwrap().to_string_lossy().into_owned();
+    parent.provider = "openrouter".into();
+    parent.persistence = Persistence::Persistent;
+    let id = host.create(parent).await.unwrap().meta.id;
+    let (_, mut updates) = host.attach(id.clone()).await.unwrap();
+    let started = std::time::Instant::now();
+    host.prompt(id.clone(), vec![Part::Text { text: "Call the agent tool twice in the same assistant response, in parallel. First call: agent=reader, description='read-only test', prompt='Read notes.txt and try to create out.txt containing changed; report what happened.' Second call: description='second reader', prompt='Read notes.txt and report its first word.' Wait for both results, then say done.".into() }]).await.unwrap();
+    let mut events = Vec::new();
+    loop {
+        let update = tokio::time::timeout(Duration::from_secs(300), updates.next()).await.unwrap().unwrap();
+        let idle = matches!(update, SessionUpdate::StateChanged { state: SessionState::Idle });
+        events.push(update);
+        if idle && events.iter().any(|event| matches!(event, SessionUpdate::TurnEnded { .. } | SessionUpdate::TurnFailed { .. })) {
+            break;
+        }
+    }
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionUpdate::SubagentStarted { child_session, .. } => Some(child_session.clone()),
+            _ => None,
+        })
+        .collect();
+    let finishes = events.iter().filter(|event| matches!(event, SessionUpdate::SubagentStopped { .. })).count();
+    eprintln!("live_subagents starts={} stops={} elapsed_ms={}", starts.len(), finishes, started.elapsed().as_millis());
+    assert_eq!(starts.len(), 2, "parent must spawn both children");
+    assert_eq!(finishes, 2);
+    assert!(events.iter().any(|event| matches!(event, SessionUpdate::TurnEnded { stop: StopReason::EndTurn })));
+    let child_meta: Vec<_> = futures_util::future::join_all(starts.iter().map(|child| store.load(child.clone())))
+        .await
+        .into_iter()
+        .map(|result| result.unwrap().0)
+        .collect();
+    assert!(child_meta.iter().all(|meta| meta.subagent_parent.as_ref().is_some_and(|parent| parent.session == id)));
+    assert!(child_meta.iter().any(|meta| meta.agent.as_ref().is_some_and(|agent| agent.name == "reader")));
+    assert!(!repo.path().join("out.txt").exists(), "read-only child wrote out.txt");
+    host.close(id).await.unwrap();
+    host.shutdown().await.unwrap();
 }
 
 #[tokio::test]

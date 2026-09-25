@@ -456,6 +456,8 @@ mod tests {
                 model: "gpt-6-sol".into(),
                 title: None,
                 parent: None,
+                subagent_parent: None,
+                subagent_ceiling: None,
                 agent: None,
             },
             state,

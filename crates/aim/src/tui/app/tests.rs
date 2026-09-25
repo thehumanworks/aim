@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use aim_proto::conversation::Usage;
 use aim_proto::daemon::Location;
-use aim_proto::event::{EffortSource, SessionMeta};
+use aim_proto::event::{EffortSource, SessionMeta, SubagentStatus};
 use aim_proto::tool::ToolResult;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -37,6 +37,8 @@ fn summary(id: &str, state: SessionState) -> SessionSummary {
             model: "m1".into(),
             title: None,
             parent: None,
+            subagent_parent: None,
+            subagent_ceiling: None,
             agent: None,
         },
         state,
@@ -236,6 +238,31 @@ fn cancel_interrupts_then_settles_and_keeps_what_streamed() {
     assert_eq!(app.hint, None);
     assert_eq!(app.take_history(60).iter().filter(|r| r.text().contains("⏺ echo")).count(), 1);
     assert!(app.transcript.held().next().is_none());
+}
+
+#[test]
+fn subagent_updates_show_lifecycle_and_failure() {
+    let mut app = attached();
+    update(
+        &mut app,
+        SessionUpdate::SubagentStarted {
+            parent_session: "s1".into(),
+            call_id: "c1".into(),
+            child_session: "child1".into(),
+            description: "Inspect parser".into(),
+        },
+    );
+    update(
+        &mut app,
+        SessionUpdate::SubagentStopped {
+            parent_session: "s1".into(),
+            call_id: "c1".into(),
+            child_session: "child1".into(),
+            description: "Inspect parser".into(),
+            status: SubagentStatus::Failed,
+        },
+    );
+    assert_eq!(notices(&app), ["subagent started: Inspect parser (child1)", "subagent failed: Inspect parser (child1)"]);
 }
 
 #[test]

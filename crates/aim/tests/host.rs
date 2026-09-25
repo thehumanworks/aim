@@ -947,6 +947,8 @@ async fn a_log_from_before_adr_0038_resumes_as_it_did() {
             model: "m1".into(),
             title: None,
             parent: None,
+            subagent_parent: None,
+            subagent_ceiling: None,
             agent: None,
         };
         store.create(meta).await.unwrap();
@@ -1031,10 +1033,10 @@ impl ToolHost for ExtraTool {
 }
 
 fn composed_services() -> NativeServices {
-    let mcp: aim::host::ToolsFactory = Arc::new(|_spec| {
+    let mcp: aim::host::ToolsFactory = Arc::new(|_spec, _context| {
         Box::pin(async { Some(Arc::new(ExtraTool { name: "mcp__everything__echo", unavailable: false }) as Arc<dyn ToolHost>) })
     });
-    let board: aim::host::ToolsFactory = Arc::new(|spec| {
+    let board: aim::host::ToolsFactory = Arc::new(|spec, _context| {
         let persistent = spec.persistence == Persistence::Persistent;
         Box::pin(async move { persistent.then(|| Arc::new(ExtraTool { name: "board_list", unavailable: false }) as Arc<dyn ToolHost>) })
     });
@@ -1090,8 +1092,9 @@ async fn unavailable_mcp_tool_returns_an_error_without_failing_the_session() {
         }),
         completed(StopReason::ToolUse),
     ];
-    let service: aim::host::ToolsFactory =
-        Arc::new(|_| Box::pin(async { Some(Arc::new(ExtraTool { name: "mcp__failed__echo", unavailable: true }) as Arc<dyn ToolHost>) }));
+    let service: aim::host::ToolsFactory = Arc::new(|_, _context| {
+        Box::pin(async { Some(Arc::new(ExtraTool { name: "mcp__failed__echo", unavailable: true }) as Arc<dyn ToolHost>) })
+    });
     let memory = Arc::new(MemoryStore::default());
     let f = fixture_services(
         Arc::clone(&memory) as Arc<dyn SessionStore>,
@@ -1143,7 +1146,7 @@ async fn live_mcp_first_request_bytes_with_and_without_everything() {
 async fn extra_tool_factories_receive_the_connected_root_for_resume_stability() {
     let observed = Arc::new(Mutex::new(Vec::<String>::new()));
     let held = Arc::clone(&observed);
-    let factory: aim::host::ToolsFactory = Arc::new(move |spec| {
+    let factory: aim::host::ToolsFactory = Arc::new(move |spec, _context| {
         held.lock().unwrap().push(spec.workspace.clone());
         Box::pin(async { None })
     });

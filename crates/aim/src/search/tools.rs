@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use aim_proto::daemon::Persistence;
 use aim_proto::error::{ErrorCode, ProtoError};
+use aim_proto::event::{SessionEvent, SessionMeta};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolAnnotations, ToolInput, ToolLocation, ToolResult, ToolSpec};
 use serde::Deserialize;
@@ -108,8 +109,13 @@ async fn read_session(store: Arc<SqliteStore>, args: ReadArgs) -> Result<ToolRes
         crate::store::StoreError::NotFound(_) => ProtoError::new(ErrorCode::NotFound, "session not found"),
         _ => unavailable(),
     })?;
-    let from_seq = args.from_seq.unwrap_or(1).max(1);
-    let limit = usize::try_from(args.limit.unwrap_or(25).clamp(1, 100)).map_err(|_| invalid("invalid limit"))?;
+    session_slice(&meta, &events, args.from_seq.unwrap_or(1), args.limit.unwrap_or(25))
+}
+
+/// The same bounded `read_session` response for a persistent or private child log.
+pub(crate) fn session_slice(meta: &SessionMeta, events: &[SessionEvent], from_seq: u64, limit: u32) -> Result<ToolResult, ProtoError> {
+    let from_seq = from_seq.max(1);
+    let limit = usize::try_from(limit.clamp(1, 100)).map_err(|_| invalid("invalid limit"))?;
     let mut selected = Vec::<Value>::new();
     let mut bytes: usize = 0;
     let mut truncated = false;

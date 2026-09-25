@@ -113,7 +113,12 @@ pub fn services() -> crate::host::NativeServices {
     let decider = std::env::var_os("TYPESAFE_API_KEY")
         .is_some_and(|value| !value.is_empty())
         .then(|| Arc::new(crate::jev::JevDecider) as Arc<dyn crate::jev::Decider>);
-    crate::host::NativeServices { media: Some(media), decider, tools: vec![search_tools(), board_tools(), mcp_tools()], code: code_mode() }
+    crate::host::NativeServices {
+        media: Some(media),
+        decider,
+        tools: vec![search_tools(), board_tools(), mcp_tools(), crate::subagents::tools_factory()],
+        code: code_mode(),
+    }
 }
 
 /// Code mode, when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this
@@ -225,6 +230,7 @@ impl SearchIndex {
 struct LazySearch {
     index: Arc<SearchIndex>,
     persistence: aim_proto::daemon::Persistence,
+    child_reader: Option<(crate::host::SessionHost, String)>,
 }
 
 impl crate::agent::ToolHost for LazySearch {
@@ -241,7 +247,17 @@ impl crate::agent::ToolHost for LazySearch {
         self.index.ensure_opening();
         let mut ready = self.index.ready.subscribe();
         let persistence = self.persistence;
+        let child_reader = self.child_reader.clone();
         Box::pin(async move {
+            if name == "read_session"
+                && let Some((host, requester)) = child_reader
+                && let Some(id) = arguments.get("session").and_then(serde_json::Value::as_str)
+                && let Some((meta, events)) = host.read_ephemeral_child(&requester, id).await
+            {
+                let from = arguments.get("from_seq").and_then(serde_json::Value::as_u64).unwrap_or(1);
+                let limit = arguments.get("limit").and_then(serde_json::Value::as_u64).unwrap_or(25);
+                return crate::search::tools::session_slice(&meta, &events, from, u32::try_from(limit).unwrap_or(u32::MAX));
+            }
             let parts = tokio::time::timeout(SEARCH_READY_WAIT, ready.wait_for(Option::is_some))
                 .await
                 .ok()
@@ -263,11 +279,13 @@ impl crate::agent::ToolHost for LazySearch {
 
 /// Conversation search tools (`search_sessions`, `read_session`, ADR 0035) over this user's session
 /// database. The index opens in the background, off every session's start path.
-fn search_tools() -> crate::host::ToolsFactory {
+pub(crate) fn search_tools() -> crate::host::ToolsFactory {
     let index: Arc<SearchIndex> = Arc::new(SearchIndex::default());
-    Arc::new(move |spec: &aim_proto::daemon::SessionSpec| {
+    Arc::new(move |spec: &aim_proto::daemon::SessionSpec, context| {
         index.ensure_opening();
-        let host: Arc<dyn crate::agent::ToolHost> = Arc::new(LazySearch { index: Arc::clone(&index), persistence: spec.persistence });
+        let child_reader = context.map(|context: crate::subagents::SpawnContext| (context.host, context.session_id));
+        let host: Arc<dyn crate::agent::ToolHost> =
+            Arc::new(LazySearch { index: Arc::clone(&index), persistence: spec.persistence, child_reader });
         Box::pin(async move { Some(host) })
     })
 }
@@ -279,7 +297,7 @@ fn board_tools() -> crate::host::ToolsFactory {
 }
 
 fn board_tools_at(aim_home: PathBuf) -> crate::host::ToolsFactory {
-    Arc::new(move |spec: &aim_proto::daemon::SessionSpec| {
+    Arc::new(move |spec: &aim_proto::daemon::SessionSpec, _context| {
         let spec = spec.clone();
         let aim_home = aim_home.clone();
         Box::pin(async move {
@@ -303,7 +321,7 @@ fn board_tools_at(aim_home: PathBuf) -> crate::host::ToolsFactory {
 /// Discover trusted MCP config through the selected workspace harness, then start its servers
 /// in the background. The returned host advertises a private last-known catalog immediately.
 fn mcp_tools() -> crate::host::ToolsFactory {
-    Arc::new(|spec: &aim_proto::daemon::SessionSpec| {
+    Arc::new(|spec: &aim_proto::daemon::SessionSpec, _context| {
         let spec = spec.clone();
         Box::pin(async move { crate::mcp::session::connect_for_session(&spec).await })
     })
@@ -341,9 +359,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let aim_home = home.path().join("aim");
         let factory = board_tools_at(aim_home.clone());
-        assert!(factory(&spec(Persistence::Ephemeral)).await.is_none());
+        assert!(factory(&spec(Persistence::Ephemeral), None).await.is_none());
         assert!(!aim_home.exists(), "private session must not create shared board state");
-        let board = factory(&spec(Persistence::Persistent)).await.expect("persistent board tools");
+        let board = factory(&spec(Persistence::Persistent), None).await.expect("persistent board tools");
         assert!(board.specs().iter().any(|tool| tool.name == "board_list"));
         let listed =
             board.call("board_list".to_owned(), serde_json::json!({}), IdempotencyKey::new("list")).await.expect("real board list");

@@ -343,6 +343,8 @@ mod tests {
             model: "test".to_owned(),
             title: None,
             parent: None,
+            subagent_parent: None,
+            subagent_ceiling: None,
             agent: None,
         }
     }
