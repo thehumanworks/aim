@@ -239,4 +239,13 @@ pub trait ModelProvider: Send + Sync {
 
     /// Starts a streamed response.
     fn stream(&self, request: Request) -> BoxFuture<'_, Result<EventStream, LlmError>>;
+
+    /// Remote compaction (docs/architecture.md §6.4): summarizes `request.items` into one
+    /// provider-native item that replaces them in later requests (e.g. codex V2's encrypted
+    /// `compaction` item). `Ok(None)` means the provider has none, and the caller summarizes
+    /// locally. The returned item is only valid for this provider.
+    fn compact(&self, request: Request) -> BoxFuture<'_, Result<Option<Item>, LlmError>> {
+        let _unsupported = request;
+        Box::pin(async { Ok(None) })
+    }
 }

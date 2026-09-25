@@ -64,6 +64,9 @@ impl Backend for Agent {
     }
 
     fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<(String, Option<String>), String>> {
+        if model.is_some() {
+            self.forget_window();
+        }
         let config = self.config_mut();
         if let Some(model) = model {
             config.model = model;

@@ -257,8 +257,10 @@ impl SessionHost {
 
     async fn start(&self, spec: SessionSpec, resume: Option<Resume>) -> Result<SessionSummary, ProtoError> {
         let session_id = resume.as_ref().map_or_else(session::new_session_id, |r| r.meta.id.clone());
+        // The user sees the whole history; the model continues from its compacted context.
         let transcript = resume.as_ref().map(|r| items_of(&r.events)).unwrap_or_default();
-        let request = BackendRequest { spec: spec.clone(), session_id: session_id.clone(), transcript: transcript.clone() };
+        let context = resume.as_ref().map(|r| model_items_of(&r.events)).unwrap_or_default();
+        let request = BackendRequest { spec: spec.clone(), session_id: session_id.clone(), transcript: context };
         let Built { backend, model, root, location, shutdown } = (self.config.backends)(request).await?;
 
         let store: Arc<dyn SessionStore> = match spec.persistence {
@@ -498,6 +500,7 @@ impl Actor {
     }
 }
 
+/// Every item of a log, in order: the user's view of the transcript.
 fn items_of(events: &[SessionEvent]) -> Vec<Item> {
     events
         .iter()
@@ -506,6 +509,25 @@ fn items_of(events: &[SessionEvent]) -> Vec<Item> {
             _ => None,
         })
         .collect()
+}
+
+/// The model's context at the end of a log: its items with every compaction applied.
+#[must_use]
+pub fn model_items_of(events: &[SessionEvent]) -> Vec<Item> {
+    let mut items = Vec::new();
+    for event in events {
+        match &event.body {
+            EventBody::Item { item } => items.push(item.clone()),
+            EventBody::Compacted { replaced, items: replacement } => {
+                let replaced = usize::try_from(*replaced).unwrap_or(usize::MAX).min(items.len());
+                let mut next = replacement.clone();
+                next.extend(items.drain(replaced..));
+                items = next;
+            }
+            _ => {}
+        }
+    }
+    items
 }
 
 fn updates_of(rx: broadcast::Receiver<SessionUpdate>) -> UpdateStream {

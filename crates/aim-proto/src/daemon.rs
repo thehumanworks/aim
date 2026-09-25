@@ -211,6 +211,20 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
+    /// The model's context was compacted: its first `replaced` items were replaced by `items`
+    /// (a provider compaction item or a summary). The user's transcript keeps everything.
+    Compacted {
+        /// How many leading items of the model's context were replaced.
+        replaced: u32,
+        /// What replaced them.
+        items: Vec<Item>,
+        /// `remote` (the provider's compaction) or `summary` (a local summary).
+        method: String,
+        /// Estimated context tokens before.
+        tokens_before: u64,
+        /// Estimated context tokens after.
+        tokens_after: u64,
+    },
     /// The turn is over.
     TurnEnded {
         /// Why.

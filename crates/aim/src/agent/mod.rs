@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aim_kernel::turn::{CallId, Event as TurnEvent, Phase, Turn};
-use aim_llm::{EventStream, LlmError, ModelProvider, Request, StreamEvent};
+use aim_llm::{EventStream, LlmError, LlmErrorKind, ModelProvider, Request, StreamEvent};
 use aim_proto::conversation::{Item, Part, StopReason};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolInput, ToolResult, ToolSpec};
@@ -32,6 +32,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 pub mod backend;
+pub mod compact;
 pub mod tools;
 
 pub use backend::{Backend, BackendFuture};
@@ -120,6 +121,15 @@ const fn may_continue(stop: &StopReason) -> bool {
     !matches!(stop, StopReason::ContentFilter | StopReason::Cancelled)
 }
 
+/// What the agent knows about its model's context window.
+#[derive(Clone, Copy, Debug)]
+enum Window {
+    /// Not asked yet.
+    Unasked,
+    /// The catalog's answer (`None`: the catalog does not say).
+    Known(Option<u64>),
+}
+
 /// The native agent: a provider, a tool host and a transcript.
 pub struct Agent {
     provider: Arc<dyn ModelProvider>,
@@ -128,6 +138,11 @@ pub struct Agent {
     items: Vec<Item>,
     next_call: CallId,
     turns: u64,
+    /// The model's context window, once the catalog was asked.
+    window: Window,
+    /// The provider-measured context size (last request plus its response) and the transcript
+    /// length it covers.
+    measured: Option<(u64, usize)>,
 }
 
 fn emit(events: &UnboundedSender<AgentEvent>, event: AgentEvent) {
@@ -146,13 +161,13 @@ impl Agent {
     /// An agent with an empty transcript.
     #[must_use]
     pub fn new(provider: Arc<dyn ModelProvider>, tools: Arc<dyn ToolHost>, config: AgentConfig) -> Self {
-        Self { provider, tools, config, items: Vec::new(), next_call: 0, turns: 0 }
+        Self::with_transcript(provider, tools, config, Vec::new())
     }
 
     /// An agent continuing an existing transcript (e.g. a resumed session).
     #[must_use]
     pub fn with_transcript(provider: Arc<dyn ModelProvider>, tools: Arc<dyn ToolHost>, config: AgentConfig, items: Vec<Item>) -> Self {
-        Self { provider, tools, config, items, next_call: 0, turns: 0 }
+        Self { provider, tools, config, items, next_call: 0, turns: 0, window: Window::Unasked, measured: None }
     }
 
     /// The transcript so far.
@@ -298,6 +313,7 @@ impl Agent {
                         StreamEvent::ReasoningDelta { delta, .. } => emit(ctx.events, AgentEvent::ReasoningDelta { delta }),
                         StreamEvent::RateLimits { limits } => emit(ctx.events, AgentEvent::RateLimits { limits }),
                         StreamEvent::Completed { usage, stop: s, .. } => {
+                            self.measured = Some((usage.input_tokens.saturating_add(usage.output_tokens), self.items.len()));
                             emit(ctx.events, AgentEvent::Usage { usage });
                             stop = Some(s);
                         }
@@ -397,7 +413,10 @@ impl Agent {
         }
         self.turns = self.turns.saturating_add(1);
         let turn_id = format!("{}.{}", self.config.session_id, self.turns);
+        // The turn's own prompt survives compaction verbatim.
+        let mut prompt_at = self.items.len();
         self.push(Item::User { parts: input }, events);
+        let mut overflow_retried = false;
         let mut turn = Turn::new();
         let mut ctx = TurnCtx { events, cancel, inbox, steers: Vec::new() };
         let mut seen: HashSet<String> = HashSet::new();
@@ -425,15 +444,26 @@ impl Agent {
             if requests > self.config.max_requests {
                 return self.fail(&mut turn, &mut response, &mut ctx, AgentError::TooManyRequests(self.config.max_requests));
             }
-            emit(events, AgentEvent::RequestStarted { index: requests });
             let specs = self.tools.specs();
-            let request = self.request(specs.clone(), &turn_id);
-            let stream = tokio::select! {
-                stream = self.provider.stream(request) => match stream {
-                    Ok(stream) => stream,
+            self.compact(&specs, &turn_id, &mut prompt_at, false, events, cancel).await;
+            emit(events, AgentEvent::RequestStarted { index: requests });
+            let stream = loop {
+                let request = self.request(specs.clone(), &turn_id);
+                let attempt = tokio::select! {
+                    stream = self.provider.stream(request) => stream,
+                    () = cancel.cancelled() => return Ok(self.cancelled(&mut turn, &mut response, &mut ctx)),
+                };
+                match attempt {
+                    Ok(stream) => break stream,
+                    // The context outgrew the window before the engine noticed: compact once and retry.
+                    Err(err) if err.kind == LlmErrorKind::ContextOverflow && !overflow_retried => {
+                        overflow_retried = true;
+                        if !self.compact(&specs, &turn_id, &mut prompt_at, true, events, cancel).await {
+                            return self.fail(&mut turn, &mut response, &mut ctx, AgentError::Provider(err));
+                        }
+                    }
                     Err(err) => return self.fail(&mut turn, &mut response, &mut ctx, AgentError::Provider(err)),
-                },
-                () = cancel.cancelled() => return Ok(self.cancelled(&mut turn, &mut response, &mut ctx)),
+                }
             };
             let stop = match self.stream_response(&mut turn, &mut response, stream, &specs, &mut seen, &mut ctx).await {
                 Ended::Completed(stop) => stop,
@@ -480,6 +510,135 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// Forgets the model's window (the model changed).
+    pub(crate) const fn forget_window(&mut self) {
+        self.window = Window::Unasked;
+    }
+
+    /// The model's context window, from the provider's catalog (asked once per model).
+    async fn window(&mut self) -> Option<u64> {
+        if let Window::Known(window) = self.window {
+            return window;
+        }
+        let window = match self.provider.catalog().await {
+            Ok(models) => models.iter().find(|m| m.id == self.config.model).and_then(|m| m.context_window),
+            Err(err) => {
+                tracing::debug!(%err, "no catalog: the context window is unknown");
+                None
+            }
+        };
+        self.window = Window::Known(window);
+        window
+    }
+
+    /// Estimated tokens of the next request: the last measured size plus estimates of what was
+    /// added since, or an estimate of everything.
+    fn context_estimate(&self, specs: &[ToolSpec]) -> u64 {
+        let rest = |from: usize| self.items.iter().skip(from).map(compact::estimate).fold(0_u64, u64::saturating_add);
+        match self.measured {
+            Some((tokens, len)) if len <= self.items.len() => tokens.saturating_add(rest(len)),
+            _ => {
+                let tools = specs
+                    .iter()
+                    .map(|s| compact::estimate_text(&serde_json::to_string(s).unwrap_or_default()))
+                    .fold(0_u64, u64::saturating_add);
+                compact::estimate_text(&self.config.instructions).saturating_add(tools).saturating_add(rest(0))
+            }
+        }
+    }
+
+    /// Compacts the context when it is past the threshold, or regardless when `force`d (after a
+    /// context overflow). Keeps the prompt at `prompt_at` (updated to its new index). Returns
+    /// whether the context changed. Failures leave the transcript as it was.
+    async fn compact(
+        &mut self,
+        specs: &[ToolSpec],
+        turn_id: &str,
+        prompt_at: &mut usize,
+        force: bool,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let before = self.context_estimate(specs);
+        let window = match self.window().await {
+            Some(window) => window,
+            // The provider just said the context is too big: treat the estimate as the window.
+            None if force => before.max(1),
+            None => return false,
+        };
+        if !force && before.saturating_mul(100) < window.saturating_mul(compact::COMPACT_AT_PERCENT) {
+            return false;
+        }
+        let pinned: Vec<bool> = (0..self.items.len()).map(|i| i == *prompt_at).collect();
+        let plan = compact::plan_items(&self.items, &pinned);
+        let Some(cut) = compact::plan_cut(&plan, window.saturating_mul(compact::KEEP_PERCENT) / 100) else {
+            return false;
+        };
+        let prefix: Vec<Item> = self.items.iter().take(cut).cloned().collect();
+        let summarized = tokio::select! {
+            summarized = self.summarize(prefix, specs, turn_id) => summarized,
+            () = cancel.cancelled() => return false,
+        };
+        let (mut replacement, method) = match summarized {
+            Ok(summarized) => summarized,
+            Err(err) => {
+                tracing::warn!(%err, "compaction failed; the context is unchanged");
+                return false;
+            }
+        };
+        replacement.extend(compact::pinned_before(&self.items, &pinned, cut));
+        let kept_before_prompt = *prompt_at < cut;
+        let mut next = replacement.clone();
+        next.extend(self.items.iter().skip(cut).cloned());
+        *prompt_at = if kept_before_prompt {
+            replacement.len().saturating_sub(1)
+        } else {
+            prompt_at.saturating_sub(cut).saturating_add(replacement.len())
+        };
+        self.items = next;
+        self.measured = None;
+        let after = self.context_estimate(specs);
+        emit(
+            events,
+            AgentEvent::Compacted {
+                replaced: u32::try_from(cut).unwrap_or(u32::MAX),
+                items: replacement,
+                method,
+                tokens_before: before,
+                tokens_after: after,
+            },
+        );
+        true
+    }
+
+    /// Replaces `prefix` with the provider's compaction item, else with a local summary.
+    async fn summarize(&self, prefix: Vec<Item>, specs: &[ToolSpec], turn_id: &str) -> Result<(Vec<Item>, String), LlmError> {
+        let mut request = self.request(specs.to_vec(), turn_id);
+        request.items.clone_from(&prefix);
+        match self.provider.compact(request.clone()).await {
+            Ok(Some(item)) => return Ok((vec![item], "remote".to_owned())),
+            Ok(None) => {}
+            Err(err) => tracing::warn!(%err, "remote compaction failed; summarizing locally"),
+        }
+        // Same instructions and tools as the conversation, so the provider's prompt cache still
+        // covers everything before the request for the summary.
+        let ask = format!("{}\n\n{}", compact::SUMMARY_INSTRUCTIONS, compact::SUMMARY_REQUEST);
+        request.items.push(Item::User { parts: vec![Part::Text { text: ask }] });
+        let mut stream = self.provider.stream(request).await?;
+        let (mut text, mut completed) = (String::new(), false);
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                StreamEvent::Completed { .. } => completed = true,
+                _ => {}
+            }
+        }
+        if !completed || text.trim().is_empty() {
+            return Err(LlmError::new(LlmErrorKind::Protocol, "the summary came back empty"));
+        }
+        Ok((vec![compact::summary_item(&text)], "summary".to_owned()))
     }
 
     fn cancelled(&mut self, turn: &mut Turn, response: &mut Response, ctx: &mut TurnCtx<'_, '_>) -> StopReason {

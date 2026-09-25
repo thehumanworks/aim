@@ -141,6 +141,9 @@ impl Human {
                 self.usage.reasoning_tokens = self.usage.reasoning_tokens.saturating_add(usage.reasoning_tokens);
                 Ok(())
             }
+            AgentEvent::Compacted { method, tokens_before, tokens_after, .. } => {
+                writeln!(err, "· context compacted ({method}): ~{tokens_before} → ~{tokens_after} tokens")
+            }
             AgentEvent::SteersReturned { steers } => writeln!(err, "({} unsent message(s) returned)", steers.len()),
             AgentEvent::TurnFailed { message } => writeln!(out).and_then(|()| writeln!(err, "✗ turn failed: {message}")),
             AgentEvent::TurnEnded { stop } => {

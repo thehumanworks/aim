@@ -102,6 +102,15 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
+    /// The model's context was compacted: its first `replaced` items (as rebuilt from the log so
+    /// far) were replaced by `items`. Readers rebuilding the model's context apply it; the full
+    /// history stays in the log.
+    Compacted {
+        /// How many leading items were replaced.
+        replaced: u32,
+        /// What replaced them.
+        items: Vec<Item>,
+    },
     /// An event kind this build does not know; preserved verbatim.
     #[serde(untagged)]
     Unknown(Value),

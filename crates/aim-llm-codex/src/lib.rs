@@ -359,6 +359,10 @@ impl ModelProvider for CodexProvider {
     fn stream(&self, request: Request) -> BoxFuture<'_, Result<EventStream, LlmError>> {
         Box::pin(self.start(request, false))
     }
+
+    fn compact(&self, request: Request) -> BoxFuture<'_, Result<Option<Item>, LlmError>> {
+        Box::pin(async move { Self::compact(self, request).await.map(Some) })
+    }
 }
 
 #[cfg(test)]
