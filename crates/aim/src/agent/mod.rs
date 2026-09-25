@@ -135,6 +135,17 @@ const fn may_continue(stop: &StopReason) -> bool {
     !matches!(stop, StopReason::ContentFilter | StopReason::Cancelled)
 }
 
+/// What a compaction attempt did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Compaction {
+    /// Nothing changed (not needed, not possible, or it failed).
+    Unchanged,
+    /// The context was compacted.
+    Compacted,
+    /// The user cancelled while it ran; nothing changed.
+    Cancelled,
+}
+
 /// What the agent knows about its model's context window.
 #[derive(Clone, Copy, Debug)]
 enum Window {
@@ -377,7 +388,9 @@ impl Agent {
 
     /// Starts a complete tool call; returns its future (owned, so it runs concurrently).
     fn start_call(&self, specs: &[ToolSpec], id: CallId, name: &str, arguments: &str) -> tools::BoxFuture<(CallId, ToolResult)> {
-        let key = IdempotencyKey::new(uuid::Uuid::new_v4().simple().to_string());
+        // UUIDv7 keys carry their minting time, so the harness can age them out of its
+        // idempotency horizon instead of ever re-running an old key (FIX4).
+        let key = IdempotencyKey::new(uuid::Uuid::now_v7().simple().to_string());
         let freeform = specs.iter().any(|s| s.name == name && matches!(s.input, ToolInput::Freeform { .. }));
         let args = if freeform {
             Ok(serde_json::Value::String(arguments.to_owned()))
@@ -602,30 +615,42 @@ impl Agent {
                 return self.fail(&mut turn, &mut response, &mut ctx, AgentError::TooManyRequests(self.config.max_requests));
             }
             let specs = self.tools.specs();
-            self.compact(&specs, &turn_id, &mut prompt_at, false, events, cancel).await;
+            if self.compact(&specs, &turn_id, &mut prompt_at, false, events, cancel).await == Compaction::Cancelled {
+                return Ok(self.cancelled(&mut turn, &mut response, &mut ctx));
+            }
             emit(events, AgentEvent::RequestStarted { index: requests });
-            let stream = loop {
-                let request = self.request(specs.clone(), &turn_id);
-                let attempt = tokio::select! {
-                    stream = self.provider.stream(request) => stream,
-                    () = cancel.cancelled() => return Ok(self.cancelled(&mut turn, &mut response, &mut ctx)),
+            // A context overflow, reported when the request is made or as the stream's first
+            // failure, is answered once: compact, then retry the same request. Only a response that
+            // produced nothing is retried, so no output or tool effect is replayed.
+            let stop = loop {
+                let produced_before = self.items.len();
+                let attempt = {
+                    let request = self.request(specs.clone(), &turn_id);
+                    tokio::select! {
+                        stream = self.provider.stream(request) => stream,
+                        () = cancel.cancelled() => return Ok(self.cancelled(&mut turn, &mut response, &mut ctx)),
+                    }
                 };
-                match attempt {
-                    Ok(stream) => break stream,
-                    // The context outgrew the window before the engine noticed: compact once and retry.
-                    Err(err) if err.kind == LlmErrorKind::ContextOverflow && !overflow_retried => {
+                let failure = match attempt {
+                    Ok(stream) => match self.stream_response(&mut turn, &mut response, stream, &specs, &mut seen, &mut ctx).await {
+                        Ended::Completed(stop) => break stop,
+                        Ended::Cancelled => return Ok(self.cancelled(&mut turn, &mut response, &mut ctx)),
+                        Ended::Failed(err) => err,
+                    },
+                    Err(err) => AgentError::Provider(err),
+                };
+                let untouched = response.dispatched.is_empty() && self.items.len() == produced_before;
+                match failure {
+                    AgentError::Provider(err) if err.kind == LlmErrorKind::ContextOverflow && !overflow_retried && untouched => {
                         overflow_retried = true;
-                        if !self.compact(&specs, &turn_id, &mut prompt_at, true, events, cancel).await {
-                            return self.fail(&mut turn, &mut response, &mut ctx, AgentError::Provider(err));
+                        match self.compact(&specs, &turn_id, &mut prompt_at, true, events, cancel).await {
+                            Compaction::Compacted => {}
+                            Compaction::Cancelled => return Ok(self.cancelled(&mut turn, &mut response, &mut ctx)),
+                            Compaction::Unchanged => return self.fail(&mut turn, &mut response, &mut ctx, AgentError::Provider(err)),
                         }
                     }
-                    Err(err) => return self.fail(&mut turn, &mut response, &mut ctx, AgentError::Provider(err)),
+                    other => return self.fail(&mut turn, &mut response, &mut ctx, other),
                 }
-            };
-            let stop = match self.stream_response(&mut turn, &mut response, stream, &specs, &mut seen, &mut ctx).await {
-                Ended::Completed(stop) => stop,
-                Ended::Cancelled => return Ok(self.cancelled(&mut turn, &mut response, &mut ctx)),
-                Ended::Failed(err) => return self.fail(&mut turn, &mut response, &mut ctx, err),
             };
             // Steering that arrived before the response ended continues the turn, however the
             // stream and the inbox raced.
@@ -723,8 +748,8 @@ impl Agent {
     }
 
     /// Compacts the context when it is past the threshold, or regardless when `force`d (after a
-    /// context overflow). Keeps the prompt at `prompt_at` (updated to its new index). Returns
-    /// whether the context changed. Failures leave the transcript as it was.
+    /// context overflow). Keeps the prompt at `prompt_at` (updated to its new index). Failures and
+    /// cancellation leave the transcript as it was.
     async fn compact(
         &mut self,
         specs: &[ToolSpec],
@@ -733,32 +758,36 @@ impl Agent {
         force: bool,
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
-    ) -> bool {
+    ) -> Compaction {
         let before = self.context_estimate(specs);
-        let window = match self.window().await {
+        let known = tokio::select! {
+            known = self.window() => known,
+            () = cancel.cancelled() => return Compaction::Cancelled,
+        };
+        let window = match known {
             Some(window) => window,
             // The provider just said the context is too big: treat the estimate as the window.
             None if force => before.max(1),
-            None => return false,
+            None => return Compaction::Unchanged,
         };
         if !force && before.saturating_mul(100) < window.saturating_mul(compact::COMPACT_AT_PERCENT) {
-            return false;
+            return Compaction::Unchanged;
         }
         let pinned: Vec<bool> = (0..self.items.len()).map(|i| i == *prompt_at).collect();
         let plan = compact::plan_items(&self.items, &pinned);
         let Some(cut) = compact::plan_cut(&plan, window.saturating_mul(compact::KEEP_PERCENT) / 100) else {
-            return false;
+            return Compaction::Unchanged;
         };
         let prefix: Vec<Item> = self.items.iter().take(cut).cloned().collect();
         let summarized = tokio::select! {
             summarized = self.summarize(prefix, specs, turn_id, events) => summarized,
-            () = cancel.cancelled() => return false,
+            () = cancel.cancelled() => return Compaction::Cancelled,
         };
         let (mut replacement, method) = match summarized {
             Ok(summarized) => summarized,
             Err(err) => {
                 tracing::warn!(%err, "compaction failed; the context is unchanged");
-                return false;
+                return Compaction::Unchanged;
             }
         };
         replacement.extend(compact::pinned_before(&self.items, &pinned, cut));
@@ -783,7 +812,7 @@ impl Agent {
                 tokens_after: after,
             },
         );
-        true
+        Compaction::Compacted
     }
 
     /// Replaces `prefix` with the provider's compaction item, else with a local summary.

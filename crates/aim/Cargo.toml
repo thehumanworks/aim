@@ -33,7 +33,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tempfile = "3"
 typesafe-jev = "=0.2.0"
-uuid = { version = "1.26", features = ["v4"] }
+uuid = { version = "1.26", features = ["v4", "v7"] }
 
 [dev-dependencies]
 async-stream = "0.3"

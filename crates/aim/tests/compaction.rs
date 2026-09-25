@@ -362,3 +362,100 @@ async fn live_compaction_codex_remote_keeps_the_facts() {
     assert_eq!(method, "remote");
     assert!(reply.contains("BLUE-HERON-42"), "{reply}");
 }
+
+#[tokio::test]
+async fn an_overflow_reported_by_the_stream_also_compacts_once_and_retries() {
+    // The request is accepted, then the stream's first event is the overflow (codex
+    // `response.failed` with `context_length_exceeded`).
+    let streamed_overflow = Ok(vec![Err(LlmError::new(LlmErrorKind::ContextOverflow, "context_length_exceeded"))]);
+    let provider = Scripted::new(vec![streamed_overflow, text("SUMMARY"), text("done")], None, false);
+    let mut agent = agent(Arc::clone(&provider), history(20));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let stop = agent.run_turn(vec![Part::Text { text: "and now?".into() }], &tx, &CancellationToken::new()).await.unwrap();
+    assert_eq!(stop, StopReason::EndTurn);
+    let events = drain(&mut rx);
+    assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::Compacted { .. })).count(), 1);
+    assert_eq!(provider.seen.lock().unwrap().len(), 3, "overflow, summary, retry");
+}
+
+/// A provider that can stall: its catalog never answers, or every stream after an initial
+/// overflow never ends.
+struct Stalling {
+    stall_catalog: bool,
+    calls: Mutex<u32>,
+}
+
+impl ModelProvider for Stalling {
+    fn id(&self) -> &'static str {
+        "stalling"
+    }
+
+    fn catalog(&self) -> LlmFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
+        let stall = self.stall_catalog;
+        Box::pin(async move {
+            if stall {
+                std::future::pending::<()>().await;
+            }
+            Ok(Vec::new())
+        })
+    }
+
+    fn stream(&self, _request: Request) -> LlmFuture<'_, Result<EventStream, LlmError>> {
+        let first = {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            *calls == 1
+        };
+        Box::pin(async move {
+            if first {
+                return Err(LlmError::new(LlmErrorKind::ContextOverflow, "too long"));
+            }
+            let stream: EventStream = Box::pin(futures_util::stream::pending());
+            Ok(stream)
+        })
+    }
+}
+
+async fn cancelled_within_a_second(provider: Arc<Stalling>) -> (Result<StopReason, aim::agent::AgentError>, Vec<AgentEvent>) {
+    let mut agent = Agent::with_transcript(
+        provider,
+        Arc::new(NoTools),
+        AgentConfig {
+            model: "m".into(),
+            instructions: "be brief".into(),
+            effort: None,
+            tier: None,
+            session_id: "s".into(),
+            cache_key: None,
+            parallel_tool_calls: true,
+            max_requests: 8,
+        },
+        history(20),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        trigger.cancel();
+    });
+    let outcome =
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent.run_turn(vec![Part::Text { text: "go".into() }], &tx, &cancel))
+            .await
+            .expect("cancellation ends the turn promptly");
+    (outcome, drain(&mut rx))
+}
+
+#[tokio::test]
+async fn cancelling_during_a_forced_compaction_ends_the_turn_as_cancelled() {
+    let (outcome, events) = cancelled_within_a_second(Arc::new(Stalling { stall_catalog: false, calls: Mutex::new(0) })).await;
+    assert_eq!(outcome.unwrap(), StopReason::Cancelled);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnded { stop: StopReason::Cancelled })));
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::TurnFailed { .. } | AgentEvent::Compacted { .. })));
+}
+
+#[tokio::test]
+async fn a_stalled_catalog_does_not_delay_cancellation() {
+    let (outcome, _) = cancelled_within_a_second(Arc::new(Stalling { stall_catalog: true, calls: Mutex::new(0) })).await;
+    assert_eq!(outcome.unwrap(), StopReason::Cancelled);
+}
