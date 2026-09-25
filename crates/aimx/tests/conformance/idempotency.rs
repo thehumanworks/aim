@@ -4,7 +4,9 @@
 use std::time::Duration;
 
 use aim_proto::error::ErrorCode;
-use aim_proto::harness::{Command, ExecSpawn, ExecSpawnParams, FsWrite, FsWriteParams, Precondition, ToolsCall, ToolsCallParams};
+use aim_proto::harness::{
+    Command, ExecRelease, ExecReleaseParams, ExecSpawn, ExecSpawnParams, FsWrite, FsWriteParams, Precondition, ToolsCall, ToolsCallParams,
+};
 use aim_proto::ids::IdempotencyKey;
 use serde_json::json;
 
@@ -70,6 +72,28 @@ async fn retried_write_replays_the_recorded_outcome() {
     // A key reused for a different request is refused.
     let err = client.peer.call::<FsWrite>(write_params(&ws, "different", &k)).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bash_capacity_rejection_does_not_cache_the_key() {
+    let env = env_with(|config, _| config.max_procs_per_session = 1).await;
+    let (client, _, ws) = session(&env).await;
+    let occupied = client.peer.call::<ExecSpawn>(spawn_params(&ws, "sleep 30", &key())).await.unwrap().proc;
+    let params = ToolsCallParams {
+        workspace: ws,
+        name: "Bash".into(),
+        arguments: json!({"command": "echo ran >> bash-log"}),
+        idempotency_key: Some(key()),
+    };
+    let refused = client.peer.call::<ToolsCall>(params.clone()).await.unwrap();
+    assert!(refused.is_error, "{refused:?}");
+    assert!(!env.path("bash-log").exists());
+    client.peer.call::<ExecRelease>(ExecReleaseParams { proc: occupied }).await.unwrap();
+    let accepted = client.peer.call::<ToolsCall>(params.clone()).await.unwrap();
+    assert!(!accepted.is_error, "{accepted:?}");
+    let replay = client.peer.call::<ToolsCall>(params).await.unwrap();
+    assert_eq!(replay, accepted);
+    assert_eq!(std::fs::read_to_string(env.path("bash-log")).unwrap(), "ran\n");
 }
 
 #[tokio::test(flavor = "multi_thread")]
