@@ -22,7 +22,7 @@ client still builds.
 | ID | Task | Status | Now | Next | Branch / worktree |
 |---|---|---|---|---|---|
 | T0 | Base: merge FIX16 (`agent/claude/fix16-coderun`) and W26 (`agent/perf/tokens`) as-is (maintainer decision) | done | Merged (`eda6444`, `36f1bd8`); conflicts resolved in event.rs, session.rs, agent/mod.rs, agent/tools.rs, host.rs; clippy, xtask and 963/963 tests green | — | integration branch |
-| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | done | Merged incl. follow-ups, REV-T1 and REV-T1b fixes (`147a5a9`); a model change reaches summary and stream in one locked step | — | `agent/claude/tui-options` · `../aim-wt/tui-options` |
+| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | done | Merged incl. follow-ups, REV-T1 and REV-T1b fixes (`147a5a9`); codex REV-T1c: MERGE | — | `agent/claude/tui-options` · `../aim-wt/tui-options` |
 | T2 | `/clear` clears the chat and starts fresh | done | Merged with T1 (transcript, inline rows, row cache, screen + scrollback best effort, new session) | With T1 | with T1 |
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | review | Merged incl. REV-T4a fixes (`0186395`); re-check REV-T4a-b: residual gaps (zero-token exec limit, unbounded program errors, blocked reply writes, orphan shells if aimx ignores close, warning echoes env value); worker fixing | Merge; close | `agent/claude/code-mode` · `../aim-wt/code-mode` |
@@ -138,3 +138,4 @@ client still builds.
   run_program/save_program workspace errors and nested observer events are not cut; a reply write
   can block forever if the client stops reading; if aimx ignores close its shells can be orphaned;
   the invalid-value warning echoes the whole env value. Sent back to the T4a worker.
+- 2026-09-25 — Codex REV-T1c (final re-check; auth.json unchanged): VERDICT MERGE. Note: the unit test's 50 ms wait makes its detection timing-dependent (the stress test backs it).
