@@ -27,7 +27,7 @@ client still builds.
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | in progress | Worker running | Review its report, merge, then T4b | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | todo | Waits for T4a | Wire gate: 31 regressions on the merged base + 4 from T3's prompt | — |
-| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | review | Merged; codex REV-T5: MERGE AFTER FIXES (B1–B5); worker fixing on the same branch | Merge the fix commits; re-check | `agent/claude/acp-models` · `../aim-wt/acp-models` |
+| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | review | Merged incl. REV-T5 fixes (`c4a1b35`, merge `1deaa65`); kernel conflict rule proved; live re-run green; codex re-check running | Close on re-check verdict | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
 | T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
 
@@ -102,3 +102,7 @@ client still builds.
   effort ladder in stream and snapshot. N1: `switch` spec does not pin candidate order. Queued to
   the T1 worker with its follow-ups. Protocol compatibility, `/provider` reset, `/clear` and the
   kernel (318 verified) confirmed.
+- 2026-09-25 — REV-T5 B1–B5 fixed (`ef65740`, `c4a1b35`; merged `1deaa65`): conflicting
+  generations/families refuse (kernel `Conflict`, 3 new theorems), errors never echo the request,
+  one classification rule, variant spellings declared by the claude profile. Merged tree with T1:
+  clippy clean, aim-acp+kernel 101/101, aim lib 277/277. Codex re-check started.
