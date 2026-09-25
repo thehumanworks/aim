@@ -12,6 +12,8 @@ pub struct RemoteHarness;
 
 #[cfg(test)]
 mod live_tests;
+#[cfg(test)]
+mod sandbox_probe;
 
 /// POSIX shell single quoting, including embedded apostrophes.
 #[must_use]

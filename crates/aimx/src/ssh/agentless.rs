@@ -1,9 +1,9 @@
 //! Agentless workspace operations over a multiplexed OpenSSH connection.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::time::Duration;
 
 use aim_proto::content::Content;
@@ -16,8 +16,8 @@ use aim_proto::ids::{IdempotencyKey, ProcId};
 use globset::{Glob, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Child;
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::process::{Child, ChildStdin};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 use super::conn::Connection;
 use super::quote;
@@ -32,28 +32,23 @@ pub struct AgentlessWorkspace {
     home: String,
     caps: Caps,
     channels: Arc<Semaphore>,
+    process_slots: Arc<Semaphore>,
+    mutations: Mutex<()>,
     processes: Mutex<BTreeMap<String, Arc<Process>>>,
 }
 
 struct Process {
-    _permit: OwnedSemaphorePermit,
     remote_marker: String,
     child: Mutex<Child>,
-    output: Mutex<ProcessOutput>,
+    stdin: Mutex<Option<ChildStdin>>,
+    output: Mutex<crate::ring::OutputRing>,
     exit: Mutex<Option<ExitStatus>>,
+    last_signal: AtomicI32,
     streams_open: AtomicU8,
     notify: Notify,
 }
 
-struct ProcessOutput {
-    chunks: VecDeque<aim_proto::harness::OutputChunk>,
-    bytes: usize,
-    last_seq: u64,
-    dropped_before: Option<u64>,
-}
-
 const MAX_PROCESS_OUTPUT: usize = 8 * 1024 * 1024;
-static PROCESS_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 impl AgentlessWorkspace {
     /// Open a remote directory, resolving its canonical root on the remote host.
@@ -62,7 +57,7 @@ impl AgentlessWorkspace {
     /// Returns a protocol error if the remote root cannot be resolved.
     pub async fn open(connection: Connection, root: &str) -> Outcome<Self> {
         let output = connection.run(&format!("realpath -- {}", quote(root)), &[]).await?;
-        let root = String::from_utf8(output).map_err(|_| error(ErrorCode::Unavailable, "remote root is not UTF-8"))?.trim_end().to_owned();
+        let root = realpath_output(output)?;
         if !root.starts_with('/') {
             return Err(error(ErrorCode::InvalidParams, "remote root is not absolute"));
         }
@@ -77,9 +72,10 @@ impl AgentlessWorkspace {
             ("unknown", "unknown")
         };
         let native_search = connection.run("command -v rg >/dev/null 2>&1", &[]).await.is_ok();
+        let isolated_processes = connection.run("command -v perl >/dev/null 2>&1 || command -v setsid >/dev/null 2>&1", &[]).await.is_ok();
         let caps = Caps {
-            exec: true,
-            pty: true,
+            exec: isolated_processes,
+            pty: isolated_processes,
             watch: false,
             native_search,
             atomic_rename: true,
@@ -94,14 +90,24 @@ impl AgentlessWorkspace {
             root,
             home: platform.home,
             caps,
-            channels: Arc::new(Semaphore::new(9)),
+            channels: Arc::new(Semaphore::new(3)),
+            process_slots: Arc::new(Semaphore::new(6)),
+            mutations: Mutex::new(()),
             processes: Mutex::new(BTreeMap::new()),
         })
     }
 
     async fn run(&self, script: &str, input: &[u8]) -> Outcome<Vec<u8>> {
-        let _permit = self.channels.acquire().await.map_err(|_| error(ErrorCode::Unavailable, "SSH channels closed"))?;
-        self.connection.run(script, input).await
+        let (status, output) = self.run_status(script, input).await?;
+        if status == 0 { Ok(output) } else { Err(error(ErrorCode::Unavailable, "remote command failed")) }
+    }
+
+    async fn run_status(&self, script: &str, input: &[u8]) -> Outcome<(i32, Vec<u8>)> {
+        let _permit = tokio::time::timeout(Duration::from_secs(5), self.channels.acquire())
+            .await
+            .map_err(|_| error(ErrorCode::Unavailable, "SSH channel capacity exhausted"))?
+            .map_err(|_| error(ErrorCode::Unavailable, "SSH channels closed"))?;
+        self.connection.run_with_status(script, input, false).await
     }
 
     async fn safe(&self, path: &str, may_create: bool) -> Outcome<String> {
@@ -110,24 +116,43 @@ impl AgentlessWorkspace {
         }
         let script = if may_create {
             format!(
-                "if [ -e {0} ] || [ -L {0} ]; then realpath -- {0}; else p=$(dirname -- {0}); while [ ! -e \"$p\" ]; do p=$(dirname -- \"$p\"); done; realpath -- \"$p\"; fi",
+                "if [ -e {0} ] || [ -L {0} ]; then printf 'E'; realpath -- {0}; else p=$(dirname -- {0}); while [ ! -e \"$p\" ]; do p=$(dirname -- \"$p\"); done; printf 'A%s\\0' \"$p\"; realpath -- \"$p\"; fi",
                 quote(path)
             )
         } else {
-            format!("realpath -- {}", quote(path))
+            format!("[ -e {0} ] || [ -L {0} ] || exit 44; realpath -- {0}", quote(path))
         };
-        let resolved = self.run(&script, &[]).await.map_err(|_| error(ErrorCode::NotFound, "remote path does not exist"))?;
-        let resolved =
-            String::from_utf8(resolved).map_err(|_| error(ErrorCode::Unavailable, "remote path is not UTF-8"))?.trim_end().to_owned();
+        let (status, output) = self.run_status(&script, &[]).await?;
+        if status != 0 {
+            return Err(error(if status == 44 { ErrorCode::NotFound } else { ErrorCode::Unavailable }, "remote path cannot be resolved"));
+        }
+        let resolved = if may_create {
+            match output.first().copied() {
+                Some(b'E') => realpath_output(output.get(1..).unwrap_or_default().to_vec())?,
+                Some(b'A') => {
+                    let body = output.get(1..).unwrap_or_default();
+                    let split =
+                        body.iter().position(|byte| *byte == 0).ok_or_else(|| error(ErrorCode::Unavailable, "invalid remote path"))?;
+                    let ancestor = std::str::from_utf8(body.get(..split).unwrap_or_default())
+                        .map_err(|_| error(ErrorCode::Unavailable, "remote path is not UTF-8"))?;
+                    let canonical = realpath_output(body.get(split + 1..).unwrap_or_default().to_vec())?;
+                    let suffix = path.strip_prefix(ancestor).ok_or_else(|| error(ErrorCode::Unavailable, "invalid remote path"))?;
+                    format!("{canonical}{suffix}")
+                }
+                _ => return Err(error(ErrorCode::Unavailable, "invalid remote path")),
+            }
+        } else {
+            realpath_output(output)?
+        };
         if resolved != self.root && !resolved.starts_with(&format!("{}/", self.root)) {
             return Err(error(ErrorCode::Denied, "path leaves workspace root"));
         }
-        Ok(path.to_owned())
+        Ok(resolved)
     }
 
     async fn hash(&self, path: &str) -> Outcome<ContentHash> {
         let script = format!(
-            "if command -v sha256sum >/dev/null 2>&1; then sha256sum -- {0}; elif command -v shasum >/dev/null 2>&1; then shasum -a 256 -- {0}; else exit 127; fi",
+            "if command -v sha256sum >/dev/null 2>&1; then sha256sum < {0}; elif command -v shasum >/dev/null 2>&1; then shasum -a 256 < {0}; else exit 127; fi",
             quote(path)
         );
         let output = self.run(&script, &[]).await?;
@@ -153,7 +178,10 @@ impl AgentlessWorkspace {
             "p={}; if [ -L \"$p\" ]; then printf 'symlink\\n0'; elif [ -f \"$p\" ]; then printf 'file\\n'; wc -c < \"$p\"; elif [ -d \"$p\" ]; then printf 'dir\\n0'; elif [ -e \"$p\" ]; then printf 'other\\n0'; else exit 44; fi",
             quote(path)
         );
-        let output = self.run(&script, &[]).await.map_err(|_| error(ErrorCode::NotFound, "remote path does not exist"))?;
+        let (status, output) = self.run_status(&script, &[]).await?;
+        if status != 0 {
+            return Err(error(if status == 44 { ErrorCode::NotFound } else { ErrorCode::Unavailable }, "remote metadata failed"));
+        }
         let text = String::from_utf8(output).map_err(|_| error(ErrorCode::Unavailable, "invalid remote metadata"))?;
         let mut lines = text.lines();
         let kind = match lines.next() {
@@ -164,42 +192,70 @@ impl AgentlessWorkspace {
             None => return Err(error(ErrorCode::Unavailable, "empty remote metadata")),
         };
         let size = lines.next().unwrap_or("0").trim().parse().map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?;
-        let hash = if with_hash && kind == EntryKind::File { Some(self.hash(path).await?) } else { None };
+        let hash = if with_hash && matches!(kind, EntryKind::File | EntryKind::Symlink) { Some(self.hash(path).await?) } else { None };
         Ok(Meta { kind, size, mtime_ms: None, hash })
     }
 
     async fn read_file(&self, path: &str, range: Option<ByteRange>, max_bytes: u64) -> Outcome<FsReadResult> {
-        self.safe(path, false).await?;
-        let meta = self.meta(path, false).await?;
-        let size = match meta.kind {
-            EntryKind::File => meta.size,
-            EntryKind::Symlink => {
-                let output = self.run(&format!("wc -c < {}", quote(path)), &[]).await?;
-                String::from_utf8(output)
-                    .map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?
-                    .trim()
-                    .parse()
-                    .map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?
-            }
-            _ => return Err(error(ErrorCode::InvalidParams, "remote path is not a file")),
-        };
-        let hash = self.hash(path).await?;
+        let target = self.safe(path, false).await?;
         let start = range.map_or(0, |range| range.start);
+        let count = range.map_or(max_bytes, |range| range.len.min(max_bytes));
+        let body = if start == 0 && count == u64::MAX {
+            "cat -- \"$p\"".to_owned()
+        } else {
+            format!("tail -c +{} -- \"$p\" | head -c {count}", start.saturating_add(1))
+        };
+        let script = format!(
+            "p={}; [ -f \"$p\" ] || exit 43; n=$(wc -c < \"$p\") || exit; if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < \"$p\"); elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < \"$p\"); else exit 127; fi; printf '%s\\n%s\\n' \"$n\" \"${{h%% *}}\"; {body}",
+            quote(&target)
+        );
+        let (status, output) = self.run_status(&script, &[]).await?;
+        if status == 43 {
+            return Err(error(ErrorCode::Conflict, "remote path is not a file"));
+        }
+        if status != 0 {
+            return Err(error(ErrorCode::Unavailable, "remote read failed"));
+        }
+        let first =
+            output.iter().position(|byte| *byte == b'\n').ok_or_else(|| error(ErrorCode::Unavailable, "invalid remote read header"))?;
+        let second = output
+            .iter()
+            .enumerate()
+            .skip(first + 1)
+            .find_map(|(index, byte)| (*byte == b'\n').then_some(index))
+            .ok_or_else(|| error(ErrorCode::Unavailable, "invalid remote read header"))?;
+        let size = std::str::from_utf8(output.get(..first).unwrap_or_default())
+            .map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?;
+        let digest = std::str::from_utf8(output.get(first + 1..second).unwrap_or_default())
+            .map_err(|_| error(ErrorCode::Unavailable, "invalid remote hash"))?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(error(ErrorCode::Unavailable, "invalid remote hash"));
+        }
+        let content = output.get(second + 1..).unwrap_or_default().to_vec();
         let requested = range.map_or(size.saturating_sub(start), |range| range.len);
-        let count = requested.min(max_bytes);
-        let script = format!("dd if={} bs=1 skip={start} count={count} 2>/dev/null", quote(path));
-        let content = self.run(&script, &[]).await?;
         Ok(FsReadResult {
             content: Content::from_bytes(content),
             size,
-            hash,
+            hash: ContentHash(format!("sha256:{digest}")),
             truncated: requested > count && start.saturating_add(count) < size,
         })
     }
 
     async fn write_file(&self, req: WriteRequest<'_>) -> Outcome<WriteOutcome> {
-        self.safe(req.path, true).await?;
-        let current = self.meta(req.path, true).await.ok();
+        let _mutation = self.mutations.lock().await;
+        self.write_file_locked(req).await
+    }
+
+    async fn write_file_locked(&self, req: WriteRequest<'_>) -> Outcome<WriteOutcome> {
+        let target = self.safe(req.path, true).await?;
+        let current = match self.meta(req.path, true).await {
+            Ok(meta) => Some(meta),
+            Err(err) if err.code == ErrorCode::NotFound => None,
+            Err(err) => return Err(err),
+        };
         match req.precondition {
             Precondition::IfAbsent if current.is_some() => return Err(error(ErrorCode::PreconditionFailed, "remote file exists")),
             Precondition::IfHash { hash } if current.as_ref().and_then(|meta| meta.hash.as_ref()) != Some(hash) => {
@@ -208,23 +264,30 @@ impl AgentlessWorkspace {
             _ => {}
         }
         let bytes = req.content.clone().into_bytes();
-        let quoted = quote(req.path);
+        let quoted = quote(&target);
         let precondition = match req.precondition {
             Precondition::Any => String::new(),
             Precondition::IfAbsent => "[ ! -e \"$p\" ] && [ ! -L \"$p\" ] || exit 42;".to_owned(),
             Precondition::IfHash { hash } => format!(
-                "if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum -- \"$p\"); elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 -- \"$p\"); else exit 127; fi; [ \"sha256:${{h%% *}}\" = {} ] || exit 42;",
+                "if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < \"$p\"); elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < \"$p\"); else exit 127; fi; [ \"sha256:${{h%% *}}\" = {} ] || exit 42;",
                 quote(&hash.0)
             ),
         };
         let script = format!(
-            "umask 077; p={quoted}; d=$(dirname -- \"$p\"); {} t=$(mktemp \"$d/.aimx.XXXXXXXX\") || exit; trap 'rm -f \"$t\"' EXIT HUP INT TERM; cat > \"$t\" || exit; {precondition} mv -f \"$t\" \"$p\" || exit; trap - EXIT HUP INT TERM",
-            if req.create_dirs { "mkdir -p \"$d\" || exit;" } else { "" }
+            "p={quoted}; d=$(dirname -- \"$p\"); {} [ -d \"$p\" ] && exit 43; t=$(mktemp \"$d/.aimx.XXXXXXXX\") || exit; trap 'rm -f \"$t\"' EXIT HUP INT TERM; cat > \"$t\" || exit; {precondition} if [ -e \"$p\" ]; then mode=$(stat -f %Lp \"$p\" 2>/dev/null || stat -c %a \"$p\") || exit; else mode=$(printf '%o' $((0666 & ~0$(umask)))); fi; chmod \"$mode\" \"$t\" || exit; {} trap - EXIT HUP INT TERM",
+            if req.create_dirs { "mkdir -p \"$d\" || exit 43;" } else { "" },
+            if matches!(req.precondition, Precondition::IfAbsent) {
+                "ln \"$t\" \"$p\" || exit 42; rm -f \"$t\";"
+            } else {
+                "mv -f -- \"$t\" \"$p\" || exit;"
+            }
         );
-        let _permit = self.channels.acquire().await.map_err(|_| error(ErrorCode::Unavailable, "SSH channels closed"))?;
-        let (status, _) = self.connection.run_with_status(&script, &bytes, false).await?;
+        let (status, _) = self.run_status(&script, &bytes).await?;
         if status == 42 {
             return Err(error(ErrorCode::PreconditionFailed, "remote file changed"));
+        }
+        if status == 43 {
+            return Err(error(ErrorCode::Conflict, "remote path is a directory"));
         }
         if status != 0 {
             return Err(error(ErrorCode::Unavailable, "remote write failed"));
@@ -236,29 +299,35 @@ impl AgentlessWorkspace {
         })
     }
 
-    async fn grep_fallback(&self, query: &GrepQuery<'_>, options: &str) -> Outcome<GrepResult> {
+    async fn grep_fallback(&self, query: &GrepQuery<'_>, options: &str, target: &str) -> Outcome<GrepResult> {
         let mut builder = GlobSetBuilder::new();
         for pattern in query.globs {
             builder.add(Glob::new(pattern).map_err(|_| error(ErrorCode::InvalidParams, "invalid search glob"))?);
         }
         let globs = builder.build().map_err(|_| error(ErrorCode::InvalidParams, "invalid search glob"))?;
-        let files = self.run(&format!("find {} -type f -print0", quote(query.path)), &[]).await?;
+        let cap = 16 * 1024 * 1024;
+        let script = format!(
+            "find {} -type f -exec sh -c 'pattern=$1; shift; for f do printf \"F%s\\0\" \"$f\"; grep -EnH{options} -C {} -e \"$pattern\" -- \"$f\" 2>/dev/null || :; printf \"\\0\"; done' sh {} {{}} + | head -c {cap}",
+            quote(target),
+            query.context,
+            quote(query.pattern)
+        );
+        let files = self.run(&script, &[]).await?;
         let mut matches = Vec::new();
-        for path in files.split(|byte| *byte == 0).filter(|path| !path.is_empty()) {
-            let path = String::from_utf8(path.to_vec()).map_err(|_| error(ErrorCode::Unavailable, "remote path is not UTF-8"))?;
-            let relative = path.strip_prefix(&format!("{}/", self.root)).unwrap_or(&path);
-            if !query.globs.is_empty() && !globs.is_match(relative) && !globs.is_match(path.rsplit('/').next().unwrap_or(&path)) {
+        let mut fields = files.split(|byte| *byte == 0);
+        while let (Some(path), Some(output)) = (fields.next(), fields.next()) {
+            let path = std::str::from_utf8(path.strip_prefix(b"F").unwrap_or_default())
+                .map_err(|_| error(ErrorCode::Unavailable, "remote path is not UTF-8"))?;
+            let relative = path.strip_prefix(&format!("{}/", self.root)).unwrap_or(path);
+            if !query.globs.is_empty() && !globs.is_match(relative) && !globs.is_match(path.rsplit('/').next().unwrap_or(path)) {
                 continue;
             }
-            let command = format!("grep -n{options} -C {} -e {} -- {}", query.context, quote(query.pattern), quote(&path));
-            let (status, output) = self.connection.run_with_status(&command, &[], false).await?;
-            if status > 1 {
-                return Err(error(ErrorCode::Unavailable, "remote grep failed"));
-            }
-            let output = String::from_utf8(output).map_err(|_| error(ErrorCode::Unavailable, "grep result is not UTF-8"))?;
+            let output = String::from_utf8_lossy(output);
             let mut lines = BTreeMap::new();
             let mut hits = Vec::new();
             for line in output.lines() {
+                let line = line.strip_prefix(path).unwrap_or(line);
+                let line = line.strip_prefix(':').or_else(|| line.strip_prefix('-')).unwrap_or(line);
                 if let Some((number, text)) = line.split_once(':')
                     && let Ok(number) = number.parse::<u64>()
                 {
@@ -291,7 +360,7 @@ impl AgentlessWorkspace {
             }
         }
         let limit = usize::try_from(query.max_matches).unwrap_or(usize::MAX);
-        let truncated = matches.len() > limit;
+        let truncated = matches.len() > limit || files.len() >= cap;
         matches.truncate(limit);
         Ok(GrepResult { matches, truncated })
     }
@@ -308,10 +377,34 @@ impl Workspace for AgentlessWorkspace {
         self
     }
     fn exec(&self) -> Option<&dyn Exec> {
-        Some(self)
+        self.caps.exec.then_some(self)
     }
     fn search(&self) -> &dyn Search {
         self
+    }
+}
+
+impl Drop for AgentlessWorkspace {
+    fn drop(&mut self) {
+        let Ok(processes) = self.processes.try_lock() else { return };
+        for process in processes.values() {
+            if process.child.try_lock().is_ok_and(|mut child| child.try_wait().is_ok_and(|status| status.is_none())) {
+                let script = format!(
+                    "[ -f {0} ] || exit; read p g < {0} || exit; actual=$(ps -o pgid= -p \"$p\" 2>/dev/null | tr -d ' '); [ \"$actual\" = \"$g\" ] || exit; if [ \"$p\" = \"$g\" ]; then kill -KILL -\"$g\"; else kill -KILL \"$p\"; fi",
+                    quote(&process.remote_marker)
+                );
+                let mut command = self.connection.command(&script, false);
+                command
+                    .as_std_mut()
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                drop(command.as_std_mut().spawn());
+            }
+            if let Ok(mut child) = process.child.try_lock() {
+                drop(child.start_kill());
+            }
+        }
     }
 }
 
@@ -327,22 +420,10 @@ impl Fs for AgentlessWorkspace {
     }
     fn edit<'a>(&'a self, req: EditRequest<'a>) -> BoxFuture<'a, Outcome<EditOutcome>> {
         Box::pin(async move {
+            let _mutation = self.mutations.lock().await;
             let read = self.read_file(req.path, None, u64::MAX).await?;
-            let text = String::from_utf8(read.content.into_bytes()).map_err(|_| error(ErrorCode::Conflict, "exact edit requires UTF-8"))?;
-            let mut text = text;
-            let mut replacements = Vec::new();
-            for edit in req.edits {
-                if edit.old.is_empty() {
-                    return Err(error(ErrorCode::Conflict, "empty edit pattern"));
-                }
-                let count = text.matches(&edit.old).count();
-                if count == 0 || (!edit.replace_all && count != 1) {
-                    return Err(error(ErrorCode::Conflict, "edit pattern is not unique"));
-                }
-                replacements.push(u32::try_from(count).map_err(|_| error(ErrorCode::LimitExceeded, "too many replacements"))?);
-                text = if edit.replace_all { text.replace(&edit.old, &edit.new) } else { text.replacen(&edit.old, &edit.new, 1) };
-            }
-            let content = Content::Utf8 { text };
+            let applied = crate::edit::apply_edits(&read.content.into_bytes(), req.edits).map_err(ProtoError::from)?;
+            let content = Content::from_bytes(applied.content);
             match req.precondition {
                 Precondition::IfAbsent => return Err(error(ErrorCode::PreconditionFailed, "edit target exists")),
                 Precondition::IfHash { hash } if hash != &read.hash => {
@@ -351,7 +432,7 @@ impl Fs for AgentlessWorkspace {
                 Precondition::Any | Precondition::IfHash { .. } => {}
             }
             let write = self
-                .write_file(WriteRequest {
+                .write_file_locked(WriteRequest {
                     path: req.path,
                     content: &content,
                     precondition: &Precondition::IfHash { hash: read.hash },
@@ -359,46 +440,73 @@ impl Fs for AgentlessWorkspace {
                     key: req.key,
                 })
                 .await?;
-            Ok(EditOutcome { write, replacements })
+            Ok(EditOutcome { write, replacements: applied.replacements })
         })
     }
     fn list<'a>(&'a self, req: ListRequest<'a>) -> BoxFuture<'a, Outcome<FsListResult>> {
         Box::pin(async move {
-            self.safe(req.path, false).await?;
-            let script = format!("find {} -mindepth 1 -maxdepth 1 -print0", quote(req.path));
+            let resolved = self.safe(req.path, false).await?;
+            let script = format!(
+                "find {} -mindepth 1 -maxdepth 1 -exec sh -c 'printf \"%s\\0\" \"$#\"; for p do printf \"%s\\0\" \"${{p##*/}}\"; done; if [ \"$(uname -s)\" = Darwin ]; then stat -f \"%HT|%z\" \"$@\"; else stat -c \"%F|%s\" \"$@\"; fi | tr \"\\n\" \"\\0\"' sh {{}} +",
+                quote(&resolved)
+            );
             let output = self.run(&script, &[]).await?;
-            let mut names = output
-                .split(|byte| *byte == 0)
-                .filter(|part| !part.is_empty())
-                .filter_map(|path| {
-                    let path = String::from_utf8(path.to_vec()).ok()?;
-                    path.rsplit('/').next().map(str::to_owned)
-                })
-                .filter(|name| req.include_hidden || !name.starts_with('.'))
-                .collect::<Vec<_>>();
-            names.sort();
-            let start = req.page_token.and_then(|token| names.iter().position(|name| name.as_str() == token)).map_or(0, |index| index + 1);
             let mut entries = Vec::new();
-            let limit = usize::try_from(req.limit).unwrap_or(usize::MAX);
-            for name in names.iter().skip(start).take(limit) {
-                let path = format!("{}/{name}", req.path.trim_end_matches('/'));
-                let meta = self.meta(&path, false).await?;
-                entries.push(DirEntry { name: name.clone(), kind: meta.kind, size: meta.size });
+            let mut fields = output.split(|byte| *byte == 0);
+            while let Some(count) = fields.next().filter(|part| !part.is_empty()) {
+                let count = std::str::from_utf8(count)
+                    .map_err(|_| error(ErrorCode::Unavailable, "invalid remote listing"))?
+                    .parse::<usize>()
+                    .map_err(|_| error(ErrorCode::Unavailable, "invalid remote listing"))?;
+                let names = (0..count)
+                    .map(|_| {
+                        fields.next().ok_or_else(|| error(ErrorCode::Unavailable, "incomplete remote listing")).and_then(|name| {
+                            String::from_utf8(name.to_vec()).map_err(|_| error(ErrorCode::Unavailable, "remote name is not UTF-8"))
+                        })
+                    })
+                    .collect::<Outcome<Vec<_>>>()?;
+                for name in names {
+                    let metadata = fields.next().ok_or_else(|| error(ErrorCode::Unavailable, "incomplete remote listing"))?;
+                    if !req.include_hidden && name.starts_with('.') {
+                        continue;
+                    }
+                    let metadata = std::str::from_utf8(metadata).map_err(|_| error(ErrorCode::Unavailable, "invalid remote listing"))?;
+                    let (kind, size) = metadata.split_once('|').ok_or_else(|| error(ErrorCode::Unavailable, "invalid remote listing"))?;
+                    let kind = match kind {
+                        "Regular File" | "regular file" => EntryKind::File,
+                        "Directory" | "directory" => EntryKind::Dir,
+                        "Symbolic Link" | "symbolic link" => EntryKind::Symlink,
+                        _ => EntryKind::Other,
+                    };
+                    let size = if kind == EntryKind::File {
+                        size.parse::<u64>().map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?
+                    } else {
+                        0
+                    };
+                    entries.push(DirEntry { name, kind, size });
+                }
             }
-            let next_page = if start + entries.len() < names.len() { entries.last().map(|entry| entry.name.clone()) } else { None };
-            Ok(FsListResult { entries, next_page })
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            let start = req.page_token.map_or(0, |token| entries.partition_point(|entry| entry.name.as_str() <= token));
+            let limit = usize::try_from(req.limit).unwrap_or(usize::MAX);
+            let end = start.saturating_add(limit).min(entries.len());
+            let next_page = if end < entries.len() { entries.get(end.saturating_sub(1)).map(|entry| entry.name.clone()) } else { None };
+            Ok(FsListResult { entries: entries.get(start..end).unwrap_or_default().to_vec(), next_page })
         })
     }
     fn mkdir<'a>(&'a self, path: &'a str, _key: &'a IdempotencyKey) -> BoxFuture<'a, Outcome<()>> {
         Box::pin(async move {
-            self.safe(path, true).await?;
-            self.run(&format!("mkdir -p -- {}", quote(path)), &[]).await.map(|_| ())
+            let _mutation = self.mutations.lock().await;
+            let target = self.safe(path, true).await?;
+            let (status, _) = self.run_status(&format!("mkdir -p -- {}", quote(&target)), &[]).await?;
+            if status == 0 { Ok(()) } else { Err(error(ErrorCode::Conflict, "remote mkdir failed")) }
         })
     }
     fn remove<'a>(&'a self, path: &'a str, recursive: bool, _key: &'a IdempotencyKey) -> BoxFuture<'a, Outcome<()>> {
         Box::pin(async move {
-            self.safe(path, false).await?;
-            if path == self.root {
+            let _mutation = self.mutations.lock().await;
+            let resolved = self.safe(path, false).await?;
+            if resolved == self.root {
                 return Err(error(ErrorCode::Denied, "cannot remove workspace root"));
             }
             let quoted = quote(path);
@@ -407,15 +515,24 @@ impl Fs for AgentlessWorkspace {
             } else {
                 format!("if [ -d {quoted} ] && [ ! -L {quoted} ]; then rmdir -- {quoted}; else rm -f -- {quoted}; fi")
             };
-            self.run(&script, &[]).await.map(|_| ())
+            let (status, _) = self.run_status(&script, &[]).await?;
+            if status == 0 { Ok(()) } else { Err(error(ErrorCode::Conflict, "remote remove failed")) }
         })
     }
     fn rename<'a>(&'a self, from: &'a str, to: &'a str, overwrite: bool, _key: &'a IdempotencyKey) -> BoxFuture<'a, Outcome<()>> {
         Box::pin(async move {
-            self.safe(from, false).await?;
-            self.safe(to, true).await?;
-            if !overwrite && self.meta(to, false).await.is_ok() {
-                return Err(error(ErrorCode::Conflict, "destination exists"));
+            let _mutation = self.mutations.lock().await;
+            let source = self.safe(from, false).await?;
+            let destination = self.safe(to, true).await?;
+            if source == self.root || destination == self.root {
+                return Err(error(ErrorCode::Denied, "cannot rename workspace root"));
+            }
+            if !overwrite {
+                match self.meta(to, false).await {
+                    Ok(_) => return Err(error(ErrorCode::Conflict, "destination exists")),
+                    Err(err) if err.code == ErrorCode::NotFound => {}
+                    Err(err) => return Err(err),
+                }
             }
             self.run(&format!("mv {} -- {} {}", if overwrite { "-f" } else { "-n" }, quote(from), quote(to)), &[]).await?;
             if !overwrite && self.meta(from, false).await.is_ok() {
@@ -430,49 +547,65 @@ fn error(code: ErrorCode, message: &str) -> ProtoError {
     ProtoError::new(code, message)
 }
 
+fn realpath_output(output: Vec<u8>) -> Outcome<String> {
+    let text = String::from_utf8(output).map_err(|_| error(ErrorCode::Unavailable, "remote path is not UTF-8"))?;
+    text.strip_suffix('\n').map(str::to_owned).ok_or_else(|| error(ErrorCode::Unavailable, "invalid realpath output"))
+}
+
+fn process_script(home: &str, spec: &SpawnSpec<'_>, cwd: &str, marker: &str) -> Outcome<String> {
+    let command = match spec.command {
+        Command::Argv { argv } if !argv.is_empty() => argv.iter().map(|arg| quote(arg)).collect::<Vec<_>>().join(" "),
+        Command::Argv { .. } => return Err(error(ErrorCode::InvalidParams, "empty command")),
+        Command::Shell { script } => format!("sh -c {}", quote(script)),
+    };
+    let mut script = format!("umask 077; mkdir -p {} || exit; cd {} || exit;", quote(&format!("{home}/.aim/run")), quote(cwd));
+    for (name, value) in spec.env {
+        if name.is_empty()
+            || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || name.starts_with(|c: char| c.is_ascii_digit())
+        {
+            return Err(error(ErrorCode::InvalidParams, "invalid environment name"));
+        }
+        let _ = write!(script, " export {name}={};", quote(value));
+    }
+    let pty_setup = spec.pty.map_or_else(String::new, |size| format!("stty rows {} cols {} 2>/dev/null || :;", size.rows, size.cols));
+    let inner = format!(
+        "{pty_setup} p=$$; g=$(ps -o pgid= -p \"$p\" | tr -d ' '); printf '%s %s\\n' \"$p\" \"$g\" > {} || exit; exec {command}",
+        quote(marker)
+    );
+    let _ = write!(
+        script,
+        " if command -v perl >/dev/null 2>&1; then exec perl -MPOSIX -e 'POSIX::setpgid(0,0) == 0 or exit 127; exec(\"/bin/sh\", \"-c\", $ARGV[0])' -- {}; elif command -v setsid >/dev/null 2>&1; then exec setsid sh -c {}; else exit 127; fi",
+        quote(&inner),
+        quote(&inner)
+    );
+    Ok(script)
+}
+
 impl Exec for AgentlessWorkspace {
     fn spawn<'a>(&'a self, spec: SpawnSpec<'a>) -> BoxFuture<'a, Outcome<ProcId>> {
         Box::pin(async move {
-            self.safe(spec.cwd, false).await?;
-            let command = match spec.command {
-                Command::Argv { argv } if !argv.is_empty() => argv.iter().map(|arg| quote(arg)).collect::<Vec<_>>().join(" "),
-                Command::Argv { .. } => return Err(error(ErrorCode::InvalidParams, "empty command")),
-                Command::Shell { script } => format!("sh -c {}", quote(script)),
-            };
-            let id = ProcId::new(format!("ssh-{}-{}", std::process::id(), PROCESS_SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+            let cwd = self.safe(spec.cwd, false).await?;
+            let id = ProcId::new(format!("ssh-{}", crate::id::random_hex()));
             let remote_marker = format!("{}/.aim/run/{}.pid", self.home, id.as_str());
-            let mut script = format!(
-                "umask 077; mkdir -p {} || exit; printf '%s\\n' \"$$\" > {} || exit; cd {} || exit;",
-                quote(&format!("{}/.aim/run", self.home)),
-                quote(&remote_marker),
-                quote(spec.cwd)
-            );
-            for (name, value) in spec.env {
-                if name.is_empty()
-                    || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                    || name.starts_with(|c: char| c.is_ascii_digit())
-                {
-                    return Err(error(ErrorCode::InvalidParams, "invalid environment name"));
-                }
-                let _ = write!(script, " export {name}={};", quote(value));
-            }
-            let _ = write!(script, " exec {command}");
-            let permit =
-                Arc::clone(&self.channels).acquire_owned().await.map_err(|_| error(ErrorCode::Unavailable, "SSH channels closed"))?;
+            let script = process_script(&self.home, &spec, &cwd, &remote_marker)?;
+            let permit = Arc::clone(&self.process_slots)
+                .try_acquire_owned()
+                .map_err(|_| error(ErrorCode::LimitExceeded, "too many remote processes"))?;
             let mut cmd = self.connection.command(&script, spec.pty.is_some());
+            cmd.kill_on_drop(true);
             cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
             let mut child = cmd.spawn().map_err(|_| error(ErrorCode::Unavailable, "cannot start remote process"))?;
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
-            if !spec.stdin {
-                drop(child.stdin.take());
-            }
+            let stdin = if spec.stdin { child.stdin.take() } else { None };
             let process = Arc::new(Process {
-                _permit: permit,
                 remote_marker: remote_marker.clone(),
                 child: Mutex::new(child),
-                output: Mutex::new(ProcessOutput { chunks: VecDeque::new(), bytes: 0, last_seq: 0, dropped_before: None }),
+                stdin: Mutex::new(stdin),
+                output: Mutex::new(crate::ring::OutputRing::new(MAX_PROCESS_OUTPUT)),
                 exit: Mutex::new(None),
+                last_signal: AtomicI32::new(0),
                 streams_open: AtomicU8::new(u8::from(stdout.is_some()) + u8::from(stderr.is_some())),
                 notify: Notify::new(),
             });
@@ -487,7 +620,7 @@ impl Exec for AgentlessWorkspace {
             let marker_check = format!("test -s {}", quote(&remote_marker));
             let mut ready = false;
             for _ in 0..10 {
-                if self.connection.run(&marker_check, &[]).await.is_ok() {
+                if self.run(&marker_check, &[]).await.is_ok() {
                     ready = true;
                     break;
                 }
@@ -497,17 +630,41 @@ impl Exec for AgentlessWorkspace {
                 drop(process.child.lock().await.start_kill());
                 return Err(error(ErrorCode::Unavailable, "remote process did not start"));
             }
+            let waiter = Arc::downgrade(&process);
+            tokio::spawn(async move {
+                let _permit = permit;
+                loop {
+                    let Some(process) = waiter.upgrade() else { break };
+                    let status = process.child.lock().await.try_wait();
+                    if let Ok(Some(status)) = status {
+                        let mut exit = process.exit.lock().await;
+                        if exit.is_none() {
+                            let signal = process.last_signal.load(Ordering::Acquire);
+                            *exit = Some(if signal != 0 {
+                                ExitStatus::Signaled { signal }
+                            } else {
+                                ExitStatus::Exited { code: status.code().unwrap_or(255) }
+                            });
+                        }
+                        process.notify.notify_waiters();
+                        break;
+                    }
+                    drop(process);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            });
             if let Some(timeout) = spec.timeout {
                 let connection = self.connection.clone();
-                let process_for_timeout = Arc::clone(&process);
+                let process_for_timeout = Arc::downgrade(&process);
                 tokio::spawn(async move {
                     tokio::time::sleep(timeout).await;
-                    let mut child = process_for_timeout.child.lock().await;
-                    if child.try_wait().is_ok_and(|status| status.is_none()) {
-                        drop(remote_signal(&connection, &process_for_timeout.remote_marker, Signal::Kill).await);
-                        drop(child.start_kill());
+                    let Some(process_for_timeout) = process_for_timeout.upgrade() else { return };
+                    let running = process_for_timeout.child.lock().await.try_wait().is_ok_and(|status| status.is_none());
+                    if running {
                         *process_for_timeout.exit.lock().await = Some(ExitStatus::TimedOut);
                         process_for_timeout.notify.notify_waiters();
+                        drop(remote_signal(&connection, &process_for_timeout.remote_marker, Signal::Kill).await);
+                        drop(process_for_timeout.child.lock().await.start_kill());
                     }
                 });
             }
@@ -523,37 +680,46 @@ impl Exec for AgentlessWorkspace {
             if let Ok(Some(status)) = process.child.lock().await.try_wait() {
                 let mut exit = process.exit.lock().await;
                 if exit.is_none() {
-                    *exit = Some(ExitStatus::Exited { code: status.code().unwrap_or(255) });
+                    let signal = process.last_signal.load(Ordering::Acquire);
+                    *exit = Some(if signal != 0 {
+                        ExitStatus::Signaled { signal }
+                    } else {
+                        ExitStatus::Exited { code: status.code().unwrap_or(255) }
+                    });
                 }
             }
             let snapshot = || async {
                 let output = process.output.lock().await;
                 let mut chunks = Vec::new();
-                let mut size = 0_u64;
-                for chunk in output.chunks.iter().filter(|chunk| chunk.seq > after_seq) {
-                    let next = chunk.data.len() as u64;
-                    if size.saturating_add(next) > max_bytes {
-                        if chunks.is_empty() && max_bytes > 0 {
-                            return Err(error(ErrorCode::LimitExceeded, "max_bytes is smaller than the next output chunk"));
-                        }
-                        break;
-                    }
-                    size += next;
-                    chunks.push(chunk.clone());
+                let slice = output.read(after_seq, usize::try_from(max_bytes).unwrap_or(usize::MAX));
+                for chunk in slice.chunks {
+                    chunks.push(aim_proto::harness::OutputChunk {
+                        seq: chunk.seq,
+                        stream: chunk.stream,
+                        data: Content::from_bytes(chunk.data),
+                    });
                 }
                 let exit = if process.streams_open.load(Ordering::Acquire) == 0 { *process.exit.lock().await } else { None };
-                Ok(ExecReadResult { chunks, dropped_before: output.dropped_before, exit })
+                ExecReadResult { chunks, dropped_before: slice.dropped_before, exit }
             };
-            let mut result = snapshot().await?;
+            let notified = process.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let mut result = snapshot().await;
             if result.chunks.is_empty() && result.exit.is_none() && !wait.is_zero() {
-                let _ = tokio::time::timeout(wait, process.notify.notified()).await;
+                let _ = tokio::time::timeout(wait, &mut notified).await;
                 if let Ok(Some(status)) = process.child.lock().await.try_wait() {
                     let mut exit = process.exit.lock().await;
                     if exit.is_none() {
-                        *exit = Some(ExitStatus::Exited { code: status.code().unwrap_or(255) });
+                        let signal = process.last_signal.load(Ordering::Acquire);
+                        *exit = Some(if signal != 0 {
+                            ExitStatus::Signaled { signal }
+                        } else {
+                            ExitStatus::Exited { code: status.code().unwrap_or(255) }
+                        });
                     }
                 }
-                result = snapshot().await?;
+                result = snapshot().await;
             }
             Ok(result)
         })
@@ -563,11 +729,14 @@ impl Exec for AgentlessWorkspace {
         Box::pin(async move {
             let process =
                 self.processes.lock().await.get(proc.as_str()).cloned().ok_or_else(|| error(ErrorCode::NotFound, "process not found"))?;
-            let mut child = process.child.lock().await;
-            let stdin = child.stdin.as_mut().ok_or_else(|| error(ErrorCode::Unavailable, "stdin is closed"))?;
-            stdin.write_all(data).await.map_err(|_| error(ErrorCode::Unavailable, "remote stdin failed"))?;
+            let mut input = process.stdin.lock().await;
+            let stdin = input.as_mut().ok_or_else(|| error(ErrorCode::Unavailable, "stdin is closed"))?;
+            tokio::time::timeout(Duration::from_secs(5), stdin.write_all(data))
+                .await
+                .map_err(|_| error(ErrorCode::Unavailable, "remote stdin stalled"))?
+                .map_err(|_| error(ErrorCode::Unavailable, "remote stdin failed"))?;
             if eof {
-                drop(child.stdin.take());
+                drop(input.take());
             }
             Ok(())
         })
@@ -581,7 +750,17 @@ impl Exec for AgentlessWorkspace {
         Box::pin(async move {
             let process =
                 self.processes.lock().await.get(proc.as_str()).cloned().ok_or_else(|| error(ErrorCode::NotFound, "process not found"))?;
-            remote_signal(&self.connection, &process.remote_marker, signal).await
+            if process.child.lock().await.try_wait().is_ok_and(|status| status.is_some()) {
+                return Err(error(ErrorCode::NotFound, "process already exited"));
+            }
+            remote_signal(&self.connection, &process.remote_marker, signal).await?;
+            let number = match signal {
+                Signal::Interrupt => 2,
+                Signal::Terminate => 15,
+                Signal::Kill => 9,
+            };
+            process.last_signal.store(number, Ordering::Release);
+            Ok(())
         })
     }
 
@@ -593,7 +772,7 @@ impl Exec for AgentlessWorkspace {
                 drop(remote_signal(&self.connection, &process.remote_marker, Signal::Kill).await);
             }
             drop(process.child.lock().await.start_kill());
-            drop(self.connection.run(&format!("rm -f -- {}", quote(&process.remote_marker)), &[]).await);
+            drop(self.run(&format!("rm -f -- {}", quote(&process.remote_marker)), &[]).await);
             Ok(())
         })
     }
@@ -606,21 +785,7 @@ async fn collect_output<R: tokio::io::AsyncRead + Unpin>(mut reader: R, process:
             break;
         }
         let mut output = process.output.lock().await;
-        output.last_seq = output.last_seq.saturating_add(1);
-        let seq = output.last_seq;
-        output.bytes = output.bytes.saturating_add(count);
-        output.chunks.push_back(aim_proto::harness::OutputChunk {
-            seq,
-            stream,
-            data: Content::from_bytes(buffer.get(..count).unwrap_or(&[]).to_vec()),
-        });
-        while output.bytes > MAX_PROCESS_OUTPUT {
-            let Some(removed) = output.chunks.pop_front() else {
-                break;
-            };
-            output.bytes = output.bytes.saturating_sub(removed.data.len());
-            output.dropped_before = Some(removed.seq);
-        }
+        output.push(stream, buffer.get(..count).unwrap_or(&[]).to_vec());
         process.notify.notify_waiters();
     }
     process.streams_open.fetch_sub(1, Ordering::Release);
@@ -633,14 +798,22 @@ async fn remote_signal(connection: &Connection, marker: &str, signal: Signal) ->
         Signal::Terminate => "TERM",
         Signal::Kill => "KILL",
     };
-    let script = format!("p=$(cat -- {}) || exit; case \"$p\" in ''|*[!0-9]*) exit 1;; esac; kill -{name} \"$p\"", quote(marker));
-    connection.run(&script, &[]).await.map(|_| ())
+    let script = format!(
+        "[ -f {0} ] || exit 44; read p g < {0} || exit 44; case \"$p:$g\" in *[!0-9:]*|:*) exit 44;; esac; actual=$(ps -o pgid= -p \"$p\" 2>/dev/null | tr -d ' '); [ \"$actual\" = \"$g\" ] || exit 44; if [ \"$g\" = \"$p\" ]; then kill -{name} -\"$g\"; else kill -{name} \"$p\"; fi",
+        quote(marker)
+    );
+    let (status, _) = connection.run_with_status(&script, &[], false).await?;
+    match status {
+        0 => Ok(()),
+        44 => Err(error(ErrorCode::NotFound, "remote process already exited")),
+        _ => Err(error(ErrorCode::Unavailable, "remote signal failed")),
+    }
 }
 
 impl Search for AgentlessWorkspace {
     fn grep<'a>(&'a self, query: GrepQuery<'a>) -> BoxFuture<'a, Outcome<GrepResult>> {
         Box::pin(async move {
-            self.safe(query.path, false).await?;
+            let target = self.safe(query.path, false).await?;
             if query.context > 1000 {
                 return Err(error(ErrorCode::LimitExceeded, "search context is too large"));
             }
@@ -657,14 +830,17 @@ impl Search for AgentlessWorkspace {
                 options.push_str(" -F");
             }
             if !self.caps.native_search {
-                return self.grep_fallback(&query, &options).await;
+                return self.grep_fallback(&query, &options, &target).await;
             }
             let mut args = format!("rg --json{options} -C {}", query.context);
             for glob in query.globs {
                 let _ = write!(args, " -g {}", quote(glob));
             }
-            let _ = write!(args, " -e {} -- {}", quote(query.pattern), quote(query.path));
-            let output = self.connection.run_with_status(&args, &[], false).await?;
+            let _ = write!(args, " -e {} -- {}", quote(query.pattern), quote(&target));
+            let match_cap = query.max_matches.saturating_add(1).max(1);
+            let args =
+                format!("{args} | awk -v cap={match_cap} '{{ print; if ($0 ~ /\"type\":\"match\"/) {{ n++; if (n >= cap) exit }} }}'");
+            let output = self.run_status(&args, &[]).await?;
             if output.0 > 1 {
                 return Err(error(ErrorCode::Unavailable, "remote search failed"));
             }
@@ -723,16 +899,16 @@ impl Search for AgentlessWorkspace {
 
     fn glob<'a>(&'a self, query: GlobQuery<'a>) -> BoxFuture<'a, Outcome<GlobResult>> {
         Box::pin(async move {
-            self.safe(query.path, false).await?;
+            let target = self.safe(query.path, false).await?;
             let mut builder = GlobSetBuilder::new();
             for pattern in query.patterns {
                 builder.add(Glob::new(pattern).map_err(|_| error(ErrorCode::InvalidParams, "invalid glob"))?);
             }
             let patterns = builder.build().map_err(|_| error(ErrorCode::InvalidParams, "invalid glob"))?;
             let output = if self.caps.native_search {
-                self.run(&format!("cd {} && rg --files -0 --hidden", quote(query.path)), &[]).await?
+                self.run(&format!("cd {} && rg --files -0 --hidden", quote(&target)), &[]).await?
             } else {
-                self.run(&format!("cd {} && find . -type f -print0", quote(query.path)), &[]).await?
+                self.run(&format!("cd {} && find . -type f -print0", quote(&target)), &[]).await?
             };
             let prefix = query.path.strip_prefix(&self.root).unwrap_or("").trim_matches('/');
             let mut paths = output

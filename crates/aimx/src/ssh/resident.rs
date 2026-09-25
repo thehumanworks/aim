@@ -79,13 +79,37 @@ pub async fn ensure(root: &Path, idle: Duration) -> io::Result<ResidentPaths> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
-    let _child = child.spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut child = child.spawn()?;
+    let child_running = wait_for_socket(&paths.socket, &mut child, Instant::now() + Duration::from_secs(10)).await?;
+    // A different proxy may have won the startup lock. The launched child will exit.
+    if child_running {
+        std::thread::spawn(move || drop(child.wait()));
+    }
+    Ok(paths)
+}
+
+async fn wait_for_socket(socket: &Path, child: &mut std::process::Child, deadline: Instant) -> io::Result<bool> {
+    let mut child_running = true;
     loop {
-        if UnixStream::connect(&paths.socket).await.is_ok() {
-            return Ok(paths);
+        if UnixStream::connect(socket).await.is_ok() {
+            return Ok(child_running);
+        }
+        if child_running {
+            match child.try_wait() {
+                Ok(Some(_)) => child_running = false,
+                Ok(None) => {}
+                Err(err) => {
+                    drop(child.kill());
+                    drop(child.wait());
+                    return Err(err);
+                }
+            }
         }
         if Instant::now() >= deadline {
+            if child_running {
+                drop(child.kill());
+                drop(child.wait());
+            }
             return Err(io::Error::new(io::ErrorKind::TimedOut, "resident aimx did not start"));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -149,4 +173,21 @@ pub async fn proxy(root: &Path, idle: Duration) -> io::Result<()> {
     let outgoing = async { copy(&mut reader, &mut tokio::io::stdout()).await.map(|_| ()) };
     tokio::try_join!(incoming, outgoing)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    use super::wait_for_socket;
+
+    #[tokio::test]
+    async fn failed_start_reaps_detached_child() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn child");
+        let result = wait_for_socket(&dir.path().join("absent.sock"), &mut child, Instant::now() + Duration::from_millis(75)).await;
+        assert!(result.is_err());
+        assert!(child.try_wait().expect("check child").is_some());
+    }
 }

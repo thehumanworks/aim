@@ -107,24 +107,50 @@ pub async fn install(connection: &Connection, artifact: &Artifact, allow_unverif
     if utility.is_none() && !allow_unverified_remote_hash {
         return Err(BootstrapError::UnverifiedRemoteHash);
     }
+    connection.run(secure_dirs_script(), &[]).await.map_err(|_| BootstrapError::Unavailable)?;
     if platform.binaries.iter().any(|existing| existing == &name)
         && let Some(command) = utility
-        && remote_digest(connection, command, &remote).await? == artifact.sha256
     {
-        return Ok(remote);
+        let quoted = quote(&remote);
+        let (status, _) = connection
+            .run_with_status(&format!("[ -f {quoted} ] && [ ! -L {quoted} ] && [ -O {quoted} ]"), &[], false)
+            .await
+            .map_err(|_| BootstrapError::Unavailable)?;
+        if status == 0 && remote_digest(connection, command, &remote).await? == artifact.sha256 {
+            return Ok(remote);
+        }
     }
-    let quoted = quote(&remote);
-    let script = format!(
-        "umask 077; mkdir -p \"$HOME/.aim/bin\" || exit; t=$(mktemp \"$HOME/.aim/bin/.aimx.XXXXXXXX\") || exit; trap 'rm -f \"$t\"' EXIT HUP INT TERM; cat > \"$t\" || exit; chmod 700 \"$t\" || exit; mv -f \"$t\" {quoted} || exit; trap - EXIT HUP INT TERM"
-    );
-    connection.run(&script, &bytes).await.map_err(|_| BootstrapError::Unavailable)?;
-    if let Some(command) = utility
-        && remote_digest(connection, command, &remote).await? != artifact.sha256
-    {
-        drop(connection.run(&format!("rm -f -- {}", quote(&remote)), &[]).await);
-        return Err(BootstrapError::RemoteHashMismatch);
+    let script = install_script(&remote, &artifact.sha256, utility);
+    let (status, _) = connection.run_with_status(&script, &bytes, false).await.map_err(|_| BootstrapError::Unavailable)?;
+    match status {
+        0 => {}
+        42 => return Err(BootstrapError::RemoteHashMismatch),
+        _ => return Err(BootstrapError::Unavailable),
     }
     Ok(remote)
+}
+
+fn install_script(remote: &str, expected: &str, utility: Option<&str>) -> String {
+    let verify = utility.map_or_else(String::new, |command| {
+        format!("h=$({command} < \"$t\") || exit 41; h=${{h%% *}}; [ \"$h\" = {} ] || exit 42; ", quote(expected))
+    });
+    format!(
+        "{}; \
+         t=$(mktemp \"$HOME/.aim/bin/.aimx.XXXXXXXX\") || exit; \
+         trap 'rm -f -- \"$t\"' EXIT HUP INT TERM; \
+         cat > \"$t\" || exit; {verify}chmod 700 \"$t\" || exit; \
+         [ ! -d {} ] || exit; mv -f -- \"$t\" {} || exit; trap - EXIT HUP INT TERM",
+        secure_dirs_script(),
+        quote(remote),
+        quote(remote)
+    )
+}
+
+fn secure_dirs_script() -> &'static str {
+    "umask 077; [ ! -L \"$HOME/.aim\" ] || exit; mkdir -p -- \"$HOME/.aim\" || exit; \
+     [ -O \"$HOME/.aim\" ] && chmod 700 \"$HOME/.aim\" || exit; \
+     [ ! -L \"$HOME/.aim/bin\" ] || exit; mkdir -p -- \"$HOME/.aim/bin\" || exit; \
+     [ -O \"$HOME/.aim/bin\" ] && chmod 700 \"$HOME/.aim/bin\" || exit"
 }
 
 /// Compute the digest that callers should place in a development [`Artifact`].
@@ -158,19 +184,32 @@ async fn remote_hash_utility(connection: &Connection) -> Result<Option<&'static 
 }
 
 async fn remote_digest(connection: &Connection, utility: &str, path: &str) -> Result<String, BootstrapError> {
-    let output = connection.run(&format!("{utility} -- {}", quote(path)), &[]).await.map_err(|_| BootstrapError::Unavailable)?;
+    let output = connection.run(&format!("{utility} < {}", quote(path)), &[]).await.map_err(|_| BootstrapError::Unavailable)?;
     let text = String::from_utf8(output).map_err(|_| BootstrapError::Unavailable)?;
     text.split_whitespace().next().filter(|hash| valid_digest(hash)).map(str::to_owned).ok_or(BootstrapError::Unavailable)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::target_for_uname;
+    use super::{install_script, target_for_uname};
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
 
     #[test]
     fn maps_supported_targets() {
         assert_eq!(target_for_uname("Darwin arm64"), Some("aarch64-apple-darwin"));
         assert_eq!(target_for_uname("Linux x86_64"), Some("x86_64-unknown-linux-musl"));
         assert_eq!(target_for_uname("FreeBSD x86_64"), None);
+    }
+
+    #[test]
+    fn failed_remote_hash_never_publishes_binary() {
+        let home = tempfile::Builder::new().prefix("aimboot").tempdir_in("/private/tmp").expect("home");
+        let final_path = home.path().join(".aim/bin/aimx-test");
+        let script = install_script(&final_path.to_string_lossy(), &"0".repeat(64), Some("false"));
+        let mut child = Command::new("sh").arg("-c").arg(script).env("HOME", home.path()).stdin(Stdio::piped()).spawn().expect("shell");
+        child.stdin.take().expect("stdin").write_all(b"artifact bytes").expect("upload");
+        assert_eq!(child.wait().expect("shell status").code(), Some(41));
+        assert!(!final_path.exists(), "unverified artifact was published");
     }
 }
