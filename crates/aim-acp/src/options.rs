@@ -24,16 +24,19 @@ pub const DEFAULT_ALIASES: [(&str, &str); 6] = [
 ];
 
 /// Who executes the agent's tools (docs/architecture.md §6.1).
-#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolAuthority {
     /// The agent's built-ins run in its own process. aim sees them only as ACP updates: they are
     /// rendered and logged but not admitted, hooked or shadowed.
     #[default]
     Native,
-    /// Built-ins are disabled and every tool call goes to aim's MCP server (named
-    /// [`AIM_MCP_SERVER`], which the caller must pass in [`SessionOptions::mcp_servers`]).
-    Aim {
+    /// Strict aim authority: no built-ins or other MCP servers. Use
+    /// [`SessionOptions::strict_aim`] to construct and validate it.
+    Aim,
+    /// An explicitly local, mixed-authority session. Kept built-ins run on the adapter host;
+    /// this variant must never be accepted for SSH shadowing.
+    LocalMixed {
         /// Claude built-ins to keep (e.g. `WebSearch`, `WebFetch`, `TodoWrite`, `Task`); empty
         /// disables all of them.
         keep_builtins: Vec<String>,
@@ -42,14 +45,22 @@ pub enum ToolAuthority {
     },
 }
 
+impl core::fmt::Debug for ToolAuthority {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let kind = match self {
+            Self::Native => "Native",
+            Self::Aim => "Aim",
+            Self::LocalMixed { .. } => "LocalMixed",
+        };
+        f.debug_tuple("ToolAuthority").field(&kind).finish()
+    }
+}
+
 impl ToolAuthority {
-    /// Aim tool authority with no built-ins kept and the [`DEFAULT_ALIASES`].
+    /// Strict aim tool authority with no built-ins.
     #[must_use]
     pub fn aim() -> Self {
-        Self::Aim {
-            keep_builtins: Vec::new(),
-            aliases: DEFAULT_ALIASES.iter().map(|(from, to)| ((*from).to_owned(), (*to).to_owned())).collect(),
-        }
+        Self::Aim
     }
 }
 
@@ -105,24 +116,23 @@ impl McpServerSpec {
 
 impl core::fmt::Debug for McpServerSpec {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let masked = |map: &BTreeMap<String, String>| map.keys().map(|k| (k.clone(), "***")).collect::<BTreeMap<_, _>>();
         match self {
-            Self::Stdio { name, command, args, env } => f
+            Self::Stdio { env, .. } => f
                 .debug_struct("Stdio")
-                .field("name", name)
-                .field("command", command)
-                .field("args", args)
-                .field("env", &masked(env))
+                .field("name", &"***")
+                .field("command", &"***")
+                .field("args", &"***")
+                .field("env_count", &env.len())
                 .finish(),
-            Self::Http { name, url, headers } => {
-                f.debug_struct("Http").field("name", name).field("url", url).field("headers", &masked(headers)).finish()
+            Self::Http { headers, .. } => {
+                f.debug_struct("Http").field("name", &"***").field("url", &"***").field("headers_count", &headers.len()).finish()
             }
         }
     }
 }
 
 /// How to create a session.
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOptions {
     /// Absolute working directory **on the agent's host** (the adapter rejects missing
     /// directories; remote workspaces use a local scratch directory, docs/adr/0012).
@@ -145,7 +155,57 @@ pub struct SessionOptions {
     pub claude_options: Map<String, Value>,
 }
 
+impl core::fmt::Debug for SessionOptions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let authority = match self.tool_authority {
+            ToolAuthority::Native => "native",
+            ToolAuthority::Aim => "aim",
+            ToolAuthority::LocalMixed { .. } => "local_mixed",
+        };
+        f.debug_struct("SessionOptions")
+            .field("tool_authority", &authority)
+            .field("persist", &self.persist)
+            .field("mcp_server_count", &self.mcp_servers.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl SessionOptions {
+    /// Creates a strict aim-tools session with one aim MCP relay.
+    ///
+    /// # Errors
+    ///
+    /// The relay must be named `aim`.
+    pub fn strict_aim(cwd: impl Into<PathBuf>, relay: McpServerSpec) -> Result<Self, crate::AcpError> {
+        let mut options = Self::new(cwd);
+        options.tool_authority = ToolAuthority::Aim;
+        options.mcp_servers = vec![relay];
+        options.validate_authority()?;
+        Ok(options)
+    }
+
+    /// Checks that strict aim authority cannot be weakened by extra servers or SDK options.
+    ///
+    /// # Errors
+    ///
+    /// Invalid strict-authority options are rejected before `session/new`.
+    pub fn validate_authority(&self) -> Result<(), crate::AcpError> {
+        if self.claude_options.contains_key("persistSession") {
+            return Err(crate::AcpError::InvalidState("session persistence must use the witnessed option".into()));
+        }
+        if !matches!(self.tool_authority, ToolAuthority::Aim) {
+            return Ok(());
+        }
+        if self.mcp_servers.len() != 1 || self.mcp_servers.first().is_none_or(|server| server.name() != AIM_MCP_SERVER) {
+            return Err(crate::AcpError::InvalidState("strict aim authority needs exactly one aim MCP server".into()));
+        }
+        // An allowlist is easier to audit than a blacklist of rapidly changing SDK options.
+        if self.claude_options.keys().any(|key| !matches!(key.as_str(), "maxTurns" | "maxBudgetUsd")) {
+            return Err(crate::AcpError::InvalidState("strict aim authority has a conflicting Claude SDK option".into()));
+        }
+        Ok(())
+    }
+
     /// Options for a session in `cwd` with native tools, persisted by the agent.
     #[must_use]
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
@@ -163,7 +223,14 @@ impl SessionOptions {
     #[must_use]
     pub fn meta(&self) -> Option<Map<String, Value>> {
         let mut options = self.claude_options.clone();
-        if let ToolAuthority::Aim { keep_builtins, aliases } = &self.tool_authority {
+        let tool_settings = match &self.tool_authority {
+            ToolAuthority::Native => None,
+            ToolAuthority::Aim => {
+                Some((Vec::new(), DEFAULT_ALIASES.iter().map(|(from, to)| ((*from).to_owned(), (*to).to_owned())).collect()))
+            }
+            ToolAuthority::LocalMixed { keep_builtins, aliases } => Some((keep_builtins.clone(), aliases.clone())),
+        };
+        if let Some((keep_builtins, aliases)) = tool_settings {
             options.insert("tools".into(), json!(keep_builtins));
             options.insert("toolAliases".into(), json!(aliases));
             options.insert("strictMcpConfig".into(), json!(true));

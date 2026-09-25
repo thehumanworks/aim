@@ -7,8 +7,9 @@
 //! (with response ids remapped to the client's actual ids).
 #![expect(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing, reason = "test harness helpers fail loudly")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aim_acp::{
@@ -105,8 +106,10 @@ fn assistant_text(events: &[AcpEvent]) -> Vec<String> {
 
 fn aim_tools_options() -> SessionOptions {
     let mut options = SessionOptions::new("/tmp/aim-acp-live-aimtools");
-    options.persist = false;
-    options.tool_authority = ToolAuthority::aim();
+    options.tool_authority = ToolAuthority::LocalMixed {
+        keep_builtins: Vec::new(),
+        aliases: aim_acp::DEFAULT_ALIASES.iter().map(|(from, to)| ((*from).into(), (*to).into())).collect(),
+    };
     options.mcp_servers = vec![McpServerSpec::Stdio {
         name: "aim".into(),
         command: PathBuf::from("/home/user/aim/target/debug/aim-acp-echo-mcp"),
@@ -179,7 +182,9 @@ async fn replays_an_aim_tools_turn_into_typed_events_and_items() {
     let received = agent.await.unwrap();
     // What aim sends is exactly what worked live.
     assert_eq!(sent(&received, "initialize")["params"], recorded(&frames, "initialize")["params"]);
-    assert_eq!(sent(&received, "session/new")["params"]["_meta"], recorded(&frames, "session/new")["params"]["_meta"]);
+    let mut expected_meta = recorded(&frames, "session/new")["params"]["_meta"].clone();
+    expected_meta["claudeCode"]["options"].as_object_mut().unwrap().remove("persistSession");
+    assert_eq!(sent(&received, "session/new")["params"]["_meta"], expected_meta);
     assert_eq!(sent(&received, "session/new")["params"]["mcpServers"], recorded(&frames, "session/new")["params"]["mcpServers"]);
 }
 
@@ -187,8 +192,7 @@ async fn replays_an_aim_tools_turn_into_typed_events_and_items() {
 async fn replays_a_permission_request_answered_by_the_yolo_handler() {
     let frames = transcript("permission_turn.jsonl");
     let (client, agent) = replay(frames.clone(), None).await;
-    let mut options = SessionOptions::new("/tmp/aim-acp-live-permission");
-    options.persist = false;
+    let options = SessionOptions::new("/tmp/aim-acp-live-permission");
     let mut session = client.new_session(options).await.unwrap();
     session.set_config(&ConfigKey::Mode, "default").await.unwrap();
     assert_eq!(session.config_options().iter().find(|o| o.id == "mode").unwrap().current().as_deref(), Some("default"));
@@ -267,7 +271,7 @@ async fn auth_required_maps_to_needs_login_with_the_advertised_methods() {
     assert_eq!(
         error,
         AcpError::NeedsLogin {
-            message: "Authentication required".into(),
+            message: aim_acp::redact::safe_peer_message().into(),
             reason: Some("claude_subscription_not_supported".into()),
             methods: vec!["claude-login".into()],
         }
@@ -302,6 +306,24 @@ async fn a_dropped_turn_is_cancelled_and_its_leftovers_do_not_leak_into_the_next
     assert_eq!(assistant_text(&events), ["second"]);
     assert!(matches!(events.last(), Some(AcpEvent::Stopped(end)) if end.stop == StopReason::EndTurn));
     drop(agent.await.unwrap());
+}
+
+#[tokio::test]
+async fn immediately_dropped_turn_sends_prompt_before_cancel() {
+    let mut frames = initialize_frames();
+    frames.extend([
+        (true, json!({"jsonrpc": "2.0", "id": "n", "method": "session/new"})),
+        (false, json!({"jsonrpc": "2.0", "id": "n", "result": {"sessionId": "s1"}})),
+        (true, json!({"jsonrpc": "2.0", "id": "p", "method": "session/prompt"})),
+        (true, json!({"jsonrpc": "2.0", "method": "session/cancel"})),
+        (false, json!({"jsonrpc": "2.0", "id": "p", "result": {"stopReason": "cancelled"}})),
+    ]);
+    let (client, agent) = replay(frames, None).await;
+    let mut session = client.new_session(SessionOptions::new("/tmp/x")).await.unwrap();
+    drop(session.prompt_text("one").await.unwrap());
+    let received = tokio::time::timeout(Duration::from_secs(2), agent).await.unwrap().unwrap();
+    let methods: Vec<_> = received.iter().filter_map(|m| m["method"].as_str()).collect();
+    assert_eq!(methods, ["initialize", "session/new", "session/prompt", "session/cancel"]);
 }
 
 #[tokio::test]
@@ -365,7 +387,7 @@ fn aim_tool_authority_meta_is_the_documented_recipe() {
     let mut options = SessionOptions::new("/w");
     options.persist = false;
     options.tool_authority =
-        ToolAuthority::Aim { keep_builtins: vec!["WebSearch".into()], aliases: [("Bash".into(), "mcp__aim__bash".into())].into() };
+        ToolAuthority::LocalMixed { keep_builtins: vec!["WebSearch".into()], aliases: [("Bash".into(), "mcp__aim__bash".into())].into() };
     options.system_prompt_append = Some("Workspace is remote.".into());
     options.claude_options.insert("maxTurns".into(), json!(8));
     // A caller cannot weaken the authority settings through the passthrough.
@@ -386,10 +408,136 @@ fn aim_tool_authority_meta_is_the_documented_recipe() {
             "systemPrompt": {"append": "Workspace is remote."}
         })
     );
-    let ToolAuthority::Aim { aliases, keep_builtins } = ToolAuthority::aim() else { panic!() };
-    assert!(keep_builtins.is_empty());
-    assert_eq!(aliases.keys().map(String::as_str).collect::<Vec<_>>(), ["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
-    assert!(aliases.values().all(|v| v.starts_with("mcp__aim__")));
+    assert!(matches!(ToolAuthority::aim(), ToolAuthority::Aim));
+}
+
+#[test]
+fn strict_aim_authority_rejects_extra_execution_paths() {
+    let relay = McpServerSpec::Stdio { name: "aim".into(), command: "/bin/aim-relay".into(), args: Vec::new(), env: BTreeMap::default() };
+    let mut options = SessionOptions::strict_aim("/w", relay).unwrap();
+    assert!(options.validate_authority().is_ok());
+    options.mcp_servers.push(McpServerSpec::Stdio {
+        name: "other".into(),
+        command: "/bin/other".into(),
+        args: Vec::new(),
+        env: BTreeMap::default(),
+    });
+    assert!(options.validate_authority().is_err());
+    options.mcp_servers.pop();
+    options.claude_options.insert("mcpServers".into(), json!({"evil": {"command": "/bin/other"}}));
+    assert!(options.validate_authority().is_err());
+    options.claude_options.clear();
+    options.claude_options.insert("allowedTools".into(), json!(["Bash"]));
+    assert!(options.validate_authority().is_err());
+}
+
+#[test]
+fn passthrough_cannot_request_private_storage_without_a_witness() {
+    let mut options = SessionOptions::new("/w");
+    options.claude_options.insert("persistSession".into(), json!(false));
+    assert!(options.validate_authority().is_err());
+}
+
+#[tokio::test]
+async fn public_errors_and_debug_never_expose_account_or_credential_fields() {
+    let mut frames = initialize_frames();
+    frames.extend([
+        (true, json!({"jsonrpc": "2.0", "id": "n", "method": "session/new"})),
+        (
+            false,
+            json!({"jsonrpc": "2.0", "id": "n", "error": {
+                "code": -32603,
+                "message": "account alice@example.com in Acme Corp failed",
+                "data": {"organization": "Acme Corp", "access_token": "topsecret123", "email": "alice@example.com"}
+            }}),
+        ),
+    ]);
+    let (client, agent) = replay(frames, None).await;
+    let error = client.new_session(SessionOptions::new("/tmp/x")).await.unwrap_err();
+    for rendered in [format!("{error}"), format!("{error:?}"), format!("{}", aim_proto::error::ProtoError::from(error))] {
+        assert!(!rendered.contains("alice@example.com"), "{rendered}");
+        assert!(!rendered.contains("Acme Corp"), "{rendered}");
+        assert!(!rendered.contains("topsecret123"), "{rendered}");
+    }
+    drop(agent.await.unwrap());
+    let mut options = SessionOptions::new("/w");
+    options.claude_options.insert("env".into(), json!({"AUTH_TOKEN": "topsecret123"}));
+    assert!(!format!("{options:?}").contains("topsecret123"));
+}
+
+#[tokio::test]
+async fn private_session_requires_a_live_conformance_witness() {
+    let mut frames = initialize_frames();
+    frames.extend([
+        (true, json!({"jsonrpc": "2.0", "id": "n", "method": "session/new"})),
+        (false, json!({"jsonrpc": "2.0", "id": "n", "result": {"sessionId": "s1"}})),
+    ]);
+    let (client, agent) = replay(frames, None).await;
+    let mut options = SessionOptions::new("/tmp/x");
+    options.persist = false;
+    assert!(matches!(tokio::time::timeout(Duration::from_millis(200), client.new_session(options)).await, Ok(Err(_))));
+    agent.abort();
+}
+
+#[tokio::test]
+async fn strict_aim_session_requires_a_live_route_witness() {
+    let mut frames = initialize_frames();
+    frames.extend([
+        (true, json!({"jsonrpc": "2.0", "id": "n", "method": "session/new"})),
+        (false, json!({"jsonrpc": "2.0", "id": "n", "result": {"sessionId": "s1"}})),
+    ]);
+    let (client, agent) = replay(frames, None).await;
+    let relay = McpServerSpec::Stdio { name: "aim".into(), command: "/bin/aim-relay".into(), args: Vec::new(), env: BTreeMap::default() };
+    let options = SessionOptions::strict_aim("/tmp/x", relay).unwrap();
+    assert!(matches!(tokio::time::timeout(Duration::from_millis(200), client.new_session(options)).await, Ok(Err(_))));
+    agent.abort();
+}
+
+#[tokio::test]
+async fn raw_wire_capture_cannot_attest_private_mode() {
+    let (client, agent) = replay(initialize_frames(), Some(Box::new(|builder| builder.wire_tap(Arc::new(|_, _| {}))))).await;
+    assert!(client.verify_private_mode().await.is_err());
+    drop(agent.await.unwrap());
+}
+
+#[tokio::test]
+async fn flooded_session_reports_queue_overflow_to_its_turn() {
+    let mut frames = initialize_frames();
+    frames.extend([
+        (true, json!({"jsonrpc": "2.0", "id": "n", "method": "session/new"})),
+        (false, json!({"jsonrpc": "2.0", "id": "n", "result": {"sessionId": "s1"}})),
+        (true, json!({"jsonrpc": "2.0", "id": "p", "method": "session/prompt"})),
+    ]);
+    for _ in 0..300 {
+        frames.push((
+            false,
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "s1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "x"}}
+            }}),
+        ));
+    }
+    frames.push((false, json!({"jsonrpc": "2.0", "id": "p", "result": {"stopReason": "end_turn"}})));
+    let (client, agent) = replay(frames, None).await;
+    let mut session = client.new_session(SessionOptions::new("/tmp/x")).await.unwrap();
+    let turn = session.prompt_text("hi").await.unwrap();
+    drop(agent.await.unwrap());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(turn.collect_all().await, Err(AcpError::QueueOverflow)));
+}
+
+#[test]
+fn login_command_debug_masks_env_and_arguments() {
+    let login = aim_acp::LoginCommand {
+        method_id: "claude-login".into(),
+        label: "Acme Corp".into(),
+        program: "/tmp/alice@example.com".into(),
+        args: vec!["topsecret123".into()],
+        env: [("TOKEN".into(), "topsecret123".into())].into(),
+    };
+    let shown = format!("{login:?}");
+    assert!(!shown.contains("topsecret123"));
+    assert!(!shown.contains("alice@example.com"));
+    assert!(!shown.contains("Acme Corp"));
 }
 
 #[test]
@@ -527,7 +675,7 @@ fn yolo_prefers_allow_once_and_otherwise_cancels() {
 async fn a_missing_adapter_is_a_typed_error() {
     let config = AcpAgentConfig::new("claude", "/nonexistent/claude-agent-acp");
     let error = AcpClient::spawn(config).await.unwrap_err();
-    assert!(matches!(error, AcpError::AgentNotFound { ref command, .. } if command == "/nonexistent/claude-agent-acp"), "{error}");
+    assert!(matches!(error, AcpError::AgentNotFound { ref command, .. } if command == "<redacted>"), "{error}");
 }
 
 #[tokio::test]
@@ -536,7 +684,10 @@ async fn an_agent_that_dies_reports_its_exit_code_and_a_redacted_stderr_tail() {
     let error = AcpClient::spawn(config).await.unwrap_err();
     let AcpError::AgentExited { code, stderr_tail } = &error else { panic!("{error}") };
     assert_eq!(*code, Some(3));
-    assert!(stderr_tail.contains("boom") && stderr_tail.contains("token=***") && !stderr_tail.contains("abc123"), "{stderr_tail}");
+    assert!(
+        stderr_tail.contains("agent stderr omitted") && !stderr_tail.contains("boom") && !stderr_tail.contains("abc123"),
+        "{stderr_tail}"
+    );
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ use serde_json::Value;
 pub const AUTH_REQUIRED_CODE: i32 = -32000;
 
 /// Why an ACP operation failed.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AcpError {
     /// The adapter executable could not be found (not on `PATH`, or the configured path does not
@@ -103,6 +103,8 @@ pub enum AcpError {
     },
     /// A previous turn on this session did not finish after being cancelled.
     TurnStillRunning,
+    /// The peer sent more updates than the session can safely buffer.
+    QueueOverflow,
     /// The operation is not valid in the client's current state.
     InvalidState(String),
 }
@@ -119,46 +121,49 @@ impl AcpError {
             Self::UnknownAuthMethod { .. } | Self::ConfigUnavailable { .. } => ErrorCode::NotFound,
             Self::NotTerminalAuth { .. } | Self::ConfigValueRejected { .. } => ErrorCode::InvalidParams,
             Self::ConfigNotApplied { .. } | Self::TurnStillRunning | Self::InvalidState(_) => ErrorCode::PreconditionFailed,
+            Self::QueueOverflow => ErrorCode::LimitExceeded,
         }
+    }
+}
+
+impl core::fmt::Debug for AcpError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Debug is routinely recorded by test failures and telemetry. Do not echo any
+        // caller-supplied or peer-supplied field, including structured error data.
+        f.debug_struct("AcpError").field("code", &self.code()).finish_non_exhaustive()
     }
 }
 
 impl core::fmt::Display for AcpError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::AgentNotFound { command, hint } => write!(f, "ACP agent `{command}` not found: {hint}"),
-            Self::Spawn { command, message } => write!(f, "could not start ACP agent `{command}`: {message}"),
+            Self::AgentNotFound { .. } => f.write_str("ACP agent not found; check the configured command and mise installation"),
+            Self::Spawn { .. } => f.write_str("could not start ACP agent"),
             Self::AgentExited { code, stderr_tail } => {
                 match code {
                     Some(code) => write!(f, "ACP agent exited with code {code}")?,
                     None => f.write_str("ACP agent closed the connection")?,
                 }
-                if stderr_tail.is_empty() { Ok(()) } else { write!(f, "; stderr tail: {stderr_tail}") }
+                if stderr_tail.is_empty() { Ok(()) } else { f.write_str("; agent stderr omitted") }
             }
-            Self::NeedsLogin { message, reason, methods } => {
-                write!(f, "login required: {message}")?;
+            Self::NeedsLogin { reason, .. } => {
+                f.write_str("login required")?;
                 if let Some(reason) = reason {
                     write!(f, " ({reason})")?;
                 }
-                if !methods.is_empty() {
-                    write!(f, "; login methods: {}", methods.join(", "))?;
-                }
                 Ok(())
             }
-            Self::Rpc { method, code, message, .. } => write!(f, "`{method}` failed ({code}): {message}"),
-            Self::Protocol { method, message } => write!(f, "malformed `{method}` from the agent: {message}"),
+            Self::Rpc { method, code, .. } => write!(f, "`{method}` failed ({code}); agent details omitted"),
+            Self::Protocol { method, .. } => write!(f, "malformed `{method}` from the agent"),
             Self::Timeout { method, after_ms } => write!(f, "`{method}` timed out after {after_ms} ms"),
-            Self::UnknownAuthMethod { id } => write!(f, "the agent advertises no login method `{id}`"),
-            Self::NotTerminalAuth { id } => write!(f, "login method `{id}` is not a terminal login"),
-            Self::ConfigUnavailable { key } => write!(f, "the session has no `{key}` configuration option"),
-            Self::ConfigValueRejected { id, value, allowed } => {
-                write!(f, "`{value}` is not an advertised value of `{id}` (allowed: {})", allowed.join(", "))
-            }
-            Self::ConfigNotApplied { id, requested, current } => {
-                write!(f, "the agent did not apply `{id}` = `{requested}` (current: {})", current.as_deref().unwrap_or("unknown"))
-            }
+            Self::UnknownAuthMethod { .. } => f.write_str("the agent advertises no matching login method"),
+            Self::NotTerminalAuth { .. } => f.write_str("the login method is not a terminal login"),
+            Self::ConfigUnavailable { .. } => f.write_str("the session has no matching configuration option"),
+            Self::ConfigValueRejected { .. } => f.write_str("the configuration value was not advertised"),
+            Self::ConfigNotApplied { .. } => f.write_str("the agent did not apply the configuration value"),
             Self::TurnStillRunning => f.write_str("the previous turn is still running after cancellation"),
-            Self::InvalidState(message) => f.write_str(message),
+            Self::QueueOverflow => f.write_str("ACP session update queue exceeded its memory limit"),
+            Self::InvalidState(_) => f.write_str("ACP client state does not permit the operation"),
         }
     }
 }

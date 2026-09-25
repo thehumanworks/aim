@@ -6,9 +6,10 @@
 //! from the caller's task (never from the dispatch loop), and the notification and request
 //! handlers only route or spawn, so the connection never stalls.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, UntypedMessage};
@@ -19,12 +20,13 @@ use tokio::sync::{mpsc, oneshot};
 use crate::auth::{AuthMethodInfo, LoginCommand, login_command, parse_auth_methods};
 use crate::config::AcpAgentConfig;
 use crate::config_options::parse_config_options;
+use crate::conformance::{VerifiedAimAuthority, VerifiedPrivateMode, VerifiedSshAuthority};
 use crate::error::{AUTH_REQUIRED_CODE, AcpError};
 use crate::events::Routed;
 use crate::options::SessionOptions;
 use crate::permission::{PermissionDecision, PermissionHandler, PermissionRequest, YoloPermissions};
 use crate::process::{self, ProcessGuard, ProcessState, WireTap, lock};
-use crate::redact::redact;
+use crate::redact::{safe_auth_reason, safe_error_data, safe_peer_message};
 use crate::session::AcpSession;
 use crate::wire;
 
@@ -32,14 +34,18 @@ use crate::wire;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Updates kept for a session id the client has not registered yet (they can precede the
 /// `session/new` response).
-const EARLY_UPDATES_PER_SESSION: usize = 256;
+const EARLY_UPDATES_PER_SESSION: usize = 32;
+const EARLY_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const SESSION_QUEUE_MAX_EVENTS: usize = 256;
+pub(crate) const SESSION_QUEUE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const RETIRED_SESSIONS: usize = 256;
 /// JSON-RPC internal error.
 const INTERNAL_ERROR_CODE: i32 = -32603;
 /// Unregistered session ids tracked at once.
 const EARLY_SESSIONS: usize = 16;
 
 /// Who the agent says it is.
-#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AgentInfo {
     /// Implementation name, e.g. `@agentclientprotocol/claude-agent-acp`.
     pub name: String,
@@ -48,6 +54,12 @@ pub struct AgentInfo {
     pub title: Option<String>,
     /// Version (informational: aim gates on [`crate::ProbeReport`], never on this).
     pub version: String,
+}
+
+impl core::fmt::Debug for AgentInfo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("AgentInfo { peer identity: *** }")
+    }
 }
 
 /// What prompt content the agent accepts beyond text.
@@ -89,7 +101,7 @@ pub struct SessionCapabilities {
 }
 
 /// The agent's advertised capabilities.
-#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct AgentCapabilities {
     /// Prompt content.
     pub prompt: PromptCapabilities,
@@ -104,6 +116,16 @@ pub struct AgentCapabilities {
     pub claude_code: bool,
     /// The raw `agentCapabilities`.
     pub raw: Value,
+}
+
+impl core::fmt::Debug for AgentCapabilities {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AgentCapabilities")
+            .field("prompt", &self.prompt)
+            .field("mcp", &self.mcp)
+            .field("sessions", &self.sessions)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AgentCapabilities {
@@ -138,7 +160,7 @@ impl AgentCapabilities {
 
 /// The account state the agent reports (`_auth/status_update`), without personal data: the
 /// account's email and organization are never stored.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthStatus {
     /// `account`, `signed_out`, … as reported.
     pub kind: String,
@@ -150,35 +172,115 @@ pub struct AuthStatus {
     pub plan: Option<String>,
 }
 
+impl core::fmt::Debug for AuthStatus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("AuthStatus { account details: *** }")
+    }
+}
+
 enum Route {
     /// A registered session.
-    Live(mpsc::UnboundedSender<Routed>),
+    Live { tx: mpsc::Sender<Routed>, bytes: Arc<AtomicUsize>, overflow: Arc<AtomicBool> },
     /// Updates for a session id not registered yet (they can precede the `session/new` response).
-    Early(Vec<Routed>),
+    Early { messages: Vec<Routed>, bytes: usize, overflow: bool },
     /// A session aim no longer routes (dropped, closed, deleted): late messages are discarded.
     Retired,
+}
+
+/// A bounded session inbox; every read releases the byte budget charged on enqueue.
+pub(crate) struct SessionInbox {
+    rx: mpsc::Receiver<Routed>,
+    bytes: Arc<AtomicUsize>,
+    overflow: Arc<AtomicBool>,
+}
+
+impl SessionInbox {
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflow.load(Ordering::Acquire)
+    }
+
+    fn release(&self, message: &Routed) {
+        self.bytes.fetch_sub(message.queued_bytes(), Ordering::AcqRel);
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Result<Routed, mpsc::error::TryRecvError> {
+        let message = self.rx.try_recv()?;
+        self.release(&message);
+        Ok(message)
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<Routed> {
+        let message = self.rx.recv().await?;
+        self.release(&message);
+        Some(message)
+    }
+
+    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Routed>> {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(message)) => {
+                self.release(&message);
+                Poll::Ready(Some(message))
+            }
+            other => other,
+        }
+    }
 }
 
 /// Delivers routed messages to sessions; shared with the connection's handlers.
 #[derive(Default)]
 pub(crate) struct Router {
     sessions: Mutex<HashMap<String, Route>>,
+    retired: Mutex<VecDeque<String>>,
     auth_status: Mutex<Option<AuthStatus>>,
     closed: AtomicBool,
 }
 
 impl Router {
+    fn retire(&self, sessions: &mut HashMap<String, Route>, session_id: &str) {
+        if matches!(sessions.get(session_id), Some(Route::Retired)) {
+            return;
+        }
+        sessions.insert(session_id.to_owned(), Route::Retired);
+        let mut retired = lock(&self.retired);
+        retired.push_back(session_id.to_owned());
+        while retired.len() > RETIRED_SESSIONS {
+            if let Some(old) = retired.pop_front()
+                && matches!(sessions.get(&old), Some(Route::Retired))
+            {
+                sessions.remove(&old);
+            }
+        }
+    }
+
     pub(crate) fn deliver(&self, session_id: &str, message: Routed) {
         let mut sessions = lock(&self.sessions);
+        let size = message.queued_bytes();
+        let mut retire = false;
         match sessions.get_mut(session_id) {
-            Some(Route::Live(tx)) => {
-                if tx.send(message).is_err() {
-                    sessions.insert(session_id.to_owned(), Route::Retired);
+            Some(Route::Live { tx, bytes, overflow }) => {
+                let current = bytes.load(Ordering::Acquire);
+                if size > SESSION_QUEUE_MAX_BYTES.saturating_sub(current) {
+                    overflow.store(true, Ordering::Release);
+                    retire = true;
+                } else {
+                    bytes.fetch_add(size, Ordering::AcqRel);
+                    if tx.try_send(message).is_err() {
+                        bytes.fetch_sub(size, Ordering::AcqRel);
+                        overflow.store(true, Ordering::Release);
+                        retire = true;
+                    }
                 }
             }
-            Some(Route::Early(buffer)) => {
-                if buffer.len() < EARLY_UPDATES_PER_SESSION {
-                    buffer.push(message);
+            Some(Route::Early { messages, bytes, overflow }) => {
+                if !*overflow {
+                    if messages.len() < EARLY_UPDATES_PER_SESSION && size <= EARLY_MAX_BYTES.saturating_sub(*bytes) {
+                        *bytes += size;
+                        messages.push(message);
+                    } else {
+                        *overflow = true;
+                        messages.clear();
+                        *bytes = 0;
+                    }
                 }
             }
             Some(Route::Retired) => {}
@@ -189,41 +291,63 @@ impl Router {
                     return;
                 }
                 let early: Vec<String> =
-                    sessions.iter().filter(|(_, route)| matches!(route, Route::Early(_))).map(|(id, _)| id.clone()).collect();
+                    sessions.iter().filter(|(_, route)| matches!(route, Route::Early { .. })).map(|(id, _)| id.clone()).collect();
                 if early.len() >= EARLY_SESSIONS
                     && let Some(evicted) = early.first()
                 {
                     sessions.remove(evicted);
                 }
-                sessions.insert(session_id.to_owned(), Route::Early(vec![message]));
+                if size > EARLY_MAX_BYTES {
+                    sessions.insert(session_id.to_owned(), Route::Early { messages: Vec::new(), bytes: 0, overflow: true });
+                } else {
+                    sessions.insert(session_id.to_owned(), Route::Early { messages: vec![message], bytes: size, overflow: false });
+                }
             }
+        }
+        if retire {
+            self.retire(&mut sessions, session_id);
         }
     }
 
-    pub(crate) fn register(&self, session_id: &str) -> mpsc::UnboundedReceiver<Routed> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub(crate) fn register(&self, session_id: &str) -> SessionInbox {
+        let (tx, rx) = mpsc::channel(SESSION_QUEUE_MAX_EVENTS);
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let overflow = Arc::new(AtomicBool::new(false));
         let mut sessions = lock(&self.sessions);
         if self.closed.load(Ordering::Acquire) {
-            return rx;
+            return SessionInbox { rx, bytes, overflow };
         }
-        if let Some(Route::Early(buffer)) = sessions.remove(session_id) {
-            for message in buffer {
-                drop(tx.send(message));
+        if let Some(Route::Early { messages, overflow: early_overflow, .. }) = sessions.remove(session_id) {
+            overflow.store(early_overflow, Ordering::Release);
+            if !early_overflow {
+                for message in messages {
+                    let size = message.queued_bytes();
+                    bytes.fetch_add(size, Ordering::AcqRel);
+                    if tx.try_send(message).is_err() {
+                        overflow.store(true, Ordering::Release);
+                        break;
+                    }
+                }
             }
         }
-        sessions.insert(session_id.to_owned(), Route::Live(tx));
-        rx
+        if overflow.load(Ordering::Acquire) {
+            self.retire(&mut sessions, session_id);
+        } else {
+            sessions.insert(session_id.to_owned(), Route::Live { tx, bytes: Arc::clone(&bytes), overflow: Arc::clone(&overflow) });
+        }
+        SessionInbox { rx, bytes, overflow }
     }
 
     pub(crate) fn unregister(&self, session_id: &str) {
-        lock(&self.sessions).insert(session_id.to_owned(), Route::Retired);
+        self.retire(&mut lock(&self.sessions), session_id);
     }
 
     /// Marks the connection closed. Routes stay: every in-flight prompt still delivers its
     /// (failed) stop through them, which is how a turn learns the agent is gone.
     fn close_all(&self) {
         self.closed.store(true, Ordering::Release);
-        lock(&self.sessions).retain(|_, route| matches!(route, Route::Live(_)));
+        lock(&self.sessions).retain(|_, route| matches!(route, Route::Live { .. }));
+        lock(&self.retired).clear();
     }
 
     fn on_notification(&self, method: &str, params: &Value) {
@@ -253,7 +377,8 @@ pub(crate) struct Shared {
     pub(crate) router: Arc<Router>,
     pub(crate) request_timeout: Duration,
     pub(crate) auth_methods: Vec<AuthMethodInfo>,
-    process: Option<Arc<ProcessState>>,
+    pub(crate) tap_active: bool,
+    pub(crate) process: Option<Arc<ProcessState>>,
     connection: tokio::task::JoinHandle<()>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     _guard: Option<ProcessGuard>,
@@ -269,7 +394,7 @@ impl Shared {
     /// Sends a request and awaits its result, mapping failures to [`AcpError`]s.
     pub(crate) async fn request(&self, method: &str, params: Value, timeout: Option<Duration>) -> Result<Value, AcpError> {
         let message = UntypedMessage::new(method, params)
-            .map_err(|error| AcpError::Protocol { method: method.to_owned(), message: redact(&error.message) })?;
+            .map_err(|_| AcpError::Protocol { method: method.to_owned(), message: "could not encode request".into() })?;
         let response = self.cx.send_request(message).block_task();
         let result = match timeout {
             Some(deadline) => tokio::time::timeout(deadline, response).await.map_err(|_| AcpError::Timeout {
@@ -287,7 +412,7 @@ impl Shared {
     /// Sends a notification.
     pub(crate) fn notify(&self, method: &str, params: Value) -> Result<(), AcpError> {
         let message = UntypedMessage::new(method, params)
-            .map_err(|error| AcpError::Protocol { method: method.to_owned(), message: redact(&error.message) })?;
+            .map_err(|_| AcpError::Protocol { method: method.to_owned(), message: "could not encode notification".into() })?;
         self.cx.send_notification(message).map_err(|_| self.closed_now())
     }
 
@@ -316,8 +441,8 @@ impl Shared {
         let code = i32::from(error.code);
         if code == AUTH_REQUIRED_CODE {
             return AcpError::NeedsLogin {
-                message: redact(&error.message),
-                reason: error.data.as_ref().and_then(|data| wire::string(data, "reason")),
+                message: safe_peer_message().into(),
+                reason: safe_auth_reason(error.data.as_ref().and_then(|data| wire::str(data, "reason"))),
                 methods: self.auth_methods.iter().map(|m| m.id.clone()).collect(),
             };
         }
@@ -326,7 +451,12 @@ impl Shared {
         if agent_client_protocol::is_incoming_transport_closed(&error) || never_answered {
             return self.closed_error().await;
         }
-        AcpError::Rpc { method: method.to_owned(), code, message: redact(&error.message), data: error.data }
+        AcpError::Rpc {
+            method: method.to_owned(),
+            code,
+            message: safe_peer_message().into(),
+            data: error.data.as_ref().map(safe_error_data),
+        }
     }
 }
 
@@ -424,6 +554,7 @@ impl AcpClientBuilder {
             router,
             request_timeout: self.request_timeout,
             auth_methods: Vec::new(),
+            tap_active: self.tap.is_some(),
             process,
             connection,
             stop: Mutex::new(Some(stop_tx)),
@@ -431,10 +562,7 @@ impl AcpClientBuilder {
         };
         let init = shared.request("initialize", initialize_params(), Some(self.request_timeout)).await?;
         if wire::u64(&init, "protocolVersion") != Some(1) {
-            return Err(AcpError::Protocol {
-                method: "initialize".into(),
-                message: format!("agent speaks protocol {}, aim speaks 1", init.get("protocolVersion").unwrap_or(&Value::Null)),
-            });
+            return Err(AcpError::Protocol { method: "initialize".into(), message: "agent speaks an unsupported protocol version".into() });
         }
         shared.auth_methods = parse_auth_methods(&init);
         let agent = init.get("agentInfo").map_or_else(AgentInfo::default, |info| AgentInfo {
@@ -519,7 +647,7 @@ fn run_connection(
 
 /// A connected ACP agent.
 pub struct AcpClient {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     initialize: Value,
     agent: AgentInfo,
     capabilities: AgentCapabilities,
@@ -527,7 +655,7 @@ pub struct AcpClient {
 
 impl core::fmt::Debug for AcpClient {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("AcpClient").field("profile", &self.shared.config.profile_name).field("agent", &self.agent).finish_non_exhaustive()
+        f.debug_struct("AcpClient").field("profile", &"***").field("agent", &"***").finish_non_exhaustive()
     }
 }
 
@@ -617,6 +745,58 @@ impl AcpClient {
     /// [`AcpError::Rpc`] when the agent rejects it (e.g. a missing cwd), [`AcpError::NeedsLogin`],
     /// [`AcpError::Protocol`] when the answer has no session id, or a connection error.
     pub async fn new_session(&self, options: SessionOptions) -> Result<AcpSession, AcpError> {
+        if !options.persist {
+            return Err(AcpError::InvalidState("private sessions require a live conformance witness".into()));
+        }
+        if matches!(options.tool_authority, crate::options::ToolAuthority::Aim) {
+            return Err(AcpError::InvalidState("strict aim authority requires a live route witness".into()));
+        }
+        self.new_session_unchecked(options).await
+    }
+
+    /// Creates a private session after the same live adapter has passed the transcript check.
+    ///
+    /// # Errors
+    ///
+    /// The witness must belong to this connection, and raw wire capture must be disabled.
+    pub async fn new_private_session(&self, options: SessionOptions, witness: &VerifiedPrivateMode) -> Result<AcpSession, AcpError> {
+        if options.persist
+            || matches!(options.tool_authority, crate::options::ToolAuthority::Aim)
+            || !witness.matches(self)
+            || self.shared.tap_active
+        {
+            return Err(AcpError::InvalidState("private conformance witness is unavailable or raw capture is enabled".into()));
+        }
+        self.new_session_unchecked(options).await
+    }
+
+    /// Creates a strict local aim-tools session after a live MCP routing challenge.
+    ///
+    /// # Errors
+    ///
+    /// The witness must belong to this connection and the exact relay used in the challenge.
+    pub async fn new_aim_session(&self, options: SessionOptions, witness: &VerifiedAimAuthority) -> Result<AcpSession, AcpError> {
+        if !options.persist || !witness.matches(self, &options) {
+            return Err(AcpError::InvalidState("aim-tools conformance witness does not match this session".into()));
+        }
+        self.new_session_unchecked(options).await
+    }
+
+    /// SSH authority gate. No witness producer exists until the remote-write/local-untouched
+    /// conformance routine is delivered with the SSH integration.
+    ///
+    /// # Errors
+    ///
+    /// An invalid witness or non-strict options are rejected.
+    pub async fn new_ssh_session(&self, options: SessionOptions, witness: &VerifiedSshAuthority) -> Result<AcpSession, AcpError> {
+        if !witness.matches(self, &options) {
+            return Err(AcpError::InvalidState("SSH tool authority has not passed remote-write conformance".into()));
+        }
+        self.new_session_unchecked(options).await
+    }
+
+    pub(crate) async fn new_session_unchecked(&self, options: SessionOptions) -> Result<AcpSession, AcpError> {
+        options.validate_authority()?;
         let result = self.shared.request("session/new", options.new_session_params(), Some(self.shared.request_timeout)).await?;
         let Some(session_id) = wire::string(&result, "sessionId") else {
             return Err(AcpError::Protocol { method: "session/new".into(), message: "result has no sessionId".into() });
@@ -654,7 +834,7 @@ mod tests {
     fn routes(router: &Router) -> (usize, usize, usize) {
         let sessions = lock(&router.sessions);
         let count = |f: fn(&Route) -> bool| sessions.values().filter(|r| f(r)).count();
-        (count(|r| matches!(r, Route::Live(_))), count(|r| matches!(r, Route::Early(_))), count(|r| matches!(r, Route::Retired)))
+        (count(|r| matches!(r, Route::Live { .. })), count(|r| matches!(r, Route::Early { .. })), count(|r| matches!(r, Route::Retired)))
     }
 
     #[test]
@@ -701,6 +881,36 @@ mod tests {
         while rx.try_recv().is_ok() {
             delivered += 1;
         }
-        assert_eq!(delivered, EARLY_UPDATES_PER_SESSION);
+        assert!(rx.overflowed());
+        assert_eq!(delivered, 0);
+    }
+
+    #[test]
+    fn slow_reader_and_large_updates_fail_with_bounded_memory() {
+        let router = Router::default();
+        let inbox = router.register("slow");
+        for _ in 0..=SESSION_QUEUE_MAX_EVENTS {
+            router.deliver("slow", update());
+        }
+        assert!(inbox.overflowed());
+
+        let large =
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "x".repeat(SESSION_QUEUE_MAX_BYTES / 2)}});
+        let inbox = router.register("large");
+        router.deliver("large", Routed::Update(large.clone()));
+        router.deliver("large", Routed::Update(large));
+        assert!(inbox.overflowed());
+    }
+
+    #[test]
+    fn repeated_retirement_cannot_reopen_an_old_session() {
+        let router = Router::default();
+        router.unregister("gone");
+        router.unregister("gone");
+        for i in 0..RETIRED_SESSIONS - 1 {
+            router.unregister(&format!("other-{i}"));
+        }
+        router.deliver("gone", update());
+        assert_eq!(routes(&router).1, 0);
     }
 }

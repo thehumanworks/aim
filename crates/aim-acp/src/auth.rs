@@ -15,7 +15,7 @@ use crate::error::AcpError;
 use crate::wire;
 
 /// The kind of an advertised login method.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthMethodKind {
     /// The client runs the agent program with `args` appended, in a terminal (ACP v1
@@ -35,9 +35,19 @@ pub enum AuthMethodKind {
     },
 }
 
+impl core::fmt::Debug for AuthMethodKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Terminal { .. } => f.write_str("Terminal { args: ***, env: *** }"),
+            Self::Agent => f.write_str("Agent"),
+            Self::Other { .. } => f.write_str("Other { method_type: *** }"),
+        }
+    }
+}
+
 /// The legacy `_meta["terminal-auth"]` block: an explicit command line (the adapter fills in its
 /// own interpreter and script path).
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalAuthMeta {
     /// Program to run.
     pub command: String,
@@ -51,8 +61,14 @@ pub struct TerminalAuthMeta {
     pub label: Option<String>,
 }
 
+impl core::fmt::Debug for TerminalAuthMeta {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("TerminalAuthMeta { command: ***, args: ***, env: ***, label: *** }")
+    }
+}
+
 /// One login method advertised in the `initialize` response.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthMethodInfo {
     /// Method id, e.g. `claude-ai-login`.
     pub id: String,
@@ -66,6 +82,12 @@ pub struct AuthMethodInfo {
     /// The explicit command, when the agent provided one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_auth: Option<TerminalAuthMeta>,
+}
+
+impl core::fmt::Debug for AuthMethodInfo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AuthMethodInfo").field("kind", &self.kind).finish_non_exhaustive()
+    }
 }
 
 impl AuthMethodInfo {
@@ -104,7 +126,7 @@ fn parse_auth_method(raw: &Value) -> Option<AuthMethodInfo> {
 
 /// A login command to run interactively in a terminal. Its output is the user's to see; aim does
 /// not capture it.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginCommand {
     /// The method this performs.
     pub method_id: String,
@@ -116,6 +138,12 @@ pub struct LoginCommand {
     pub args: Vec<String>,
     /// Environment variables to add (the agent profile's plus the method's overrides).
     pub env: BTreeMap<String, String>,
+}
+
+impl core::fmt::Debug for LoginCommand {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("LoginCommand { program: ***, args: ***, env: *** }")
+    }
 }
 
 /// The command performing `method` for an agent launched as `agent`: the method's explicit

@@ -84,7 +84,7 @@ impl AcpAgentConfig {
     /// [`AcpError::AgentNotFound`] when nothing executable matches.
     pub fn resolve_command(&self) -> Result<PathBuf, AcpError> {
         let not_found = || AcpError::AgentNotFound {
-            command: self.command.display().to_string(),
+            command: "<redacted>".to_owned(),
             hint: if self.command.as_os_str() == CLAUDE_AGENT_ACP {
                 "install the pinned adapter with `mise install` (npm:@agentclientprotocol/claude-agent-acp) and run aim under mise"
                     .to_owned()
@@ -123,13 +123,12 @@ fn is_executable(path: &Path) -> bool {
 
 impl core::fmt::Debug for AcpAgentConfig {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let env: BTreeMap<&str, &str> = self.env.keys().map(|k| (k.as_str(), "***")).collect();
         f.debug_struct("AcpAgentConfig")
-            .field("profile_name", &self.profile_name)
-            .field("command", &self.command)
-            .field("args", &self.args)
-            .field("env", &env)
-            .field("cwd", &self.cwd)
+            .field("profile_name", &"***")
+            .field("command", &"***")
+            .field("args", &"***")
+            .field("env_count", &self.env.len())
+            .field("cwd", &"***")
             .finish()
     }
 }
@@ -142,7 +141,7 @@ mod tests {
     fn debug_masks_env_values() {
         let config = AcpAgentConfig::claude().with_env("ANTHROPIC_API_KEY", "sk-secret-value");
         let debug = format!("{config:?}");
-        assert!(debug.contains("ANTHROPIC_API_KEY"));
+        assert!(!debug.contains("ANTHROPIC_API_KEY"));
         assert!(!debug.contains("sk-secret-value"));
     }
 
@@ -150,7 +149,7 @@ mod tests {
     fn missing_binary_is_a_typed_error_with_a_hint() {
         let config = AcpAgentConfig::new("x", "aim-acp-definitely-not-installed").with_env("PATH", "/nonexistent");
         match config.resolve_command() {
-            Err(AcpError::AgentNotFound { command, .. }) => assert_eq!(command, "aim-acp-definitely-not-installed"),
+            Err(AcpError::AgentNotFound { command, .. }) => assert_eq!(command, "<redacted>"),
             other => panic!("unexpected {other:?}"),
         }
         let claude = AcpAgentConfig::claude().with_env("PATH", "/nonexistent");

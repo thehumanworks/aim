@@ -8,6 +8,39 @@
 
 const MASK: &str = "***";
 
+/// A fixed, non-personal error message for untrusted agent text. Free-form peer messages can
+/// contain organization names or arbitrary secrets that pattern matching cannot identify.
+#[must_use]
+pub const fn safe_peer_message() -> &'static str {
+    "agent returned an error (details omitted)"
+}
+
+/// Keeps the array/object shape of peer error data while replacing every key, string and number.
+/// This is deliberately structural: an organization name or numeric account id may have no
+/// recognizable syntax.
+#[must_use]
+pub fn safe_error_data(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Null | Value::Bool(_) => value.clone(),
+        Value::String(_) | Value::Number(_) => Value::String(MASK.into()),
+        Value::Array(values) => Value::Array(values.iter().map(safe_error_data).collect()),
+        Value::Object(values) => {
+            Value::Object(values.values().enumerate().map(|(index, value)| (format!("field_{index}"), safe_error_data(value))).collect())
+        }
+    }
+}
+
+/// Only documented machine reasons are exposed from an `authRequired` response.
+#[must_use]
+pub fn safe_auth_reason(value: Option<&str>) -> Option<String> {
+    match value {
+        Some("claude_subscription_not_supported") => Some("claude_subscription_not_supported".into()),
+        Some("authentication_required") => Some("authentication_required".into()),
+        _ => None,
+    }
+}
+
 /// Whether a key name looks like it holds a credential.
 fn is_secret_key(key: &str) -> bool {
     let key = key.trim_matches(|c: char| c == '"' || c == '\'').to_ascii_lowercase();
@@ -104,7 +137,7 @@ fn split_assignment(segment: &str) -> Option<(&str, &str, char)> {
 
 #[cfg(test)]
 mod tests {
-    use super::redact;
+    use super::{redact, safe_error_data};
 
     #[test]
     fn masks_bearer_tokens_keys_and_emails() {
@@ -124,5 +157,13 @@ mod tests {
     fn leaves_ordinary_text_and_urls_alone() {
         let text = "fetch https://example.com/a:b failed: code=500 at 12:30";
         assert_eq!(redact(text), text);
+    }
+
+    #[test]
+    fn structured_error_data_hides_numeric_account_ids() {
+        let data = serde_json::json!({"account_id": 123_456_789, "nested": [true, "Acme Corp"]});
+        let shown = safe_error_data(&data).to_string();
+        assert!(!shown.contains("123456789"));
+        assert!(!shown.contains("Acme Corp"));
     }
 }

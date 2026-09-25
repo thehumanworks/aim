@@ -30,7 +30,7 @@ pub enum Requirement {
 }
 
 /// What the probe found.
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeReport {
     /// The agent (informational).
     pub agent: AgentInfo,
@@ -55,13 +55,23 @@ pub struct ProbeReport {
     pub missing_aim_tools: Vec<Requirement>,
 }
 
+impl core::fmt::Debug for ProbeReport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ProbeReport")
+            .field("capabilities", &self.capabilities)
+            .field("missing_native", &self.missing_native)
+            .field("missing_aim_tools", &self.missing_aim_tools)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ProbeReport {
     /// Whether sessions with `authority` can be offered.
     #[must_use]
     pub fn supports(&self, authority: &ToolAuthority) -> bool {
         match authority {
             ToolAuthority::Native => self.missing_native.is_empty(),
-            ToolAuthority::Aim { .. } => self.missing_aim_tools.is_empty(),
+            ToolAuthority::Aim | ToolAuthority::LocalMixed { .. } => self.missing_aim_tools.is_empty(),
         }
     }
 }
@@ -94,7 +104,7 @@ impl AcpClient {
     /// As [`Self::probe`].
     pub async fn probe_with(&self, options: SessionOptions) -> Result<ProbeReport, AcpError> {
         let start = Instant::now();
-        let mut session = self.new_session(options).await?;
+        let mut session = self.new_session_unchecked(options).await?;
         let session_new_ms = elapsed_ms(start);
         let config = session.config_options().to_vec();
         let mode = config_options::find(&config, &ConfigKey::Mode).and_then(ConfigOption::current);

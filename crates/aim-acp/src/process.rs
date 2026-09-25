@@ -16,7 +16,6 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 
 use crate::config::AcpAgentConfig;
 use crate::error::AcpError;
-use crate::redact::redact;
 
 /// Largest single JSON-RPC line accepted from the agent (session replays can carry images).
 pub const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
@@ -42,10 +41,16 @@ pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A bounded tail of the agent's stderr.
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub struct StderrTail {
     bytes: VecDeque<u8>,
     truncated: bool,
+}
+
+impl core::fmt::Debug for StderrTail {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StderrTail").field("bytes", &self.bytes.len()).field("truncated", &self.truncated).finish()
+    }
 }
 
 impl StderrTail {
@@ -59,13 +64,14 @@ impl StderrTail {
         }
     }
 
-    /// The tail as redacted text.
+    /// A safe diagnostic summary. Free-form stderr can contain names or secrets with no
+    /// recognizable syntax, so it must not leave this process as text.
     pub fn text(&self) -> String {
-        let (front, back) = self.bytes.as_slices();
-        let mut raw = String::from_utf8_lossy(front).into_owned();
-        raw.push_str(&String::from_utf8_lossy(back));
-        let text = redact(raw.trim());
-        if self.truncated { format!("[…] {text}") } else { text }
+        if self.bytes.is_empty() {
+            String::new()
+        } else {
+            format!("agent stderr omitted ({} bytes captured, truncated: {})", self.bytes.len(), self.truncated)
+        }
     }
 }
 
@@ -156,12 +162,12 @@ pub fn spawn(config: &AcpAgentConfig) -> Result<Spawned, AcpError> {
     command.process_group(0);
     let mut child = command.spawn().map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => AcpError::AgentNotFound {
-            command: program.display().to_string(),
+            command: "<redacted>".to_owned(),
             hint: "the executable or its interpreter (e.g. `node` for claude-agent-acp) is missing; run aim under mise".to_owned(),
         },
-        _ => AcpError::Spawn { command: program.display().to_string(), message: error.to_string() },
+        _ => AcpError::Spawn { command: "<redacted>".to_owned(), message: format!("{:?}", error.kind()) },
     })?;
-    let missing = |what: &str| AcpError::Spawn { command: program.display().to_string(), message: format!("no {what} pipe") };
+    let missing = |what: &str| AcpError::Spawn { command: "<redacted>".to_owned(), message: format!("no {what} pipe") };
     let stdin = child.stdin.take().ok_or_else(|| missing("stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| missing("stderr"))?;
@@ -243,11 +249,21 @@ mod tests {
     fn stderr_tail_is_bounded_and_redacted() {
         let mut tail = StderrTail::default();
         tail.push(b"token=abc\n");
-        assert_eq!(tail.text(), "token=***");
+        assert!(tail.text().contains("agent stderr omitted"));
         tail.push(&vec![b'x'; STDERR_TAIL_BYTES + 10]);
         let text = tail.text();
-        assert!(text.starts_with("[…] "));
+        assert!(text.contains("truncated: true"));
         assert!(!text.contains("token"));
         assert!(text.len() <= STDERR_TAIL_BYTES + "[…] ".len());
+    }
+
+    #[test]
+    fn stderr_diagnostics_omit_unstructured_organization_names() {
+        let mut tail = StderrTail::default();
+        tail.push(b"account alice@example.com from Acme Corp token=secret");
+        let shown = tail.text();
+        assert!(!shown.contains("alice@example.com"));
+        assert!(!shown.contains("Acme Corp"));
+        assert!(!shown.contains("secret"));
     }
 }

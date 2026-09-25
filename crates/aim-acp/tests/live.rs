@@ -243,7 +243,9 @@ async fn live_prompt_native() {
     let private_cwd = Scratch::new("private");
     let mut options = SessionOptions::new(private_cwd.path());
     options.persist = false;
-    let mut session = client.new_session(options).await.unwrap();
+    let witness = client.verify_private_mode().await.unwrap();
+    println!("[live_prompt_native] private conformance: {:?}", witness.evidence());
+    let mut session = client.new_private_session(options, &witness).await.unwrap();
     let id = session.id().to_owned();
     let (events, reply, elapsed) = run_turn(&mut session, "Reply with exactly: OK").await;
     let end = stop_of(&events);
@@ -299,8 +301,7 @@ fn entry_types(path: &Path) -> Vec<String> {
 async fn live_set_config() {
     let client = connect("live_set_config").await;
     let cwd = Scratch::new("config");
-    let mut options = SessionOptions::new(cwd.path());
-    options.persist = false;
+    let options = SessionOptions::new(cwd.path());
     let mut session = client.new_session(options).await.unwrap();
     let show = |session: &AcpSession| {
         session.config_options().iter().map(|o| format!("{}={}", o.id, o.current().unwrap_or_default())).collect::<Vec<_>>().join(" ")
@@ -338,7 +339,6 @@ async fn live_aim_tools_mode_start() {
     let log = cwd.path().join("echo-mcp.log");
     let nonce = format!("ping-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
     let mut options = SessionOptions::new(cwd.path());
-    options.persist = false;
     options.tool_authority = aim_acp::ToolAuthority::aim();
     options.mcp_servers = vec![aim_acp::McpServerSpec::Stdio {
         name: aim_acp::AIM_MCP_SERVER.into(),
@@ -346,8 +346,11 @@ async fn live_aim_tools_mode_start() {
         args: Vec::new(),
         env: [("AIM_ACP_ECHO_LOG".to_owned(), log.display().to_string())].into(),
     }];
+    let relay = options.mcp_servers.first().unwrap().clone();
+    let witness = client.verify_local_aim_authority(relay, "mcp__aim__echo", &nonce).await.unwrap();
+    println!("[live_aim_tools_mode_start] local aim conformance: {:?}", witness.evidence());
     let start = Instant::now();
-    let mut session = client.new_session(options).await.unwrap();
+    let mut session = client.new_aim_session(options, &witness).await.unwrap();
     println!("[live_aim_tools_mode_start] session/new (aim tools) {} ms", start.elapsed().as_millis());
     // Does Claude Code connect the session's MCP servers before any prompt? (Lets a probe verify
     // the spawn without a model call.)
@@ -396,8 +399,7 @@ async fn live_aim_tools_mode_start() {
 async fn live_permission_yolo() {
     let client = connect("live_permission_yolo").await;
     let cwd = Scratch::new("permission");
-    let mut options = SessionOptions::new(cwd.path());
-    options.persist = false;
+    let options = SessionOptions::new(cwd.path());
     let mut session = client.new_session(options).await.unwrap();
     // "Manual" mode asks before file writes (read-only commands such as `echo` run unasked).
     session.set_config(&ConfigKey::Mode, "default").await.unwrap();

@@ -9,7 +9,7 @@ use crate::wire;
 
 /// Which option to set: a semantic key resolved by category (then by conventional id), or an
 /// explicit option id.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "key", content = "id", rename_all = "snake_case")]
 pub enum ConfigKey {
     /// The model (category `model`, id `model`).
@@ -46,7 +46,7 @@ impl ConfigKey {
 }
 
 /// One selectable value.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigValue {
     /// Value id sent on the wire.
     pub value: String,
@@ -61,7 +61,7 @@ pub struct ConfigValue {
 }
 
 /// An option's kind and current value.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConfigKind {
     /// One of a list of values.
@@ -84,7 +84,7 @@ pub enum ConfigKind {
 }
 
 /// A session configuration option as advertised by the agent.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigOption {
     /// Option id (`model`, `effort`, `mode`, `fast`, …).
     pub id: String,
@@ -99,6 +99,20 @@ pub struct ConfigOption {
     /// Kind and value.
     pub kind: ConfigKind,
 }
+
+macro_rules! opaque_config_debug {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            impl core::fmt::Debug for $name {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str(concat!(stringify!($name), " { provider value: *** }"))
+                }
+            }
+        )+
+    };
+}
+
+opaque_config_debug!(ConfigKey, ConfigValue, ConfigKind, ConfigOption);
 
 impl ConfigOption {
     /// The current value as a string (`true`/`false` for booleans).

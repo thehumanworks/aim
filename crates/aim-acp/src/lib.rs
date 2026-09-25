@@ -28,6 +28,7 @@ mod auth;
 mod client;
 mod config;
 mod config_options;
+mod conformance;
 mod error;
 mod events;
 mod options;
@@ -45,6 +46,7 @@ pub use client::{
 };
 pub use config::{AcpAgentConfig, CLAUDE_AGENT_ACP};
 pub use config_options::{ConfigKey, ConfigKind, ConfigOption, ConfigValue, parse_config_options};
+pub use conformance::{AimAuthorityEvidence, PrivateModeEvidence, VerifiedAimAuthority, VerifiedPrivateMode, VerifiedSshAuthority};
 pub use error::{AUTH_REQUIRED_CODE, AcpError};
 pub use events::{
     AcpEvent, AvailableCommand, Chunk, ContentPart, ContextUsage, PlanEntry, ToolCallContent, ToolCallState, ToolCallStatus, ToolKind,

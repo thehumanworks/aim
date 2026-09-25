@@ -20,7 +20,7 @@ use crate::permission::{PermissionDecision, PermissionRequest};
 use crate::wire;
 
 /// One piece of message content (an ACP `ContentBlock`).
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     /// Text.
@@ -133,7 +133,7 @@ impl ContentPart {
 }
 
 /// A streamed message chunk.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chunk {
     /// The message the chunk belongs to, when the agent says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,7 +179,7 @@ impl ToolCallStatus {
 }
 
 /// Content produced by a tool call.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolCallContent {
     /// Ordinary content.
@@ -220,7 +220,7 @@ impl ToolCallContent {
 }
 
 /// A file location a tool call touches.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolLocation {
     /// Path.
     pub path: PathBuf,
@@ -231,7 +231,7 @@ pub struct ToolLocation {
 
 /// The merged state of a tool call after every update seen so far (ACP `tool_call` is an insert,
 /// `tool_call_update` a partial update; this is the upsert).
-#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ToolCallState {
     /// Tool call id.
     pub id: String,
@@ -256,6 +256,12 @@ pub struct ToolCallState {
     /// Raw output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_output: Option<Value>,
+}
+
+impl core::fmt::Debug for ToolCallState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ToolCallState").field("status", &self.status).finish_non_exhaustive()
+    }
 }
 
 impl ToolCallState {
@@ -321,7 +327,7 @@ impl ToolCallState {
 }
 
 /// One step of an agent's plan.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanEntry {
     /// What the step is.
     pub content: String,
@@ -332,7 +338,7 @@ pub struct PlanEntry {
 }
 
 /// Context-window occupancy and cost reported by the agent (`usage_update`).
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextUsage {
     /// Tokens in context.
     pub used: u64,
@@ -350,7 +356,7 @@ pub struct ContextUsage {
 }
 
 /// A slash command the agent offers.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AvailableCommand {
     /// Command name (without `/`).
     pub name: String,
@@ -359,7 +365,7 @@ pub struct AvailableCommand {
 }
 
 /// A typed `session/update`.
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "update", rename_all = "snake_case")]
 pub enum Update {
     /// A chunk of the agent's reply.
@@ -408,8 +414,22 @@ pub enum Update {
     },
 }
 
+macro_rules! opaque_payload_debug {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            impl core::fmt::Debug for $name {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str(concat!(stringify!($name), " { payload: *** }"))
+                }
+            }
+        )+
+    };
+}
+
+opaque_payload_debug!(ContentPart, Chunk, ToolCallContent, ToolLocation, PlanEntry, ContextUsage, AvailableCommand, Update);
+
 /// How a turn ended.
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnEnd {
     /// Normalized reason.
     pub stop: StopReason,
@@ -422,8 +442,14 @@ pub struct TurnEnd {
     pub raw: Value,
 }
 
+impl core::fmt::Debug for TurnEnd {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TurnEnd").field("stop", &self.stop).finish_non_exhaustive()
+    }
+}
+
 /// One event of a prompt turn.
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AcpEvent {
     /// A `session/update`, typed and raw.
@@ -447,6 +473,18 @@ pub enum AcpEvent {
     },
     /// The turn ended. Always the last event of a successful turn.
     Stopped(TurnEnd),
+}
+
+impl core::fmt::Debug for AcpEvent {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let kind = match self {
+            Self::Update { .. } => "Update",
+            Self::Permission { .. } => "Permission",
+            Self::Item { .. } => "Item",
+            Self::Stopped(_) => "Stopped",
+        };
+        f.debug_tuple("AcpEvent").field(&kind).finish()
+    }
 }
 
 /// Parses the `update` object of a `session/update` notification. `tool_calls` holds the merged
@@ -538,18 +576,22 @@ pub fn parse_turn_end(raw: Value) -> Result<TurnEnd, AcpError> {
 }
 
 /// Folds a turn's updates into complete conversation items.
-#[derive(Debug)]
 pub struct TurnCollector {
     provider: String,
     open: Option<OpenMessage>,
     emitted_calls: std::collections::BTreeSet<String>,
 }
 
-#[derive(Debug)]
 struct OpenMessage {
     reasoning: bool,
     message_id: Option<String>,
     parts: Vec<Part>,
+}
+
+impl core::fmt::Debug for TurnCollector {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TurnCollector").field("emitted_call_count", &self.emitted_calls.len()).finish_non_exhaustive()
+    }
 }
 
 impl TurnCollector {
@@ -641,7 +683,6 @@ impl TurnCollector {
 }
 
 /// A prompt event carried from the connection to a session's reader.
-#[derive(Debug)]
 pub(crate) enum Routed {
     /// A raw `session/update` object.
     Update(Value),
@@ -654,6 +695,24 @@ pub(crate) enum Routed {
         /// The result, or the error.
         result: Result<Value, AcpError>,
     },
+}
+
+impl core::fmt::Debug for Routed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Routed { payload: *** }")
+    }
+}
+
+impl Routed {
+    /// Approximate resident payload bytes before enqueueing. The JSON form is bounded by the
+    /// transport line limit; count it here so a slow consumer cannot accumulate many such lines.
+    pub(crate) fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Update(raw) | Self::Stopped { result: Ok(raw), .. } => raw.to_string().len(),
+            Self::Permission(boxed) => boxed.0.raw.to_string().len(),
+            Self::Stopped { result: Err(_), .. } => 512,
+        }
+    }
 }
 
 #[cfg(test)]

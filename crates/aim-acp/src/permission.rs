@@ -39,7 +39,7 @@ impl PermissionKind {
 }
 
 /// One answer the agent offers.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionOption {
     /// Option id to send back.
     pub id: String,
@@ -49,8 +49,14 @@ pub struct PermissionOption {
     pub kind: PermissionKind,
 }
 
+impl core::fmt::Debug for PermissionOption {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PermissionOption").field("kind", &self.kind).finish_non_exhaustive()
+    }
+}
+
 /// A permission request.
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {
     /// The session asking.
     pub session_id: String,
@@ -60,6 +66,12 @@ pub struct PermissionRequest {
     pub options: Vec<PermissionOption>,
     /// The raw request params (e.g. the adapter's `_meta.permission` title and description).
     pub raw: Value,
+}
+
+impl core::fmt::Debug for PermissionRequest {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PermissionRequest { tool and payload: *** }")
+    }
 }
 
 impl PermissionRequest {
@@ -85,7 +97,7 @@ impl PermissionRequest {
 }
 
 /// The embedder's answer.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum PermissionDecision {
     /// The option with this id.
@@ -95,6 +107,12 @@ pub enum PermissionDecision {
     },
     /// No answer: the tool call is aborted (different from a reject).
     Cancelled,
+}
+
+impl core::fmt::Debug for PermissionDecision {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PermissionDecision { option id: *** }")
+    }
 }
 
 impl PermissionDecision {

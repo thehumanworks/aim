@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use agent_client_protocol::UntypedMessage;
 use aim_proto::conversation::Part;
 use futures::Stream;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
-use crate::client::Shared;
+use crate::client::{SessionInbox, Shared};
 use crate::config_options::{self, ConfigKey, ConfigOption, parse_config_options};
 use crate::error::AcpError;
 use crate::events::{AcpEvent, ContentPart, Routed, ToolCallState, TurnCollector, Update, parse_turn_end, parse_update};
@@ -29,7 +29,7 @@ pub struct AcpSession {
     options: SessionOptions,
     config_options: Vec<ConfigOption>,
     new_session_result: Value,
-    events: mpsc::UnboundedReceiver<Routed>,
+    events: SessionInbox,
     tool_calls: BTreeMap<String, ToolCallState>,
     /// Turn sequence number of the last prompt sent.
     turn: u64,
@@ -41,7 +41,7 @@ pub struct AcpSession {
 
 impl core::fmt::Debug for AcpSession {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("AcpSession").field("id", &self.id).field("turn", &self.turn).finish_non_exhaustive()
+        f.debug_struct("AcpSession").field("id", &"***").field("turn", &self.turn).finish_non_exhaustive()
     }
 }
 
@@ -52,7 +52,7 @@ impl AcpSession {
         options: SessionOptions,
         config_options: Vec<ConfigOption>,
         new_session_result: Value,
-        events: mpsc::UnboundedReceiver<Routed>,
+        events: SessionInbox,
     ) -> Self {
         Self {
             shared,
@@ -114,15 +114,26 @@ impl AcpSession {
         }
         self.finish_abandoned().await?;
         self.pull_idle();
+        if self.events.overflowed() {
+            return Err(AcpError::QueueOverflow);
+        }
         self.turn = self.turn.saturating_add(1);
         let turn = self.turn;
         let params = json!({"sessionId": self.id, "prompt": parts.iter().map(ContentPart::to_acp).collect::<Vec<_>>()});
+        let message = UntypedMessage::new("session/prompt", params)
+            .map_err(|_| AcpError::Protocol { method: "session/prompt".into(), message: "could not encode prompt".into() })?;
+        // send_request enqueues synchronously. A Turn can be dropped immediately after this
+        // method returns, so the prompt must be ahead of its cancel notification on the wire.
+        let pending_request = self.shared.cx.send_request(message);
         let shared = Arc::clone(&self.shared);
         let session_id = self.id.clone();
         // The response is awaited on its own task and routed into the session's channel behind
         // every update the agent sent before it, so the stream sees updates, then the stop.
         tokio::spawn(async move {
-            let result = shared.request("session/prompt", params, None).await;
+            let result = match pending_request.block_task().await {
+                Ok(value) => Ok(value),
+                Err(error) => Err(shared.map_error("session/prompt", error).await),
+            };
             shared.router.deliver(&session_id, Routed::Stopped { turn, result });
         });
         let pending = core::mem::take(&mut self.idle).into_iter().map(Ok).collect();
@@ -244,7 +255,9 @@ impl AcpSession {
         loop {
             match tokio::time::timeout_at(deadline, self.events.recv()).await {
                 Err(_) => return Err(AcpError::TurnStillRunning),
-                Ok(None) => return Err(self.shared.closed_error().await),
+                Ok(None) => {
+                    return if self.events.overflowed() { Err(AcpError::QueueOverflow) } else { Err(self.shared.closed_error().await) };
+                }
                 Ok(Some(Routed::Stopped { turn, .. })) if turn >= abandoned => {
                     self.abandoned = None;
                     return Ok(());
@@ -275,7 +288,7 @@ pub struct CancelHandle {
 
 impl core::fmt::Debug for CancelHandle {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CancelHandle").field("session_id", &self.session_id).finish_non_exhaustive()
+        f.debug_struct("CancelHandle").field("session_id", &"***").finish_non_exhaustive()
     }
 }
 
@@ -301,7 +314,7 @@ pub struct Turn<'a> {
 
 impl core::fmt::Debug for Turn<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Turn").field("session", &self.session.id).field("seq", &self.seq).field("done", &self.done).finish_non_exhaustive()
+        f.debug_struct("Turn").field("session", &"***").field("seq", &self.seq).field("done", &self.done).finish_non_exhaustive()
     }
 }
 
@@ -370,7 +383,8 @@ impl Stream for Turn<'_> {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
                     this.done = true;
-                    return Poll::Ready(Some(Err(this.session.shared.closed_now())));
+                    let error = if this.session.events.overflowed() { AcpError::QueueOverflow } else { this.session.shared.closed_now() };
+                    return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(Some(message)) => this.accept(message),
             }
