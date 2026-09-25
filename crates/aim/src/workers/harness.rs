@@ -10,13 +10,14 @@ use aim_proto::ids::IdempotencyKey;
 use uuid::Uuid;
 
 use crate::harness::HarnessClient;
-use crate::remote::RemoteHarness;
+use crate::remote::{RemoteHarness, connect_network};
 
 const OUTPUT_LIMIT: usize = 512 * 1024;
 
 enum Connection {
     Local(HarnessClient),
     Ssh(RemoteHarness),
+    Remote(HarnessClient),
 }
 
 /// One command's bounded output and exit state.
@@ -51,13 +52,14 @@ impl GitHarness {
         let connection = match location {
             Location::Local => Connection::Local(HarnessClient::spawn_stdio(&aimx.to_string_lossy(), root).await?),
             Location::Ssh { destination } => Connection::Ssh(RemoteHarness::connect(aimx, destination, root).await?),
+            Location::Remote { url } => Connection::Remote(connect_network(url, root).await?),
         };
         Ok(Self { connection })
     }
 
     fn client(&self) -> &HarnessClient {
         match &self.connection {
-            Connection::Local(client) => client,
+            Connection::Local(client) | Connection::Remote(client) => client,
             Connection::Ssh(remote) => &remote.client,
         }
     }
@@ -127,7 +129,7 @@ impl GitHarness {
     /// Stops the harness transport after all owned commands and sessions have ended.
     pub async fn shutdown(self) {
         match self.connection {
-            Connection::Local(client) => client.shutdown().await,
+            Connection::Local(client) | Connection::Remote(client) => client.shutdown().await,
             Connection::Ssh(remote) => remote.shutdown().await,
         }
     }

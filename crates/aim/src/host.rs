@@ -38,7 +38,7 @@ use crate::context;
 use crate::harness::HarnessClient;
 use crate::jev::Decider;
 use crate::media::{Dispatcher, MediaService};
-use crate::remote::RemoteHarness;
+use crate::remote::{RemoteHarness, connect_network};
 use crate::resources::agents::ToolPolicy;
 use crate::resources::backend::WithSkills;
 use crate::resources::tools::AllowedTools;
@@ -53,7 +53,7 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub type UpdateStream = Pin<Box<dyn Stream<Item = SessionUpdate> + Send>>;
 /// Builds a provider and resolves its default model.
 pub type ProviderFactory = Arc<dyn Fn(&str, Option<&str>) -> Result<(Arc<dyn ModelProvider>, String), String> + Send + Sync>;
-/// Connects a session's workspace (aimx locally, over SSH, or a fake in tests).
+/// Connects a session's workspace (aimx locally, over SSH or the network, or a fake in tests).
 pub type WorkspaceFactory = Arc<dyn Fn(&SessionSpec) -> BoxFuture<Result<Connected, ProtoError>> + Send + Sync>;
 
 /// A connected workspace: its tools and what the agent is told about it.
@@ -62,7 +62,7 @@ pub struct Connected {
     pub tools: Arc<dyn ToolHost>,
     /// Canonical root on the workspace's host.
     pub root: String,
-    /// Where it is (`local`, or `ssh:<destination>`), as the agent is told.
+    /// Where it is (`local`, `ssh:<destination>`, or `remote:<url>`), as the agent is told.
     pub location: String,
     /// The project's files, for its resources (`AGENTS.md`, `.agents/`, foreign formats), read
     /// through the workspace so a remote project's apply; `None` when the workspace has none.
@@ -71,13 +71,29 @@ pub struct Connected {
     pub shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send>,
 }
 
-/// Connects workspaces by spawning the local aimx harness.
+/// Connects workspaces to a local, SSH, or authenticated network aimx harness.
 #[must_use]
 pub fn aimx_workspaces(aimx: PathBuf) -> WorkspaceFactory {
     Arc::new(move |spec: &SessionSpec| {
         let aimx = aimx.clone();
         let spec = spec.clone();
         Box::pin(async move {
+            if let Location::Remote { url } = &spec.location {
+                let harness = connect_network(url, &spec.workspace).await?;
+                let project: Option<Arc<dyn Files>> =
+                    Some(Arc::new(HarnessFiles::new(harness.peer().clone(), harness.workspace().id.clone())));
+                let root = harness.workspace().root.clone();
+                let harness = Arc::new(harness);
+                let held = Arc::clone(&harness);
+                let shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send> = Box::new(move || {
+                    Box::pin(async move {
+                        if let Ok(harness) = Arc::try_unwrap(held) {
+                            harness.shutdown().await;
+                        }
+                    })
+                });
+                return Ok(Connected { tools: harness as Arc<dyn ToolHost>, root, location: format!("remote:{url}"), project, shutdown });
+            }
             if let Location::Ssh { destination } = &spec.location {
                 let harness = RemoteHarness::connect(&aimx, destination, &spec.workspace).await?;
                 let project: Option<Arc<dyn Files>> =
@@ -148,7 +164,7 @@ pub struct Built {
     pub model: String,
     /// Canonical workspace root.
     pub root: String,
-    /// Where the workspace is (`local`, `ssh:<destination>`).
+    /// Where the workspace is (`local`, `ssh:<destination>`, `remote:<url>`).
     pub location: String,
     /// The named agent and its tool ceiling in force, recorded in a new session's metadata.
     pub agent: Option<SessionAgent>,
@@ -701,9 +717,12 @@ impl SessionHost {
         }
         let (meta, events) = self.config.store.load(id.to_owned()).await.map_err(|e| err(ErrorCode::NotFound, e.to_string()))?;
         let (model, effort, _) = last_config(&meta, &events);
-        let location = match meta.location.strip_prefix("ssh:") {
-            Some(destination) => Location::Ssh { destination: destination.to_owned() },
-            None => Location::Local,
+        let location = if let Some(url) = meta.location.strip_prefix("remote:") {
+            Location::Remote { url: url.to_owned() }
+        } else if let Some(destination) = meta.location.strip_prefix("ssh:") {
+            Location::Ssh { destination: destination.to_owned() }
+        } else {
+            Location::Local
         };
         let spec = SessionSpec {
             workspace: meta.workspace.clone(),

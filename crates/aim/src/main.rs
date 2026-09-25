@@ -68,8 +68,11 @@ enum Command {
         #[arg(short = 'C', long, default_value = ".")]
         cwd: PathBuf,
         /// SSH destination for a remote workspace.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "remote")]
         ssh: Option<String>,
+        /// Network aimx endpoint (bearer from `AIM_REMOTE_TOKEN` or `AIM_REMOTE_TOKEN_FILE`).
+        #[arg(long, conflicts_with = "ssh")]
+        remote: Option<String>,
         /// The aimx binary (default: next to aim, else on PATH).
         #[arg(long)]
         aimx: Option<PathBuf>,
@@ -292,12 +295,12 @@ async fn main_async(args: Args) -> Result<i32, String> {
     let Some(command) = args.command else { return tui(args.tui).await };
     match command {
         Command::Tui(tui_args) => tui(tui_args).await,
-        Command::Run { provider: p, model, effort, cwd, ssh, aimx, ephemeral, json, max_requests, prompt } => {
+        Command::Run { provider: p, model, effort, cwd, ssh, remote, aimx, ephemeral, json, max_requests, prompt } => {
             let prompt = read_prompt(&prompt)?;
             if prompt.trim().is_empty() {
                 return Err("empty prompt".to_owned());
             }
-            let options = RunOptions { provider: p, model, effort, cwd, ssh, aimx, ephemeral, json, max_requests, prompt };
+            let options = RunOptions { provider: p, model, effort, cwd, ssh, remote, aimx, ephemeral, json, max_requests, prompt };
             cli::run(options, provider).await
         }
         Command::Search { query } => search_cli(&query).await,
@@ -407,5 +410,19 @@ fn main() -> ExitCode {
             eprintln!("aim: {message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use clap::Parser as _;
+
+    use super::Args;
+
+    #[test]
+    fn run_remote_and_ssh_are_exclusive() {
+        assert!(Args::try_parse_from(["aim", "run", "--remote", "wss://example.test", "--ssh", "box", "hi"]).is_err());
+        assert!(Args::try_parse_from(["aim", "run", "--remote", "wss://example.test", "hi"]).is_ok());
+        assert!(Args::try_parse_from(["aim", "tui", "--remote", "wss://example.test"]).is_ok());
     }
 }

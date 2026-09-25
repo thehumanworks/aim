@@ -129,7 +129,9 @@ pub fn tls_acceptor(cert: &Path, key: &Path) -> io::Result<TlsAcceptor> {
     let mut key_reader = io::BufReader::new(std::fs::File::open(key)?);
     let private = rustls_pemfile::private_key(&mut key_reader)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "TLS private key is missing"))?;
-    let config = rustls::ServerConfig::builder()
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(io::Error::other)?
         .with_no_client_auth()
         .with_single_cert(certs, PrivateKeyDer::clone_key(&private))
         .map_err(io::Error::other)?;
@@ -650,7 +652,11 @@ mod tests {
         let mut cert_reader = io::BufReader::new(std::fs::File::open(&cert).unwrap());
         let cert_der = rustls_pemfile::certs(&mut cert_reader).next().unwrap().unwrap();
         roots.add(cert_der).unwrap();
-        let client_config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(client_config));
         let tcp = TcpStream::connect(address).await.unwrap();
         let tls = connector.connect(rustls::pki_types::ServerName::try_from("localhost").unwrap(), tcp).await.unwrap();

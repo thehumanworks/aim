@@ -395,11 +395,14 @@ impl Queued {
     }
 }
 
-/// `local` or `ssh:<destination>`, as session metadata records a location.
+/// `local`, `ssh:<destination>`, or `remote:<url>`, as session metadata records a location.
 fn location_of(text: &str) -> Location {
-    match text.strip_prefix("ssh:") {
-        Some(destination) => Location::Ssh { destination: destination.to_owned() },
-        None => Location::Local,
+    if let Some(url) = text.strip_prefix("remote:") {
+        Location::Remote { url: url.to_owned() }
+    } else if let Some(destination) = text.strip_prefix("ssh:") {
+        Location::Ssh { destination: destination.to_owned() }
+    } else {
+        Location::Local
     }
 }
 
