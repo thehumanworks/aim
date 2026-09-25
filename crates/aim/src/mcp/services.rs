@@ -197,9 +197,16 @@ impl AimServices {
 pub fn with_programs(host: Arc<dyn ToolHost>, aim_home: &Path) -> Arc<dyn ToolHost> {
     let Some(code) = crate::providers::code_mode() else { return host };
     let runtime = crate::coderun::CodeToolHost::new(Arc::clone(&host), code.worker, "aim-mcp", crate::coderun::CodeMode::RunCode);
-    let project = std::env::current_dir().ok().map(|root| root.join(".agents/programs"));
-    let store = Arc::new(crate::programs::ProgramStore::new(aim_home.join("programs"), project));
-    let programs: Arc<dyn ToolHost> = Arc::new(crate::coderun::ProgramToolHost::new(runtime, store));
+    let store = Arc::new(crate::programs::ProgramStore::new(aim_home.join("programs")));
+    let mut programs = crate::coderun::ProgramToolHost::new(runtime, store);
+    // Project programs are read from the working directory's `.agents/programs`. They are written
+    // only through a workspace's `Write` tool (ADR 0066), which this service does not offer, so
+    // saving one here is refused with a clear message.
+    if let Ok(root) = std::env::current_dir() {
+        let files: Arc<dyn crate::resources::files::Files> = Arc::new(LocalFiles::new(root));
+        programs = programs.with_project(crate::programs::project::ProjectPrograms::new(files, Arc::clone(&host)));
+    }
+    let programs: Arc<dyn ToolHost> = Arc::new(programs);
     Arc::new(crate::agent::tools::Compose::new(host, vec![programs]))
 }
 
