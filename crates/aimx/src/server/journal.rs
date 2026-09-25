@@ -218,7 +218,16 @@ mod tests {
         assert_eq!(file_mode, 0o600);
         drop(dead);
         drop(other);
-        let abandoned = journal.abandoned("/w");
+        // A child forked by a concurrent test holds a copy of every descriptor until it execs
+        // (then `CLOEXEC` closes them), and with it the lock: retry briefly.
+        let mut abandoned = journal.abandoned("/w");
+        for _ in 0..100 {
+            if !abandoned.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            abandoned = journal.abandoned("/w");
+        }
         assert_eq!(abandoned.iter().map(|(record, _)| record.path.as_str()).collect::<Vec<_>>(), ["/w/b.png"]);
         // While a sweeper holds the abandoned entry, another sweeper skips it too.
         assert!(journal.abandoned("/w").is_empty());
