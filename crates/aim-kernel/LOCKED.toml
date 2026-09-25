@@ -19,6 +19,26 @@ adr = "0025"
 sha256 = "7ea77f5ce46dc0ba5713501029c62ac29f497d4697cc9ff0ca4617aebc543cb0"
 
 [[locked]]
+decision = "policy::effective_ok"
+adr = "0027"
+sha256 = "61f9bd7b83a55b6ec478c9161287b38aede21202d9d6c4cb059b422e1acf78df"
+
+[[locked]]
+decision = "policy::intersection_ok"
+adr = "0027"
+sha256 = "da31db0dd67b1aebb510ad6c371910fa4a3d3aa91c4531aa5559c45e1488203e"
+
+[[locked]]
+decision = "policy::narrows"
+adr = "0027"
+sha256 = "0645e649ab83d3f7ca3ac03bf94229a69f1de7629eb7e6e778bd3cf5454691cd"
+
+[[locked]]
+decision = "policy::permits"
+adr = "0027"
+sha256 = "02ff049196e212714de9e4499158bdc8001682389faf312e96e743576695d5d9"
+
+[[locked]]
 decision = "compaction::plan_ok"
 adr = "0025"
 sha256 = "e2a78dbf038d98aa155d8e80f6d803b7f82a18922041c12a35bed2e5cb313b64"
