@@ -203,6 +203,11 @@ pub enum SessionUpdate {
         /// Snapshot.
         limits: RateLimits,
     },
+    /// A Jev effort decision was applied to the next provider request.
+    Decision {
+        /// Its logged inputs, advice and output.
+        decision: crate::event::DecisionRecord,
+    },
     /// Model or effort changed.
     ConfigChanged {
         /// Model id.

@@ -84,6 +84,11 @@ pub enum EventBody {
         /// Snapshot.
         limits: RateLimits,
     },
+    /// One bounded Jev effort decision, including the evidence needed to tune thresholds.
+    Decision {
+        /// Inputs, validated advice and the effort applied to the next request.
+        decision: DecisionRecord,
+    },
     /// A turn ended.
     TurnEnded {
         /// Why.
@@ -114,4 +119,44 @@ pub enum EventBody {
     /// An event kind this build does not know; preserved verbatim.
     #[serde(untagged)]
     Unknown(Value),
+}
+
+/// A recorded effort decision (docs/adr/0013 and 0028). Scores are diagnostic only; the
+/// controller receives `proposed_bp`, never a float.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DecisionRecord {
+    /// Model whose catalog supplied the ladder.
+    pub model: String,
+    /// Ordered effort labels supplied by that catalog.
+    pub ladder: Vec<String>,
+    /// Current index before this decision.
+    pub current: u32,
+    /// Effective lower bound.
+    pub lo: u32,
+    /// Effective upper bound.
+    pub hi: u32,
+    /// Decisions since the previous change.
+    pub since_change: u32,
+    /// Required hysteresis window.
+    pub hysteresis: u32,
+    /// Jev's raw ordinal score.
+    pub raw_score: f64,
+    /// Jev's raw score confidence.
+    pub raw_confidence: f64,
+    /// Jev's raw per-level probabilities, in ladder order.
+    pub raw_probabilities: Vec<f64>,
+    /// Jev's raw `stuck`, `progress` and `past_sessions` probabilities.
+    pub raw_noul: [f64; 3],
+    /// Score position quantized to basis points.
+    pub proposed_bp: u32,
+    /// `stuck`, `progress` and `past_sessions` probabilities, in basis points.
+    pub noul_bp: [u32; 3],
+    /// The resulting ladder index.
+    pub output: u32,
+    /// End-to-end advice latency in milliseconds.
+    pub latency_ms: u64,
+    /// Charged input tokens, when the API reported them.
+    pub input_tokens: Option<u64>,
+    /// Estimated list-price cost, in micro-US dollars.
+    pub cost_micro_usd: Option<u64>,
 }
