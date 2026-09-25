@@ -3,6 +3,8 @@
 //!
 //! - `openrouter`, `ai-gateway` — OpenAI-compatible gateways (ADR 0011); keys from
 //!   `OPENROUTER_API_KEY` / `AI_GATEWAY_API_KEY`.
+//! - Endpoints can be overridden with `AIM_CODEX_BASE_URL`, `AIM_OPENROUTER_BASE_URL` and
+//!   `AIM_AI_GATEWAY_BASE_URL` (https, or http to loopback only).
 //! - `codex` — the `ChatGPT` subscription (ADR 0010). Credentials: aim's own login
 //!   (`~/.aim/auth/codex.json`), else the Codex CLI's file, read-only and never refreshed. One
 //!   provider (one auth manager) serves the whole process, so a refresh never races itself.
@@ -18,6 +20,31 @@ use aim_llm_codex::CodexProvider;
 use aim_llm_codex::media::{MediaClient, MediaConfig};
 use aim_llm_openai::{OpenAiProvider, Profile};
 
+/// A provider endpoint override from the environment (endpoints are configuration data: a
+/// recording proxy for benchmarks, an enterprise gateway). Only `https://` URLs, or `http://` to a
+/// loopback address, are accepted; anything else is ignored with a warning, so a typo cannot send
+/// credentials in the clear.
+fn base_url_override(var: &str) -> Option<String> {
+    let value = std::env::var(var).ok().filter(|v| !v.trim().is_empty())?;
+    let url = value.trim().trim_end_matches('/').to_owned();
+    let loopback = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+        .iter()
+        .any(|prefix| url.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')));
+    if url.starts_with("https://") || loopback {
+        Some(url)
+    } else {
+        tracing::warn!(variable = var, "ignoring a base URL that is neither https nor loopback http");
+        None
+    }
+}
+
+fn with_base_url(mut profile: Profile, var: &str) -> Profile {
+    if let Some(base) = base_url_override(var) {
+        profile.base_url = base;
+    }
+    profile
+}
+
 /// Default model for `codex`.
 pub const CODEX_DEFAULT_MODEL: &str = "gpt-6-sol";
 
@@ -32,7 +59,11 @@ pub fn codex() -> Result<Arc<CodexProvider>, String> {
     if let Some(provider) = slot.as_ref() {
         return Ok(Arc::clone(provider));
     }
-    let provider = Arc::new(CodexProvider::new().map_err(|e| format!("codex: {e}"))?);
+    let mut config = aim_llm_codex::CodexConfig::default();
+    if let Some(base) = base_url_override("AIM_CODEX_BASE_URL") {
+        config.base_url = base;
+    }
+    let provider = Arc::new(CodexProvider::with_config(config).map_err(|e| format!("codex: {e}"))?);
     *slot = Some(Arc::clone(&provider));
     Ok(provider)
 }
@@ -53,8 +84,8 @@ pub fn build(id: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, S
         Ok((Arc::new(provider), model.unwrap_or(GATEWAY_DEFAULT_MODEL).to_owned()))
     };
     match id {
-        "openrouter" => gateway(Profile::openrouter()),
-        "ai-gateway" => gateway(Profile::ai_gateway()),
+        "openrouter" => gateway(with_base_url(Profile::openrouter(), "AIM_OPENROUTER_BASE_URL")),
+        "ai-gateway" => gateway(with_base_url(Profile::ai_gateway(), "AIM_AI_GATEWAY_BASE_URL")),
         "codex" => Ok((codex()? as Arc<dyn ModelProvider>, model.unwrap_or(CODEX_DEFAULT_MODEL).to_owned())),
         "acp:claude" | "acp:claude-native" => Err(format!("`{id}` is an agent (Claude Code), not a model provider: run it as a session")),
         other => Err(format!("unknown provider `{other}` (known: {})", KNOWN.join(", "))),

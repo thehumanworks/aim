@@ -380,6 +380,8 @@ plan fits the budget; compaction strictly shrinks; token arithmetic cannot overf
     secrets, read per request and never serialized. `models` is a static catalog for endpoints
     without discovery.
 
+
+Provider endpoints are configuration: `AIM_CODEX_BASE_URL`, `AIM_OPENROUTER_BASE_URL` and `AIM_AI_GATEWAY_BASE_URL` override them. Only `https://` URLs, or `http://` to a loopback address, are accepted; the loopback case covers benchmark recording proxies (ADR 0024).
 ### 6.6 Auth
 
 - **ChatGPT**: aim's own OAuth grant (browser PKCE on `127.0.0.1:1455`, fallback 1457; device code
