@@ -12,6 +12,7 @@ use aim_proto::tool::{ToolContent, ToolSpec};
 use aim_rpc::Peer;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
 
 const MODERN: &str = "2026-07-28";
@@ -55,28 +56,51 @@ impl Mcp {
     pub async fn serve<R, W>(&self, reader: R, mut writer: W) -> std::io::Result<()>
     where
         R: tokio::io::AsyncRead + Unpin,
-        W: tokio::io::AsyncWrite + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let mut reader = BufReader::new(reader);
         let mut pending_line = Vec::new();
         let mut discarding = false;
+        let mut input_closed = false;
         let mut tasks = JoinSet::new();
         let mut inflight: HashMap<String, AbortHandle> = HashMap::new();
-        loop {
+        let (replies, mut reply_rx) = mpsc::channel::<Value>(MAX_INFLIGHT * 2);
+        let mut writer_task = tokio::spawn(async move {
+            while let Some(reply) = reply_rx.recv().await {
+                write_reply(&mut writer, &reply).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let outcome = loop {
+            if input_closed && tasks.is_empty() {
+                break Ok(());
+            }
             tokio::select! {
                 biased;
-                () = self.peer.closed() => return Ok(()),
+                () = self.peer.closed() => break Ok(()),
+                result = &mut writer_task => break result.map_err(std::io::Error::other).and_then(|result| result),
                 Some(done) = tasks.join_next(), if !tasks.is_empty() => {
                     if let Ok((key, reply)) = done {
                         inflight.remove(&key);
-                        if let Some(reply) = reply {
-                            write_reply(&mut writer, &reply).await?;
+                        if let Some(reply) = reply
+                            && let Err(err) = queue_reply(&replies, reply)
+                        {
+                            break Err(err);
                         }
+                    } else {
+                        inflight.retain(|_, handle| !handle.is_finished());
                     }
                 }
-                line = read_line_bounded(&mut reader, &mut pending_line, &mut discarding) => {
-                    let reply = match line? {
-                        IncomingLine::Eof => return Ok(()),
+                line = read_line_bounded(&mut reader, &mut pending_line, &mut discarding), if !input_closed => {
+                    let line = match line {
+                        Ok(line) => line,
+                        Err(err) => break Err(err),
+                    };
+                    let reply = match line {
+                        IncomingLine::Eof => {
+                            input_closed = true;
+                            continue;
+                        }
                         IncomingLine::Oversized => Some(error(&Value::Null, -32600, "MCP message exceeds size limit")),
                         IncomingLine::Line(line) => match serde_json::from_slice::<Value>(&line) {
                             Err(_) => Some(error(&Value::Null, -32700, "invalid JSON")),
@@ -107,12 +131,21 @@ impl Mcp {
                             }
                         },
                     };
-                    if let Some(reply) = reply {
-                        write_reply(&mut writer, &reply).await?;
+                    if let Some(reply) = reply
+                        && let Err(err) = queue_reply(&replies, reply)
+                    {
+                        break Err(err);
                     }
                 }
             }
+        };
+        drop(replies);
+        if outcome.is_ok() && input_closed {
+            writer_task.await.map_err(std::io::Error::other)??;
+        } else {
+            writer_task.abort();
         }
+        outcome
     }
 
     async fn dispatch(&self, request: &Value) -> Option<Value> {
@@ -256,6 +289,10 @@ async fn read_line_bounded<R: AsyncBufRead + Unpin>(
 
 fn request_key(id: &Value) -> Option<String> {
     (id.is_number() || id.is_string()).then(|| id.to_string())
+}
+
+fn queue_reply(replies: &mpsc::Sender<Value>, reply: Value) -> std::io::Result<()> {
+    replies.try_send(reply).map_err(|_| std::io::Error::other("MCP writer backlog is unavailable or full"))
 }
 
 fn server_info() -> Value {
@@ -558,6 +595,27 @@ mod tests {
             .expect("dead harness held MCP open")
             .expect("MCP task")
             .expect("MCP transport");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn end_of_input_drains_accepted_request_and_reply() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_str().expect("UTF-8 temporary root");
+        let (mcp, server) = local(root).await;
+        let (client, adapter) = tokio::io::duplex(64 * 1024);
+        let (adapter_read, adapter_write) = tokio::io::split(adapter);
+        let task = tokio::spawn(async move { mcp.serve(adapter_read, adapter_write).await });
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        client_write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n").await.expect("request");
+        client_write.shutdown().await.expect("end input");
+        drop(client_write);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), client_read.read_line(&mut line)).await.expect("reply timeout").expect("reply");
+        let reply: Value = serde_json::from_str(&line).expect("MCP JSON");
+        assert_eq!(reply["id"], 1);
+        tokio::time::timeout(Duration::from_secs(1), task).await.expect("server did not drain").expect("MCP task").expect("MCP transport");
         server.shutdown().await;
     }
 
