@@ -7,6 +7,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
+use aim_proto::board::{
+    AssignParams, BoardAssign, BoardCancel, BoardClaim, BoardComplete, BoardEvent, BoardEventParams, BoardFail, BoardHeartbeat, BoardList,
+    BoardMessage, BoardPoll, BoardPost, BoardRetry, BoardReview, BoardShow, BoardWatch, CancelParams, ClaimParams, ClaimResult,
+    CompleteParams, FailParams, HeartbeatParams, JobRef, JobSnapshot, ListParams, ListResult, MessageParams, MessageResult, PollParams,
+    PollResult, PostParams, PostResult, RetryParams, ReviewParams, WatchParams,
+};
 use aim_proto::conversation::Part;
 use aim_proto::daemon::{
     DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeParams, DaemonInitializeResult, DetachReason, MAX_DAEMON_MESSAGE_BYTES,
@@ -45,6 +51,7 @@ struct Attachments {
 
 type Subscribers = Arc<Mutex<HashMap<String, Attachments>>>;
 type DetachReasons = Arc<Mutex<HashMap<String, DetachReason>>>;
+type BoardEventChannels = Arc<Mutex<HashMap<String, tokio::sync::broadcast::Sender<BoardEvent>>>>;
 
 fn clear_subscribers(subscribers: &Subscribers) {
     for (_, mut attachments) in lock(subscribers).drain() {
@@ -63,6 +70,7 @@ fn clear_subscribers(subscribers: &Subscribers) {
 struct UpdateHandler {
     subscribers: Subscribers,
     reasons: DetachReasons,
+    board_events: BoardEventChannels,
 }
 
 struct ClientLifetime(Peer);
@@ -81,6 +89,7 @@ impl Handler for UpdateHandler {
     fn notification(&self, _ctx: NotificationCtx, method: String, params: Value) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let subscribers = Arc::clone(&self.subscribers);
         let reasons = Arc::clone(&self.reasons);
+        let board_events = Arc::clone(&self.board_events);
         Box::pin(async move {
             match method.as_str() {
                 "session.update" => {
@@ -110,6 +119,13 @@ impl Handler for UpdateHandler {
                         }
                     }
                 }
+                "board.event" => {
+                    if let Ok(BoardEventParams { event }) = serde_json::from_value(params)
+                        && let Some(sender) = lock(&board_events).get(&event.run_id)
+                    {
+                        let _delivered = sender.send(event);
+                    }
+                }
                 _ => {}
             }
         })
@@ -124,6 +140,7 @@ pub struct DaemonClient {
     init: DaemonInitializeResult,
     subscribers: Subscribers,
     detach_reasons: DetachReasons,
+    board_events: BoardEventChannels,
     serial: Arc<std::sync::atomic::AtomicU64>,
     attach_gate: Arc<tokio::sync::Mutex<()>>,
     lifetime: Arc<ClientLifetime>,
@@ -139,11 +156,16 @@ impl DaemonClient {
             UnixStream::connect(socket).await.map_err(|e| ProtoError::new(ErrorCode::Unavailable, format!("connecting daemon: {e}")))?;
         let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
         let detach_reasons: DetachReasons = Arc::new(Mutex::new(HashMap::new()));
+        let board_events: BoardEventChannels = Arc::new(Mutex::new(HashMap::new()));
         let (read, write) = stream.into_split();
         let peer = Peer::spawn(
             read,
             write,
-            UpdateHandler { subscribers: Arc::clone(&subscribers), reasons: Arc::clone(&detach_reasons) },
+            UpdateHandler {
+                subscribers: Arc::clone(&subscribers),
+                reasons: Arc::clone(&detach_reasons),
+                board_events: Arc::clone(&board_events),
+            },
             PeerConfig { max_message_bytes: MAX_DAEMON_MESSAGE_BYTES, ..PeerConfig::default() },
         );
         let (min, max) = DAEMON_GENERATIONS;
@@ -173,6 +195,7 @@ impl DaemonClient {
             init,
             subscribers,
             detach_reasons,
+            board_events,
             serial: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             attach_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
@@ -208,6 +231,126 @@ impl DaemonClient {
         idempotency_key: IdempotencyKey,
     ) -> Result<PromptOutcome, ProtoError> {
         self.peer.call::<SessionPrompt>(SessionPromptParams { session, parts, idempotency_key }).await
+    }
+}
+
+impl DaemonClient {
+    /// Posts one job on the daemon board.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_post(&self, params: PostParams) -> Result<PostResult, ProtoError> {
+        self.peer.call::<BoardPost>(params).await
+    }
+
+    /// Lists authoritative board jobs.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_list(&self, params: ListParams) -> Result<ListResult, ProtoError> {
+        self.peer.call::<BoardList>(params).await
+    }
+
+    /// Reads one authoritative job.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_show(&self, params: JobRef) -> Result<JobSnapshot, ProtoError> {
+        self.peer.call::<BoardShow>(params).await
+    }
+
+    /// Assigns a worker without launching an attempt.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_assign(&self, params: AssignParams) -> Result<JobSnapshot, ProtoError> {
+        self.peer.call::<BoardAssign>(params).await
+    }
+
+    /// Claims a dependency-ready job; the token in the receipt must be stored privately.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_claim(&self, params: ClaimParams) -> Result<ClaimResult, ProtoError> {
+        self.peer.call::<BoardClaim>(params).await
+    }
+
+    /// Renews a current attempt's lease.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_heartbeat(&self, params: HeartbeatParams) -> Result<JobSnapshot, ProtoError> {
+        self.peer.call::<BoardHeartbeat>(params).await
+    }
+
+    /// Persists a bounded message from the current attempt.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_message(&self, params: MessageParams) -> Result<MessageResult, ProtoError> {
+        self.peer.call::<BoardMessage>(params).await
+    }
+
+    /// Completes execution, leaving review separate.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_complete(&self, params: CompleteParams) -> Result<JobSnapshot, ProtoError> {
+        self.peer.call::<BoardComplete>(params).await
+    }
+
+    /// Records attempt failure and cleanup state.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_fail(&self, params: FailParams) -> Result<JobSnapshot, ProtoError> {
+        self.peer.call::<BoardFail>(params).await
+    }
+
+    /// Cancels a job at an observed version.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_cancel(&self, params: CancelParams) -> Result<JobSnapshot, ProtoError> {
+        self.peer.call::<BoardCancel>(params).await
+    }
+
+    /// Retries after a terminal attempt and confirmed cleanup.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_retry(&self, params: RetryParams) -> Result<JobSnapshot, ProtoError> {
+        self.peer.call::<BoardRetry>(params).await
+    }
+
+    /// Records a separate review decision.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_review(&self, params: ReviewParams) -> Result<JobSnapshot, ProtoError> {
+        self.peer.call::<BoardReview>(params).await
+    }
+
+    /// Reconciles current jobs and committed events after a cursor.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_poll(&self, params: PollParams) -> Result<PollResult, ProtoError> {
+        self.peer.call::<BoardPoll>(params).await
+    }
+
+    /// Registers a bounded event hint stream before requesting the server snapshot.
+    /// Call `board_poll` when this receiver lags or reconnects.
+    ///
+    /// # Errors
+    /// Returns the daemon or transport error.
+    pub async fn board_watch(&self, params: WatchParams) -> Result<(PollResult, tokio::sync::broadcast::Receiver<BoardEvent>), ProtoError> {
+        let receiver = {
+            let mut channels = lock(&self.board_events);
+            channels.entry(params.run_id.clone()).or_insert_with(|| tokio::sync::broadcast::channel(1024).0).subscribe()
+        };
+        let snapshot = self.peer.call::<BoardWatch>(params).await?;
+        Ok((snapshot, receiver))
     }
 }
 

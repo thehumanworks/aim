@@ -13,8 +13,10 @@
 //! - [`login`] — `aim login codex | claude`.
 //! - [`daemon`] — the local daemon server, client and auto-spawn.
 //! - [`tui`] — the terminal UI: inline chat on a [`host::SessionClient`].
+//! - [`board`] — the durable job ledger and board CLI.
 pub mod acp;
 pub mod agent;
+pub mod board;
 pub mod cli;
 pub mod context;
 pub mod daemon;

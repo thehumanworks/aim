@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use aim_kernel::negotiate::{Generations, negotiate};
+use aim_proto::board::{
+    BoardAssign, BoardCancel, BoardClaim, BoardComplete, BoardEvent, BoardEventNotification, BoardEventParams, BoardFail, BoardHeartbeat,
+    BoardList, BoardMessage, BoardPoll, BoardPost, BoardRetry, BoardReview, BoardShow, BoardWatch, PollParams,
+};
 use aim_proto::daemon::{
     DAEMON_GENERATIONS, DaemonInitialize, DaemonInitializeResult, DetachReason, MAX_DAEMON_MESSAGE_BYTES, MediaTranscribe, PromptOutcome,
     SessionAttach, SessionCancel, SessionClose, SessionConfigParams, SessionCreate, SessionDetach, SessionDetachedNotification,
@@ -25,6 +29,7 @@ use serde_json::Value;
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
+use crate::board::{Board as BoardService, Error as BoardError};
 use crate::host::{SessionClient, UpdateStream};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -39,6 +44,16 @@ fn io_error(action: &str, cause: &std::io::Error) -> ProtoError {
     error(ErrorCode::Unavailable, format!("{action}: {cause}"))
 }
 
+fn board_error(cause: BoardError) -> ProtoError {
+    match cause {
+        BoardError::NotFound => error(ErrorCode::NotFound, "board record not found"),
+        BoardError::StaleClaim => error(ErrorCode::Denied, "stale or invalid board claim"),
+        BoardError::Conflict(message) => error(ErrorCode::Conflict, message),
+        BoardError::Invalid(message) => error(ErrorCode::InvalidParams, message),
+        BoardError::Storage(message) => error(ErrorCode::Unavailable, message),
+    }
+}
+
 struct Forwarder {
     cancel: CancellationToken,
 }
@@ -48,6 +63,8 @@ struct Connection {
     forwarders: Mutex<HashMap<String, Arc<Forwarder>>>,
     ordering: Arc<tokio::sync::Mutex<()>>,
     host: Arc<dyn SessionClient>,
+    board: Arc<BoardService>,
+    board_forwarders: Mutex<HashMap<String, CancellationToken>>,
     dedup: Arc<Dedup>,
 }
 
@@ -127,6 +144,48 @@ async fn forward_updates(connection: Arc<Connection>, peer: Peer, session: Strin
     if current {
         lock(&connection.forwarders).remove(&session);
         let _sent = peer.notify::<SessionDetachedNotification>(SessionDetachedParams { session, reason }).await;
+    }
+}
+
+async fn forward_board_events(
+    peer: Peer,
+    board: Arc<BoardService>,
+    run_id: String,
+    mut cursor: u64,
+    cancel: CancellationToken,
+    mut events: tokio::sync::broadcast::Receiver<BoardEvent>,
+) {
+    loop {
+        let event = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = peer.closed() => return,
+            event = events.recv() => event,
+        };
+        match event {
+            Ok(event) if event.run_id == run_id && event.seq > cursor => {
+                cursor = event.seq;
+                if peer.notify::<BoardEventNotification>(BoardEventParams { event }).await.is_err() {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // Push is a hint. Reconcile from the outbox after a bounded channel gap.
+                let Ok(snapshot) = board.poll(PollParams { run_id: run_id.clone(), after_seq: cursor, limit: 256 }).await else {
+                    return;
+                };
+                for event in snapshot.events {
+                    if event.seq > cursor {
+                        cursor = event.seq;
+                        if peer.notify::<BoardEventNotification>(BoardEventParams { event }).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
     }
 }
 
@@ -255,7 +314,39 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
         .method::<SessionCancel, _, _>(|state, _, reference| async move { state.host.cancel(reference.session).await })
         .method::<SessionSetConfig, _, _>(|state, _, params: SessionConfigParams| async move { state.host.set_config(params).await })
         .method::<SessionClose, _, _>(|state, _, reference| async move { state.host.close(reference.session).await })
-        .method::<MediaTranscribe, _, _>(|state, _, params| async move { state.host.transcribe(params).await });
+        .method::<MediaTranscribe, _, _>(|state, _, params| async move { state.host.transcribe(params).await })
+        .method::<BoardPost, _, _>(|state, _, params| async move { state.board.post(params).await.map_err(board_error) })
+        .method::<BoardList, _, _>(|state, _, params| async move { state.board.list(params).await.map_err(board_error) })
+        .method::<BoardShow, _, _>(|state, _, reference| async move { state.board.show(reference.job_id).await.map_err(board_error) })
+        .method::<BoardAssign, _, _>(|state, _, params| async move { state.board.assign(params).await.map_err(board_error) })
+        .method::<BoardClaim, _, _>(|state, _, params| async move { state.board.claim(params).await.map_err(board_error) })
+        .method::<BoardHeartbeat, _, _>(|state, _, params| async move { state.board.heartbeat(params).await.map_err(board_error) })
+        .method::<BoardMessage, _, _>(|state, _, params| async move { state.board.message(params).await.map_err(board_error) })
+        .method::<BoardComplete, _, _>(|state, _, params| async move { state.board.complete(params).await.map_err(board_error) })
+        .method::<BoardFail, _, _>(|state, _, params| async move { state.board.fail(params).await.map_err(board_error) })
+        .method::<BoardCancel, _, _>(|state, _, params| async move { state.board.cancel(params).await.map_err(board_error) })
+        .method::<BoardRetry, _, _>(|state, _, params| async move { state.board.retry(params).await.map_err(board_error) })
+        .method::<BoardReview, _, _>(|state, _, params| async move { state.board.review(params).await.map_err(board_error) })
+        .method::<BoardPoll, _, _>(|state, _, params| async move { state.board.poll(params).await.map_err(board_error) })
+        .method::<BoardWatch, _, _>(|state, ctx, params| async move {
+            let events = state.board.subscribe();
+            let snapshot = state.board.watch(params.run_id.clone(), params.after_seq).await.map_err(board_error)?;
+            let run_id = params.run_id;
+            let cursor = snapshot.next_seq;
+            let peer = ctx.peer.clone();
+            let cancelled = ctx.cancelled.clone();
+            let board = Arc::clone(&state.board);
+            ctx.after_reply(move || {
+                if !cancelled.is_cancelled() {
+                    let cancel = CancellationToken::new();
+                    if let Some(old) = lock(&state.board_forwarders).insert(run_id.clone(), cancel.clone()) {
+                        old.cancel();
+                    }
+                    tokio::spawn(forward_board_events(peer, board, run_id, cursor, cancel, events));
+                }
+            })?;
+            Ok(snapshot)
+        });
     GuardedRouter { connection, router }
 }
 
@@ -325,7 +416,12 @@ fn prepare(home: &Path, socket: &Path) -> Result<(UnixListener, SocketFiles), Pr
     Ok((listener, files))
 }
 
-fn serve_connection(stream: UnixStream, host: Arc<dyn SessionClient>, dedup: Arc<Dedup>) -> Result<Peer, ProtoError> {
+fn serve_connection(
+    stream: UnixStream,
+    host: Arc<dyn SessionClient>,
+    board: Arc<BoardService>,
+    dedup: Arc<Dedup>,
+) -> Result<Peer, ProtoError> {
     let credentials = stream.peer_cred().map_err(|e| io_error("checking peer credentials", &e))?;
     if credentials.uid() != nix::unistd::Uid::current().as_raw() {
         return Err(error(ErrorCode::Denied, "socket peer has a different uid"));
@@ -335,6 +431,8 @@ fn serve_connection(stream: UnixStream, host: Arc<dyn SessionClient>, dedup: Arc
         forwarders: Mutex::new(HashMap::new()),
         ordering: Arc::new(tokio::sync::Mutex::new(())),
         host,
+        board,
+        board_forwarders: Mutex::new(HashMap::new()),
         dedup,
     });
     let (read, write) = stream.into_split();
@@ -363,6 +461,7 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = Result<(), ProtoError>>,
 {
+    let board = Arc::new(BoardService::open(&home.join("aim.db")).map_err(board_error)?);
     let (listener, _files) = prepare(home, socket)?;
     let dedup = Arc::new(Dedup::default());
     let connections = Arc::new(AtomicUsize::new(0));
@@ -372,7 +471,7 @@ where
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.map_err(|e| io_error("accepting daemon client", &e))?;
-                match serve_connection(stream, Arc::clone(&host), Arc::clone(&dedup)) {
+                match serve_connection(stream, Arc::clone(&host), Arc::clone(&board), Arc::clone(&dedup)) {
                     Ok(peer) => {
                         connections.fetch_add(1, Ordering::AcqRel);
                         let count = Arc::clone(&connections);
