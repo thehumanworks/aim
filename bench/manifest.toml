@@ -3,6 +3,7 @@ version = 1
 hardware = "macOS arm64, report host details in each result"
 topology = "local, loopback HTTP recording proxy, fresh git worktree per run"
 permissions = "workspace read/write/exec; no hosted search; no network tool"
+aim_code_mode = "enabled, with a built and explicitly selected aim-coderun worker"
 cache_state = "fresh isolated HOME per trial; one recorded mock prewarm per harness before timed trials"
 token_estimate = "ceil(uncompressed request JSON bytes / 4); provider usage is separate"
 

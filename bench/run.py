@@ -104,6 +104,8 @@ def invocation(harness: str, paths: dict[str, Path], home: Path, url: str, model
                effort: str | None, workspace: Path) -> tuple[dict[str, str], list[str]]:
     env = isolated_env(home)
     env["PATH"] = str(paths["python"].parent) + os.pathsep + env.get("PATH", "")
+    if harness.startswith("aim_"):
+        env["AIM_CODERUN"] = str(paths["aim_coderun"])
     if harness == "aim_openrouter":
         env["AIM_OPENROUTER_BASE_URL"] = url + "/v1"
         env["OPENROUTER_API_KEY"] = "fixture" if mode == "mock" else BASE_ENV["OPENROUTER_API_KEY"]
@@ -157,7 +159,8 @@ def invocation(harness: str, paths: dict[str, Path], home: Path, url: str, model
 
 
 def path_map(args: argparse.Namespace) -> dict[str, Path]:
-    paths = {"aim": ROOT / "target/debug/aim", "aimx": ROOT / "target/debug/aimx", "codex": pinned("codex"),
+    paths = {"aim": ROOT / "target/debug/aim", "aimx": ROOT / "target/debug/aimx",
+             "aim_coderun": ROOT / "target/debug/aim-coderun", "codex": pinned("codex"),
              "pi": pinned("pi"), "python": pinned("python")}
     if args.omp:
         paths["omp"] = args.omp.resolve()

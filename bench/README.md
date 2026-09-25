@@ -39,6 +39,8 @@ checked by hash before/after each aim/Codex run. Never run `codex login` for thi
 
 The task driver resolves pinned executable paths before replacing `HOME`, so peers cannot
 silently use workstation-global `latest` shims. Each run gets a fresh HOME and workspace.
+The build includes `aim`, `aimx`, and `aim-coderun`, and `AIM_CODERUN` is set explicitly for
+both aim providers; the tool set cannot depend on whether another cargo task built the worker.
 One scripted mock prewarm per harness is retained separately in the result; timed trials use
 fresh HOMEs but warmed binary/OS caches.
 Temporary harness output is discarded. The recorder persists only request/response sizes,
