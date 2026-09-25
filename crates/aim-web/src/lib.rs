@@ -1,4 +1,9 @@
 //! Leptos browser client for `aim-daemon/1`. Credentials stay in the tab session.
+//!
+//! Agent-authored UI surfaces (ADR 0064) are folded with the same model the session host runs and
+//! rendered by [`surface`]; a pressed button is sent to the session as user input.
+
+pub mod surface;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -13,6 +18,8 @@ use aim_proto::daemon::{
 };
 use aim_proto::harness::{AuthProof, GenerationRange, PeerInfo};
 use aim_proto::ids::IdempotencyKey;
+use aim_proto::ui::model::{Change, Surface, Surfaces};
+use aim_proto::ui::{UiAction, UiMessage};
 use leptos::prelude::*;
 use serde_json::{Value, json};
 use wasm_bindgen::JsCast;
@@ -29,12 +36,29 @@ struct Ui {
     rows: Vec<Row>,
     streaming: String,
     steering: usize,
+    /// The attached session's UI surfaces (ADR 0064).
+    surfaces: Surfaces,
 }
 
 #[derive(Clone)]
 enum Row {
-    Text { kind: &'static str, text: String },
-    Tool { name: String, detail: String, done: bool },
+    Text {
+        kind: &'static str,
+        text: String,
+    },
+    Tool {
+        name: String,
+        detail: String,
+        done: bool,
+    },
+    /// A transcript surface, shown in its current state.
+    Surface {
+        id: String,
+    },
+    /// A transcript surface that was deleted, as it last was.
+    Closed {
+        surface: Box<Surface>,
+    },
 }
 
 enum Pending {
@@ -54,6 +78,7 @@ struct Snapshot {
     id: String,
     total_bytes: usize,
     bytes: Vec<u8>,
+    surfaces: Vec<Surface>,
 }
 
 struct Client {
@@ -220,6 +245,7 @@ impl Client {
                         id: attached.snapshot_id,
                         total_bytes,
                         bytes: attached.first_chunk.0,
+                        surfaces: attached.surfaces,
                     };
                     self.continue_snapshot(snapshot);
                 }
@@ -267,10 +293,24 @@ impl Client {
         }
         match serde_json::from_slice::<Vec<Item>>(&snapshot.bytes) {
             Ok(items) => {
-                let rows = items.iter().filter_map(item_row).collect();
+                // Transcript surfaces replay where they were created: after the items before them.
+                let surfaces = Surfaces::from_snapshot(snapshot.surfaces);
+                let mut anchored: Vec<&Surface> =
+                    surfaces.list.iter().filter(|s| surface::slot(&s.placement) == surface::Slot::Transcript).collect();
+                anchored.sort_by_key(|s| s.anchor);
+                let mut anchored = anchored.into_iter().peekable();
+                let mut rows = Vec::new();
+                for (index, item) in items.iter().enumerate() {
+                    while let Some(s) = anchored.next_if(|s| s.anchor <= index as u64) {
+                        rows.push(Row::Surface { id: s.id.clone() });
+                    }
+                    rows.extend(item_row(item));
+                }
+                rows.extend(anchored.map(|s| Row::Surface { id: s.id.clone() }));
                 self.ui.update(|s| {
                     s.selected = Some(snapshot.summary);
                     s.rows = rows;
+                    s.surfaces = surfaces;
                     s.streaming.clear();
                     s.status = "Attached".into();
                 });
@@ -336,6 +376,22 @@ impl Client {
             }
             SessionUpdate::ConfigRejected { message, .. } | SessionUpdate::TurnFailed { message } => s.error = message,
             SessionUpdate::TurnEnded { .. } => s.streaming.clear(),
+            SessionUpdate::Ui { message } => match s.surfaces.apply(&message.message, 0) {
+                Ok(Change::Created(id)) => {
+                    let transcript = s.surfaces.get(&id).is_some_and(|x| surface::slot(&x.placement) == surface::Slot::Transcript);
+                    if transcript && matches!(message.message, UiMessage::CreateSurface { .. }) {
+                        s.rows.push(Row::Surface { id });
+                    }
+                }
+                Ok(Change::Deleted(gone)) => {
+                    for row in &mut s.rows {
+                        if matches!(row, Row::Surface { id } if *id == gone.id) {
+                            *row = Row::Closed { surface: gone.clone() };
+                        }
+                    }
+                }
+                Ok(Change::Updated(_)) | Err(_) => {}
+            },
             _ => {}
         });
     }
@@ -350,6 +406,7 @@ impl Client {
                 s.selected = None;
                 s.rows.clear();
                 s.streaming.clear();
+                s.surfaces = Surfaces::default();
             }
             s.status = "Attaching…".into();
         });
@@ -389,7 +446,14 @@ fn parts_text(parts: &[Part]) -> String {
 
 fn item_row(item: &Item) -> Option<Row> {
     match item {
-        Item::User { parts } => Some(Row::Text { kind: "user", text: parts_text(parts) }),
+        Item::User { parts } => {
+            let text = parts_text(parts);
+            // A pressed button, sent as user input: shown as the action, not its envelope.
+            Some(match UiAction::from_input_text(&text) {
+                Some(action) => Row::Text { kind: "action", text: surface::action_line(&action) },
+                None => Row::Text { kind: "user", text },
+            })
+        }
         Item::Assistant { parts, .. } => Some(Row::Text { kind: "assistant", text: parts_text(parts) }),
         Item::Reasoning { summary, .. } => Some(Row::Text { kind: "reasoning", text: summary.join("\n") }),
         Item::ToolCall { name, arguments, .. } => Some(Row::Tool { name: name.clone(), detail: arguments.clone(), done: false }),
@@ -415,6 +479,14 @@ fn App() -> impl IntoView {
     let effort = RwSignal::new(String::new());
     let private = RwSignal::new(false);
     let draft = RwSignal::new(String::new());
+    // A pressed surface button goes to the attached session as user input (ADR 0064).
+    let press = move |action: UiAction| {
+        if let Some(c) = client.get_value().borrow().as_ref()
+            && let Some(s) = ui.get_untracked().selected
+        {
+            c.prompt(s.meta.id, action.to_input_text());
+        }
+    };
 
     let connect = move |secret: String| {
         if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
@@ -490,6 +562,7 @@ fn App() -> impl IntoView {
                         {move || ui.get().selected.as_ref().and_then(|s| (s.persistence == Persistence::Ephemeral).then_some(view! { <span class="pill">"Private · ephemeral"</span> }))}
                         <span class="status">{move || ui.get().selected.as_ref().map(|s| format!("{} · {}", s.meta.provider, s.meta.model)).unwrap_or_default()}</span>
                         <span class="status">{move || { let n = ui.get().steering; if n == 0 { String::new() } else { format!("{n} steering queued") } }}</span>
+                        <span class="status ui-status">{move || ui.get().surfaces.list.iter().filter(|s| surface::slot(&s.placement) == surface::Slot::Status).map(|s| surface::view(surface::render(s), &press)).collect_view()}</span>
                         <button on:click=move |_| { if let Some(c) = client.get_value().borrow().as_ref() && let Some(s) = ui.get_untracked().selected { c.cancel(&s.meta.id); } }>"Cancel"</button>
                     </div>
                     <div class="top">
@@ -506,10 +579,16 @@ fn App() -> impl IntoView {
                         {move || ui.get().rows.into_iter().map(|row| match row {
                             Row::Text { kind, text } => view! { <div class=format!("entry {kind}")>{text}</div> }.into_any(),
                             Row::Tool { name, detail, done } => view! { <details class="tool"><summary>{format!("{} {}", if done { "✓" } else { "◌" }, name)}</summary><pre>{detail}</pre></details> }.into_any(),
+                            Row::Surface { id } => ui.with(|s| s.surfaces.get(&id).map(surface::render)).map_or_else(|| ().into_any(), |node| surface::view(node, &press)),
+                            Row::Closed { surface: last } => surface::view(surface::render(&last), &press),
                         }).collect_view()}
                         <div class="entry assistant">{move || ui.get().streaming}</div>
                         <div class="entry error">{move || ui.get().error}</div>
                     </div>
+                    <div class="surfaces">{move || ui.get().surfaces.list.iter().filter(|s| surface::slot(&s.placement) == surface::Slot::Pinned).map(|s| {
+                        let class = if matches!(s.placement, aim_proto::ui::Placement::Dialog) { "pinned dialog" } else { "pinned" };
+                        view! { <div class=class>{surface::view(surface::render(s), &press)}</div> }
+                    }).collect_view()}</div>
                     <form class="composer" on:submit=move |event| {
                         event.prevent_default();
                         let text = draft.get_untracked();

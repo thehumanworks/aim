@@ -258,6 +258,7 @@ dependencies = [
  "aim-proto",
  "js-sys",
  "leptos",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "wasm-bindgen",
