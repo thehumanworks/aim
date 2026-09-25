@@ -52,7 +52,9 @@ pub use events::{
     AcpEvent, AvailableCommand, Chunk, ContentPart, ContextUsage, PlanEntry, ToolCallContent, ToolCallState, ToolCallStatus, ToolKind,
     ToolLocation, TurnCollector, TurnEnd, Update, parse_turn_end, parse_update,
 };
-pub use options::{AIM_MCP_SERVER, DEFAULT_ALIASES, McpServerSpec, SessionOptions, ToolAuthority};
+pub use options::{
+    AIM_CODE_TOOL, AIM_MCP_SERVER, AimRoute, CODE_RELAY_TOOL_TIMEOUT_MS, DEFAULT_ALIASES, McpServerSpec, SessionOptions, ToolAuthority,
+};
 pub use permission::{
     PermissionDecision, PermissionHandler, PermissionKind, PermissionOption, PermissionRequest, YoloPermissions, yolo_choice,
 };

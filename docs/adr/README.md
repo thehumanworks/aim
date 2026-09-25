@@ -79,3 +79,4 @@ Rules (enforced by `mise run check`):
 | [0066](0066-code-cell-lifecycle-provenance-and-limits.md) | Bind code cells to the turn that observes them, record their nested calls, and bound their output. |
 | [0074](0074-session-options-and-tui-session-switches.md) | Sessions advertise what they can switch to; the TUI derives new sessions in the kernel. |
 | [0075](0075-resolve-acp-config-values-to-advertised-values.md) | Resolve requested ACP model and effort values to advertised values by verified tiers; list the values on refusal. |
+| [0076](0076-code-mode-setting-and-acp-relay.md) | Select code mode with `AIM_CODE_MODE`, decide its exposure in the kernel, and serve it to Claude through aim's relay. |

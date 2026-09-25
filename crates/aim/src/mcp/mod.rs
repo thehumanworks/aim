@@ -4,6 +4,7 @@ mod bridge;
 mod cache;
 pub mod client;
 pub mod config;
+pub mod proxy;
 pub mod server;
 pub mod services;
 pub mod session;

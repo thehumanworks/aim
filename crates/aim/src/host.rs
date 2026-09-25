@@ -194,19 +194,23 @@ pub struct NativeServices {
     /// factory decides for the session and may offer none; they are composed after the workspace's
     /// and media tools (which keep their names) and before the agent's allowlist.
     pub tools: Vec<ToolsFactory>,
-    /// Code mode (ADR 0018): the `aim-coderun` worker. Sessions get `run_code` (or codex's
+    /// Code mode (ADR 0018, 0076): the `aim-coderun` worker. Sessions get `run_code` (or codex's
     /// `exec`/`wait`, when the catalog asks for it) and the saved-program tools over their final,
-    /// allowlist-narrowed tools, unless an agent's allowlist excludes `run_code`.
+    /// allowlist-narrowed tools, unless an agent's allowlist excludes `run_code`; the mode decides
+    /// which direct tools stay visible beside them.
     pub code: Option<CodeConfig>,
 }
 
-/// Where code mode runs and where programs are kept.
+/// Where code mode runs, where programs are kept, and in which mode. A `CodeConfig` stands for a
+/// worker that was found on a platform that sandboxes it ([`crate::providers::code_mode`]).
 #[derive(Clone, Debug)]
 pub struct CodeConfig {
     /// The `aim-coderun` worker binary.
     pub worker: PathBuf,
     /// The user's program repository (`~/.aim/programs`).
     pub user_programs: PathBuf,
+    /// `On` or `Only` (ADR 0076); `Off` composes no code tools.
+    pub mode: crate::coderun::mode::Mode,
 }
 
 /// Offers a session extra tools, or none (see [`NativeServices::tools`]).
@@ -329,9 +333,9 @@ pub fn native_backends_with(
                 Some((agent, policy)) => (narrowed(tools, agent, policy), Some(policy.record(&agent.meta.name))),
                 None => (tools, None),
             };
-            if let Some(code) = services.code.as_ref().filter(|_| code_permitted) {
+            if let Some((code, exposure)) = code_exposure(services.code.as_ref(), code_permitted) {
                 let cells;
-                (tools, cells) = with_code_mode(tools, code, agent.as_ref(), model_info, &session_id, project);
+                (tools, cells) = with_code_mode(tools, code, exposure.direct, agent.as_ref(), model_info, &session_id, project);
                 shutdown = cells_first(cells, shutdown);
             }
             let config = AgentConfig {
@@ -381,19 +385,32 @@ fn cells_first(
     })
 }
 
+/// A session's code-mode exposure, when code mode applies to it (ADR 0076). A `CodeConfig` stands
+/// for a worker found on a sandboxing platform; the session's ceiling decides the rest, and a
+/// ceiling without `run_code` never gets code tools, whatever the mode.
+fn code_exposure(code: Option<&CodeConfig>, permitted: bool) -> Option<(&CodeConfig, crate::coderun::mode::Exposure)> {
+    let code = code?;
+    let exposure = crate::coderun::mode::decide(Some(code.mode), true, true, permitted);
+    exposure.code.then_some((code, exposure))
+}
+
 /// Adds code mode and the saved-program tools over `tools`, the session's final (narrowed) set,
-/// so nested calls in a cell reach exactly the tools the session may use. Also returns the handle
-/// that ends the session's cells.
-fn with_code_mode(
+/// so nested calls in a cell reach exactly the tools the session may use, and shows the direct
+/// tools `direct` selects beside them (ADR 0076). Also returns the handle that ends the
+/// session's cells.
+pub(crate) fn with_code_mode(
     tools: Arc<dyn ToolHost>,
     code: &CodeConfig,
+    direct: crate::coderun::mode::Direct,
     agent: Option<&(resources::agents::AgentDef, ToolPolicy)>,
     model: Option<&aim_llm::ModelInfo>,
     session_id: &str,
     project: Option<Arc<dyn Files>>,
 ) -> (Arc<dyn ToolHost>, crate::coderun::CodeModeHandle) {
+    let hidden = crate::coderun::mode::COMPACT_HIDDEN;
     let mode = model.map_or(crate::coderun::CodeMode::RunCode, crate::coderun::CodeMode::from_model);
-    let host = crate::coderun::CodeToolHost::new(Arc::clone(&tools), code.worker.clone(), session_id.to_owned(), mode);
+    let host = crate::coderun::CodeToolHost::new(Arc::clone(&tools), code.worker.clone(), session_id.to_owned(), mode)
+        .with_direct(direct, &hidden);
     let cells = host.handle();
     let store = Arc::new(crate::programs::ProgramStore::new(code.user_programs.clone()));
     let mut programs = crate::coderun::ProgramToolHost::new(host, store);
@@ -402,8 +419,8 @@ fn with_code_mode(
         programs = programs.with_project(crate::programs::project::ProjectPrograms::new(project, Arc::clone(&tools)));
     }
     let programs: Arc<dyn ToolHost> = Arc::new(programs);
-    // The model sees a compact direct set; the hidden tools stay callable inside cells (ADR 0056).
-    let direct: Arc<dyn ToolHost> = Arc::new(crate::coderun::DirectCodeTools(tools));
+    // The model sees the mode's direct set; the others stay callable inside cells (ADR 0056, 0076).
+    let direct: Arc<dyn ToolHost> = Arc::new(crate::coderun::DirectCodeTools::new(tools, direct, &hidden));
     let composed: Arc<dyn ToolHost> = Arc::new(crate::agent::tools::Compose::new(direct, vec![programs]));
     // The model-visible code and program tools obey the agent's allowlist too: `save_program`,
     // `run_program` and `list_programs` need their own permission; codex's `exec`/`wait` are

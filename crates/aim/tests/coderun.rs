@@ -713,7 +713,7 @@ async fn a_session_ends_its_turn_while_a_cell_runs_and_closes_it_with_the_sessio
         media: None,
         decider: None,
         tools: Vec::new(),
-        code: Some(CodeConfig { worker: worker(), user_programs: programs.path().join("programs") }),
+        code: Some(CodeConfig { worker: worker(), user_programs: programs.path().join("programs"), mode: aim::coderun::mode::Mode::On }),
     };
     let for_factory = Arc::clone(&provider);
     let host = SessionHost::new(HostConfig {

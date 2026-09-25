@@ -412,6 +412,7 @@ async fn live_acp_claude_ssh_remote_changed_local_untouched() {
     assert_eq!(std::fs::read_to_string(local.join("task.sh")).unwrap(), "local sentinel\n");
     let events: Vec<Value> = String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
     let names: Vec<_> = events.iter().filter_map(|event| event.get("name").and_then(Value::as_str)).collect();
+    eprintln!("live_acp_ssh_tools={names:?}");
     assert!(!names.is_empty() && names.iter().all(|name| name.starts_with("mcp__aim__")), "only aim MCP tools may execute");
     assert!(String::from_utf8_lossy(&output.stdout).contains("remote-ok"));
 }

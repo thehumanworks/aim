@@ -11,7 +11,7 @@ use aim_proto::conversation::StopReason;
 use crate::client::{AcpClient, AgentInfo, Shared};
 use crate::error::AcpError;
 use crate::events::{AcpEvent, Update};
-use crate::options::{McpServerSpec, SessionOptions, ToolAuthority};
+use crate::options::{AIM_CODE_TOOL, AimRoute, McpServerSpec, SessionOptions, ToolAuthority};
 use crate::probe::ProbeReport;
 
 /// Evidence from the positive and negative transcript controls.
@@ -94,6 +94,7 @@ impl core::fmt::Debug for AimAuthorityEvidence {
 pub struct VerifiedAimAuthority {
     connection: Weak<Shared>,
     relay: McpServerSpec,
+    route: AimRoute,
     evidence: AimAuthorityEvidence,
 }
 
@@ -110,6 +111,7 @@ impl VerifiedAimAuthority {
             && options.persist
             && matches!(options.tool_authority, ToolAuthority::Aim)
             && options.mcp_servers.as_slice() == [self.relay.clone()]
+            && options.aim_route == self.route
             && options.validate_authority().is_ok()
     }
 }
@@ -125,6 +127,7 @@ impl core::fmt::Debug for VerifiedAimAuthority {
 pub struct VerifiedSshAuthority {
     connection: Weak<Shared>,
     relay: McpServerSpec,
+    route: AimRoute,
     agent: AgentInfo,
 }
 
@@ -135,6 +138,7 @@ impl VerifiedSshAuthority {
             && options.persist
             && matches!(options.tool_authority, ToolAuthority::Aim)
             && options.mcp_servers.as_slice() == [self.relay.clone()]
+            && options.aim_route == self.route
             && options.validate_authority().is_ok()
     }
 }
@@ -316,19 +320,22 @@ impl AcpClient {
         Ok(VerifiedAimAuthority {
             connection: Arc::downgrade(&self.shared),
             relay,
+            route: AimRoute::Aimx,
             evidence: AimAuthorityEvidence { agent: self.agent().clone(), probe, observed_tool: expected_tool.into(), response_confirmed },
         })
     }
 
-    /// Challenges a strict local relay by reading a file whose contents are withheld from the
-    /// agent's prompt. The caller creates the file inside the relay's workspace and removes it
-    /// after this method returns.
+    /// Challenges a strict local relay of kind `route` by reading a file whose contents are
+    /// withheld from the agent's prompt: with the relay's direct read tool, or, when it shows none
+    /// (code mode `only`, ADR 0076), with a `run_code` cell that calls `Read`. The caller creates
+    /// the file inside the relay's workspace and removes it after this method returns.
     ///
     /// # Errors
     /// The adapter did not route a completed aim read or did not report the file's contents.
     pub async fn verify_local_aim_read_authority(
         &self,
         relay: McpServerSpec,
+        route: &AimRoute,
         path: &Path,
         expected_content: &str,
     ) -> Result<VerifiedAimAuthority, AcpError> {
@@ -336,19 +343,19 @@ impl AcpClient {
             return Err(AcpError::InvalidState("empty aim read challenge".into()));
         }
         let scratch = Scratch::new("aim-read")?;
-        let options = SessionOptions::strict_aim(&scratch.path, relay.clone())?;
+        let options = SessionOptions::strict_aim_via(&scratch.path, relay.clone(), route.clone())?;
         let probe = self.probe_with(options.clone()).await?;
         if !probe.supports(&ToolAuthority::Aim) {
             return Err(AcpError::InvalidState("aim-tools capability probe failed".into()));
         }
         let mut session = self.new_session_unchecked(options).await?;
-        let prompt = format!("Use the mcp__aim__read tool to read {}. Reply with only the file contents.", path.display());
+        let (tool, prompt) = read_challenge(route, path);
         let events = session.prompt_text(prompt).await?.collect_all().await?;
         session.close().await?;
         let response_confirmed = events.iter().any(|event| {
             matches!(event,
                 AcpEvent::Update { update: Update::ToolCall(call), .. }
-                    if call.name.as_deref() == Some("mcp__aim__read")
+                    if call.name.as_deref() == Some(tool.as_str())
                         && call.status == crate::events::ToolCallStatus::Completed
                         && call.raw_output.as_ref().is_some_and(|value| value.to_string().contains(expected_content))
             )
@@ -359,23 +366,22 @@ impl AcpClient {
         Ok(VerifiedAimAuthority {
             connection: Arc::downgrade(&self.shared),
             relay,
-            evidence: AimAuthorityEvidence {
-                agent: self.agent().clone(),
-                probe,
-                observed_tool: "mcp__aim__read".into(),
-                response_confirmed,
-            },
+            route: route.clone(),
+            evidence: AimAuthorityEvidence { agent: self.agent().clone(), probe, observed_tool: tool, response_confirmed },
         })
     }
 
-    /// Challenges an SSH relay with a completed aim write, then checks the remote file through
-    /// the caller's independent harness read while a local sentinel remains unchanged.
+    /// Challenges an SSH relay of kind `route` with a completed aim write (the relay's direct
+    /// write tool, or a `run_code` cell that calls `Write` when it shows none), then checks the
+    /// remote file through the caller's independent harness read while a local sentinel remains
+    /// unchanged.
     ///
     /// # Errors
     /// The adapter, remote read, or local sentinel failed the challenge.
     pub async fn verify_ssh_aim_authority<F, Fut>(
         &self,
         relay: McpServerSpec,
+        route: &AimRoute,
         remote_path: &str,
         local_sentinel: &Path,
         content: &str,
@@ -390,20 +396,19 @@ impl AcpClient {
         }
         let before = std::fs::read(local_sentinel).map_err(|_| AcpError::InvalidState("cannot read local authority sentinel".into()))?;
         let scratch = Scratch::new("aim-ssh")?;
-        let options = SessionOptions::strict_aim(&scratch.path, relay.clone())?;
+        let options = SessionOptions::strict_aim_via(&scratch.path, relay.clone(), route.clone())?;
         let probe = self.probe_with(options.clone()).await?;
         if !probe.supports(&ToolAuthority::Aim) {
             return Err(AcpError::InvalidState("aim-tools capability probe failed".into()));
         }
         let mut session = self.new_session_unchecked(options).await?;
-        let prompt =
-            format!("Use mcp__aim__write to create {remote_path} with exactly this content: {content}. Do not use any other tool.");
+        let (tool, prompt) = write_challenge(route, remote_path, content);
         let events = session.prompt_text(prompt).await?.collect_all().await?;
         session.close().await?;
         let called = events.iter().any(|event| {
             matches!(event,
                 AcpEvent::Update { update: Update::ToolCall(call), .. }
-                    if call.name.as_deref() == Some("mcp__aim__write")
+                    if call.name.as_deref() == Some(tool.as_str())
                         && call.status == crate::events::ToolCallStatus::Completed
             )
         });
@@ -411,6 +416,57 @@ impl AcpClient {
         if !called || !local_untouched || !verify_remote().await? {
             return Err(AcpError::InvalidState("SSH aim-tools route did not pass remote-write conformance".into()));
         }
-        Ok(VerifiedSshAuthority { connection: Arc::downgrade(&self.shared), relay, agent: self.agent().clone() })
+        Ok(VerifiedSshAuthority { connection: Arc::downgrade(&self.shared), relay, route: route.clone(), agent: self.agent().clone() })
+    }
+}
+
+/// A JavaScript string literal for `text`.
+fn js_string(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+/// The tool a read challenge must see completed, and the prompt that asks for it.
+fn read_challenge(route: &AimRoute, path: &Path) -> (String, String) {
+    if let Some(tool) = route.tool_for("Read") {
+        let prompt = format!("Use the {tool} tool to read {}. Reply with only the file contents.", path.display());
+        return (tool, prompt);
+    }
+    let code = format!("const r = await tools.Read({{file_path: {}}}); text(r.text);", js_string(&path.to_string_lossy()));
+    let prompt = format!("Call the {AIM_CODE_TOOL} tool with exactly this code: {code} Reply with only its output.");
+    (AIM_CODE_TOOL.to_owned(), prompt)
+}
+
+/// The tool a write challenge must see completed, and the prompt that asks for it.
+fn write_challenge(route: &AimRoute, path: &str, content: &str) -> (String, String) {
+    if let Some(tool) = route.tool_for("Write") {
+        let prompt = format!("Use {tool} to create {path} with exactly this content: {content}. Do not use any other tool.");
+        return (tool, prompt);
+    }
+    let code = format!("await tools.Write({{file_path: {}, content: {}}}); text('written');", js_string(path), js_string(content));
+    let prompt = format!("Call the {AIM_CODE_TOOL} tool with exactly this code: {code} Do not use any other tool.");
+    (AIM_CODE_TOOL.to_owned(), prompt)
+}
+
+#[cfg(test)]
+mod challenge_tests {
+    use std::path::Path;
+
+    use super::{read_challenge, write_challenge};
+    use crate::options::AimRoute;
+
+    #[test]
+    fn challenges_use_the_route_s_direct_tool_or_its_code_tool() {
+        let path = Path::new("/w/challenge.txt");
+        assert_eq!(read_challenge(&AimRoute::Aimx, path).0, "mcp__aim__read");
+        let on = AimRoute::Code { direct: vec!["Read".into(), "Write".into(), "Bash".into()] };
+        assert_eq!(read_challenge(&on, path).0, "mcp__aim__Read");
+        assert_eq!(write_challenge(&on, "/w/x", "nonce").0, "mcp__aim__Write");
+        let only = AimRoute::Code { direct: Vec::new() };
+        let (tool, prompt) = read_challenge(&only, path);
+        assert_eq!(tool, "mcp__aim__run_code");
+        assert!(prompt.contains(r#"tools.Read({file_path: "/w/challenge.txt"})"#), "{prompt}");
+        let (tool, prompt) = write_challenge(&only, "/w/x", "nonce");
+        assert_eq!(tool, "mcp__aim__run_code");
+        assert!(prompt.contains(r#"tools.Write({file_path: "/w/x", content: "nonce"})"#), "{prompt}");
     }
 }

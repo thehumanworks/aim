@@ -1040,7 +1040,11 @@ fn composed_services() -> NativeServices {
     });
     NativeServices {
         tools: vec![mcp, board],
-        code: Some(aim::host::CodeConfig { worker: "/missing-test-worker".into(), user_programs: "/missing-test-programs".into() }),
+        code: Some(aim::host::CodeConfig {
+            worker: "/missing-test-worker".into(),
+            user_programs: "/missing-test-programs".into(),
+            mode: aim::coderun::mode::Mode::On,
+        }),
         ..NativeServices::default()
     }
 }

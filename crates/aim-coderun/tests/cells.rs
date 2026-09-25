@@ -71,6 +71,48 @@ async fn typescript_nested_calls_and_output() {
     assert!(!events[0].immediate);
 }
 
+/// ADR 0076: a nested result's `.text` (and its string form) is its text, `Promise.all` runs
+/// calls together, and the added fields stay out of the result's JSON.
+#[tokio::test]
+async fn nested_results_expose_their_text_and_run_together() {
+    let (result, _) = execute(
+        "const [a, b] = await Promise.all([tools.add({a:1,b:2}), tools.add({a:3,b:4})]); text(a.text + ',' + `${b}` + ',' + JSON.stringify(a).includes('\"text\":\"3\"') + ',' + Object.keys(a).includes('text'));",
+        None,
+        1024,
+        2_000,
+        16 << 20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.output, "3,7,true,false\n");
+}
+
+/// ADR 0076, from a live run where a model's cells failed silently: the last expression is the
+/// cell's value (a promise chain is awaited, not dropped), `console.log` is `text`, and an
+/// exception reaches the model by name and message.
+#[tokio::test]
+async fn scripts_written_like_node_return_their_output_and_their_errors() {
+    let last = execute("const r = await tools.add({a:2,b:2});\n({ sum: Number(r.text) })", None, 1024, 2_000, 16 << 20).await.unwrap();
+    assert_eq!((last.0.output.as_str(), last.0.returned), ("{\"sum\":4}", true));
+    let chained = execute(
+        "async function go() { return (await tools.add({a:1,b:1})).text; }\ngo().then(v => console.log('got', v))",
+        None,
+        1024,
+        2_000,
+        16 << 20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(chained.0.output, "got 2\n", "the chain was awaited and console.log is text");
+    let thrown =
+        execute("const { tools: t } = global; await t.add({a:1,b:2}); missing.call();", None, 1024, 2_000, 16 << 20).await.unwrap_err();
+    assert!(thrown.message.contains("ReferenceError") && thrown.message.contains("missing"), "{}", thrown.message);
+    let node = execute("const fs = require('fs');", None, 1024, 2_000, 16 << 20).await.unwrap_err();
+    assert!(node.message.contains("not Node") && node.message.contains("tools.*"), "{}", node.message);
+    let returned = execute("return 7", None, 1024, 2_000, 16 << 20).await.unwrap();
+    assert_eq!(returned.0.output, "7", "a top-level return still works");
+}
+
 #[tokio::test]
 async fn global_this_exposes_tools_and_index() {
     let (result, _) = execute(

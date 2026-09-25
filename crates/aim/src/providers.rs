@@ -147,18 +147,23 @@ pub fn services() -> crate::host::NativeServices {
     }
 }
 
-/// Code mode, when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this
-/// executable. It runs sandboxed on macOS and refuses to run on Linux until its bubblewrap profile
-/// exists (ADR 0018), so it is offered on macOS only.
+/// Code mode as `AIM_CODE_MODE` asks (ADR 0076; unset means the provisional default), when the
+/// `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this executable. It runs
+/// sandboxed on macOS and refuses to run on Linux until its bubblewrap profile exists (ADR 0018),
+/// so it is offered on macOS only. `None` when the mode is off or cannot run.
 pub(crate) fn code_mode() -> Option<crate::host::CodeConfig> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
+    code_mode_as(crate::coderun::mode::requested_from_env())
+}
+
+/// [`code_mode`] with an explicit request (`None`: the default).
+pub(crate) fn code_mode_as(requested: Option<crate::coderun::mode::Mode>) -> Option<crate::host::CodeConfig> {
     let worker = std::env::var_os("AIM_CODERUN")
         .map(PathBuf::from)
         .or_else(|| std::env::current_exe().ok().map(|exe| exe.with_file_name("aim-coderun")))
-        .filter(|path| path.exists())?;
-    Some(crate::host::CodeConfig { worker, user_programs: crate::cli::aim_home().join("programs") })
+        .filter(|path| path.exists());
+    let exposure = crate::coderun::mode::decide(requested, worker.is_some(), cfg!(target_os = "macos"), true);
+    let worker = worker.filter(|_| exposure.code)?;
+    Some(crate::host::CodeConfig { worker, user_programs: crate::cli::aim_home().join("programs"), mode: exposure.mode })
 }
 
 type SearchParts = (Arc<crate::search::SearchEngine>, Arc<crate::store::SqliteStore>);

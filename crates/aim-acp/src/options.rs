@@ -23,6 +23,49 @@ pub const DEFAULT_ALIASES: [(&str, &str); 6] = [
     ("Grep", "mcp__aim__grep"),
 ];
 
+/// The code tool of aim's code-mode relay, as Claude names it (ADR 0076).
+pub const AIM_CODE_TOOL: &str = "mcp__aim__run_code";
+
+/// The longest a call to aim's code-mode relay may take, on either side: above its longest tool
+/// (a 600 s `Bash`, or a cell's 300 s deadline) with a margin (ADR 0076). Claude is told it as
+/// `MCP_TOOL_TIMEOUT` rather than relying on its default.
+pub const CODE_RELAY_TOOL_TIMEOUT_MS: u64 = 630_000;
+
+/// Which strict aim relay a session uses, and so which aim tools stand in for Claude's built-ins
+/// (ADR 0076).
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AimRoute {
+    /// `aimx mcp`: its lowercase tools, aliased by [`DEFAULT_ALIASES`].
+    #[default]
+    Aimx,
+    /// aim's code-mode relay (`aim code-mcp`): `run_code`, the saved-program tools, and these
+    /// direct tools under their own names (none in code mode `only`).
+    Code {
+        /// The direct tools the relay shows, by name (`Read`, `Bash`, …).
+        direct: Vec<String>,
+    },
+}
+
+impl AimRoute {
+    /// The aim MCP tool that stands in for Claude's built-in `builtin`, when the relay shows one.
+    #[must_use]
+    pub fn tool_for(&self, builtin: &str) -> Option<String> {
+        match self {
+            Self::Aimx => DEFAULT_ALIASES.iter().find(|(from, _)| *from == builtin).map(|(_, to)| (*to).to_owned()),
+            Self::Code { direct } => (DEFAULT_ALIASES.iter().any(|(from, _)| *from == builtin)
+                && direct.iter().any(|name| name == builtin))
+            .then(|| format!("mcp__{AIM_MCP_SERVER}__{builtin}")),
+        }
+    }
+
+    /// Built-in → aim MCP tool aliases; never one to a tool the relay does not show.
+    #[must_use]
+    pub fn aliases(&self) -> BTreeMap<String, String> {
+        DEFAULT_ALIASES.iter().filter_map(|(from, _)| self.tool_for(from).map(|to| ((*from).to_owned(), to))).collect()
+    }
+}
+
 /// Who executes the agent's tools (docs/architecture.md §6.1).
 #[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -153,6 +196,9 @@ pub struct SessionOptions {
     /// keys (so they cannot weaken the tool-authority settings), e.g. `maxTurns`.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub claude_options: Map<String, Value>,
+    /// The strict relay's kind, which decides the built-in aliases (ADR 0076).
+    #[serde(default)]
+    pub aim_route: AimRoute,
 }
 
 impl core::fmt::Debug for SessionOptions {
@@ -177,9 +223,19 @@ impl SessionOptions {
     ///
     /// The relay must be named `aim`.
     pub fn strict_aim(cwd: impl Into<PathBuf>, relay: McpServerSpec) -> Result<Self, crate::AcpError> {
+        Self::strict_aim_via(cwd, relay, AimRoute::Aimx)
+    }
+
+    /// [`SessionOptions::strict_aim`] through a relay of kind `route` (ADR 0076).
+    ///
+    /// # Errors
+    ///
+    /// The relay must be named `aim`.
+    pub fn strict_aim_via(cwd: impl Into<PathBuf>, relay: McpServerSpec, route: AimRoute) -> Result<Self, crate::AcpError> {
         let mut options = Self::new(cwd);
         options.tool_authority = ToolAuthority::Aim;
         options.mcp_servers = vec![relay];
+        options.aim_route = route;
         options.validate_authority()?;
         Ok(options)
     }
@@ -216,6 +272,7 @@ impl SessionOptions {
             persist: true,
             system_prompt_append: None,
             claude_options: Map::new(),
+            aim_route: AimRoute::Aimx,
         }
     }
 
@@ -225,9 +282,7 @@ impl SessionOptions {
         let mut options = self.claude_options.clone();
         let tool_settings = match &self.tool_authority {
             ToolAuthority::Native => None,
-            ToolAuthority::Aim => {
-                Some((Vec::new(), DEFAULT_ALIASES.iter().map(|(from, to)| ((*from).to_owned(), (*to).to_owned())).collect()))
-            }
+            ToolAuthority::Aim => Some((Vec::new(), self.aim_route.aliases())),
             ToolAuthority::LocalMixed { keep_builtins, aliases } => Some((keep_builtins.clone(), aliases.clone())),
         };
         if let Some((keep_builtins, aliases)) = tool_settings {
@@ -240,6 +295,9 @@ impl SessionOptions {
             // removes (docs/research/acp-mcp.md §2.7 caveat 5).
             let mut env = options.get("env").and_then(Value::as_object).cloned().unwrap_or_default();
             env.insert("ENABLE_TOOL_SEARCH".into(), json!("false"));
+            if matches!(self.tool_authority, ToolAuthority::Aim) && matches!(self.aim_route, AimRoute::Code { .. }) {
+                env.insert("MCP_TOOL_TIMEOUT".into(), json!(CODE_RELAY_TOOL_TIMEOUT_MS.to_string()));
+            }
             options.insert("env".into(), Value::Object(env));
         }
         if !self.persist {

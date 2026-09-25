@@ -6,6 +6,7 @@
 //! ran the cell.
 
 mod cells;
+pub mod mode;
 mod programs;
 pub mod sandbox;
 pub mod scheduler;
@@ -36,10 +37,14 @@ use uuid::Uuid;
 use crate::agent::ToolHost;
 use crate::agent::tools::{BoxFuture, ToolCallContext};
 use cells::{CellRecord, ExecCell, merge_store};
+use mode::Direct;
 use supervisor::{CellBridge, CellTicket, Observer, OutputSink, Supervisor};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-const MAX_TIMEOUT_MS: u64 = 300_000;
+/// The longest a cell may run: its deadline from admission (ADR 0066).
+pub const MAX_TIMEOUT_MS: u64 = 300_000;
+/// Most bytes of typed signatures in a code tool's description (ADR 0076).
+const API_BYTES: usize = 4 * 1024;
 const DEFAULT_OUTPUT_BYTES: usize = 40_000;
 const MAX_OUTPUT_BYTES: usize = 64_000;
 /// Cells that may wait behind the running one (`REV13a` M9).
@@ -138,18 +143,31 @@ impl CodeModeHandle {
 pub struct CodeToolHost {
     shared: Arc<Shared>,
     guard: Arc<HostGuard>,
+    /// The direct tools the model also sees; the rest are typed first in the description.
+    direct: Arc<(Direct, Vec<String>)>,
 }
 
-/// Keep common file/shell and composed service actions directly visible in code mode. Less common
-/// built-in file/search actions remain available inside cells with the complete admitted set.
-pub(crate) struct DirectCodeTools(pub Arc<dyn ToolHost>);
+/// The direct tools a code-mode session shows beside its code tools (ADR 0076): all of them,
+/// all but the compact set's hidden ones (ADR 0056), or none. Every tool stays callable inside
+/// cells with the complete admitted set; a hidden tool cannot be called directly.
+pub(crate) struct DirectCodeTools {
+    inner: Arc<dyn ToolHost>,
+    direct: Direct,
+    hidden: Vec<String>,
+}
+
+impl DirectCodeTools {
+    /// Shows `inner`'s tools as `direct` selects, `hidden` naming the compact set's exclusions.
+    pub(crate) fn new(inner: Arc<dyn ToolHost>, direct: Direct, hidden: &[&str]) -> Self {
+        Self { inner, direct, hidden: hidden.iter().map(|name| (*name).to_owned()).collect() }
+    }
+}
 
 impl ToolHost for DirectCodeTools {
     fn specs(&self) -> Vec<ToolSpec> {
-        self.0
-            .specs()
+        let hidden: Vec<&str> = self.hidden.iter().map(String::as_str).collect();
+        mode::direct_specs(self.direct, self.inner.specs(), &hidden)
             .into_iter()
-            .filter(|spec| !matches!(spec.name.as_str(), "Glob" | "Grep" | "KillShell" | "search_sessions" | "read_session"))
             .map(|mut spec| {
                 if spec.name == "Read" {
                     spec.description =
@@ -165,23 +183,23 @@ impl ToolHost for DirectCodeTools {
     }
 
     fn call(&self, name: String, arguments: Value, key: IdempotencyKey) -> BoxFuture<Result<ToolResult, ProtoError>> {
-        self.0.call(name, arguments, key)
+        self.inner.call(name, arguments, key)
     }
 
     fn reserve_blob(&self, path: String, key: IdempotencyKey) -> BoxFuture<Result<String, ProtoError>> {
-        self.0.reserve_blob(path, key)
+        self.inner.reserve_blob(path, key)
     }
 
     fn finalize_blob(&self, reservation: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
-        self.0.finalize_blob(reservation, bytes, key)
+        self.inner.finalize_blob(reservation, bytes, key)
     }
 
     fn cancel_blob(&self, reservation: String, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
-        self.0.cancel_blob(reservation, key)
+        self.inner.cancel_blob(reservation, key)
     }
 
     fn write_blob(&self, path: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
-        self.0.write_blob(path, bytes, key)
+        self.inner.write_blob(path, bytes, key)
     }
 }
 
@@ -211,7 +229,16 @@ impl CodeToolHost {
             tasks: closer.tasks.clone(),
             programs: Arc::new(Semaphore::new(PROGRAM_WORKERS)),
         });
-        Self { shared, guard: Arc::new(HostGuard { closer }) }
+        Self { shared, guard: Arc::new(HostGuard { closer }), direct: Arc::new((Direct::Full, Vec::new())) }
+    }
+
+    /// Tells the code tool which of its nested tools the model also sees directly (`direct`, with
+    /// the compact set's `hidden` names), so its description types the others first (ADR 0076).
+    /// Without it, every nested tool counts as direct and is listed by name.
+    #[must_use]
+    pub fn with_direct(mut self, direct: Direct, hidden: &[&str]) -> Self {
+        self.direct = Arc::new((direct, hidden.iter().map(|name| (*name).to_owned()).collect()));
+        self
     }
 
     /// The handle that ends this session's code mode (for the session's shutdown).
@@ -224,6 +251,18 @@ impl CodeToolHost {
     #[must_use]
     pub fn tool_index(&self) -> String {
         types::index(&self.shared.inner.specs())
+    }
+
+    /// The model-visible API of the tools callable in a cell: typed signatures for the tools the
+    /// model cannot call directly, within a budget, and the rest by name (ADR 0076).
+    #[must_use]
+    pub fn tool_api(&self) -> String {
+        let specs = self.shared.inner.specs();
+        let (direct, hidden) = &*self.direct;
+        let hidden: Vec<&str> = hidden.iter().map(String::as_str).collect();
+        let shown: std::collections::HashSet<String> =
+            mode::direct_specs(*direct, specs.clone(), &hidden).into_iter().map(|spec| spec.name).collect();
+        types::api(&specs, &|name| !shown.contains(name), API_BYTES)
     }
 
     /// Bounded TypeScript declarations for the admitted nested tools.
@@ -251,6 +290,10 @@ impl CodeToolHost {
         };
         drop(ticket);
         let mut output = result.output;
+        if output.is_empty() {
+            // A silent cell usually forgot to emit or to await (ADR 0076, from a live run).
+            output.push_str("(no output: emit results with text(value), or end the script with an expression; await its promises)\n");
+        }
         for note in [dropped_note(result.dropped_bytes, result.dropped_events), store_note].into_iter().flatten() {
             output.push_str(&note);
             output.push('\n');
@@ -433,12 +476,12 @@ fn closed() -> ProtoError {
 
 impl ToolHost for CodeToolHost {
     fn specs(&self) -> Vec<ToolSpec> {
-        let index = self.tool_index();
+        let index = self.tool_api();
         match self.shared.mode {
             CodeMode::RunCode => vec![spec(
                 "run_code",
                 &format!(
-                    "Run JavaScript/TypeScript in an isolated async cell. Execute statements at top level, not only a function definition. Call await tools.NAME(args); each returns a ToolResult with text in result.content[0].text. Emit results with text(value).\n{index}"
+                    "Run a JavaScript/TypeScript script in an isolated async cell. Prefer one script to several tool calls for multi-step work (find, read several files, summarize) and fan-out; Promise.all runs calls together: const [a, b] = await Promise.all([tools.Read({{file_path: \"a.rs\"}}), tools.Read({{file_path: \"b.rs\"}})]); text(a.text + b.text). Emit results with text(value). Not Node: no require/import, fs or fetch; use tools.*.\n{index}"
                 ),
                 ToolInput::Json,
                 json!({"type":"object","properties":{"code":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":300_000}},"required":["code"]}),
@@ -447,7 +490,7 @@ impl ToolHost for CodeToolHost {
                 spec(
                     "exec",
                     &format!(
-                        "Run raw JavaScript in an isolated async cell. Use await tools.NAME(args), text(value), store/load, notify and yield_control(). Nested text is result.content[0].text. Optional // @exec: {{\"yield_time_ms\":10000,\"max_output_tokens\":1000}}; use wait for running cells.\n{index}"
+                        "Run raw JavaScript in an isolated async cell. Prefer one script to several tool calls for multi-step work and fan-out: await Promise.all([tools.NAME(args), ...]) runs calls together. Use text(value), store/load, notify and yield_control(). A result's .text is its text. Not Node: no require/import, fs or fetch. Optional // @exec: {{\"yield_time_ms\":10000,\"max_output_tokens\":1000}}; use wait for running cells.\n{index}"
                     ),
                     ToolInput::Freeform { syntax: None, definition: None },
                     Value::Null,
