@@ -335,14 +335,17 @@ impl Agent {
     async fn await_results(&mut self, turn: &mut Turn, response: &mut Response, ctx: &mut TurnCtx<'_, '_>) -> Option<Ended> {
         while matches!(turn.phase(), Phase::AwaitingResults) {
             tokio::select! {
+                // Cancellation, then steering, win over a result that is ready at the same time,
+                // so a steer typed before the last result lands is never left in the inbox.
+                biased;
+                () = ctx.cancel.cancelled() => return Some(Ended::Cancelled),
+                Some(parts) = next_steer(&mut ctx.inbox) => ctx.steer(turn, parts),
                 Some((id, result)) = response.running.next() => {
                     if turn.apply(TurnEvent::Result { id }).is_err() {
                         return Some(Ended::Failed(AgentError::Protocol(format!("unexpected result for call {id}"))));
                     }
                     response.finished.insert(id, result);
                 }
-                Some(parts) = next_steer(&mut ctx.inbox) => ctx.steer(turn, parts),
-                () = ctx.cancel.cancelled() => return Some(Ended::Cancelled),
             }
         }
         None
@@ -432,6 +435,9 @@ impl Agent {
                 Ended::Cancelled => return Ok(self.cancelled(&mut turn, &mut response, &mut ctx)),
                 Ended::Failed(err) => return self.fail(&mut turn, &mut response, &mut ctx, err),
             };
+            // Steering that arrived before the response ended continues the turn, however the
+            // stream and the inbox raced.
+            ctx.drain_inbox(&mut turn);
             if turn.apply(TurnEvent::ResponseDone { may_continue: may_continue(&stop) }).is_err() {
                 return self.fail(&mut turn, &mut response, &mut ctx, AgentError::Protocol("response ended outside streaming".to_owned()));
             }
@@ -499,6 +505,19 @@ struct TurnCtx<'a, 'b> {
 }
 
 impl TurnCtx<'_, '_> {
+    /// Takes every steer already waiting in the inbox.
+    fn drain_inbox(&mut self, turn: &mut Turn) {
+        let mut waiting = Vec::new();
+        if let Some(rx) = self.inbox.as_mut() {
+            while let Ok(parts) = rx.try_recv() {
+                waiting.push(parts);
+            }
+        }
+        for parts in waiting {
+            self.steer(turn, parts);
+        }
+    }
+
     fn steer(&mut self, turn: &mut Turn, parts: Vec<Part>) {
         if turn.apply(TurnEvent::Steer).is_ok() {
             self.steers.push(parts);
