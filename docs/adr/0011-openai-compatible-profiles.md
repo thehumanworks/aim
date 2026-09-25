@@ -20,6 +20,14 @@ docs/architecture.md §6.5.
   name. Only `chat` is implemented: a `responses` profile is rejected when the provider is built
   (`InvalidRequest`, a configuration error). Reference an environment variable by name, never
   save its value in project configuration or session events. The key is read at request time.
+  The same holds for any other secret a gateway needs: an extra header's value may be an
+  environment reference, for example:
+
+  ```toml
+  [headers]
+  "x-title" = "aim"                          # literal, non-secret
+  "helicone-auth" = { env = "HELICONE_AUTH" } # read per request, never stored
+  ```
 - Ship presets for OpenRouter and Vercel AI Gateway (`Profile::openrouter()`,
   `Profile::ai_gateway()`), while allowing user-defined endpoints. A preset supplies defaults and
   an explicit user profile can override them. *As implemented:* a profile is complete, and code
@@ -45,8 +53,8 @@ docs/architecture.md §6.5.
   time a request carries a tool-result image for a model it has not seen.
 
 *Amended 2026-09-25, same day:* the profile settings below record what `crates/aim-llm-openai`
-implements after its first two reviews. The first version named `key_env` (the field is
-`api_key_env`) and listed only `min_output_tokens` as a quirk.
+implements after its cross-model reviews. The first version named `key_env` (the field is
+`api_key_env`), listed only `min_output_tokens` as a quirk and had no secret header values.
 
 ### Profile settings
 
@@ -54,9 +62,9 @@ implements after its first two reviews. The first version named `key_env` (the f
 | --- | --- |
 | `id` | Provider id; also scopes replayed provider-native items (`NativeItem.provider`). |
 | `base_url` | Endpoint root without a route (`…/v1`); `chat/completions` and `models` are appended. |
-| `api_key_env` | Environment variable holding the bearer key, read per request. |
+| `api_key_env` | Environment variable holding the bearer key, read per request; unset or empty fails the call as `Auth`. |
 | `wire` | `chat` (implemented) or `responses` (rejected at construction). |
-| `headers` | Extra request headers with literal, non-secret values. `Authorization` is rejected; names and values are validated at construction; `Debug` prints names only. |
+| `headers` | Extra request headers. A string is a literal, non-secret value stored with the profile; a secret is an environment reference `{ env = "NAME" }`, read per request (unset or empty: `Auth`), sent as a sensitive header and scrubbed from errors like the key. Only the variable name is ever serialized. `Authorization` is rejected; names and literal values are validated at construction; `Debug` prints header and variable names only. |
 | `models` | Static catalog for endpoints without `GET /models`; when set, the catalog is never fetched. |
 
 | Quirk | Meaning | OpenRouter | AI Gateway |
@@ -116,5 +124,6 @@ behavior, so the adapter must surface unsupported features instead of approximat
   input").
   The first version of this ADR named them `live_openrouter_chat` and `live_ai_gateway_chat`.
 - Unit and local-HTTP tests in the crate cover explicit wire selection, key-env lookup without
-  logging, quirk application, unknown-key rejection, verbatim stream captures of both gateways
-  and error mapping. Preset override precedence is untested because merging is not implemented.
+  logging, environment-referenced headers (sent per request, scrubbed from errors, never
+  serialized), quirk application, unknown-key rejection, verbatim stream captures of both
+  gateways and error mapping. Preset override precedence is untested because merging is not implemented.

@@ -376,3 +376,73 @@ async fn a_static_catalog_is_never_fetched() -> Result<(), Box<dyn std::error::E
     assert!(sent.starts_with("POST /v1/chat/completions") && !sent.contains("image_url"));
     Ok(())
 }
+
+/// Stands in for a secret header value: an environment variable `cargo test` sets, distinct from
+/// [`KEY`].
+const HEADER_ENV: &str = "CARGO_PKG_DESCRIPTION";
+
+fn profile_with_env_header(base: &str) -> Result<Profile, toml::de::Error> {
+    toml::from_str(&format!(
+        r#"
+id = "custom"
+base_url = "{base}"
+api_key_env = "{KEY_ENV}"
+wire = "chat"
+[headers]
+"x-title" = "aim"
+"x-extra-auth" = {{ env = "{HEADER_ENV}" }}
+[quirks]
+supports_stream_usage = true
+"#
+    ))
+}
+
+/// REV4-B Minor 4: a header value can reference an environment variable. It is read per request,
+/// sent, and scrubbed from errors, while serialized profile data only ever holds the name.
+#[tokio::test]
+async fn env_referenced_headers_are_resolved_per_request_and_never_serialized() -> Result<(), Box<dyn std::error::Error>> {
+    let secret = std::env::var(HEADER_ENV)?;
+    assert!(secret.len() >= 4 && !secret.contains(KEY));
+    let (base, server) = serve(sse_response(ANSWER), None).await?;
+    let profile = profile_with_env_header(&base)?;
+    for serialized in [toml::to_string(&profile)?, serde_json::to_string(&profile)?, format!("{profile:?}")] {
+        assert!(serialized.contains(HEADER_ENV) && !serialized.contains(&secret), "{serialized}");
+    }
+    assert_eq!(toml::from_str::<Profile>(&toml::to_string(&profile)?)?, profile, "round trip");
+    collect(&OpenAiProvider::new(profile)?, request()).await?;
+    let sent = String::from_utf8(server.await?)?.to_ascii_lowercase();
+    assert!(sent.contains(&format!("x-extra-auth: {}", secret.to_ascii_lowercase())));
+    assert!(sent.contains("x-title: aim"));
+
+    // An echo of the header's value is scrubbed like the key, in HTTP and in-stream errors.
+    let body = format!(r#"{{"error":{{"message":"bad header {secret}","code":400}}}}"#);
+    let http = format!("HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+    let stream = sse_response(&format!("data: {body}\n\n"));
+    for response in [http.into_bytes(), stream] {
+        let (base, _server) = serve(response, None).await?;
+        let error = collect(&OpenAiProvider::new(profile_with_env_header(&base)?)?, request()).await.err().ok_or("expected an error")?;
+        assert!(error.message.contains("bad header") && !error.message.contains(&secret), "{}", error.message);
+    }
+    Ok(())
+}
+
+/// An unset header variable fails the call as `Auth` before anything is sent; an empty variable
+/// name, an `Authorization` reference and unknown keys are rejected when the profile is loaded.
+#[tokio::test]
+async fn env_referenced_headers_are_validated() -> Result<(), Box<dyn std::error::Error>> {
+    let (base, _server) = serve(sse_response(ANSWER), None).await?;
+    let unset = profile_with_env_header(&base)?;
+    let unset: Profile = toml::from_str(&toml::to_string(&unset)?.replace(HEADER_ENV, "AIM_TEST_UNSET_HEADER_VARIABLE"))?;
+    let error = collect(&OpenAiProvider::new(unset)?, request()).await.err().ok_or("expected an error")?;
+    assert_eq!(error.kind, LlmErrorKind::Auth);
+    assert!(error.message.contains("AIM_TEST_UNSET_HEADER_VARIABLE"));
+    let header = |value: &str| {
+        toml::from_str::<Profile>(&format!(
+            "id = \"x\"\nbase_url = \"https://e.invalid\"\napi_key_env = \"K\"\nwire = \"chat\"\n[headers]\n{value}\n"
+        ))
+    };
+    assert!(header("x-a = { env = \"A\", value = \"literal\" }").is_err(), "unknown key");
+    assert_eq!(OpenAiProvider::new(header("x-a = { env = \"\" }")?).err().map(|e| e.kind), Some(LlmErrorKind::InvalidRequest));
+    assert_eq!(OpenAiProvider::new(header("Authorization = { env = \"A\" }")?).err().map(|e| e.kind), Some(LlmErrorKind::InvalidRequest));
+    Ok(())
+}

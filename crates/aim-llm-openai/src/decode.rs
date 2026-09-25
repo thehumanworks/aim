@@ -44,7 +44,8 @@ pub(crate) struct ChatDecoder {
     provider: String,
     cost_pointer: Option<String>,
     freeform: BTreeSet<String>,
-    /// Values scrubbed from errors reported inside the stream: the request's API key.
+    /// Values scrubbed from errors reported inside the stream: the request's API key and its
+    /// environment-referenced header values.
     secrets: Vec<String>,
     response_id: Option<String>,
     text: String,

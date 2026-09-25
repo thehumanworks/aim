@@ -16,9 +16,11 @@
 //!   fetches the catalog (once per provider; a static `models` list is authoritative and never
 //!   fetched). A model the catalog cannot vouch for gets a text placeholder instead, so a
 //!   text-only model is never sent an image it would reject.
+//! - **Credentials** are read from the environment for every request: the key from
+//!   `api_key_env` and each `{ env = "NAME" }` header value. Profiles hold variable names only.
 //! - **Errors** keep the provider's detail (message, code, type, upstream error), scrubbed of
-//!   the API key and truncated, whether they arrive as an HTTP status or inside the stream; 401
-//!   bodies are dropped because servers echo key prefixes.
+//!   the API key and environment-referenced header values and truncated, whether they arrive as
+//!   an HTTP status or inside the stream; 401 bodies are dropped because servers echo key prefixes.
 
 mod catalog;
 mod decode;
@@ -27,7 +29,7 @@ mod profile;
 mod request;
 mod sse;
 
-pub use profile::{MaxOutputTokensField, Profile, Quirks, ReasoningParam, Wire};
+pub use profile::{EnvRef, HeaderSource, MaxOutputTokensField, Profile, Quirks, ReasoningParam, Wire};
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -54,7 +56,10 @@ const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 pub struct OpenAiProvider {
     profile: Profile,
     client: Client,
+    /// Literal profile headers, validated at construction.
     headers: HeaderMap,
+    /// Profile headers whose values are read from these environment variables per request.
+    env_headers: Vec<(HeaderName, String)>,
     session_header: Option<HeaderName>,
     /// Image-input support per model id, from the static catalog or the last fetched one.
     vision: Mutex<BTreeMap<String, bool>>,
@@ -82,6 +87,14 @@ fn transport(error: &reqwest::Error) -> LlmError {
     LlmError::new(LlmErrorKind::Transport, message)
 }
 
+/// What one request authenticates with. Every value in `secrets` (the key and the
+/// environment-referenced header values) is scrubbed from the errors the request reports.
+struct Credentials {
+    key: String,
+    headers: HeaderMap,
+    secrets: Vec<String>,
+}
+
 /// Reads at most `cap` bytes of a body; the flag says whether it was cut.
 async fn read_capped(response: Response, cap: usize) -> Result<(Vec<u8>, bool), LlmError> {
     let mut body = Vec::new();
@@ -97,11 +110,20 @@ async fn read_capped(response: Response, cap: usize) -> Result<(Vec<u8>, bool), 
     Ok((body, false))
 }
 
-async fn failure(response: Response, key: &str) -> LlmError {
+async fn failure(response: Response, secrets: &[String]) -> LlmError {
     let status = response.status().as_u16();
     let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
     let body = read_capped(response, MAX_ERROR_BODY_BYTES).await.map(|(body, _)| body).unwrap_or_default();
-    errors::http_error(status, retry_after.as_ref(), &body, &[key])
+    let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    errors::http_error(status, retry_after.as_ref(), &body, &secrets)
+}
+
+/// A non-empty environment variable; `Auth` when it is unset, since it holds a credential.
+fn credential(variable: &str, purpose: &str) -> Result<String, LlmError> {
+    std::env::var(variable)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| LlmError::new(LlmErrorKind::Auth, format!("environment variable {variable} ({purpose}) is unset")))
 }
 
 /// Whether any tool result in `items` carries an image.
@@ -133,22 +155,32 @@ impl OpenAiProvider {
     ///
     /// # Errors
     /// `InvalidRequest` for a profile this provider cannot serve (Responses wire, invalid or
-    /// `Authorization` headers); `Transport` if the TLS client cannot be built.
+    /// `Authorization` headers, an empty header variable name); `Transport` if the TLS client
+    /// cannot be built. Environment-referenced header values are read per request, not here.
     pub fn new(profile: Profile) -> Result<Self, LlmError> {
         if profile.wire == Wire::Responses {
             return Err(invalid("the Responses wire is not implemented for OpenAI-compatible profiles; set wire = \"chat\""));
         }
         let mut headers = HeaderMap::new();
-        for (name, value) in &profile.headers {
+        let mut env_headers = Vec::new();
+        for (name, source) in &profile.headers {
             let header_name =
                 HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid(format!("profile header name {name:?} is invalid")))?;
             if header_name == header::AUTHORIZATION {
                 return Err(invalid("profile headers must not set Authorization: the key is read from api_key_env"));
             }
-            let mut header_value =
-                HeaderValue::from_str(value).map_err(|_| invalid(format!("profile header {name} has an invalid value")))?;
-            header_value.set_sensitive(true);
-            headers.insert(header_name, header_value);
+            match source {
+                HeaderSource::Literal(value) => {
+                    let mut header_value =
+                        HeaderValue::from_str(value).map_err(|_| invalid(format!("profile header {name} has an invalid value")))?;
+                    header_value.set_sensitive(true);
+                    headers.insert(header_name, header_value);
+                }
+                HeaderSource::Env(EnvRef { env }) if env.is_empty() => {
+                    return Err(invalid(format!("profile header {name} references an empty environment variable name")));
+                }
+                HeaderSource::Env(EnvRef { env }) => env_headers.push((header_name, env.clone())),
+            }
         }
         let session_header = profile
             .quirks
@@ -163,7 +195,15 @@ impl OpenAiProvider {
             .build()
             .map_err(|_| LlmError::new(LlmErrorKind::Transport, "could not build the HTTP client"))?;
         let vision = profile.models.iter().flatten().map(|model| (model.id.clone(), model.images)).collect();
-        Ok(Self { profile, client, headers, session_header, vision: Mutex::new(vision), catalog_looked_up: AtomicBool::new(false) })
+        Ok(Self {
+            profile,
+            client,
+            headers,
+            env_headers,
+            session_header,
+            vision: Mutex::new(vision),
+            catalog_looked_up: AtomicBool::new(false),
+        })
     }
 
     /// The profile this provider serves.
@@ -215,26 +255,36 @@ impl OpenAiProvider {
         }
     }
 
-    fn key(&self) -> Result<String, LlmError> {
-        std::env::var(&self.profile.api_key_env)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| LlmError::new(LlmErrorKind::Auth, format!("environment variable {} is unset", self.profile.api_key_env)))
+    /// Reads the key and the environment-referenced header values for one request.
+    fn credentials(&self) -> Result<Credentials, LlmError> {
+        let key = credential(&self.profile.api_key_env, "the API key")?;
+        let mut headers = self.headers.clone();
+        let mut secrets = vec![key.clone()];
+        for (name, variable) in &self.env_headers {
+            let value = credential(variable, &format!("header {name}"))?;
+            let mut header_value = HeaderValue::from_str(&value)
+                .map_err(|_| invalid(format!("environment variable {variable} (header {name}) is not a valid header value")))?;
+            header_value.set_sensitive(true);
+            headers.insert(name.clone(), header_value);
+            secrets.push(value);
+        }
+        Ok(Credentials { key, headers, secrets })
     }
 
     fn endpoint(&self, route: &str) -> String {
         format!("{}/{route}", self.profile.base_url.trim_end_matches('/'))
     }
 
-    fn authorized(&self, builder: RequestBuilder, key: &str) -> RequestBuilder {
-        builder.headers(self.headers.clone()).bearer_auth(key)
+    fn authorized(builder: RequestBuilder, credentials: &Credentials) -> RequestBuilder {
+        builder.headers(credentials.headers.clone()).bearer_auth(&credentials.key)
     }
 
     async fn fetch_catalog(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        let key = self.key()?;
-        let response = self.authorized(self.client.get(self.endpoint("models")), &key).send().await.map_err(|error| transport(&error))?;
+        let credentials = self.credentials()?;
+        let response =
+            Self::authorized(self.client.get(self.endpoint("models")), &credentials).send().await.map_err(|error| transport(&error))?;
         if !response.status().is_success() {
-            return Err(failure(response, &key).await);
+            return Err(failure(response, &credentials.secrets).await);
         }
         let (body, cut) = read_capped(response, MAX_CATALOG_BYTES).await?;
         if cut {
@@ -265,17 +315,17 @@ impl ModelProvider for OpenAiProvider {
         Box::pin(async move {
             self.learn_image_support(&request).await;
             let body = self.request_body(&request)?;
-            let key = self.key()?;
-            let mut builder = self.authorized(self.client.post(self.endpoint("chat/completions")), &key).json(&body);
+            let credentials = self.credentials()?;
+            let mut builder = Self::authorized(self.client.post(self.endpoint("chat/completions")), &credentials).json(&body);
             if let (Some(name), Some(session)) = (&self.session_header, &request.session_id) {
                 let value = HeaderValue::from_str(session).map_err(|_| invalid("the session id is not a valid header value"))?;
                 builder = builder.header(name.clone(), value);
             }
             let response = builder.send().await.map_err(|error| transport(&error))?;
             if !response.status().is_success() {
-                return Err(failure(response, &key).await);
+                return Err(failure(response, &credentials.secrets).await);
             }
-            let mut decoder = ChatDecoder::new(&self.profile, request::freeform_names(&request.tools), vec![key]);
+            let mut decoder = ChatDecoder::new(&self.profile, request::freeform_names(&request.tools), credentials.secrets);
             let mut bytes = response.bytes_stream();
             let events = stream! {
                 let mut sse = Sse::default();

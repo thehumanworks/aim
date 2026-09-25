@@ -370,8 +370,9 @@ plan fits the budget; compaction strictly shrinks; token arithmetic cannot overf
     required: a turn without it is a `Protocol` error, never zero usage), `reasoning_param`,
     `replay_reasoning_details`, `tool_result_images` (only to models whose catalog entry accepts
     images; an unseen model is looked up once), `idle_timeout_secs`.
-  - `headers` holds extra request headers with literal, non-secret values; `models` is a static
-    catalog for endpoints without discovery.
+  - `headers` holds extra request headers: literal non-secret values, or `{ env = "NAME" }` for
+    secrets, read per request and never serialized. `models` is a static catalog for endpoints
+    without discovery.
 
 ### 6.6 Auth
 
