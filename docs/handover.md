@@ -208,7 +208,10 @@ share the new `aim-sandbox` crate), then W33 and W34.
   bubblewrap profiles come with W31.
 - **Tests under heavy load:** at a load average of about 30 (six agents building), the W30 worker
   saw two flakes. The `bench:wire` temp-directory cleanup raced the codex peer, and a
-  `rev7_daemon` connect was refused. Neither reproduced on rerun.
+  `rev7_daemon` connect was refused. Neither reproduced on rerun. Likewise, the PTY test
+  `tui_surfaces::a_reattached_session_replays_its_surfaces` timed out after 20 s once, in a
+  low-priority gate run while other work was active. It passes in about 2.6 s alone (3 of 3) and in
+  the full gate at normal priority. Harden its wait if it recurs.
 - **The W22 benchmark numbers need care:**
   - The W4 "prefix stability" ratio measured JSON key order, not caching (REV15).
   - The codex peer's usage was lost by the recorder on four requests.
