@@ -23,6 +23,7 @@ fn spec(persistence: Persistence) -> SessionSpec {
         effort: None,
         agent: None,
         persistence,
+        code_mode: None,
     }
 }
 
@@ -38,6 +39,7 @@ fn summary(id: &str, state: SessionState) -> SessionSummary {
             title: None,
             parent: None,
             agent: None,
+            code_mode: None,
         },
         state,
         persistence: Persistence::Ephemeral,

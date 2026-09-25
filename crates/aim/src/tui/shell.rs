@@ -41,6 +41,8 @@ pub struct Options {
     pub close_on_exit: bool,
     /// Keep superseded completion requests running (tests of the app's fence).
     pub keep_superseded_completions: bool,
+    /// A warning to show when the UI starts (an invalid `AIM_CODE_MODE`, ADR 0076).
+    pub notice: Option<String>,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -491,6 +493,9 @@ pub async fn run(client: Arc<dyn SessionClient>, options: Options) -> Result<i32
     let hyperlinks = hyperlinks();
     let config = AppConfig { spec: options.spec.clone(), hyperlinks, home: env("HOME"), persist_history: options.history.is_some() };
     let mut app = App::new(Theme::detect(env), config, options.fullscreen);
+    if let Some(notice) = &options.notice {
+        app.warn(notice.clone());
+    }
     app.handle(Input::Resize(size.0, size.1));
 
     let mut modes = Modes::enter().map_err(|e| format!("terminal: {e}"))?;

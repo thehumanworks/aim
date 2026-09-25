@@ -8,6 +8,7 @@ use aim_proto::daemon::{AUTO_EFFORT, ChoiceValue, Location, Persistence, Session
 
 use super::app::SessionView;
 use super::complete::Hint;
+use crate::coderun::mode;
 
 /// Collision-free ids for the values one decision involves: equal values get equal ids.
 struct Registry<T> {
@@ -84,18 +85,25 @@ pub fn derive_spec(attached: Option<&SessionView>, configured: &SessionSpec, to:
     let mut text = Registry::<String>::new();
     let mut places = Registry::<Location>::new();
     let mut values = Folded::new();
-    let mut shape = |provider: &str, location: &Location, workspace: &str, persistence, model: Option<&str>, effort: Option<&str>| Shape {
+    let mut shape = |provider: &str,
+                     location: &Location,
+                     workspace: &str,
+                     persistence,
+                     model: Option<&str>,
+                     effort: Option<&str>,
+                     code: Option<aim_proto::event::CodeModeSetting>| Shape {
         provider: text.id(&provider.to_owned()),
         location: places.id(location),
         workspace: text.id(&workspace.to_owned()),
         persistent: persistence == Persistence::Persistent,
         model: model.map(|m| values.id(m)),
         effort: effort.map(|e| values.id(e)),
+        code_mode: code.map(mode::from_setting),
     };
     let attached = attached.map(|s| {
         // An agent that reports no model (an empty id) has none to carry.
         let model = Some(s.model.as_str()).filter(|m| !m.is_empty());
-        shape(&s.provider, &s.location, &s.workspace, s.persistence, model, s.effort.as_deref())
+        shape(&s.provider, &s.location, &s.workspace, s.persistence, model, s.effort.as_deref(), s.code_mode)
     });
     let configured_shape = shape(
         &configured.provider,
@@ -104,6 +112,7 @@ pub fn derive_spec(attached: Option<&SessionView>, configured: &SessionSpec, to:
         configured.persistence,
         configured.model.as_deref(),
         configured.effort.as_deref(),
+        configured.code_mode,
     );
     let switch = match to {
         SwitchTo::New => Switch::New,
@@ -125,6 +134,8 @@ pub fn derive_spec(attached: Option<&SessionView>, configured: &SessionSpec, to:
         },
         agent: configured.agent.clone(),
         persistence: if out.persistent { Persistence::Persistent } else { Persistence::Ephemeral },
+        // The session's code mode travels with every switch (`aim_kernel::switch::switches_keep_place_and_privacy`).
+        code_mode: out.code_mode.map(mode::to_setting),
     })
 }
 
@@ -219,6 +230,7 @@ mod tests {
             persistence: Persistence::Ephemeral,
             options: None,
             stale_efforts: false,
+            code_mode: None,
         }
     }
 
@@ -231,11 +243,30 @@ mod tests {
             effort: Some("high".into()),
             agent: Some("reader".into()),
             persistence: Persistence::Persistent,
+            code_mode: None,
         }
     }
 
     fn choice(value: &str) -> ChoiceValue {
         ChoiceValue { value: value.into(), name: None, description: None }
+    }
+
+    /// T4c (ADR 0076): `/new`, `/clear` and `/provider` carry the attached session's code mode;
+    /// without one attached, the client's setting.
+    #[test]
+    fn switches_carry_the_code_mode() {
+        use aim_proto::event::CodeModeSetting;
+        let mut attached = view("codex", "gpt-6-sol", None);
+        attached.code_mode = Some(CodeModeSetting::Only);
+        let mut client = configured();
+        client.code_mode = Some(CodeModeSetting::On);
+        for to in [SwitchTo::New, SwitchTo::Clear, SwitchTo::Provider("openrouter".into())] {
+            let spec = derive_spec(Some(&attached), &client, &to).expect("a new session");
+            assert_eq!(spec.code_mode, Some(CodeModeSetting::Only), "{to:?}");
+        }
+        assert_eq!(derive_spec(None, &client, &SwitchTo::New).expect("a new session").code_mode, Some(CodeModeSetting::On));
+        attached.code_mode = None;
+        assert_eq!(derive_spec(Some(&attached), &client, &SwitchTo::Clear).expect("a new session").code_mode, None);
     }
 
     #[test]
