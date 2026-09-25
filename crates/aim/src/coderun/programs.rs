@@ -18,20 +18,60 @@ use super::supervisor::{CellBridge, Observer, Supervisor};
 use super::{ADMISSION_WAIT, CodeToolHost, DEFAULT_OUTPUT_BYTES, DEFAULT_TIMEOUT_MS, PROGRAM_WORKERS, closed};
 use crate::agent::ToolHost;
 use crate::agent::tools::{BoxFuture, ToolCallContext};
-use crate::programs::{ProgramError, ProgramManifest, ProgramScope, ProgramStore};
+use crate::programs::project::{ProgramFiles, ProjectPrograms};
+use crate::programs::{Listing, ProgramError, ProgramManifest, ProgramScope, ProgramStore, SavedProgram};
 
 /// Code mode plus the three saved-program tools for one session.
 #[derive(Clone)]
 pub struct ProgramToolHost {
     code: CodeToolHost,
     programs: Arc<ProgramStore>,
+    project: Option<Arc<ProjectPrograms>>,
 }
 
 impl ProgramToolHost {
-    /// Attach a Git-backed store to a session's code tool host.
+    /// Attach the user's program store to a session's code tool host. Without
+    /// [`ProgramToolHost::with_project`], the session has no project programs.
     #[must_use]
     pub fn new(code: CodeToolHost, programs: Arc<ProgramStore>) -> Self {
-        Self { code, programs }
+        Self { code, programs, project: None }
+    }
+
+    /// Adds the project's programs, read and written through the session's workspace.
+    #[must_use]
+    pub fn with_project(mut self, project: ProjectPrograms) -> Self {
+        self.project = Some(Arc::new(project));
+        self
+    }
+
+    fn project(&self) -> Result<&ProjectPrograms, ProtoError> {
+        self.project.as_deref().ok_or_else(|| ProtoError::new(ErrorCode::NotFound, "this session has no project programs"))
+    }
+
+    /// Runs a blocking store operation off the async runtime.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&ProgramStore) -> Result<T, ProgramError> + Send + 'static,
+    ) -> Result<T, ProtoError> {
+        let programs = Arc::clone(&self.programs);
+        tokio::task::spawn_blocking(move || operation(&programs)).await.map_err(|_| unavailable())?.map_err(program_error)
+    }
+
+    async fn load(&self, scope: ProgramScope, slug: String) -> Result<SavedProgram, ProtoError> {
+        match scope {
+            ProgramScope::User => self.blocking(move |programs| programs.load(ProgramScope::User, &slug)).await,
+            ProgramScope::Project => {
+                let project = self.project()?;
+                let manifest = project
+                    .manifest(&slug)
+                    .await
+                    .map_err(program_error)?
+                    .ok_or_else(|| program_error(ProgramError::Missing(slug.clone())))?;
+                let language = ProgramStore::parse_manifest(&manifest).map_err(program_error)?.language;
+                let files = project.load(&slug, manifest, language).await.map_err(program_error)?;
+                self.blocking(move |programs| programs.assemble(ProgramScope::Project, &slug, &files)).await
+            }
+        }
     }
 
     async fn save(&self, arguments: Value) -> Result<ToolResult, ProtoError> {
@@ -43,22 +83,46 @@ impl ProgramToolHost {
         args.manifest.provenance.session_id.clone_from(&self.code.shared.session_id);
         args.manifest.provenance.turn = self.code.shared.turn;
         args.manifest.tools = aim_coderun::runtime::referenced_tools(&args.source)?;
-        let programs = Arc::clone(&self.programs);
-        let saved = tokio::task::spawn_blocking(move || {
-            args.manifest.id =
-                programs.load(args.scope, &args.slug).map_or_else(|_| Uuid::now_v7().to_string(), |previous| previous.manifest.id);
-            programs.save(args.scope, &args.slug, &args.manifest, &args.source)
-        })
-        .await
-        .map_err(|_| unavailable())?
-        .map_err(program_error)?;
+        args.manifest.id =
+            self.load(args.scope, args.slug.clone()).await.map_or_else(|_| Uuid::now_v7().to_string(), |previous| previous.manifest.id);
+        let saved = match args.scope {
+            ProgramScope::User => {
+                self.blocking(move |programs| programs.save(ProgramScope::User, &args.slug, &args.manifest, &args.source)).await?
+            }
+            ProgramScope::Project => {
+                let manifest = ProgramStore::render(&args.manifest, &args.source).map_err(program_error)?;
+                let files = ProgramFiles { manifest, source: args.source, readme: ProgramStore::readme(&args.slug, &args.manifest) };
+                let stored = self.project()?.save(&args.slug, files, args.manifest.language).await.map_err(program_error)?;
+                let slug = args.slug;
+                self.blocking(move |programs| {
+                    let mut saved = programs.assemble(ProgramScope::Project, &slug, &stored)?;
+                    programs.trust_hash(&saved.sha256)?;
+                    saved.trusted = true;
+                    Ok(saved)
+                })
+                .await?
+            }
+        };
         Ok(ToolResult::text(json!({"slug":saved.slug,"scope":saved.scope,"sha256":saved.sha256}).to_string()))
     }
 
     async fn list(&self) -> Result<ToolResult, ProtoError> {
-        let programs = Arc::clone(&self.programs);
-        let saved = tokio::task::spawn_blocking(move || programs.list()).await.map_err(|_| unavailable())?.map_err(program_error)?;
-        let descriptions: Vec<Value> = saved
+        let Listing { mut programs, mut problems } = self.blocking(ProgramStore::list).await?;
+        if let Some(project) = self.project.as_deref() {
+            match project.slugs().await {
+                Ok(slugs) => {
+                    for slug in slugs {
+                        match self.load(ProgramScope::Project, slug.clone()).await {
+                            Ok(program) => programs.push(program),
+                            Err(error) => problems.push(format!("project program `{slug}`: {}", error.message)),
+                        }
+                    }
+                }
+                Err(error) => problems.push(format!("project programs: {error}")),
+            }
+        }
+        programs.sort_by(|a, b| (a.scope != ProgramScope::Project, &a.slug).cmp(&(b.scope != ProgramScope::Project, &b.slug)));
+        let descriptions: Vec<Value> = programs
             .iter()
             .map(|program| {
                 json!({"slug":program.slug,"scope":program.scope,"name":program.manifest.name,
@@ -66,16 +130,15 @@ impl ProgramToolHost {
                     "trusted":program.trusted,"sha256":program.sha256})
             })
             .collect();
-        Ok(ToolResult::text(Value::Array(descriptions).to_string()))
+        if problems.is_empty() {
+            return Ok(ToolResult::text(Value::Array(descriptions).to_string()));
+        }
+        Ok(ToolResult::text(json!({"programs": descriptions, "skipped": problems}).to_string()))
     }
 
     async fn run(&self, arguments: Value) -> Result<ToolResult, ProtoError> {
         let args: RunArgs = serde_json::from_value(arguments).map_err(|_| invalid("invalid run_program arguments"))?;
-        let programs = Arc::clone(&self.programs);
-        let saved = tokio::task::spawn_blocking(move || programs.load(args.scope, &args.slug))
-            .await
-            .map_err(|_| unavailable())?
-            .map_err(program_error)?;
+        let saved = self.load(args.scope, args.slug).await?;
         if !saved.trusted {
             return Err(ProtoError::new(ErrorCode::Denied, "program content hash is not trusted"));
         }
@@ -241,6 +304,7 @@ fn validate_schema(schema: &Value, value: &Value, depth: usize) -> Result<(), Pr
 fn program_error(error: ProgramError) -> ProtoError {
     match error {
         ProgramError::Invalid(message) => ProtoError::new(ErrorCode::InvalidParams, message),
+        ProgramError::Denied(message) => ProtoError::new(ErrorCode::Denied, message),
         ProgramError::Missing(_) => ProtoError::new(ErrorCode::NotFound, "program not found"),
         _ => unavailable(),
     }

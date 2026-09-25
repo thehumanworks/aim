@@ -211,7 +211,21 @@ async fn nested_call(bridges: Arc<Bridges>, call: ToolCall) -> Result<ToolCallRe
         Finished { context, call_id: call_id.clone(), name: call.name.clone(), result: None }
     });
     let span = tracing::info_span!("code_nested_tool", cell_id = %call.cell_id, call_id = call.call_id, tool = %call.name);
-    let result = bridge.host.call(call.name, call.arguments, IdempotencyKey::new(call_id)).instrument(span).await;
+    // The nested call runs as a call of its own turn, so a host that makes further calls (a
+    // subagent) names this one as their parent.
+    let child = finished.as_ref().map(|finished| ToolCallContext {
+        call_id: call_id.clone(),
+        events: finished.context.events.clone(),
+        cancel: finished.context.cancel.clone(),
+    });
+    let key = IdempotencyKey::new(call_id);
+    let result = match child {
+        Some(child) => {
+            let future = child.enter(|| bridge.host.call(call.name, call.arguments, key));
+            child.scope(future.instrument(span)).await
+        }
+        None => bridge.host.call(call.name, call.arguments, key).instrument(span).await,
+    };
     if let Some(finished) = finished.as_mut() {
         finished.result = Some(match &result {
             Ok(result) => result.clone(),

@@ -274,10 +274,10 @@ impl CodeToolHost {
     fn prune_finished(&self) {
         let mut cells = locked(&self.shared.cells);
         let mut finished: Vec<(String, bool)> = Vec::new();
-        let now = Instant::now();
+        let stale = Instant::now().checked_sub(Duration::from_secs(600));
         for (id, cell) in cells.iter() {
             if cell.record.is_done() {
-                finished.push((id.clone(), cell.record.finished_before(now - Duration::from_secs(600))));
+                finished.push((id.clone(), stale.is_some_and(|cutoff| cell.record.finished_before(cutoff))));
             }
         }
         // UUIDv7 ids sort by creation time.

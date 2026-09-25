@@ -185,7 +185,7 @@ fn manifest(grants: &[&str]) -> Value {
 async fn saved_program_runs_with_intersected_tool_grants() {
     let temporary = tempfile::tempdir().expect("temporary program root");
     let (_, code) = host(CodeMode::RunCode);
-    let store = Arc::new(ProgramStore::new(temporary.path().join("programs"), None));
+    let store = Arc::new(ProgramStore::new(temporary.path().join("programs")));
     let host = ProgramToolHost::new(code, Arc::clone(&store));
     let source = "export default async function main(args) { const a = await tools.first_number({}); return Number(a.content[0].text) + args.delta; }";
     let saved = host
@@ -213,7 +213,7 @@ async fn saved_program_runs_with_intersected_tool_grants() {
 async fn program_grants_only_narrow() {
     let temporary = tempfile::tempdir().expect("temporary program root");
     let (scripted, code) = host(CodeMode::RunCode);
-    let host = ProgramToolHost::new(code, Arc::new(ProgramStore::new(temporary.path().join("programs"), None)));
+    let host = ProgramToolHost::new(code, Arc::new(ProgramStore::new(temporary.path().join("programs"))));
     // It references two session tools but was granted one; the other is refused at call time.
     let source = "export default async function main(args) { const a = await tools.first_number({}); let refused = false; try { await tools.side_effect({}); } catch (e) { refused = true; } return refused ? Number(a.content[0].text) + args.delta : -1; }";
     host.call(
@@ -506,7 +506,7 @@ async fn run_code_behind_a_long_cell_is_told_busy_instead_of_waiting_silently() 
 async fn program_workers_are_capped_per_session() {
     let temporary = tempfile::tempdir().expect("temporary program root");
     let (_, code) = host(CodeMode::RunCode);
-    let host = ProgramToolHost::new(code, Arc::new(ProgramStore::new(temporary.path().join("programs"), None)));
+    let host = ProgramToolHost::new(code, Arc::new(ProgramStore::new(temporary.path().join("programs"))));
     let source = "export default async function main(args) { await new Promise(r => setTimeout(r, 30000)); return args.delta; }";
     host.call(
         "save_program".into(),
@@ -548,4 +548,72 @@ async fn a_queued_cell_merges_its_store_instead_of_overwriting_it() {
     }
     let both = exec(&host, "text(JSON.stringify([load('a') ?? null, load('b') ?? null]));").await.unwrap();
     assert_eq!(both.trim(), "[1,2]");
+}
+
+// REV13a L5: project programs are plain files, written and read through the workspace.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn project_programs_are_plain_files_written_through_the_workspace() {
+    use aim::harness::HarnessClient;
+    use aim::programs::project::ProjectPrograms;
+    use aim::resources::files::{Files, HarnessFiles};
+
+    let aimx = PathBuf::from(env!("CARGO_BIN_EXE_aim")).with_file_name("aimx");
+    assert!(aimx.exists(), "build aimx first (`cargo build -p aimx`)");
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let root = workspace.path().canonicalize().expect("canonical workspace");
+    let user = tempfile::tempdir().expect("temporary user programs");
+    let harness = Arc::new(HarnessClient::spawn_stdio(&aimx.to_string_lossy(), &root.to_string_lossy()).await.expect("aimx starts"));
+    let files: Arc<dyn Files> = Arc::new(HarnessFiles::new(harness.peer().clone(), harness.workspace().id.clone()));
+    let tools: Arc<dyn ToolHost> = Arc::clone(&harness) as Arc<dyn ToolHost>;
+    let code = CodeToolHost::new(Arc::clone(&tools), worker(), "test-session", CodeMode::RunCode);
+    let host = ProgramToolHost::new(code, Arc::new(ProgramStore::new(user.path().join("programs"))))
+        .with_project(ProjectPrograms::new(Arc::clone(&files), Arc::clone(&tools)));
+    let source = "export default async function main(args) { return 41 + args.delta; }";
+    host.call(
+        "save_program".into(),
+        json!({"scope":"project","slug":"answer","manifest":manifest(&[]),"source":source}),
+        IdempotencyKey::new("save"),
+    )
+    .await
+    .expect("a project program is saved through the workspace");
+    let directory = root.join(".agents/programs/answer");
+    assert_eq!(std::fs::read_to_string(directory.join("main.js")).unwrap_or_default(), source);
+    assert!(directory.join("program.toml").is_file() && directory.join("README.md").is_file());
+    assert!(!root.join(".agents/programs/.git").exists(), "no nested Git repository");
+    let run = host
+        .call("run_program".into(), json!({"scope":"project","slug":"answer","params":{"delta":1}}), IdempotencyKey::new("run"))
+        .await
+        .expect("the saved program runs");
+    assert_eq!(result_text(&run).trim(), "42");
+    let listed = host.call("list_programs".into(), json!({}), IdempotencyKey::new("list")).await.expect("programs list");
+    assert!(result_text(&listed).contains("\"slug\":\"answer\"") && result_text(&listed).contains("\"trusted\":true"));
+    // An edit outside save_program makes it untrusted, so it no longer runs.
+    std::fs::write(directory.join("main.js"), "export default async function main() { return 0; }").expect("edit");
+    let refused = host
+        .call("run_program".into(), json!({"scope":"project","slug":"answer","params":{"delta":1}}), IdempotencyKey::new("again"))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Denied);
+    // A session that may not write files cannot save one either.
+    let read_only = {
+        let tools: Arc<dyn ToolHost> = Arc::new(Scripted::default());
+        let code = CodeToolHost::new(Arc::clone(&tools), worker(), "read-only", CodeMode::RunCode);
+        ProgramToolHost::new(code, Arc::new(ProgramStore::new(user.path().join("other-programs"))))
+            .with_project(ProjectPrograms::new(Arc::clone(&files), tools))
+    };
+    let denied = read_only
+        .call(
+            "save_program".into(),
+            json!({"scope":"project","slug":"other","manifest":manifest(&[]),"source":source}),
+            IdempotencyKey::new("denied"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, ErrorCode::Denied, "{denied:?}");
+    assert!(!root.join(".agents/programs/other").exists());
+    drop((host, read_only, tools));
+    if let Ok(harness) = Arc::try_unwrap(harness) {
+        harness.shutdown().await;
+    }
 }
