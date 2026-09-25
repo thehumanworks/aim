@@ -3,7 +3,7 @@ version = 1
 hardware = "macOS arm64, report host details in each result"
 topology = "local, loopback HTTP recording proxy, fresh git worktree per run"
 permissions = "workspace read/write/exec; no hosted search; no network tool"
-aim_code_mode = "aim's default (off since T4b, ADR 0076) unless an arm sets AIM_CODE_MODE; the aim-coderun worker is built and explicitly selected"
+aim_code_mode = "aim's default (on, ADR 0076 §6) unless an arm sets AIM_CODE_MODE; the aim-coderun worker is built and explicitly selected"
 cache_state = "fresh isolated HOME per trial; one recorded mock prewarm per harness before timed trials"
 token_estimate = "ceil(uncompressed request JSON bytes / 4); provider usage is separate"
 
@@ -15,15 +15,14 @@ harnesses = ["aim_openrouter", "codex", "pi"]
 optional_harnesses = ["omp", "unreal"] # require pinned local artifacts supplied to run.py
 max_concurrency = 1
 prewarm_mock_runs = 1
-# The gate's current-main baseline (T4b, recorded at 7afcf10 with the default code mode, off).
+# The gate's current-main baseline (T4b, recorded at 477cdef with the default code mode, on).
 baseline = "results/t4b-main-baseline.json"
-# W1 is 8,112 bytes: W26's 5,844 plus ADR 0064's UI tools, T3's prompt line, ADR 0076's code tool
-# description and the default's move to off, without the code-mode prompt section that only
-# code-mode sessions get (bench/README.md, "Wire gate repair"). 48 bytes of room: any new tool or
-# prompt line needs this number changed in review.
-aim_w1_max_bytes = 8160
+# W1 is 7,745 bytes: W26's 5,844 plus ADR 0064's UI tools, T3's prompt line, and ADR 0076's code
+# tool description and code-mode prompt section (bench/README.md, "Wire gate repair"). 48 bytes of
+# room: any new tool or prompt line needs this number changed in review.
+aim_w1_max_bytes = 7793
 aim_w2_max_tool_output_chars = 12088
-aim_expected_tools = 15 # 11 direct tools with code mode off, and ADR 0064's four ui_* tools
+aim_expected_tools = 14 # code mode on: 6 direct tools, run_code, 3 program tools, 4 ui_* tools
 aim_max_auxiliary_requests = 1
 
 [[wire.case]]
