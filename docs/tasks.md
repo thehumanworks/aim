@@ -21,13 +21,13 @@ client still builds.
 
 | ID | Task | Status | Now | Next | Branch / worktree |
 |---|---|---|---|---|---|
-| T0 | Base: merge FIX16 (`agent/claude/fix16-coderun`) and W26 (`agent/perf/tokens`) as-is (maintainer decision) | in progress | Merged (`eda6444`, `36f1bd8`); conflicts resolved in event.rs, session.rs, agent/mod.rs, agent/tools.rs, host.rs; clippy and xtask green | Workspace tests on the merged tree | integration branch |
-| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | todo | Brief written | Launch worker | `agent/claude/tui-options` · `../aim-wt/tui-options` |
+| T0 | Base: merge FIX16 (`agent/claude/fix16-coderun`) and W26 (`agent/perf/tokens`) as-is (maintainer decision) | done | Merged (`eda6444`, `36f1bd8`); conflicts resolved in event.rs, session.rs, agent/mod.rs, agent/tools.rs, host.rs; clippy, xtask and 963/963 tests green | — | integration branch |
+| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | in progress | Worker running | Review its report, merge | `agent/claude/tui-options` · `../aim-wt/tui-options` |
 | T2 | `/clear` clears the chat and starts fresh | todo | Folded into T1 (same files) | — | with T1 |
-| T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | todo | Brief written | Launch worker | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
-| T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | todo | Brief written | Launch worker | `agent/claude/code-mode` · `../aim-wt/code-mode` |
+| T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | in progress | Worker running | Review its report, merge | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
+| T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | in progress | Worker running | Review its report, merge, then T4b | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default | todo | Waits for T4a | — | — |
-| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | todo | Brief written | Launch worker | `agent/claude/acp-models` · `../aim-wt/acp-models` |
+| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | in progress | Worker running | Review its report, merge | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
 | T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
 
@@ -64,3 +64,4 @@ client still builds.
   `.claude/hooks/no-nested-agents.py` (verified live: a sub-agent's Agent call was refused).
 - 2026-09-25 — FIX16's scheduler runs at most one cell per session by design (REV13a H1); in code
   mode, parallelism is `Promise.all` inside a cell. Kept; the scheduler moves to the kernel (T3).
+- 2026-09-25 — Merged base green (963 tests). Four workers launched (T1, T3, T4a, T5), Opus, one worktree each.
