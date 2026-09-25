@@ -683,7 +683,7 @@ impl Conn {
         let grant = ws.grant.clone();
         let cwd = grant.exec_path(params.cwd.as_deref().unwrap_or(""))?;
         let max_processes = usize::try_from(grant.limits().map_or(u32::MAX, |limits| limits.max_processes)).unwrap_or(usize::MAX);
-        let push_bytes = output_cap(&grant)?;
+        let push_bytes = grant.limits().map_or(u64::MAX, |limits| limits.max_output_bytes);
         if ws.backend.exec().is_none() {
             return Err(ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"));
         }
@@ -710,8 +710,11 @@ impl Conn {
                 Err(err) => return Ok(Err(err)),
             };
             owner.procs.insert_at(proc.clone(), target.id.clone(), cwd, &target.grant, slot);
-            // Pushed output honours the spawning call's output limit, per batch (ADR 0067).
-            owner.forward(Arc::clone(&target.backend), proc.clone(), push_bytes);
+            // Pushed output honours the spawning call's output limit, per batch (ADR 0067); an
+            // authority that permits no output bytes gets none pushed.
+            if push_bytes > 0 {
+                owner.forward(Arc::clone(&target.backend), proc.clone(), push_bytes);
+            }
             Ok(Ok(ExecSpawnResult { proc }))
         })
         .await?
