@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead as _, Write as _};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::process::{Command as SyncCommand, Stdio};
 use std::sync::Arc;
@@ -87,14 +87,23 @@ impl AskpassScript {
     fn create() -> Result<Self, String> {
         let home = std::env::var_os("HOME").ok_or("HOME is unset")?;
         let dir = PathBuf::from(home).join(".aim/ssh");
-        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|err| err.to_string())?;
-        let path = dir.join(format!("askpass-{}.sh", std::process::id()));
+        Self::create_in(&dir)
+    }
+
+    fn create_in(dir: &std::path::Path) -> Result<Self, String> {
+        std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+        let metadata = std::fs::symlink_metadata(dir).map_err(|err| err.to_string())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != rustix::process::getuid().as_raw() {
+            return Err("askpass directory is not private".to_owned());
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|err| err.to_string())?;
+        let path = dir.join(format!("askpass-{}.sh", crate::id::random_hex()));
+        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o700).open(&path).map_err(|err| err.to_string())?;
+        let script = Self { path };
         let exe = std::env::current_exe().map_err(|err| err.to_string())?;
-        std::fs::write(&path, format!("#!/bin/sh\nexec {} askpass \"$@\"\n", quote(&exe.to_string_lossy())))
-            .map_err(|err| err.to_string())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(|err| err.to_string())?;
-        Ok(Self { path })
+        write!(file, "#!/bin/sh\nexec {} askpass \"$@\"\n", quote(&exe.to_string_lossy())).map_err(|err| err.to_string())?;
+        file.flush().map_err(|err| err.to_string())?;
+        Ok(script)
     }
 }
 
@@ -160,4 +169,32 @@ async fn serve_agentless(connection: Connection, options: &ForwardOptions) -> Re
     let server = Server::new_agentless(ServerConfig::new(principal, protected), Arc::new(workspace));
     server.serve_stdio().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::AskpassScript;
+
+    #[test]
+    fn askpass_script_does_not_follow_existing_symlink() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let target = dir.path().join("sentinel");
+        std::fs::write(&target, "keep").expect("write sentinel");
+        symlink(&target, dir.path().join(format!("askpass-{}.sh", std::process::id()))).expect("create old predictable link");
+        let script = AskpassScript::create_in(dir.path()).expect("create askpass");
+        assert_ne!(script.path, dir.path().join(format!("askpass-{}.sh", std::process::id())));
+        assert_eq!(std::fs::read_to_string(target).expect("read sentinel"), "keep");
+    }
+
+    #[test]
+    fn askpass_rejects_symlinked_directory() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let actual = dir.path().join("actual");
+        std::fs::create_dir(&actual).expect("create directory");
+        let link = dir.path().join("link");
+        symlink(actual, &link).expect("create directory symlink");
+        assert!(AskpassScript::create_in(&link).is_err());
+    }
 }
