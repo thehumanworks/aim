@@ -18,7 +18,7 @@ Existing public Rust API, protocol types, persisted formats, and policy defaults
 
 - The new live tests reproduced B1, B2, M1–M9 and the relevant minors against the original slice before implementation. The sandbox probe also demonstrated that the prior local/remote assertion was not a real filesystem boundary.
 - `mise run check`: passed after integration and rebase (rustfmt, verusfmt, workspace Clippy with `-D warnings`, workspace tests, `cargo xtask check`).
-- `mise exec -- cargo test -p aimx -- --ignored live_`: **32 passed, 0 failed** (31 SSH library smoke tests and one binary conformance test). This includes a real OpenRouter remote edit/exec path, resident reconnect, agentless fallback, askpass, tampering, and filesystem isolation. A separate launch test refuses a replaced resident binary before execution.
+- `mise exec -- cargo test -p aimx -- --ignored live_`: **33 passed, 0 failed** (31 SSH smoke tests, one MCP smoke test from current `main`, and one binary conformance test). This includes a real OpenRouter remote edit/exec path, resident reconnect, agentless fallback, askpass, tampering, and filesystem isolation. A separate launch test refuses a replaced resident binary before execution.
 - Localhost SSH performance test: 4 MiB read **165 ms**, listing 100 files **54 ms**. The review's original probes measured 4.84 s and 5.33 s on their respective fixtures; these are local measurements, not a network RTT claim.
 - An intermediate smoke attempt found a test-filter bug in the sandbox child probe, which was fixed. Another attempt saw one temporary sshd startup failure under parallel load; its targeted retry and the final full smoke run passed. The test harness uses isolated temporary configuration and keys.
 
