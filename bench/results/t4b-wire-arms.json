@@ -1,14 +1,14 @@
 {
   "binary_sha256": {
-    "aim": "8a82a9ea4059b968fdca29dbb2664bd373968dc58b3fd2c16527fc886fd42bfe",
-    "aim_coderun": "dadb0f55ab3d56c06d2c20c83fd93cb43878bb6fff45ae0ee43b91719770c448",
-    "aimx": "65b6d2ffa8260f7289dde8855b0c97c1dcd666eed06153e507cd18413d341dac",
+    "aim": "0fb2b27a65d50f72384934690ac912aaa91e7f73cc88c6a22848d903425f27ac",
+    "aim_coderun": "95182e41f2c35835695f318ffd5ab836af354eaf821338bc9720f4e115f0e8df",
+    "aimx": "fae8bd58a1f76b8cc71937ca91203630d324b2f8c0bad2d464911e8e250e891a",
     "codex": "8b93eddd656ee85e07785fed7b0c6f445491abfba80d52e278d0afd1fe680a4e",
     "pi": "0fcda879f854b95368a4c217782a78808f7fea61cf60cc1e6fbec4f5b5d700f9",
     "python": "ab15cbe78b02b5fc939765827e0b1c2dc3668def22c6952f06a369bfbde01163"
   },
   "budget_used_including_transport_reserve_usd": 0.0,
-  "finished_unix": 1790353858.1680892,
+  "finished_unix": 1790354710.5166059,
   "hardware": {
     "machine": "arm64",
     "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
@@ -25,10 +25,10 @@
       "effort": "low",
       "exit_code": 0,
       "failed_tools_by_name": {},
-      "first_request_bytes": 8353,
-      "first_request_instructions_chars": 1820,
-      "first_request_ms": 25.46,
-      "first_request_tokens_estimate": 2089,
+      "first_request_bytes": 8112,
+      "first_request_instructions_chars": 1579,
+      "first_request_ms": 27.89,
+      "first_request_tokens_estimate": 2028,
       "first_request_tool_schema_bytes": [
         {
           "bytes": 649,
@@ -93,19 +93,19 @@
       ],
       "first_request_tools": 15,
       "first_request_tools_json_bytes": 6164,
-      "first_token_ms": 40.5,
+      "first_token_ms": 46.96,
       "harness": "aim_openrouter@off",
-      "harness_peak_rss_mb": 26.98,
-      "helpers_peak_rss_mb": 15.89,
+      "harness_peak_rss_mb": 27.34,
+      "helpers_peak_rss_mb": 15.93,
       "http_exchanges": 2,
-      "ite": 2094.0,
+      "ite": 2033.0,
       "max_tool_output_chars": 0,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 44.12,
+      "peak_rss_mb": 44.37,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -114,12 +114,12 @@
       "read_failure_classes": {},
       "repetition": -1,
       "request_json_bytes": [
-        8353
+        8112
       ],
       "request_lcp_bytes": [],
       "request_response_sizes": [
         [
-          8353,
+          8112,
           515
         ]
       ],
@@ -128,7 +128,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2089,
+          "input_tokens": 2028,
           "output_tokens": 1,
           "reasoning_tokens": 0
         }
@@ -149,11 +149,11 @@
         "cache_write_tokens": 0,
         "cached_tokens": 0,
         "cost_usd": 0.0,
-        "input_tokens": 2089,
+        "input_tokens": 2028,
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 68.64
+      "wall_ms": 78.44
     },
     {
       "append_only_steps": 0,
@@ -166,7 +166,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 7745,
       "first_request_instructions_chars": 1820,
-      "first_request_ms": 25.91,
+      "first_request_ms": 28.6,
       "first_request_tokens_estimate": 1937,
       "first_request_tool_schema_bytes": [
         {
@@ -228,10 +228,10 @@
       ],
       "first_request_tools": 14,
       "first_request_tools_json_bytes": 5556,
-      "first_token_ms": 41.815,
+      "first_token_ms": 47.062,
       "harness": "aim_openrouter@on",
-      "harness_peak_rss_mb": 27.26,
-      "helpers_peak_rss_mb": 15.81,
+      "harness_peak_rss_mb": 27.51,
+      "helpers_peak_rss_mb": 16.01,
       "http_exchanges": 2,
       "ite": 1942.0,
       "max_tool_output_chars": 0,
@@ -240,7 +240,7 @@
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 44.27,
+      "peak_rss_mb": 44.63,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -288,7 +288,7 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 70.38
+      "wall_ms": 79.17
     },
     {
       "append_only_steps": 0,
@@ -301,7 +301,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 4998,
       "first_request_instructions_chars": 1820,
-      "first_request_ms": 25.31,
+      "first_request_ms": 29.34,
       "first_request_tokens_estimate": 1250,
       "first_request_tool_schema_bytes": [
         {
@@ -323,10 +323,10 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 2809,
-      "first_token_ms": 41.283,
+      "first_token_ms": 50.203,
       "harness": "aim_openrouter@only",
-      "harness_peak_rss_mb": 27.31,
-      "helpers_peak_rss_mb": 15.88,
+      "harness_peak_rss_mb": 27.39,
+      "helpers_peak_rss_mb": 16.02,
       "http_exchanges": 2,
       "ite": 1255.0,
       "max_tool_output_chars": 0,
@@ -335,7 +335,7 @@
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 44.29,
+      "peak_rss_mb": 44.68,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -383,7 +383,7 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 69.33
+      "wall_ms": 82.73
     }
   ],
   "recorded_spend_usd": 0.0,
@@ -397,10 +397,10 @@
       "effort": "low",
       "exit_code": 0,
       "failed_tools_by_name": {},
-      "first_request_bytes": 8353,
-      "first_request_instructions_chars": 1820,
-      "first_request_ms": 26.04,
-      "first_request_tokens_estimate": 2089,
+      "first_request_bytes": 8112,
+      "first_request_instructions_chars": 1579,
+      "first_request_ms": 29.17,
+      "first_request_tokens_estimate": 2028,
       "first_request_tool_schema_bytes": [
         {
           "bytes": 649,
@@ -465,19 +465,19 @@
       ],
       "first_request_tools": 15,
       "first_request_tools_json_bytes": 6164,
-      "first_token_ms": 40.368,
+      "first_token_ms": 51.671,
       "harness": "aim_openrouter@off",
-      "harness_peak_rss_mb": 27.31,
-      "helpers_peak_rss_mb": 15.79,
+      "harness_peak_rss_mb": 27.23,
+      "helpers_peak_rss_mb": 15.96,
       "http_exchanges": 2,
-      "ite": 2094.0,
+      "ite": 2033.0,
       "max_tool_output_chars": 0,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 44.17,
+      "peak_rss_mb": 44.4,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -486,12 +486,12 @@
       "read_failure_classes": {},
       "repetition": 0,
       "request_json_bytes": [
-        8353
+        8112
       ],
       "request_lcp_bytes": [],
       "request_response_sizes": [
         [
-          8353,
+          8112,
           515
         ]
       ],
@@ -500,7 +500,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2089,
+          "input_tokens": 2028,
           "output_tokens": 1,
           "reasoning_tokens": 0
         }
@@ -521,11 +521,11 @@
         "cache_write_tokens": 0,
         "cached_tokens": 0,
         "cost_usd": 0.0,
-        "input_tokens": 2089,
+        "input_tokens": 2028,
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 69.21
+      "wall_ms": 84.36
     },
     {
       "append_only_steps": 0,
@@ -538,7 +538,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 7745,
       "first_request_instructions_chars": 1820,
-      "first_request_ms": 25.66,
+      "first_request_ms": 28.62,
       "first_request_tokens_estimate": 1937,
       "first_request_tool_schema_bytes": [
         {
@@ -600,10 +600,10 @@
       ],
       "first_request_tools": 14,
       "first_request_tools_json_bytes": 5556,
-      "first_token_ms": 39.688,
+      "first_token_ms": 45.23,
       "harness": "aim_openrouter@on",
-      "harness_peak_rss_mb": 27.25,
-      "helpers_peak_rss_mb": 15.83,
+      "harness_peak_rss_mb": 27.51,
+      "helpers_peak_rss_mb": 15.89,
       "http_exchanges": 2,
       "ite": 1942.0,
       "max_tool_output_chars": 0,
@@ -612,7 +612,7 @@
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 44.34,
+      "peak_rss_mb": 44.47,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -660,7 +660,7 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 67.97
+      "wall_ms": 77.0
     },
     {
       "append_only_steps": 0,
@@ -673,7 +673,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 4998,
       "first_request_instructions_chars": 1820,
-      "first_request_ms": 25.1,
+      "first_request_ms": 28.44,
       "first_request_tokens_estimate": 1250,
       "first_request_tool_schema_bytes": [
         {
@@ -695,10 +695,10 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 2809,
-      "first_token_ms": 39.717,
+      "first_token_ms": 47.178,
       "harness": "aim_openrouter@only",
-      "harness_peak_rss_mb": 27.16,
-      "helpers_peak_rss_mb": 15.81,
+      "harness_peak_rss_mb": 27.38,
+      "helpers_peak_rss_mb": 15.91,
       "http_exchanges": 2,
       "ite": 1255.0,
       "max_tool_output_chars": 0,
@@ -707,7 +707,7 @@
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 44.24,
+      "peak_rss_mb": 44.53,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -755,7 +755,7 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 67.55
+      "wall_ms": 78.89
     },
     {
       "append_only_steps": 1,
@@ -768,7 +768,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 7771,
       "first_request_instructions_chars": 1820,
-      "first_request_ms": 25.32,
+      "first_request_ms": 27.53,
       "first_request_tokens_estimate": 1943,
       "first_request_tool_schema_bytes": [
         {
@@ -830,10 +830,10 @@
       ],
       "first_request_tools": 14,
       "first_request_tools_json_bytes": 5556,
-      "first_token_ms": 39.579,
+      "first_token_ms": 48.216,
       "harness": "aim_openrouter@on",
-      "harness_peak_rss_mb": 28.15,
-      "helpers_peak_rss_mb": 17.66,
+      "harness_peak_rss_mb": 28.07,
+      "helpers_peak_rss_mb": 17.71,
       "http_exchanges": 3,
       "ite": 7304.0,
       "max_tool_output_chars": 11191,
@@ -842,7 +842,7 @@
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 47.05,
+      "peak_rss_mb": 47.02,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -910,7 +910,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 129.82
+      "wall_ms": 150.27
     },
     {
       "append_only_steps": 1,
@@ -923,7 +923,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 5024,
       "first_request_instructions_chars": 1820,
-      "first_request_ms": 25.33,
+      "first_request_ms": 28.2,
       "first_request_tokens_estimate": 1256,
       "first_request_tool_schema_bytes": [
         {
@@ -945,10 +945,10 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 2809,
-      "first_token_ms": 39.068,
+      "first_token_ms": 45.299,
       "harness": "aim_openrouter@only",
-      "harness_peak_rss_mb": 28.98,
-      "helpers_peak_rss_mb": 30.61,
+      "harness_peak_rss_mb": 29.07,
+      "helpers_peak_rss_mb": 30.57,
       "http_exchanges": 3,
       "ite": 11561.0,
       "max_tool_output_chars": 30147,
@@ -959,7 +959,7 @@
         "Bash": 1
       },
       "passed": true,
-      "peak_rss_mb": 60.95,
+      "peak_rss_mb": 60.98,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1028,7 +1028,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 631.83
+      "wall_ms": 391.0
     },
     {
       "append_only_steps": 1,
@@ -1039,10 +1039,10 @@
       "effort": "low",
       "exit_code": 0,
       "failed_tools_by_name": {},
-      "first_request_bytes": 8379,
-      "first_request_instructions_chars": 1820,
-      "first_request_ms": 24.83,
-      "first_request_tokens_estimate": 2095,
+      "first_request_bytes": 8138,
+      "first_request_instructions_chars": 1579,
+      "first_request_ms": 28.65,
+      "first_request_tokens_estimate": 2035,
       "first_request_tool_schema_bytes": [
         {
           "bytes": 649,
@@ -1107,19 +1107,19 @@
       ],
       "first_request_tools": 15,
       "first_request_tools_json_bytes": 6164,
-      "first_token_ms": 40.219,
+      "first_token_ms": 45.785,
       "harness": "aim_openrouter@off",
-      "harness_peak_rss_mb": 27.72,
-      "helpers_peak_rss_mb": 17.73,
+      "harness_peak_rss_mb": 27.77,
+      "helpers_peak_rss_mb": 17.83,
       "http_exchanges": 3,
-      "ite": 7608.0,
+      "ite": 7487.0,
       "max_tool_output_chars": 11191,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 46.74,
+      "peak_rss_mb": 46.91,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1128,19 +1128,19 @@
       "read_failure_classes": {},
       "repetition": 0,
       "request_json_bytes": [
-        8379,
-        22009
+        8138,
+        21768
       ],
       "request_lcp_bytes": [
-        8377
+        8136
       ],
       "request_response_sizes": [
         [
-          8379,
+          8138,
           637
         ],
         [
-          22009,
+          21768,
           515
         ]
       ],
@@ -1149,7 +1149,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2095,
+          "input_tokens": 2035,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1157,7 +1157,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 5503,
+          "input_tokens": 5442,
           "output_tokens": 1,
           "reasoning_tokens": 0
         }
@@ -1183,11 +1183,11 @@
         "cache_write_tokens": 0,
         "cached_tokens": 0,
         "cost_usd": 0.0,
-        "input_tokens": 7598,
+        "input_tokens": 7477,
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 129.61
+      "wall_ms": 151.08
     },
     {
       "append_only_steps": 1,
@@ -1200,7 +1200,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 5015,
       "first_request_instructions_chars": 1820,
-      "first_request_ms": 25.47,
+      "first_request_ms": 28.28,
       "first_request_tokens_estimate": 1254,
       "first_request_tool_schema_bytes": [
         {
@@ -1222,9 +1222,9 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 2809,
-      "first_token_ms": 39.273,
+      "first_token_ms": 45.683,
       "harness": "aim_openrouter@only",
-      "harness_peak_rss_mb": 29.03,
+      "harness_peak_rss_mb": 28.69,
       "helpers_peak_rss_mb": 30.21,
       "http_exchanges": 3,
       "ite": 10484.0,
@@ -1236,7 +1236,7 @@
         "Bash": 1
       },
       "passed": true,
-      "peak_rss_mb": 60.34,
+      "peak_rss_mb": 60.31,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1305,7 +1305,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 132.85
+      "wall_ms": 152.8
     },
     {
       "append_only_steps": 1,
@@ -1316,10 +1316,10 @@
       "effort": "low",
       "exit_code": 0,
       "failed_tools_by_name": {},
-      "first_request_bytes": 8370,
-      "first_request_instructions_chars": 1820,
-      "first_request_ms": 25.12,
-      "first_request_tokens_estimate": 2093,
+      "first_request_bytes": 8129,
+      "first_request_instructions_chars": 1579,
+      "first_request_ms": 28.22,
+      "first_request_tokens_estimate": 2033,
       "first_request_tool_schema_bytes": [
         {
           "bytes": 649,
@@ -1384,19 +1384,19 @@
       ],
       "first_request_tools": 15,
       "first_request_tools_json_bytes": 6164,
-      "first_token_ms": 39.099,
+      "first_token_ms": 46.122,
       "harness": "aim_openrouter@off",
-      "harness_peak_rss_mb": 27.66,
-      "helpers_peak_rss_mb": 17.19,
+      "harness_peak_rss_mb": 27.93,
+      "helpers_peak_rss_mb": 17.27,
       "http_exchanges": 3,
-      "ite": 7178.0,
+      "ite": 7058.0,
       "max_tool_output_chars": 11191,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 46.07,
+      "peak_rss_mb": 46.37,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1405,19 +1405,19 @@
       "read_failure_classes": {},
       "repetition": 0,
       "request_json_bytes": [
-        8370,
-        20299
+        8129,
+        20058
       ],
       "request_lcp_bytes": [
-        8368
+        8127
       ],
       "request_response_sizes": [
         [
-          8370,
+          8129,
           636
         ],
         [
-          20299,
+          20058,
           515
         ]
       ],
@@ -1426,7 +1426,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2093,
+          "input_tokens": 2033,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1434,7 +1434,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 5075,
+          "input_tokens": 5015,
           "output_tokens": 1,
           "reasoning_tokens": 0
         }
@@ -1460,11 +1460,11 @@
         "cache_write_tokens": 0,
         "cached_tokens": 0,
         "cost_usd": 0.0,
-        "input_tokens": 7168,
+        "input_tokens": 7048,
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 115.84
+      "wall_ms": 137.23
     },
     {
       "append_only_steps": 1,
@@ -1477,7 +1477,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 7762,
       "first_request_instructions_chars": 1820,
-      "first_request_ms": 24.74,
+      "first_request_ms": 28.83,
       "first_request_tokens_estimate": 1941,
       "first_request_tool_schema_bytes": [
         {
@@ -1539,10 +1539,10 @@
       ],
       "first_request_tools": 14,
       "first_request_tools_json_bytes": 5556,
-      "first_token_ms": 40.27,
+      "first_token_ms": 48.219,
       "harness": "aim_openrouter@on",
-      "harness_peak_rss_mb": 28.11,
-      "helpers_peak_rss_mb": 17.24,
+      "harness_peak_rss_mb": 28.05,
+      "helpers_peak_rss_mb": 17.38,
       "http_exchanges": 3,
       "ite": 6874.0,
       "max_tool_output_chars": 11191,
@@ -1551,7 +1551,7 @@
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 46.66,
+      "peak_rss_mb": 46.71,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1619,7 +1619,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 119.05
+      "wall_ms": 140.31
     },
     {
       "append_only_steps": 20,
@@ -1630,10 +1630,10 @@
       "effort": "low",
       "exit_code": 0,
       "failed_tools_by_name": {},
-      "first_request_bytes": 8393,
-      "first_request_instructions_chars": 1820,
-      "first_request_ms": 25.86,
-      "first_request_tokens_estimate": 2099,
+      "first_request_bytes": 8152,
+      "first_request_instructions_chars": 1579,
+      "first_request_ms": 29.93,
+      "first_request_tokens_estimate": 2038,
       "first_request_tool_schema_bytes": [
         {
           "bytes": 649,
@@ -1698,19 +1698,19 @@
       ],
       "first_request_tools": 15,
       "first_request_tools_json_bytes": 6164,
-      "first_token_ms": 39.003,
+      "first_token_ms": 45.416,
       "harness": "aim_openrouter@off",
       "harness_peak_rss_mb": 27.92,
-      "helpers_peak_rss_mb": 17.14,
+      "helpers_peak_rss_mb": 17.19,
       "http_exchanges": 22,
-      "ite": 55392.0,
+      "ite": 54126.0,
       "max_tool_output_chars": 220,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 46.38,
+      "peak_rss_mb": 46.45,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1719,133 +1719,133 @@
       "read_failure_classes": {},
       "repetition": 0,
       "request_json_bytes": [
-        8393,
-        8606,
-        8819,
-        9032,
-        9245,
-        9458,
-        9671,
-        9884,
-        10097,
-        10310,
-        10525,
-        10740,
-        10955,
-        11170,
-        11385,
-        11600,
-        11815,
-        12030,
-        12245,
-        12460,
-        12675
+        8152,
+        8365,
+        8578,
+        8791,
+        9004,
+        9217,
+        9430,
+        9643,
+        9856,
+        10069,
+        10284,
+        10499,
+        10714,
+        10929,
+        11144,
+        11359,
+        11574,
+        11789,
+        12004,
+        12219,
+        12434
       ],
       "request_lcp_bytes": [
-        8391,
-        8604,
-        8817,
-        9030,
-        9243,
-        9456,
-        9669,
-        9882,
-        10095,
-        10308,
-        10523,
-        10738,
-        10953,
-        11168,
-        11383,
-        11598,
-        11813,
-        12028,
-        12243,
-        12458
+        8150,
+        8363,
+        8576,
+        8789,
+        9002,
+        9215,
+        9428,
+        9641,
+        9854,
+        10067,
+        10282,
+        10497,
+        10712,
+        10927,
+        11142,
+        11357,
+        11572,
+        11787,
+        12002,
+        12217
       ],
       "request_response_sizes": [
         [
-          8393,
+          8152,
           629
         ],
         [
-          8606,
+          8365,
           629
         ],
         [
-          8819,
+          8578,
           629
         ],
         [
-          9032,
+          8791,
           629
         ],
         [
-          9245,
+          9004,
           629
         ],
         [
-          9458,
+          9217,
           629
         ],
         [
-          9671,
+          9430,
           629
         ],
         [
-          9884,
+          9643,
           629
         ],
         [
-          10097,
+          9856,
           629
         ],
         [
-          10310,
+          10069,
           632
         ],
         [
-          10525,
+          10284,
           632
         ],
         [
-          10740,
+          10499,
           632
         ],
         [
-          10955,
+          10714,
           632
         ],
         [
-          11170,
+          10929,
           632
         ],
         [
-          11385,
+          11144,
           632
         ],
         [
-          11600,
+          11359,
           632
         ],
         [
-          11815,
+          11574,
           632
         ],
         [
-          12030,
+          11789,
           632
         ],
         [
-          12245,
+          12004,
           632
         ],
         [
-          12460,
+          12219,
           632
         ],
         [
-          12675,
+          12434,
           517
         ]
       ],
@@ -1854,7 +1854,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2099,
+          "input_tokens": 2038,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1862,7 +1862,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2152,
+          "input_tokens": 2092,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1870,7 +1870,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2205,
+          "input_tokens": 2145,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1878,7 +1878,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2258,
+          "input_tokens": 2198,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1886,7 +1886,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2312,
+          "input_tokens": 2251,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1894,7 +1894,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2365,
+          "input_tokens": 2305,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1902,7 +1902,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2418,
+          "input_tokens": 2358,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1910,7 +1910,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2471,
+          "input_tokens": 2411,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1918,7 +1918,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2525,
+          "input_tokens": 2464,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1926,7 +1926,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2578,
+          "input_tokens": 2518,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1934,7 +1934,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2632,
+          "input_tokens": 2571,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1942,7 +1942,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2685,
+          "input_tokens": 2625,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1950,7 +1950,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2739,
+          "input_tokens": 2679,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1958,7 +1958,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2793,
+          "input_tokens": 2733,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1966,7 +1966,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2847,
+          "input_tokens": 2786,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1974,7 +1974,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2900,
+          "input_tokens": 2840,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1982,7 +1982,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 2954,
+          "input_tokens": 2894,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1990,7 +1990,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 3008,
+          "input_tokens": 2948,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -1998,7 +1998,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 3062,
+          "input_tokens": 3001,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -2006,7 +2006,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 3115,
+          "input_tokens": 3055,
           "output_tokens": 1,
           "reasoning_tokens": 0
         },
@@ -2014,7 +2014,7 @@
           "cache_write_tokens": 0,
           "cached_tokens": 0,
           "cost_usd": 0.0,
-          "input_tokens": 3169,
+          "input_tokens": 3109,
           "output_tokens": 1,
           "reasoning_tokens": 0
         }
@@ -2078,11 +2078,11 @@
         "cache_write_tokens": 0,
         "cached_tokens": 0,
         "cost_usd": 0.0,
-        "input_tokens": 55287,
+        "input_tokens": 54021,
         "output_tokens": 21,
         "reasoning_tokens": 0
       },
-      "wall_ms": 1034.86
+      "wall_ms": 1238.86
     },
     {
       "append_only_steps": 20,
@@ -2095,7 +2095,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 7785,
       "first_request_instructions_chars": 1820,
-      "first_request_ms": 24.97,
+      "first_request_ms": 28.51,
       "first_request_tokens_estimate": 1947,
       "first_request_tool_schema_bytes": [
         {
@@ -2157,10 +2157,10 @@
       ],
       "first_request_tools": 14,
       "first_request_tools_json_bytes": 5556,
-      "first_token_ms": 38.292,
+      "first_token_ms": 46.587,
       "harness": "aim_openrouter@on",
-      "harness_peak_rss_mb": 28.18,
-      "helpers_peak_rss_mb": 17.15,
+      "harness_peak_rss_mb": 28.2,
+      "helpers_peak_rss_mb": 17.19,
       "http_exchanges": 22,
       "ite": 52200.0,
       "max_tool_output_chars": 220,
@@ -2169,7 +2169,7 @@
       "nested_tool_calls": 0,
       "nested_tool_calls_by_name": {},
       "passed": true,
-      "peak_rss_mb": 46.66,
+      "peak_rss_mb": 46.69,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -2541,7 +2541,7 @@
         "output_tokens": 21,
         "reasoning_tokens": 0
       },
-      "wall_ms": 998.45
+      "wall_ms": 1195.88
     },
     {
       "append_only_steps": 20,
@@ -2554,7 +2554,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 5038,
       "first_request_instructions_chars": 1820,
-      "first_request_ms": 24.32,
+      "first_request_ms": 32.1,
       "first_request_tokens_estimate": 1260,
       "first_request_tool_schema_bytes": [
         {
@@ -2576,10 +2576,10 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 2809,
-      "first_token_ms": 39.649,
+      "first_token_ms": 46.216,
       "harness": "aim_openrouter@only",
-      "harness_peak_rss_mb": 28.62,
-      "helpers_peak_rss_mb": 30.1,
+      "harness_peak_rss_mb": 29.0,
+      "helpers_peak_rss_mb": 30.28,
       "http_exchanges": 22,
       "ite": 41558.0,
       "max_tool_output_chars": 240,
@@ -2590,7 +2590,7 @@
         "Bash": 20
       },
       "passed": true,
-      "peak_rss_mb": 60.1,
+      "peak_rss_mb": 60.64,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -2963,20 +2963,20 @@
         "output_tokens": 21,
         "reasoning_tokens": 0
       },
-      "wall_ms": 1063.51
+      "wall_ms": 1258.36
     }
   ],
-  "source_sha": "d211f6a92cf12bd25b10e2088ef14937f55984a9",
+  "source_sha": "7afcf10d2ceb903e86c7f4cbb0cb5c8492b8c211",
   "spend_cap_usd": null,
-  "started_unix": 1790353852.54058,
+  "started_unix": 1790354704.401862,
   "summary": [
     {
       "harness": "aim_openrouter@off",
-      "ite_per_passed": 18068.0,
+      "ite_per_passed": 17676.0,
       "mean_direct_tool_calls": 5.5,
       "mean_nested_tool_calls": 0,
       "mean_requests": 6.5,
-      "p50_wall_ms": 122.73,
+      "p50_wall_ms": 144.16,
       "pass_rate": 1.0,
       "pass_rate_ci95": [
         0.51,
@@ -2992,7 +2992,7 @@
       "mean_direct_tool_calls": 5.5,
       "mean_nested_tool_calls": 0,
       "mean_requests": 6.5,
-      "p50_wall_ms": 124.44,
+      "p50_wall_ms": 145.29,
       "pass_rate": 1.0,
       "pass_rate_ci95": [
         0.51,
@@ -3008,7 +3008,7 @@
       "mean_direct_tool_calls": 5.5,
       "mean_nested_tool_calls": 5.5,
       "mean_requests": 6.5,
-      "p50_wall_ms": 382.34,
+      "p50_wall_ms": 271.9,
       "pass_rate": 1.0,
       "pass_rate_ci95": [
         0.51,
