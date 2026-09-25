@@ -95,6 +95,47 @@ for bin in aim aimx aim-coderun; do
 done
 '''
 
+[tasks.install]
+description = "Build and install aim, aimx and aim-coderun to /usr/local/bin; restart the daemon"
+depends = ["build"]
+dir = "{{config_root}}"
+run = '''
+set -eu
+install_dir=${AIM_INSTALL_DIR:-/usr/local/bin}
+case "$install_dir" in
+  /*) ;;
+  *) echo "AIM_INSTALL_DIR must be an absolute path" >&2; exit 1 ;;
+esac
+# Stop even after a no-op build: an existing daemon may still be using an older installation.
+if target/release/aim daemon status >/dev/null 2>&1; then
+  target/release/aim daemon stop
+fi
+if [ -d "$install_dir" ] && [ -w "$install_dir" ]; then
+  for bin in aim aimx aim-coderun; do
+    # Rename within the destination directory so concurrent CLI invocations see whole binaries.
+    install -m 755 "target/release/$bin" "$install_dir/.$bin.tmp.$$"
+    mv -f "$install_dir/.$bin.tmp.$$" "$install_dir/$bin"
+  done
+else
+  sudo install -d -m 755 "$install_dir"
+  for bin in aim aimx aim-coderun; do
+    sudo install -m 755 "target/release/$bin" "$install_dir/.$bin.tmp.$$"
+    sudo mv -f "$install_dir/.$bin.tmp.$$" "$install_dir/$bin"
+  done
+fi
+# The CLI normally auto-starts the daemon, but an installation must leave it running immediately.
+nohup "$install_dir/aim" daemon </dev/null >/dev/null 2>&1 &
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if "$install_dir/aim" daemon status >/dev/null 2>&1; then
+    echo "Installed aim, aimx and aim-coderun in $install_dir; daemon running"
+    exit 0
+  fi
+  sleep 1
+done
+echo "Installed binaries, but the daemon did not start (check ~/.aim/logs/daemon.log)" >&2
+exit 1
+'''
+
 [tasks.tui]
 alias = "run"
 description = "Build, then start the TUI in the current directory; extra args go to aim (`mise run tui -- -p openrouter`)"
