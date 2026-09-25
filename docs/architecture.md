@@ -769,16 +769,16 @@ contract exists.
 M2–M4 are self-hosted with ordinary `aim run` sessions (codex and Claude workers in herdr panes,
 cross-model review). From M5, milestones are posted as blackboard jobs and executed by aim agents.
 
-**Status (2026-09-25).**
+**Status (2026-09-25, later).**
 
 | M | State |
 | --- | --- |
-| M0, M1-proto | Done. The kernel has 97 verified obligations; locked specs are `negotiate::agreed`, `path::confined`, `compaction::plan_ok` and `compaction::cut_ok`. |
-| M1a | Done: aimx local, 88 tests. A second review round (FIX4) is in flight. |
-| M1b | SSH in slices 1–2: the connection manager, bootstrap, the agentless fallback, and a resident remote aimx with proxy, reconnect and resume. `aim run --ssh` works live. Review fixes (FIX6) and `aimx mcp` (W09) are in flight. |
-| M2-llm | codex, OpenRouter and AI Gateway are live. `acp:claude` is live through the session host. |
-| M2a | Done. aim made and tested a change on its own repo (6658595). |
-| M2b | codex, OpenRouter and Claude run end to end locally through one session host. SSH works for the native backends; Claude over SSH (W09) is in flight. |
-| M3 | The daemon (`aim daemon`, auto-spawn) is merged. The TUI (W07) is in flight. |
-| M4 | Compaction is done: remote codex V2 or a local summary, retry on overflow, and the verified planner. Live on codex (~16k → ~2k tokens) and OpenRouter; both kept the fact in the test history. Skills, agents, instructions and memory (W12) are in flight. |
-| M6 | Jev (W13) and the policy kernel (W11) are in flight. |
+| M0, M1-proto | Done. 163 kernel obligations verified. Locked specs are `negotiate`, `path`, `compaction`, `policy` and `effort`. |
+| M1a | Done, with two review rounds (FIX4): identity-checked protected paths, fd-relative resolution, group kill and admission caps. Per-call scopes (ADR 0027 policy kernel) are not yet wired into aimx. |
+| M1b | SSH works: the connection manager, bootstrap, a resident remote aimx with reconnect and resume, the agentless fallback, and `aimx mcp`. Linux agentless fixes (FIX8) are in flight after a Claude verification on Debian and Alpine found a regression. |
+| M2-llm, M2a, M2b | Done. codex, OpenRouter and AI Gateway work locally and over SSH. `acp:claude` runs on aim's tools over MCP, locally and over SSH (strict authority, witness-gated). |
+| M3 | The daemon is done (auto-spawn, ordered attach, detach reasons). The TUI (W07) is in flight. |
+| M4 | Done: compaction (remote V2 or a local summary, a single overflow retry, the verified planner) and resources (instructions, rules, skills with `$mentions`, agent definitions with tool allowlists, prompts, memory index). |
+| M5 | The blackboard ledger and verified job lifecycle (W14) are in flight. |
+| M6 | The Jev effort controller is done (verified; advice overlaps tool execution). The router is a design only. |
+| M8 | codex web search, image generation and transcription are done. Conversation search (W16) is in flight. |
