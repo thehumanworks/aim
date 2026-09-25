@@ -405,18 +405,43 @@ async fn outgoing_request_and_response_limits_are_enforced() {
 }
 
 #[tokio::test]
-async fn notification_queue_cap_closes_a_flooding_peer() {
+async fn a_full_notification_queue_applies_backpressure_and_loses_nothing() {
     let (a, b) = tokio::io::duplex(1 << 16);
     let (ar, aw) = tokio::io::split(a);
     let (br, bw) = tokio::io::split(b);
-    let router = Router::new(()).notification::<SlowNotice, _, _>(|_, _, ()| async move {
-        tokio::time::sleep(Duration::from_secs(10)).await;
+    let seen = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&seen);
+    let router = Router::new(()).notification::<SlowNotice, _, _>(move |_, _, ()| {
+        let counter = Arc::clone(&counter);
+        async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
     });
     let server = Peer::spawn(br, bw, router, PeerConfig { notification_queue_capacity: 4, ..PeerConfig::default() });
     let client = Peer::spawn(ar, aw, NoHandler, PeerConfig::default());
-    for _ in 0..6 {
-        let _sent = client.notify::<SlowNotice>(()).await;
+    for _ in 0..40 {
+        client.notify::<SlowNotice>(()).await.unwrap();
     }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while seen.load(Ordering::SeqCst) < 40 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!server.is_closed(), "a busy handler slows the peer down; it does not cut it off");
+    client.close();
+}
+
+#[tokio::test]
+async fn a_connection_that_takes_no_notifications_closes_on_the_first() {
+    let (a, b) = tokio::io::duplex(1 << 16);
+    let (ar, aw) = tokio::io::split(a);
+    let (br, bw) = tokio::io::split(b);
+    let server = Peer::spawn(br, bw, NoHandler, PeerConfig { notification_queue_capacity: 0, ..PeerConfig::default() });
+    let client = Peer::spawn(ar, aw, NoHandler, PeerConfig::default());
+    let _sent = client.notify::<SlowNotice>(()).await;
     tokio::time::timeout(Duration::from_secs(1), server.closed()).await.unwrap();
 }
 

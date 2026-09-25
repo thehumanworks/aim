@@ -26,7 +26,7 @@ struct Args {
 enum Command {
     /// Run one turn headlessly in a workspace.
     Run {
-        /// Provider: openrouter, ai-gateway (codex and acp:claude as they land).
+        /// Provider: codex, openrouter, ai-gateway (acp:claude as it lands).
         #[arg(short, long, default_value = "codex")]
         provider: String,
         /// Model id (the provider's default when omitted).

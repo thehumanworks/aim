@@ -71,7 +71,10 @@ pub struct PeerConfig {
     pub outgoing_capacity: usize,
     /// Maximum active request handlers on this connection.
     pub max_inflight_requests: usize,
-    /// Maximum notifications waiting behind this connection's ordered handler.
+    /// Maximum notifications waiting behind this connection's ordered handler. Beyond it the
+    /// reader stops reading until the handler catches up (backpressure on the peer; nothing is
+    /// dropped). So a notification handler must never wait for a response from the same peer.
+    /// `0` refuses notifications: the first one closes the connection.
     pub notification_queue_capacity: usize,
 }
 
@@ -397,7 +400,21 @@ async fn read_loop<R: AsyncRead + Unpin>(peer: Peer, mut reader: FrameReader<R>,
                 tracing::debug!(%err, "read failed; closing connection");
                 break;
             }
-            Some(Ok(frame)) => dispatch(&peer, &handler, &frame),
+            Some(Ok(frame)) => {
+                let mut waiting = None;
+                dispatch(&peer, &handler, &frame, &mut waiting);
+                if let Some(notice) = waiting {
+                    // The ordered queue is full: stop reading until it has room.
+                    let queued = tokio::select! {
+                        biased;
+                        () = peer.inner.closed.cancelled() => false,
+                        sent = peer.inner.notification_queue.send(notice) => sent.is_ok(),
+                    };
+                    if !queued {
+                        break;
+                    }
+                }
+            }
         }
     }
     peer.close();
@@ -420,7 +437,9 @@ async fn notification_loop(peer: Peer, handler: Arc<dyn Handler>, mut queue: mps
     }
 }
 
-fn dispatch(peer: &Peer, handler: &Arc<dyn Handler>, frame: &str) {
+/// Handles one inbound frame. A notification that finds the ordered queue full is left in
+/// `waiting` for the caller to enqueue with backpressure.
+fn dispatch(peer: &Peer, handler: &Arc<dyn Handler>, frame: &str, waiting: &mut Option<QueuedNotification>) {
     let raw: Value = match serde_json::from_str(frame) {
         Ok(raw) => raw,
         Err(err) => {
@@ -466,10 +485,14 @@ fn dispatch(peer: &Peer, handler: &Arc<dyn Handler>, frame: &str) {
                 }
                 return;
             }
-            if peer.inner.notification_limit == 0 || peer.inner.notification_queue.try_send(QueuedNotification { method, params }).is_err()
-            {
-                tracing::warn!(reason = "limit_exceeded", "ordered notification queue is full; closing connection");
+            if peer.inner.notification_limit == 0 {
+                tracing::warn!(reason = "limit_exceeded", "this connection takes no notifications; closing it");
                 peer.close();
+                return;
+            }
+            match peer.inner.notification_queue.try_send(QueuedNotification { method, params }) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(notice)) => *waiting = Some(notice),
             }
         }
         // An error with `"id": null` is the other side failing to parse something we sent: it

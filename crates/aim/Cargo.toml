@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 aim-kernel = { path = "../aim-kernel" }
 aim-llm = { path = "../aim-llm" }
+aim-llm-codex = { path = "../aim-llm-codex" }
 aim-llm-openai = { path = "../aim-llm-openai" }
 aim-proto = { path = "../aim-proto" }
 aim-rpc = { path = "../aim-rpc" }
