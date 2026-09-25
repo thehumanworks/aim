@@ -16,6 +16,7 @@
 //! - [`tui`] — the terminal UI: inline chat on a [`host::SessionClient`].
 //! - [`board`] — the durable job ledger and board CLI.
 //! - [`workers`] — isolated board attempt execution and Git integration.
+//! - [`ui`] — agent-authored UI surfaces: the `ui_*` tools, validation, bounds and ownership.
 pub mod acp;
 pub mod agent;
 pub mod board;
@@ -37,4 +38,5 @@ pub mod search;
 pub mod session;
 pub mod store;
 pub mod tui;
+pub mod ui;
 pub mod workers;

@@ -782,7 +782,10 @@ impl App {
                 }
                 self.transcript.push_item(&item);
             }
-            SessionUpdate::ToolStarted { .. } | SessionUpdate::ToolFinished { .. } | SessionUpdate::SteerQueued => {}
+            SessionUpdate::ToolStarted { .. }
+            | SessionUpdate::ToolFinished { .. }
+            | SessionUpdate::SteerQueued
+            | SessionUpdate::Ui { .. } => {}
             // Which chips went out is told by the user items that follow, not by position: the
             // oldest chip may be a turn's first prompt whose answer is merely late.
             SessionUpdate::SteerDelivered { count } => self.pending_deliveries = self.pending_deliveries.saturating_add(count),
@@ -816,7 +819,6 @@ impl App {
                 // One per request: shown in the status line, not the transcript.
                 self.jev_effort = decision.ladder.get(usize::try_from(decision.output).unwrap_or(usize::MAX)).cloned();
             }
-            SessionUpdate::Ui { .. } => {}
             SessionUpdate::TurnEnded { stop } => self.on_turn_ended(&stop),
             SessionUpdate::TurnFailed { message } => {
                 self.flush_live();
