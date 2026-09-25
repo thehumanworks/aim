@@ -315,6 +315,7 @@ fn adr_0074_session_options_are_additive() {
             ChoiceValue { value: "opus[1m]".into(), name: None, description: None },
         ],
         efforts: vec![ChoiceValue { value: "low".into(), name: None, description: Some("default".into()) }],
+        auto_effort: Some("Jev picks the effort per request".into()),
     };
     let update = SessionUpdate::Options { options: options.clone() };
     let wire = serde_json::to_value(&update).unwrap();
@@ -322,7 +323,8 @@ fn adr_0074_session_options_are_additive() {
         wire,
         json!({"type": "options", "options": {
             "models": [{"value": "gpt-6-sol", "name": "GPT-6 Sol", "description": "400k context"}, {"value": "opus[1m]"}],
-            "efforts": [{"value": "low", "description": "default"}]
+            "efforts": [{"value": "low", "description": "default"}],
+            "auto_effort": "Jev picks the effort per request"
         }})
     );
     assert_eq!(serde_json::from_value::<SessionUpdate>(wire.clone()).unwrap(), update);
@@ -330,8 +332,9 @@ fn adr_0074_session_options_are_additive() {
         serde_json::from_value::<before_adr_0066::SessionUpdate>(wire).is_err(),
         "an older client's parser refuses the unknown update, so it drops it and reads on"
     );
-    // Missing lists read as empty.
+    // Missing lists read as empty, and a missing `auto_effort` as a session that refuses `auto`.
     assert_eq!(serde_json::from_value::<SessionOptions>(json!({})).unwrap(), SessionOptions::default());
+    assert_eq!(serde_json::to_value(SessionOptions::default()).unwrap(), json!({"models": [], "efforts": []}));
 
     let summary = json!({"meta": {"id": "s", "created_ms": 1, "workspace": "/w", "location": "local", "provider": "p", "model": "m"},
                          "state": "idle", "persistence": "persistent", "last_activity_ms": 1, "turns": 0});

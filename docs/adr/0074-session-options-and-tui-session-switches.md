@@ -6,8 +6,8 @@
 - Scope: the `aim-daemon/1` update `SessionUpdate::Options` with `SessionOptions`/`ChoiceValue`,
   the `options` field of `session.attach` and `session.attach_paged` replies, the `Backend::options`
   hook that fills them, and the TUI's `/provider`, `/clear`, `/new`, `/model` and `/effort` decisions
-  (`aim_kernel::switch`). It does not cover how an ACP agent resolves a model alias (T5), the web
-  client (which ignores the update), or making `auto` meaningful for ACP agents.
+  (`aim_kernel::switch`). It does not cover how an ACP agent resolves a value (ADR 0075), the web
+  client (which ignores the update), or what `auto` does (ADR 0038); only where it is offered.
 
 ## Context
 
@@ -31,6 +31,19 @@
   model or effort carried into it would be chosen under the old provider: `providers::build` uses
   an explicit model verbatim and the provider's default only when none is given
   (`crates/aim/src/providers.rs:100,105`), so a codex id would be sent to OpenRouter.
+- Where `auto` (`AUTO_EFFORT`, ADR 0038) is taken differs by backend:
+  - the native loop always takes it: `set_config` maps it to "no level, source automatic" and never
+    refuses it (`crates/aim/src/agent/backend.rs:147,172`). What it then does depends on Jev: a
+    decider is attached only to persistent sessions (`crates/aim/src/host.rs:296`) and exists only
+    with `TYPESAFE_API_KEY` (`crates/aim/src/providers.rs:139`); Jev decides only for an automatic
+    source and a model ladder of 2 to 10 levels (`crates/aim/src/agent/mod.rs:351-363`,
+    `ladder_start` at `:169`), moving one step per decision from the level in force. Without it the
+    level in force stays, unpinned, and a model change resets it to the provider's default
+    (`forget_window`, `crates/aim/src/agent/mod.rs:836-843`);
+  - an ACP agent takes only values it advertises: ADR 0075's resolver refuses anything else
+    (`crates/aim-acp/src/config_options.rs:208`, used by `check_option` at
+    `crates/aim/src/acp.rs:155`), and claude-agent-acp 0.81.2 advertises no `auto` (fixture above;
+    test at `crates/aim/src/acp.rs:679`).
 - Surfaces set the pattern for state a late client must see (ADR 0064): the attach reply carries a
   snapshot taken under the same lock that orders the stream. Old clients drop update types they do
   not know and read on (`crates/aim/src/daemon/client.rs:99`, REV19 test
@@ -44,18 +57,29 @@ seen values (wrong across providers).
 ## Decision
 
 1. **One contract.** `SessionUpdate::Options { options: SessionOptions }` with
-   `SessionOptions { models: Vec<ChoiceValue>, efforts: Vec<ChoiceValue> }` and
-   `ChoiceValue { value, name?, description? }`. `models` are the values `session.set_config`
+   `SessionOptions { models: Vec<ChoiceValue>, efforts: Vec<ChoiceValue>, auto_effort: Option<String> }`
+   and `ChoiceValue { value, name?, description? }`. `models` are the values `session.set_config`
    takes for this session's provider; `efforts` is the ladder of the model in force, least effort
-   first (empty: none known). `auto` (`AUTO_EFFORT`) is never listed; clients add it. The latest
-   options are replayed as `options` in `session.attach` and `session.attach_paged` replies; both
-   fields and the update are additive and are not recorded in the session log.
+   first (empty: none known). `auto` (`AUTO_EFFORT`) is never listed in `efforts`: `auto_effort` is
+   `Some(what it does here)` when the session takes it and `None` when it refuses it. Native
+   sessions always take it ("Jev picks the effort per request" with a decider and a usable ladder,
+   else "unpinned: kept until a model change, then the provider's default"); an ACP agent takes it
+   only when it advertises an `auto` effort value, which is then reported here rather than as a
+   level. The latest options are replayed as `options` in `session.attach` and
+   `session.attach_paged` replies; the fields and the update are additive and are not recorded in
+   the session log.
 2. **Backends fill it, off the critical path.** `Backend::options()` returns a `'static` future
    (nothing borrowed from the backend). The host spawns it after the session is live and again after
    every announced configuration, aborting an older lookup, and publishes the answer under the
    transcript lock (so an attach sees it in its snapshot or on its stream, never both or neither).
    An unchanged answer is not sent again, except after a model change: clients treat the ladder as
-   unknown from a model's `ConfigChanged` until the next `Options`.
+   unknown from a model's `ConfigChanged` until the next `Options`. Every lookup is tagged with the
+   session's configuration generation, which `announce` bumps before it sends `ConfigChanged` and
+   the actor bumps at close; a lookup publishes only if its generation is still current, checked
+   under the options lock that also orders the bump. An abort alone cannot stop a lookup that has
+   already resolved (REV-T1 B1). The live summary's model follows every announced change and a
+   resumed session's summary shows the model it resumed with, so a client attaching later is told
+   the model in force.
    Native sessions answer from the catalog W26 fetched at start (codex) or from one bounded
    background fetch (the gateways' catalog is cached by the provider), without hidden models, with
    the current model's ladder and the default effort marked. ACP sessions answer from the agent's
@@ -67,10 +91,15 @@ seen values (wrong across providers).
    - `/provider <id>` validates the id against `providers::KNOWN`, is a no-op for the current
      provider, and otherwise creates a session like the attached one on that provider with **no
      model and no effort**, so the provider picks its defaults;
-   - `/effort <level>` is sent only when it is `auto`, the ladder is not known yet (or empty: the
-     backend decides, as before), or it is in the ladder; `/effort` completes the ladder plus
-     `auto`, without duplicates. `/model` completes the session's `models` and is always sent (an
-     ACP agent may resolve aliases).
+   - `/effort <value>` is refused locally only when the session said so: a level off a known ladder,
+     or `auto` where `auto_effort` is `None`. An unknown ladder (options not arrived, or empty) or
+     unknown `auto` support leaves the decision to the session, as before. Values match with case
+     and inner whitespace folded (as ADR 0075 folds them) in the shell's id registry, so `Low`
+     matches `low` while the kernel's check stays exact over ids. Native sessions are sent the
+     ladder's spelling of the matched level (the loop matches exactly); ACP sessions are sent the
+     value as typed, for ADR 0075's resolver. `/effort` completes the ladder's levels once, in its
+     order, then `auto` only where the session takes it. `/model` completes the session's `models`
+     and is always sent (an ACP agent may resolve aliases).
    - Until a session's options arrive, completion falls back to values seen *for its provider*.
 
 ## Consequences
@@ -79,9 +108,8 @@ seen values (wrong across providers).
   provider's models.
 - Each native model change costs one catalog lookup in the background (cached for the gateways; a
   conditional `If-None-Match` GET for codex, as `set_config` already does).
-- The TUI offers `auto` for ACP sessions too, which claude-agent-acp refuses
-  (`crates/aim/src/acp.rs:650`); the refusal is reported as before. Open until ACP effort semantics
-  are decided.
+- `auto` is not offered before a session's options arrive (its support is unknown then); typed, it is
+  still sent and the session decides. It is never sent to a session that said it refuses it.
 - A backend that cannot tell (a test fake, a future agent) sends nothing; clients keep their
   fallback.
 
@@ -89,8 +117,16 @@ seen values (wrong across providers).
 
 - Proofs in `crates/aim-kernel/src/switch.rs`: `provider_switch_resets_model_and_effort`,
   `same_provider_switch_is_a_no_op`, `new_and_clear_keep_the_session_shape`,
-  `switches_keep_place_and_privacy`, `effort_candidates_are_the_ladder_and_auto` (with the exec
-  fns' `ensures`: no duplicates, exactly ladder ∪ {auto}), `effort_sent_only_if_offered`.
+  `switches_keep_place_and_privacy`, `effort_sent_only_if_offered`,
+  `auto_is_never_sent_where_refused`, `distinct_levels_are_the_ladder_once`, and
+  `effort_candidates_are_the_ladder_and_auto` (every candidate is one the shell sends, `auto` is
+  offered iff taken and comes last, no duplicates). `effort_candidates_spec` pins the order: the
+  ladder's first occurrences in order (`distinct_levels`), then `auto` when taken (REV-T1 N1). The
+  exec fns `derive`, `effort_sent` and `effort_candidates` are verified to equal their specs.
+- Generation fence: `crates/aim/src/host.rs::tests::a_lookup_for_an_older_configuration_never_publishes`
+  (a lookup released after a model change; fails without the check). Summary model:
+  `crates/aim/tests/host.rs::attach_reports_the_model_in_force_after_a_change_and_a_resume`; what
+  `auto` does: `options_say_what_auto_does_in_an_advised_session`.
 - Contract: `crates/aim-proto/tests/contract.rs::adr_0074_session_options_are_additive`.
 - Host and daemon: `crates/aim/tests/host.rs::options_are_published_replayed_on_attach_and_follow_the_model`,
   `a_session_without_a_catalog_sends_no_options_and_is_not_held_up`,

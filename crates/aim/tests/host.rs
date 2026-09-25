@@ -1204,6 +1204,11 @@ async fn options_are_published_replayed_on_attach_and_follow_the_model() {
     assert_eq!(options.models[1].description.as_deref(), Some("1M context"));
     assert_eq!(options.models[0].name, None, "a display name equal to the id adds nothing");
     assert_eq!(values(&options.efforts), ["low", "medium", "high"], "the ladder of the model in force");
+    assert_eq!(
+        options.auto_effort.as_deref(),
+        Some("unpinned: kept until a model change, then the provider's default"),
+        "the native loop takes `auto`; without a decider it only unpins the effort"
+    );
 
     // A client attaching later gets them in its snapshot.
     let (late, _late_updates) = f.host.attach(id.clone()).await.unwrap();
@@ -1255,4 +1260,19 @@ async fn a_session_without_a_catalog_sends_no_options_and_is_not_held_up() {
     assert_eq!(first.options, None, "no options yet, and attach did not wait for them");
     stalled.host.prompt(id, user("hi")).await.unwrap();
     until(&mut updates, is_idle).await;
+}
+
+/// Jev's `auto`: a persistent session with a decider says Jev picks the effort.
+#[tokio::test]
+async fn options_say_what_auto_does_in_an_advised_session() {
+    let counting = Arc::new(Counting::default());
+    let memory = Arc::new(MemoryStore::default());
+    let f = fixture_services(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, Vec::new(), vec![ladder_model()], advised(&counting));
+    let id = f.host.create(spec(Persistence::Persistent)).await.unwrap().meta.id;
+    let (first, mut updates) = f.host.attach(id).await.unwrap();
+    let options = match first.options {
+        Some(options) => options,
+        None => until(&mut updates, |u| options_of(u).is_some()).await.last().and_then(options_of).cloned().unwrap(),
+    };
+    assert_eq!(options.auto_effort.as_deref(), Some("Jev picks the effort per request"));
 }

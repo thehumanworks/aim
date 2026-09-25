@@ -270,6 +270,11 @@ impl Agent {
         Arc::clone(&self.catalog)
     }
 
+    /// Whether Jev advises this session's effort (the host attaches it to persistent sessions).
+    pub(crate) fn has_decider(&self) -> bool {
+        self.decider.is_some()
+    }
+
     /// Reuse the capability snapshot fetched while the session was built. `None` leaves the
     /// existing lazy lookup in place (for providers whose catalog was unavailable at startup).
     #[must_use]

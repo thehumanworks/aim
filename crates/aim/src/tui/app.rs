@@ -16,6 +16,8 @@ use aim_proto::ui::model::{Change, Surface, Surfaces};
 use aim_proto::ui::{Placement, UiAction, UiMessage};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use aim_kernel::switch::AutoEffort;
+
 use super::choices::{self, SwitchTo};
 use super::commands::{self, COMMANDS};
 use super::complete::{self, Candidate, Completed, Context, Hint, Kind, Request, Trigger};
@@ -1383,17 +1385,19 @@ impl App {
             }
             ("model", Some(_)) => self.configure(raw, Some(arg.to_owned()), None),
             ("effort", Some(_)) => {
-                // A known ladder decides here; an unknown one leaves it to the session (ADR 0074).
-                if let Some((model, ladder)) = self.known_ladder()
-                    && !choices::effort_offered(ladder, arg)
-                {
-                    let offered: Vec<String> = choices::effort_hints(Some(ladder), &[]).into_iter().map(|h| h.value).collect();
-                    let message = format!("effort `{arg}` is not offered by {model} (offers: {})", offered.join(", "));
-                    self.refill(&[raw.to_owned()]);
-                    self.notice(Level::Error, message);
-                    return Vec::new();
+                // What the session told decides here; what it has not told, it decides (ADR 0074).
+                let (auto, _) = self.auto_effort();
+                let (model, ladder) = self.known_ladder().map_or((String::new(), Vec::new()), |(model, ladder)| (model, ladder.to_vec()));
+                // An ACP agent resolves values itself (ADR 0075); the native loop matches exactly.
+                let canonical = self.session.as_ref().is_none_or(|s| !s.provider.starts_with(crate::acp::ACP_PREFIX));
+                if let Some(value) = choices::effort_to_send(&ladder, auto, arg, canonical) {
+                    return self.configure(raw, None, Some(value));
                 }
-                self.configure(raw, None, Some(arg.to_owned()))
+                let offered: Vec<String> = choices::effort_hints(Some(&ladder), &[], auto, "").into_iter().map(|h| h.value).collect();
+                let message = format!("effort `{arg}` is not offered by {model} (offers: {})", offered.join(", "));
+                self.refill(&[raw.to_owned()]);
+                self.notice(Level::Error, message);
+                Vec::new()
             }
             ("provider", _) if arg.is_empty() => {
                 let current = self.target_provider().unwrap_or("unknown").to_owned();
@@ -1489,6 +1493,17 @@ impl App {
         Some((session.model.clone(), ladder))
     }
 
+    /// Whether the attached session takes `auto`, and what it does there: unknown until its
+    /// options arrive, and again after a model change until the next ones (ADR 0074).
+    fn auto_effort(&self) -> (AutoEffort, String) {
+        let options = self.session.as_ref().filter(|s| !self.connecting && !s.stale_efforts).and_then(|s| s.options.as_ref());
+        match options.map(|o| o.auto_effort.as_ref()) {
+            None => (AutoEffort::Unknown, String::new()),
+            Some(Some(detail)) => (AutoEffort::Taken, detail.clone()),
+            Some(None) => (AutoEffort::Refused, String::new()),
+        }
+    }
+
     /// Values seen for the target provider.
     fn seen(&self, list: &[(String, String)]) -> Vec<String> {
         let provider = self.target_provider();
@@ -1502,7 +1517,10 @@ impl App {
                 let models = self.current_options().map(|o| o.models.as_slice()).filter(|m| !m.is_empty());
                 choices::model_hints(models, &self.seen(&self.models))
             }
-            "effort" => choices::effort_hints(self.known_ladder().map(|(_, ladder)| ladder), &self.seen(&self.efforts)),
+            "effort" => {
+                let (auto, detail) = self.auto_effort();
+                choices::effort_hints(self.known_ladder().map(|(_, ladder)| ladder), &self.seen(&self.efforts), auto, &detail)
+            }
             "provider" => choices::provider_hints(),
             _ => Vec::new(),
         }
