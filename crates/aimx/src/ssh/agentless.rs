@@ -446,32 +446,44 @@ impl Fs for AgentlessWorkspace {
         Box::pin(async move {
             let resolved = self.safe(req.path, false).await?;
             let script = format!(
-                "find {} -mindepth 1 -maxdepth 1 -exec sh -c 'for p do if [ -L \"$p\" ]; then k=symlink; n=0; elif [ -f \"$p\" ]; then k=file; n=$(wc -c < \"$p\"); elif [ -d \"$p\" ]; then k=dir; n=0; else k=other; n=0; fi; printf \"%s\\0%s\\0%s\\0\" \"$k\" \"$n\" \"${{p##*/}}\"; done' sh {{}} +",
+                "find {} -mindepth 1 -maxdepth 1 -exec sh -c 'printf \"%s\\0\" \"$#\"; for p do printf \"%s\\0\" \"${{p##*/}}\"; done; if [ \"$(uname -s)\" = Darwin ]; then stat -f \"%HT|%z\" \"$@\"; else stat -c \"%F|%s\" \"$@\"; fi | tr \"\\n\" \"\\0\"' sh {{}} +",
                 quote(&resolved)
             );
             let output = self.run(&script, &[]).await?;
             let mut entries = Vec::new();
             let mut fields = output.split(|byte| *byte == 0);
-            while let (Some(kind), Some(size), Some(name)) = (fields.next(), fields.next(), fields.next()) {
-                if name.is_empty() {
-                    continue;
+            while let Some(count) = fields.next().filter(|part| !part.is_empty()) {
+                let count = std::str::from_utf8(count)
+                    .map_err(|_| error(ErrorCode::Unavailable, "invalid remote listing"))?
+                    .parse::<usize>()
+                    .map_err(|_| error(ErrorCode::Unavailable, "invalid remote listing"))?;
+                let names = (0..count)
+                    .map(|_| {
+                        fields.next().ok_or_else(|| error(ErrorCode::Unavailable, "incomplete remote listing")).and_then(|name| {
+                            String::from_utf8(name.to_vec()).map_err(|_| error(ErrorCode::Unavailable, "remote name is not UTF-8"))
+                        })
+                    })
+                    .collect::<Outcome<Vec<_>>>()?;
+                for name in names {
+                    let metadata = fields.next().ok_or_else(|| error(ErrorCode::Unavailable, "incomplete remote listing"))?;
+                    if !req.include_hidden && name.starts_with('.') {
+                        continue;
+                    }
+                    let metadata = std::str::from_utf8(metadata).map_err(|_| error(ErrorCode::Unavailable, "invalid remote listing"))?;
+                    let (kind, size) = metadata.split_once('|').ok_or_else(|| error(ErrorCode::Unavailable, "invalid remote listing"))?;
+                    let kind = match kind {
+                        "Regular File" | "regular file" => EntryKind::File,
+                        "Directory" | "directory" => EntryKind::Dir,
+                        "Symbolic Link" | "symbolic link" => EntryKind::Symlink,
+                        _ => EntryKind::Other,
+                    };
+                    let size = if kind == EntryKind::File {
+                        size.parse::<u64>().map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?
+                    } else {
+                        0
+                    };
+                    entries.push(DirEntry { name, kind, size });
                 }
-                let name = String::from_utf8(name.to_vec()).map_err(|_| error(ErrorCode::Unavailable, "remote name is not UTF-8"))?;
-                if !req.include_hidden && name.starts_with('.') {
-                    continue;
-                }
-                let kind = match kind {
-                    b"file" => EntryKind::File,
-                    b"dir" => EntryKind::Dir,
-                    b"symlink" => EntryKind::Symlink,
-                    _ => EntryKind::Other,
-                };
-                let size = std::str::from_utf8(size)
-                    .map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?
-                    .trim()
-                    .parse::<u64>()
-                    .map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?;
-                entries.push(DirEntry { name, kind, size });
             }
             entries.sort_by(|a, b| a.name.cmp(&b.name));
             let start = req.page_token.map_or(0, |token| entries.partition_point(|entry| entry.name.as_str() <= token));

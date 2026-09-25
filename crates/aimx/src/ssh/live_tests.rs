@@ -235,7 +235,7 @@ impl Sshd {
             .arg("-f")
             .arg(&self.sandbox)
             .arg(std::env::current_exe().expect("test binary"))
-            .args(["--exact", "ssh::live_tests::sandbox_denies_local_std_fs_at_remote_path", "--ignored"])
+            .args(["--exact", "ssh::sandbox_probe::local_std_fs_denied_at_remote_path", "--ignored"])
             .env("AIM_SSH_SANDBOX_PROBE", remote_file)
             .output()
             .expect("probe local sandbox");
@@ -349,14 +349,6 @@ async fn timed<T>(name: &str, operation: impl Future<Output = T>) -> T {
     let result = operation.await;
     eprintln!("{name}_ms={}", started.elapsed().as_millis());
     result
-}
-
-#[test]
-#[ignore = "probes the local sandbox created by its parent live test"]
-fn sandbox_denies_local_std_fs_at_remote_path() {
-    let path = std::env::var_os("AIM_SSH_SANDBOX_PROBE").expect("only the isolation parent test invokes this probe");
-    assert!(std::fs::read(&path).is_err(), "sandboxed local std::fs read reached the remote path");
-    assert!(std::fs::write(&path, b"local overwrite").is_err(), "sandboxed local std::fs write reached the remote path");
 }
 
 #[tokio::test]
