@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use aim_proto::daemon::SessionState;
 use aim_proto::event::{SessionEvent, SessionMeta};
-use rusqlite::{Connection, OptionalExtension as _, params};
+use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use tokio::sync::oneshot;
 
 use super::{BoxFuture, MAX_FORK_DEPTH, SessionStore, StoreError, StoredSessionSummary, check_sequence};
@@ -97,7 +97,7 @@ fn create(conn: &Connection, meta: &SessionMeta) -> Result<(), StoreError> {
 }
 
 fn append(conn: &mut Connection, session: &str, events: &[SessionEvent]) -> Result<(), StoreError> {
-    let tx = conn.transaction().map_err(backend)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(backend)?;
     let meta_json: Option<String> =
         tx.query_row("SELECT meta FROM sessions WHERE id = ?1", params![session], |r| r.get(0)).optional().map_err(backend)?;
     let meta = meta_of(&meta_json.ok_or_else(|| StoreError::NotFound(session.to_owned()))?)?;
