@@ -2,7 +2,9 @@
 //!
 //! Commands run with `bash -c` in the workspace root (falling back to the `sh` of
 //! `Command::Shell` when the host has no bash), in their own process group, killed at the timeout.
-//! Each call starts a fresh shell: `cd` and exported variables do not carry over to the next call.
+//! Each call starts a fresh shell: `cd` and exported variables do not carry over to the next call,
+//! and a foreground call releases its process when it returns, which kills its whole process group
+//! (jobs it started with `&` included); a long-lived job needs `run_in_background`.
 //! Output beyond a budget keeps its head and tail; the process is then kept (not released) and its
 //! id returned as the result's `handle`, so the full retained output stays readable with
 //! `exec.read` or `BashOutput`.
@@ -138,12 +140,16 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Outcome<ToolResult>
     };
     ctx.grant.exec()?;
     let exec = exec_of(ctx)?;
+    let slot = match ctx.procs.reserve() {
+        Ok(slot) => slot,
+        Err(err) => return model_error(err),
+    };
     if args.run_in_background {
         let proc = match spawn(ctx, exec, &args.command, None).await {
             Ok(proc) => proc,
             Err(err) => return model_error(err),
         };
-        ctx.procs.insert(proc.clone(), ctx.workspace_id.clone());
+        ctx.procs.insert(proc.clone(), ctx.workspace_id.clone(), slot);
         return Ok(ToolResult::text(format!(
             "Started in the background with id {proc}. Read its output with BashOutput; stop it with KillShell."
         )));
@@ -153,7 +159,7 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Outcome<ToolResult>
         Ok(proc) => proc,
         Err(err) => return model_error(err),
     };
-    ctx.procs.insert(proc.clone(), ctx.workspace_id.clone());
+    ctx.procs.insert(proc.clone(), ctx.workspace_id.clone(), slot);
     let mut output = HeadTail::new();
     let mut cursor = 0u64;
     let mut dropped = false;

@@ -8,6 +8,7 @@
 //! No I/O happens here; canonicalising roots is the server's job.
 
 pub mod confine;
+pub mod identity;
 
 use std::sync::Arc;
 
@@ -58,13 +59,16 @@ impl ProtectedPaths {
         Self { paths }
     }
 
-    /// The default set for a home directory: `~/.aim/gate`, `~/.aim/ledger`, and every path
-    /// listed in `~/.aim/protected` (`listing` is that file's content, if it exists). Lines are
-    /// absolute paths or `~/`-relative; blank lines and `#` comments are skipped.
+    /// The default set for a home directory: `~/.aim/gate`, `~/.aim/ledger`, the policy file
+    /// `~/.aim/protected` itself (so aimx cannot be used to widen its own policy; the owner edits
+    /// it directly), and every path listed in it (`listing` is that file's content, if it
+    /// exists). Lines are absolute paths or `~/`-relative; blank lines and `#` comments are
+    /// skipped. `~/.aim` itself stays writable, but it cannot be removed, moved or replaced, since
+    /// it contains protected paths.
     #[must_use]
     pub fn defaults(home: &str, listing: Option<&str>) -> Self {
         let home = home.trim_end_matches('/');
-        let mut paths = vec![format!("{home}/.aim/gate"), format!("{home}/.aim/ledger")];
+        let mut paths = vec![format!("{home}/.aim/gate"), format!("{home}/.aim/ledger"), format!("{home}/.aim/protected")];
         for line in listing.unwrap_or_default().lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -161,6 +165,9 @@ impl Grant {
     /// `denied` outside the root, for mutations by a read-only principal, on protected paths and
     /// for removing or moving the root itself; `invalid_params` for malformed paths.
     pub fn path(&self, user_path: &str, access: Access) -> Result<String, ProtoError> {
+        // TODO(ADR-per-call-scope): intersect with the caller's per-call ceiling (REV4-A finding 4,
+        // ADR 0008/0021 narrow-only delegation) once the protocol carries one; until then only the
+        // principal's own authority is enforced here and in `mutation`/`exec`.
         let path = self.confine(user_path)?;
         match access {
             Access::Read => {}
@@ -244,7 +251,7 @@ mod tests {
     #[test]
     fn defaults_parse_the_listing() {
         let set = ProtectedPaths::defaults("/home/u/", Some("~/x\n  /abs/y  \n#no\n\nrel"));
-        assert_eq!(set.paths(), ["/abs/y", "/home/u/.aim/gate", "/home/u/.aim/ledger", "/home/u/x"]);
+        assert_eq!(set.paths(), ["/abs/y", "/home/u/.aim/gate", "/home/u/.aim/ledger", "/home/u/.aim/protected", "/home/u/x"]);
     }
 
     #[test]

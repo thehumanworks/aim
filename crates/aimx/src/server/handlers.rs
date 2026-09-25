@@ -129,15 +129,27 @@ impl Conn {
         Ok((session, workspace))
     }
 
-    /// Runs a mutation in workspace `ws` at most once per (principal, key).
-    async fn idempotent<T, F>(&self, ws: &OpenWorkspace, key: &IdempotencyKey, method: &str, params: &impl Serialize, work: F) -> Outcome<T>
+    /// Runs a mutation in workspace `ws` at most once per (principal, key). `session` scopes the
+    /// recorded outcome to that session when it names session state (a process id).
+    async fn idempotent<T, F>(
+        &self,
+        ws: &OpenWorkspace,
+        key: &IdempotencyKey,
+        method: &str,
+        params: &impl Serialize,
+        session: Option<&Session>,
+        work: F,
+    ) -> Outcome<T>
     where
         T: Serialize + DeserializeOwned + Send + 'static,
         F: Future<Output = Outcome<T>> + Send + 'static,
     {
         let scoped = format!("{}\u{0}{key}", ws.grant.principal().id);
         let fingerprint = fingerprint(method, &ws.info.root, params);
-        let value = self.state.idempotent(scoped, fingerprint, async move { serde_json::to_value(work.await?).map_err(internal) }).await?;
+        let owner = session.map(|session| session.token.clone());
+        let minted = crate::dedup::minted_ms(key.as_str());
+        let work = async move { serde_json::to_value(work.await?).map_err(internal) };
+        let value = self.state.idempotent(scoped, minted, fingerprint, owner, work).await?;
         serde_json::from_value(value).map_err(internal)
     }
 
@@ -198,19 +210,22 @@ impl Conn {
         if let Some(open) = session.find_root(&root) {
             return Ok(open.info.clone());
         }
+        session.may_add_workspace()?;
         let backend: Arc<dyn crate::workspace::Workspace> = if let Some(fixed) = &self.state.fixed_workspace {
             Arc::clone(fixed)
         } else {
             let config = LocalConfig {
                 output_ring_bytes: usize::try_from(self.state.config.output_ring_bytes).unwrap_or(usize::MAX),
                 protected: Arc::clone(&self.state.protected),
+                ptys: Some(Arc::clone(&self.state.ptys)),
+                max_concurrency: Some(self.state.config.max_procs_per_session),
             };
             Arc::new(LocalWorkspace::open(&root, config).await?)
         };
         let id = WorkspaceId::new(format!("w{}", crate::id::random_hex()));
         let info = WorkspaceInfo { id: id.clone(), root: root.clone(), caps: backend.caps().clone() };
         let grant = Grant::new(Arc::clone(&session.principal), Arc::clone(&self.state.protected), root, normalize(&params.root));
-        session.add_workspace(Arc::new(OpenWorkspace { id, info: info.clone(), grant, backend }));
+        session.add_workspace(Arc::new(OpenWorkspace { id, info: info.clone(), grant, backend }))?;
         Ok(info)
     }
 
@@ -230,7 +245,7 @@ impl Conn {
         let (_, ws) = self.workspace(&params.workspace)?;
         let path = ws.grant.path(&params.path, Access::Write)?;
         let work_params = params.clone();
-        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsWrite::NAME, &params, async move {
+        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsWrite::NAME, &params, None, async move {
             let p = work_params;
             let request = WriteRequest {
                 path: &path,
@@ -248,7 +263,7 @@ impl Conn {
         let (_, ws) = self.workspace(&params.workspace)?;
         let path = ws.grant.path(&params.path, Access::Write)?;
         let work_params = params.clone();
-        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsEdit::NAME, &params, async move {
+        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsEdit::NAME, &params, None, async move {
             let p = work_params;
             ws.backend.fs().edit(EditRequest { path: &path, edits: &p.edits, precondition: &p.precondition, key: &p.idempotency_key }).await
         })
@@ -267,7 +282,7 @@ impl Conn {
         let (_, ws) = self.workspace(&params.workspace)?;
         let path = ws.grant.path(&params.path, Access::Write)?;
         let key = params.idempotency_key.clone();
-        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsMkdir::NAME, &params, async move {
+        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsMkdir::NAME, &params, None, async move {
             ws.backend.fs().mkdir(&path, &key).await
         })
         .await
@@ -277,7 +292,7 @@ impl Conn {
         let (_, ws) = self.workspace(&params.workspace)?;
         let path = ws.grant.path(&params.path, Access::Tree)?;
         let (key, recursive) = (params.idempotency_key.clone(), params.recursive);
-        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsRemove::NAME, &params, async move {
+        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsRemove::NAME, &params, None, async move {
             ws.backend.fs().remove(&path, recursive, &key).await
         })
         .await
@@ -288,7 +303,7 @@ impl Conn {
         let from = ws.grant.path(&params.from, Access::Tree)?;
         let to = ws.grant.path(&params.to, Access::Tree)?;
         let (key, overwrite) = (params.idempotency_key.clone(), params.overwrite);
-        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsRename::NAME, &params, async move {
+        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, FsRename::NAME, &params, None, async move {
             ws.backend.fs().rename(&from, &to, overwrite, &key).await
         })
         .await
@@ -330,7 +345,7 @@ impl Conn {
         let to = ws.grant.path(&params.to, Access::Tree)?;
         let (key, overwrite, recursive) = (params.idempotency_key.clone(), params.overwrite, params.recursive);
         let target = Arc::clone(&ws);
-        self.idempotent(&ws, &params.idempotency_key, FsCopy::NAME, &params, async move {
+        self.idempotent(&ws, &params.idempotency_key, FsCopy::NAME, &params, None, async move {
             target.backend.fs().copy(CopyRequest { from: &from, to: &to, overwrite, recursive, key: &key }).await
         })
         .await
@@ -355,7 +370,7 @@ impl Conn {
         }
         let work_params = params.clone();
         let owner = Arc::clone(&session);
-        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, ExecSpawn::NAME, &params, async move {
+        self.idempotent(&Arc::clone(&ws), &params.idempotency_key, ExecSpawn::NAME, &params, Some(&session), async move {
             let p = work_params;
             let exec = ws.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
             let spec = SpawnSpec {
@@ -367,8 +382,9 @@ impl Conn {
                 timeout: p.timeout_ms.map(Duration::from_millis),
                 key: &p.idempotency_key,
             };
+            let slot = owner.procs.reserve()?;
             let proc = exec.spawn(spec).await?;
-            owner.procs.insert(proc.clone(), ws.id.clone());
+            owner.procs.insert(proc.clone(), ws.id.clone(), slot);
             owner.forward(Arc::clone(&ws.backend), proc.clone());
             Ok(ExecSpawnResult { proc })
         })
@@ -388,7 +404,7 @@ impl Conn {
         ws.grant.exec()?;
         let work_params = params.clone();
         let target = Arc::clone(&ws);
-        self.idempotent(&ws, &params.idempotency_key, ExecWriteStdin::NAME, &params, async move {
+        self.idempotent(&ws, &params.idempotency_key, ExecWriteStdin::NAME, &params, None, async move {
             let p = work_params;
             let exec =
                 target.backend.exec().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "this workspace cannot run processes"))?;
@@ -493,6 +509,8 @@ impl Conn {
             ));
         };
         let (name, arguments) = (params.name.clone(), params.arguments.clone());
-        self.idempotent(&Arc::clone(&ws), &key, ToolsCall::NAME, &params, async move { tools::call(&ctx, &name, arguments).await }).await
+        let scope = tools::spawns_processes(&params.name).then_some(&*session);
+        self.idempotent(&Arc::clone(&ws), &key, ToolsCall::NAME, &params, scope, async move { tools::call(&ctx, &name, arguments).await })
+            .await
     }
 }

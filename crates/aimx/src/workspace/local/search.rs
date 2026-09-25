@@ -3,9 +3,17 @@
 //! Walks honour `.gitignore`, `.ignore` and git's global excludes even outside a git repository
 //! (`require_git(false)`), skip hidden entries (as `rg` does), never follow symlinks (so a walk
 //! cannot leave the root), and visit paths in sorted order so results are deterministic.
+//!
+//! The walk lists directories by path, so a directory swapped for a symlink mid-walk could make it
+//! *list* a directory outside the root. Nothing it lists is trusted: every file is opened, and
+//! every glob hit checked, through [`Beneath`], by descriptors from the start directory the
+//! resolution held open (REV4-A finding 3). An entry that no longer resolves inside is skipped.
 
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::os::fd::OwnedFd;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use aim_proto::error::{ErrorCode, ProtoError};
@@ -16,7 +24,10 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContex
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 
-use super::{Base, Follow, blocking};
+use rustix::fs::{Mode, OFlags};
+
+use super::walk::{Follow, Loc, open_dir, open_entry, stat_entry};
+use super::{Base, blocking};
 use crate::workspace::{BoxFuture, GlobQuery, GrepQuery, Outcome, Search};
 
 /// Longest line (in bytes) returned in a match or context line; longer lines are cut.
@@ -24,6 +35,77 @@ const MAX_LINE_BYTES: usize = 4096;
 /// Text (paths and lines) collected per search before it is reported as truncated, so a result
 /// always fits in one message (JSON escaping can grow text up to six-fold; 16 MiB messages).
 const MAX_RESULT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Opens entries below a directory held open, by descriptors (never by path).
+struct Beneath<'a> {
+    /// The start: a directory, or (a single-file search) the directory holding the file and its name.
+    start: Start<'a>,
+    /// The directories opened for the last lookup, from the start down (the walk is sorted, so
+    /// consecutive lookups share most of it and each directory is opened about once).
+    stack: Vec<(OsString, OwnedFd)>,
+}
+
+enum Start<'a> {
+    Dir(&'a OwnedFd),
+    File(&'a OwnedFd, &'a OsStr),
+}
+
+impl<'a> Beneath<'a> {
+    fn new(loc: &'a Loc) -> Option<Self> {
+        let start = match (loc.target_dir(), loc.dir(), &loc.name) {
+            (Some(dir), _, _) => Start::Dir(dir),
+            (None, Ok(dir), Some(name)) if loc.missing.is_empty() => Start::File(dir, name),
+            _ => return None,
+        };
+        Some(Self { start, stack: Vec::new() })
+    }
+
+    /// The directory `rel` (relative to the start), opened component by component without
+    /// following symlinks.
+    fn dir(&mut self, rel: &Path) -> io::Result<&OwnedFd> {
+        let Start::Dir(start) = self.start else {
+            return Err(io::Error::new(io::ErrorKind::NotADirectory, "the start is a file"));
+        };
+        let mut names = Vec::new();
+        for component in rel.components() {
+            let Component::Normal(name) = component else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a plain relative path"));
+            };
+            names.push(name);
+        }
+        let common = self.stack.iter().zip(&names).take_while(|((held, _), wanted)| held.as_os_str() == **wanted).count();
+        self.stack.truncate(common);
+        for name in names.into_iter().skip(common) {
+            let opened = open_dir(self.stack.last().map_or(start, |(_, fd)| fd), name)?;
+            self.stack.push((name.to_owned(), opened));
+        }
+        Ok(self.stack.last().map_or(start, |(_, fd)| fd))
+    }
+
+    /// The directory holding `rel` and its name.
+    fn parent<'p>(&mut self, rel: &'p Path) -> io::Result<(&OwnedFd, &'p OsStr)> {
+        let name = rel.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+        let dir = self.dir(rel.parent().unwrap_or_else(|| Path::new("")))?;
+        Ok((dir, name))
+    }
+
+    /// Opens the regular file `rel` (relative to the start; empty for a single-file start).
+    fn open(&mut self, rel: &Path) -> io::Result<File> {
+        let file = match self.start {
+            Start::File(dir, name) if rel.as_os_str().is_empty() => open_entry(dir, name, OFlags::RDONLY, Mode::empty())?,
+            _ => {
+                let (dir, name) = self.parent(rel)?;
+                open_entry(dir, name, OFlags::RDONLY, Mode::empty())?
+            }
+        };
+        if file.metadata()?.is_file() { Ok(file) } else { Err(io::Error::other("not a regular file")) }
+    }
+
+    /// Whether entry `rel` exists (without following it).
+    fn exists(&mut self, rel: &Path) -> bool {
+        self.parent(rel).is_ok_and(|(dir, name)| stat_entry(dir, name).is_ok())
+    }
+}
 
 /// Search over the local filesystem.
 #[derive(Debug)]
@@ -144,8 +226,10 @@ struct GrepJob {
 fn grep(base: &Base, job: &GrepJob) -> Outcome<GrepResult> {
     let GrepJob { pattern, path, globs, case, fixed, context, max } = job;
     let (case, fixed, context, max) = (*case, *fixed, *context, *max);
-    let start = base.resolve(path, Follow::Final)?;
-    if !start.exists() {
+    let loc = base.resolve(path, Follow::Final)?;
+    let mut beneath = Beneath::new(&loc).ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("`{path}` does not exist")))?;
+    let start = base.real(&loc);
+    if matches!(beneath.start, Start::File(..)) && beneath.open(Path::new("")).is_err() {
         return Err(ProtoError::new(ErrorCode::NotFound, format!("`{path}` does not exist")));
     }
     let regex = RegexMatcherBuilder::new()
@@ -190,8 +274,15 @@ fn grep(base: &Base, job: &GrepJob) -> Outcome<GrepResult> {
             bytes: &mut bytes,
             truncated: &mut truncated,
         };
-        if let Err(err) = searcher.search_path(&regex, entry.path(), &mut sink) {
-            tracing::debug!(%err, path = %rel, "skipping an unreadable file");
+        // Opened through the held start directory, never by the path the walk listed.
+        let opened = entry.path().strip_prefix(&start).map_err(io::Error::other).and_then(|within| beneath.open(within));
+        match opened {
+            Ok(file) => {
+                if let Err(err) = searcher.search_file(&regex, &file, &mut sink) {
+                    tracing::debug!(%err, path = %rel, "skipping an unreadable file");
+                }
+            }
+            Err(err) => tracing::debug!(%err, path = %rel, "skipping a file that no longer resolves inside the root"),
         }
         if truncated {
             break;
@@ -201,10 +292,12 @@ fn grep(base: &Base, job: &GrepJob) -> Outcome<GrepResult> {
 }
 
 fn glob(base: &Base, patterns: &[String], path: &str, max: u32) -> Outcome<GlobResult> {
-    let start = base.resolve(path, Follow::Final)?;
-    if !start.is_dir() {
+    let loc = base.resolve(path, Follow::Final)?;
+    if loc.target_dir().is_none() {
         return Err(ProtoError::new(ErrorCode::NotFound, format!("`{path}` is not a directory")));
     }
+    let mut beneath = Beneath::new(&loc).ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("`{path}` does not exist")))?;
+    let start = base.real(&loc);
     let mut set = GlobSetBuilder::new();
     let mut hidden = false;
     for pattern in patterns {
@@ -227,7 +320,8 @@ fn glob(base: &Base, patterns: &[String], path: &str, max: u32) -> Outcome<GlobR
             continue;
         }
         let Ok(within) = entry.path().strip_prefix(&start) else { continue };
-        if set.is_match(within) {
+        // Reported only if it still resolves inside, through the held start directory.
+        if set.is_match(within) && beneath.exists(within) {
             let path = base.relative(entry.path());
             bytes = bytes.saturating_add(path.len());
             if paths.len() >= limit || bytes > MAX_RESULT_BYTES {
