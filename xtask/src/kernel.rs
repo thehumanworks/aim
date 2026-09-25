@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::source::load_dir;
+use aim_gate_validators::source::load_dir;
 
 /// Constructs that make a proof an assumption; also rejected by `verus --no-cheating`, checked
 /// here so the plain gate catches them without Verus installed.
