@@ -16,6 +16,8 @@ pub enum Network {
         /// Whether the sandbox may bind and accept on that port.
         listen: bool,
     },
+    /// Temporary W28 test-only exception for tests that bind dynamic localhost ports.
+    TestLoopback,
 }
 
 /// Inputs to a Seatbelt profile. The caller must pass canonical absolute paths.
@@ -38,7 +40,9 @@ impl Policy {
     /// A path is relative or contains characters unsafe for Seatbelt profile parsing, or the
     /// requested port is zero.
     pub fn render(&self) -> Result<String, &'static str> {
-        let mut result = String::from("(version 1)\n(deny default)\n(allow process-fork)\n(allow process-exec)\n");
+        let mut result = String::from(
+            "(version 1)\n(deny default)\n(allow process-fork)\n(allow process-exec)\n(allow sysctl-read)\n(allow file-read* (literal \"/\"))\n",
+        );
         for path in &self.readable {
             result.push_str("(allow file-read* (subpath ");
             result.push_str(&quote_path(path)?);
@@ -57,15 +61,34 @@ impl Policy {
             result.push_str(&path);
             result.push_str("))\n");
         }
-        if let Network::LoopbackPort { port, listen } = self.network {
-            if port == 0 {
-                return Err("Seatbelt loopback port must be nonzero");
+        match self.network {
+            Network::Off => {}
+            Network::LoopbackPort { port, listen } => {
+                if port == 0 {
+                    return Err("Seatbelt loopback port must be nonzero");
+                }
+                let endpoint = format!("\"localhost:{port}\"");
+                writeln!(&mut result, "(allow network-outbound (remote ip {endpoint}))")
+                    .map_err(|_| "Seatbelt output allocation failed")?;
+                if listen {
+                    writeln!(&mut result, "(allow network-bind (local ip {endpoint}))").map_err(|_| "Seatbelt output allocation failed")?;
+                    writeln!(&mut result, "(allow network-inbound (local ip {endpoint}))")
+                        .map_err(|_| "Seatbelt output allocation failed")?;
+                }
             }
-            let endpoint = format!("\"localhost:{port}\"");
-            writeln!(&mut result, "(allow network-outbound (remote ip {endpoint}))").map_err(|_| "Seatbelt output allocation failed")?;
-            if listen {
-                writeln!(&mut result, "(allow network-bind (local ip {endpoint}))").map_err(|_| "Seatbelt output allocation failed")?;
-                writeln!(&mut result, "(allow network-inbound (local ip {endpoint}))").map_err(|_| "Seatbelt output allocation failed")?;
+            Network::TestLoopback => {
+                result.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+                result.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+                result.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
+                for root in &self.writable {
+                    let path = quote_path(root)?;
+                    writeln!(&mut result, "(allow network-outbound (remote unix-socket (subpath {path})))")
+                        .map_err(|_| "Seatbelt output allocation failed")?;
+                    writeln!(&mut result, "(allow network-bind (local unix-socket (subpath {path})))")
+                        .map_err(|_| "Seatbelt output allocation failed")?;
+                    writeln!(&mut result, "(allow network-inbound (local unix-socket (subpath {path})))")
+                        .map_err(|_| "Seatbelt output allocation failed")?;
+                }
             }
         }
         Ok(result)
@@ -98,9 +121,15 @@ mod tests {
         };
         let profile = policy.render().unwrap();
         assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(allow file-read* (literal \"/\"))"));
+        assert!(profile.contains("(allow sysctl-read)"));
+        assert!(!profile.contains("(subpath \"/\")"));
         assert!(profile.contains("(remote ip \"localhost:41111\")"));
         assert!(!profile.contains("localhost:*"));
         assert!(profile.contains("(deny file-read* (subpath \"/workspace/.aim-gate\"))"));
         assert!(Policy { readable: vec![PathBuf::from("relative")], ..Policy::default() }.render().is_err());
+        let test_profile = Policy { network: Network::TestLoopback, ..Policy::default() }.render().unwrap();
+        assert!(test_profile.contains("(remote ip \"localhost:*\")"));
+        assert!(!test_profile.contains("(allow network*)"));
     }
 }

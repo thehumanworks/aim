@@ -61,13 +61,21 @@ impl Default for Thresholds {
 /// with tiny fake commands in tests, but a candidate cannot edit this file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Commands {
-    /// Offline quality gate.
-    pub check: CommandSpec,
+    /// Rust formatting check.
+    pub rustfmt: CommandSpec,
+    /// Verus formatting check; the gate appends kernel source paths.
+    pub verusfmt: CommandSpec,
+    /// Strict workspace Clippy.
+    pub clippy: CommandSpec,
+    /// Offline workspace tests.
+    pub test: CommandSpec,
+    /// Build subject binaries for the pinned wire runner.
+    pub build: CommandSpec,
     /// Verus gate when the kernel changes.
     pub verify: CommandSpec,
     /// Full test-name inventory.
     pub test_inventory: CommandSpec,
-    /// Offline wire benchmark.
+    /// Pinned wire runner marker; a trusted fixture config may name a fake command.
     pub bench: CommandSpec,
     /// Offline smoke after deploy.
     pub canary: CommandSpec,
@@ -76,11 +84,30 @@ pub struct Commands {
 impl Default for Commands {
     fn default() -> Self {
         Self {
-            check: CommandSpec::new("mise", &["run", "check"]),
-            verify: CommandSpec::new("mise", &["run", "verify"]),
+            rustfmt: CommandSpec::new("cargo", &["fmt", "--all", "--check"]),
+            verusfmt: CommandSpec::new("verusfmt", &["--check"]),
+            clippy: CommandSpec::new("cargo", &["clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]),
+            test: CommandSpec::new("cargo", &["test", "--workspace", "--locked"]),
+            build: CommandSpec::new("cargo", &["build", "-p", "aim", "-p", "aimx", "-p", "aim-coderun", "--bins", "--locked"]),
+            verify: CommandSpec::new(
+                "cargo",
+                &[
+                    "verus",
+                    "verify",
+                    "-p",
+                    "aim-kernel",
+                    "--target-dir",
+                    "target/verus",
+                    "--fwd-verus-args-to",
+                    "roots",
+                    "--",
+                    "--no-cheating",
+                    "--time",
+                ],
+            ),
             test_inventory: CommandSpec::new("cargo", &["test", "--workspace", "--locked", "--", "--list"]),
-            bench: CommandSpec::new("mise", &["run", "bench:wire"]),
-            canary: CommandSpec::new("mise", &["run", "smoke:offline"]),
+            bench: CommandSpec::new("@pinned-bench-wire", &[]),
+            canary: CommandSpec::new("cargo", &["run", "-p", "aim", "--locked", "--", "--help"]),
         }
     }
 }
@@ -94,15 +121,27 @@ pub struct GateConfig {
     pub repository: PathBuf,
     /// Pinned source tree containing the protected bench runner and manifest, outside the gate home.
     pub evaluator_root: PathBuf,
+    /// Private artifact root, confined below the gate home.
+    pub deploy_root: PathBuf,
     /// Git remote name or URL used for trial and ledger pushes.
     pub origin: String,
     /// SHA-256 of the pinned evaluator binary, checked on every invocation.
     pub evaluator_digest: String,
     /// Protected evaluator files whose bytes are bound to `evaluator_digest`.
     pub suite_paths: Vec<PathBuf>,
+    /// Explicit fake protected manifest for fixture gates; normal initialization stores `None`.
+    pub fixture_manifest: Option<String>,
     /// Additional canonical toolchain/cache roots mounted read-only in Seatbelt.
     #[serde(default)]
     pub readable_roots: Vec<PathBuf>,
+    /// Read-only Cargo registry cache, without credentials or global config.
+    pub cargo_registry: Option<PathBuf>,
+    /// Read-only Cargo Git cache, when needed by the locked dependency closure.
+    pub cargo_git: Option<PathBuf>,
+    /// Read-only installed Mise toolchains, not the owner's config directory.
+    pub mise_data: Option<PathBuf>,
+    /// Exact directories searched for executables inside the sandbox.
+    pub executable_roots: Vec<PathBuf>,
     /// Evaluator-owned commands.
     #[serde(default)]
     pub commands: Commands,
@@ -126,9 +165,15 @@ impl GateConfig {
         ensure!(self.version == FORMAT_VERSION, "unsupported gate config version");
         ensure!(self.repository.is_absolute(), "gate repository must be absolute");
         ensure!(self.evaluator_root.is_absolute(), "evaluator root must be absolute");
-        ensure!(!self.origin.is_empty(), "gate origin is missing");
+        ensure!(
+            !self.origin.is_empty()
+                && self.origin.len() <= 64
+                && self.origin.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "gate origin must be a configured remote name"
+        );
         ensure!(self.evaluator_digest.len() == 64 && hex::decode(&self.evaluator_digest).is_ok(), "invalid evaluator digest");
         ensure!(self.paid_spend_cap_cents <= 50, "paid spend cap exceeds the W28 limit");
+        ensure!(self.fixture_manifest.is_none() || self.paid_spend_cap_cents == 0, "fixture validator cannot enable paid proposals");
         ensure!(
             !self.bench_result.is_absolute() && !self.bench_result.components().any(|c| matches!(c, std::path::Component::ParentDir)),
             "bench result must be workspace-relative"
@@ -144,6 +189,7 @@ impl GateConfig {
             ensure!(value.is_finite() && value >= 0.0, "invalid gate threshold");
         }
         let home = fs::canonicalize(home).context("gate home must exist")?;
+        ensure!(self.deploy_root.starts_with(&home) && self.deploy_root != home, "deploy root must be below gate home");
         let evaluator_root = fs::canonicalize(&self.evaluator_root).context("evaluator root unavailable")?;
         ensure!(!evaluator_root.starts_with(&home) && !home.starts_with(&evaluator_root), "evaluator root overlaps gate home");
         for path in &self.suite_paths {
@@ -159,9 +205,27 @@ impl GateConfig {
             ensure!(!real.starts_with(&home) && !home.starts_with(&real), "read root overlaps gate home");
             ensure!(real != Path::new("/"), "read root cannot be filesystem root");
         }
-        for command in
-            [&self.commands.check, &self.commands.verify, &self.commands.test_inventory, &self.commands.bench, &self.commands.canary]
-        {
+        for root in [&self.cargo_registry, &self.cargo_git, &self.mise_data].into_iter().flatten() {
+            let real = fs::canonicalize(root).with_context(|| format!("gate cache unavailable: {}", root.display()))?;
+            ensure!(!real.starts_with(&home) && !home.starts_with(&real) && real != Path::new("/"), "cache root overlaps gate home");
+        }
+        ensure!(!self.executable_roots.is_empty(), "sandbox executable search path is empty");
+        for root in &self.executable_roots {
+            let real = fs::canonicalize(root).with_context(|| format!("gate executable root unavailable: {}", root.display()))?;
+            ensure!(!real.starts_with(&home) && !home.starts_with(&real), "executable root overlaps gate home");
+            ensure!(real != Path::new("/"), "executable root cannot be filesystem root");
+        }
+        for command in [
+            &self.commands.rustfmt,
+            &self.commands.verusfmt,
+            &self.commands.clippy,
+            &self.commands.test,
+            &self.commands.build,
+            &self.commands.verify,
+            &self.commands.test_inventory,
+            &self.commands.bench,
+            &self.commands.canary,
+        ] {
             ensure!(!command.program.is_empty(), "empty gate command");
         }
         Ok(())
@@ -178,11 +242,54 @@ pub fn current_evaluator_digest(config: &GateConfig) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"aim-gate-evaluator-v1\0");
     hasher.update(fs::read(executable).context("read gate executable")?);
+    hasher.update(serde_json::to_vec(&config.commands).context("encode pinned evaluator steps")?);
+    if let Some(fixture) = &config.fixture_manifest {
+        hasher.update(fixture.as_bytes());
+    }
     for path in &config.suite_paths {
         hasher.update(path.to_string_lossy().as_bytes());
         hasher.update(b"\0");
         hasher.update(fs::read(config.evaluator_root.join(path)).context("read protected suite")?);
     }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Bind the private config, selected executable bytes, pinned toolchain lock and host target to
+/// one environment digest. Resolution follows the sandbox's exact configured PATH order.
+///
+/// # Errors
+/// Missing selected executable or unreadable environment input.
+pub fn current_environment_digest(config: &GateConfig, home: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"aim-gate-environment-v1\0");
+    hasher.update(std::env::consts::OS.as_bytes());
+    hasher.update(std::env::consts::ARCH.as_bytes());
+    hasher.update(fs::read(home.join("config.toml")).context("read private environment config")?);
+    for command in [
+        &config.commands.rustfmt,
+        &config.commands.verusfmt,
+        &config.commands.clippy,
+        &config.commands.test,
+        &config.commands.build,
+        &config.commands.verify,
+        &config.commands.test_inventory,
+        &config.commands.canary,
+    ] {
+        let selected = if Path::new(&command.program).is_absolute() {
+            PathBuf::from(&command.program)
+        } else {
+            config
+                .executable_roots
+                .iter()
+                .map(|root| root.join(&command.program))
+                .find(|path| path.is_file())
+                .with_context(|| format!("gate executable unavailable: {}", command.program))?
+        };
+        let real = fs::canonicalize(selected).context("canonicalize selected gate executable")?;
+        hasher.update(real.to_string_lossy().as_bytes());
+        hasher.update(fs::read(real).context("read selected gate executable")?);
+    }
+    hasher.update(fs::read(config.evaluator_root.join("mise.lock")).context("read locked toolchain pins")?);
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -220,6 +327,8 @@ pub struct ReceiptBody {
     pub tree_hash: String,
     /// Baseline commit.
     pub baseline_sha: String,
+    /// Exact previously runnable artifact retained for rollback.
+    pub rollback_sha: String,
     /// Pinned gate executable plus protected suite digest.
     pub evaluator_digest: String,
     /// Toolchain pins, OS, architecture and sandbox policy digest.
@@ -354,7 +463,7 @@ pub fn ensure_private_home(home: &Path) -> Result<()> {
         fs::set_permissions(home, fs::Permissions::from_mode(0o700)).context("set gate home mode")?;
     }
     let meta = fs::symlink_metadata(home).context("inspect gate home")?;
-    ensure!(meta.file_type().is_dir() && meta.permissions().mode().trailing_zeros() >= 6, "gate home must be a private directory");
+    ensure!(meta.file_type().is_dir() && meta.permissions().mode() & 0o777 == 0o700, "gate home must be a 0700 directory");
     ensure!(meta.uid() == rustix::process::geteuid().as_raw(), "gate home belongs to another user");
     Ok(())
 }
@@ -366,7 +475,7 @@ pub fn ensure_private_home(home: &Path) -> Result<()> {
 pub fn private_file(path: &Path) -> Result<File> {
     let file = File::from(open(path, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()).context("open private file without symlink")?);
     let meta = file.metadata().context("inspect opened private file")?;
-    ensure!(meta.file_type().is_file() && meta.permissions().mode().trailing_zeros() >= 6, "gate file must be private and regular");
+    ensure!(meta.file_type().is_file() && meta.permissions().mode() & 0o777 == 0o600, "gate file must be 0600 and regular");
     ensure!(meta.uid() == rustix::process::geteuid().as_raw(), "gate file belongs to another user");
     Ok(file)
 }
@@ -463,7 +572,7 @@ pub fn append_ledger(home: &Path, event: LedgerEvent) -> Result<LedgerRecord> {
         open(&lock_path, OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW, Mode::from_raw_mode(0o600)).context("open ledger lock")?,
     );
     let lock_meta = lock_file.metadata().context("inspect ledger lock")?;
-    ensure!(lock_meta.file_type().is_file() && lock_meta.permissions().mode().trailing_zeros() >= 6, "unsafe ledger lock");
+    ensure!(lock_meta.file_type().is_file() && lock_meta.permissions().mode() & 0o777 == 0o600, "ledger lock must be 0600 and regular");
     ensure!(lock_meta.uid() == rustix::process::geteuid().as_raw(), "ledger lock belongs to another user");
     flock(&lock_file, FlockOperation::LockExclusive).context("lock ledger")?;
     let path = home.join("ledger.jsonl");
@@ -478,6 +587,12 @@ pub fn append_ledger(home: &Path, event: LedgerEvent) -> Result<LedgerRecord> {
         Err(err) => return Err(err).context("read ledger"),
     };
     let entries = verify_ledger(&old)?;
+    if let LedgerEvent::Proposed { id, .. } = &event {
+        ensure!(
+            !entries.iter().any(|entry| matches!(&entry.event, LedgerEvent::Proposed { id: existing, .. } if existing == id)),
+            "candidate id already exists in ledger"
+        );
+    }
     let seq = u64::try_from(entries.len()).context("ledger too long")?;
     let prev_hash = entries.last().map_or_else(|| "0".repeat(64), |record| record.hash.clone());
     let hash = record_hash(seq, &prev_hash, &event)?;
@@ -580,6 +695,7 @@ mod tests {
             candidate_sha: "a".repeat(40),
             tree_hash: "b".repeat(40),
             baseline_sha: "c".repeat(40),
+            rollback_sha: "c".repeat(40),
             evaluator_digest: "d".repeat(64),
             environment_digest: "e".repeat(64),
             validation_digest: "f".repeat(64),

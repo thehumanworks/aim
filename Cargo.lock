@@ -176,10 +176,12 @@ dependencies = [
 name = "aim-gate"
 version = "0.0.0"
 dependencies = [
+ "aim-gate-validators",
  "aim-kernel",
  "anyhow",
  "clap",
  "hex",
+ "reqwest",
  "ring",
  "rustix",
  "serde",
