@@ -82,7 +82,7 @@ Two cross-model reviews found gaps in ADR 0046's per-call authority and ADR 0054
      that gets its claim back and removes its own marker.
 6. **Durable reservation journal.** A new persisted format:
    - **Location.** `<canonical home>/.aim/aimx/reservations/`. The directory has mode 0700, is
-     owned by the user, and is added to the default protected paths.
+     owned by the user, and lies inside the protected `~/.aim` (ADR 0055).
    - **Trusted storage (REV19 B1).** Writing and sweeping both open the directory component by
      component from `/` with `O_NOFOLLOW`, so no component may be a symlink. The directory must be
      owned by the user; a looser mode is tightened to 0700. Every entry is then reached relative to
