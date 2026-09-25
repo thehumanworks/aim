@@ -178,6 +178,19 @@ pub struct NativeServices {
     /// factory decides for the session and may offer none; they are composed after the workspace's
     /// and media tools (which keep their names) and before the agent's allowlist.
     pub tools: Vec<ToolsFactory>,
+    /// Code mode (ADR 0018): the `aim-coderun` worker. Sessions get `run_code` (or codex's
+    /// `exec`/`wait`, when the catalog asks for it) and the saved-program tools over their final,
+    /// allowlist-narrowed tools, unless an agent's allowlist excludes `run_code`.
+    pub code: Option<CodeConfig>,
+}
+
+/// Where code mode runs and where programs are kept.
+#[derive(Clone, Debug)]
+pub struct CodeConfig {
+    /// The `aim-coderun` worker binary.
+    pub worker: PathBuf,
+    /// The user's program repository (`~/.aim/programs`).
+    pub user_programs: PathBuf,
 }
 
 /// Offers a session extra tools, or none (see [`NativeServices::tools`]).
@@ -290,19 +303,15 @@ pub fn native_backends_with(
             {
                 tools = Arc::new(Dispatcher::with_policy(tools, media, spec.persistence == Persistence::Persistent));
             }
-            let mut extra = Vec::new();
-            for factory in &services.tools {
-                if let Some(host) = factory(&spec).await {
-                    extra.push(host);
-                }
-            }
-            if !extra.is_empty() {
-                tools = Arc::new(crate::agent::tools::Compose::new(tools, extra));
-            }
-            let (tools, record) = match &agent {
+            tools = with_extra_tools(tools, &services.tools, &spec).await;
+            let code_permitted = agent.as_ref().is_none_or(|(_, policy)| policy.permits("run_code"));
+            let (mut tools, record) = match &agent {
                 Some((agent, policy)) => (narrowed(tools, agent, policy), Some(policy.record(&agent.meta.name))),
                 None => (tools, None),
             };
+            if let Some(code) = services.code.as_ref().filter(|_| code_permitted) {
+                tools = with_code_mode(tools, code, provider.as_ref(), &model, &session_id, &spec.location, &root).await;
+            }
             let config = AgentConfig {
                 model: model.clone(),
                 instructions: prefix.text,
@@ -331,6 +340,38 @@ async fn starting_effort(provider: &dyn ModelProvider, model: &str) -> Option<St
 }
 
 /// `tools` narrowed to `policy`, the ceiling of `agent`.
+/// Composes the per-session extra tools after `tools` (whose names take precedence).
+async fn with_extra_tools(tools: Arc<dyn ToolHost>, factories: &[ToolsFactory], spec: &SessionSpec) -> Arc<dyn ToolHost> {
+    let mut extra = Vec::new();
+    for factory in factories {
+        if let Some(host) = factory(spec).await {
+            extra.push(host);
+        }
+    }
+    if extra.is_empty() { tools } else { Arc::new(crate::agent::tools::Compose::new(tools, extra)) }
+}
+
+/// Adds code mode and the saved-program tools over `tools`, the session's final (narrowed) set,
+/// so nested calls in a cell reach exactly the tools the session may use.
+async fn with_code_mode(
+    tools: Arc<dyn ToolHost>,
+    code: &CodeConfig,
+    provider: &dyn ModelProvider,
+    model: &str,
+    session_id: &str,
+    location: &Location,
+    root: &str,
+) -> Arc<dyn ToolHost> {
+    let catalog = provider.catalog().await.unwrap_or_default();
+    let mode = catalog.iter().find(|m| m.id == model).map_or(crate::coderun::CodeMode::RunCode, crate::coderun::CodeMode::from_model);
+    let host = crate::coderun::CodeToolHost::new(Arc::clone(&tools), code.worker.clone(), session_id.to_owned(), mode);
+    // Project programs live in the workspace; remote workspaces get user programs only for now.
+    let project = matches!(location, Location::Local).then(|| PathBuf::from(root).join(".agents/programs"));
+    let store = Arc::new(crate::programs::ProgramStore::new(code.user_programs.clone(), project));
+    let programs: Arc<dyn ToolHost> = Arc::new(crate::coderun::ProgramToolHost::new(host, store));
+    Arc::new(crate::agent::tools::Compose::new(tools, vec![programs]))
+}
+
 fn narrowed(tools: Arc<dyn ToolHost>, agent: &resources::agents::AgentDef, policy: &ToolPolicy) -> Arc<dyn ToolHost> {
     if policy.is_unrestricted() {
         return tools;

@@ -109,7 +109,21 @@ pub fn services() -> crate::host::NativeServices {
     let decider = std::env::var_os("TYPESAFE_API_KEY")
         .is_some_and(|value| !value.is_empty())
         .then(|| Arc::new(crate::jev::JevDecider) as Arc<dyn crate::jev::Decider>);
-    crate::host::NativeServices { media: Some(media), decider, tools: vec![search_tools()] }
+    crate::host::NativeServices { media: Some(media), decider, tools: vec![search_tools()], code: code_mode() }
+}
+
+/// Code mode, when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this
+/// executable. It runs sandboxed on macOS and refuses to run on Linux until its bubblewrap profile
+/// exists (ADR 0018), so it is offered on macOS only.
+fn code_mode() -> Option<crate::host::CodeConfig> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let worker = std::env::var_os("AIM_CODERUN")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok().map(|exe| exe.with_file_name("aim-coderun")))
+        .filter(|path| path.exists())?;
+    Some(crate::host::CodeConfig { worker, user_programs: crate::cli::aim_home().join("programs") })
 }
 
 type SearchParts = (Arc<crate::search::SearchEngine>, Arc<crate::store::SqliteStore>);

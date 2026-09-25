@@ -822,6 +822,7 @@ fn with_media(media: &Arc<FakeMedia>) -> NativeServices {
         })),
         decider: None,
         tools: Vec::new(),
+        code: None,
     }
 }
 

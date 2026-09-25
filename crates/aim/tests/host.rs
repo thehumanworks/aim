@@ -562,7 +562,7 @@ impl Decider for Counting {
 }
 
 fn advised(counting: &Arc<Counting>) -> NativeServices {
-    NativeServices { media: None, decider: Some(Arc::clone(counting) as Arc<dyn Decider>), tools: Vec::new() }
+    NativeServices { media: None, decider: Some(Arc::clone(counting) as Arc<dyn Decider>), tools: Vec::new(), code: None }
 }
 
 /// Runs one prompt to idle; returns its updates.
@@ -690,6 +690,7 @@ async fn without_media_services_only_workspace_tools_are_offered() {
         })),
         decider: None,
         tools: Vec::new(),
+        code: None,
     };
     let memory = Arc::new(MemoryStore::default());
     let search = vec![
