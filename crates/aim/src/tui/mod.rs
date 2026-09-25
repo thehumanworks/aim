@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use aim_proto::daemon::{Location, Persistence, SessionSpec};
 
-pub use complete::{Candidate, Kind, Request, Source, Sources};
+pub use complete::{Candidate, Kind, Request, Source, SourceFactory, Sources};
 pub use shell::Options;
 
 use crate::host::SessionClient;
@@ -107,7 +107,7 @@ impl TuiArgs {
             attach: self.session.clone(),
             fullscreen: self.fullscreen,
             history: (!self.ephemeral).then(|| home.join("history")),
-            sources: Sources::local(&root, Some(home.join("skills"))),
+            sources: Sources::factory(Some(home.join("skills"))),
             close_on_exit: true,
             keep_superseded_completions: false,
         })

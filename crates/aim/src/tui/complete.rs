@@ -9,9 +9,14 @@
 //! cloud buckets plug in without touching the app. The local file source walks the workspace with
 //! `ignore` (gitignore-aware, bounded) and ranks with `nucleo`'s matcher.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+use futures_util::FutureExt as _;
+use futures_util::future::Shared;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
@@ -27,8 +32,12 @@ pub const MAX_CANDIDATES: usize = 50;
 pub const MAX_INDEXED: usize = 50_000;
 /// Deepest directory level the file index walks.
 pub const MAX_DEPTH: usize = 16;
-/// How long a file index stays fresh.
+/// How long a file index (or skill list) stays fresh.
 pub const INDEX_TTL: Duration = Duration::from_secs(10);
+/// Most bytes of a `SKILL.md` read for its front matter.
+pub const FRONT_MATTER_BYTES: u64 = 8 * 1024;
+/// Most skills read from one directory.
+pub const MAX_SKILLS: usize = 256;
 
 /// What is being completed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +169,82 @@ impl Sources {
             commands: Arc::new(CommandSource),
         }
     }
+
+    /// Sources for a workspace on another machine: never this machine's files or project skills
+    /// (a harness-backed source replaces them later); user skills and commands still apply.
+    pub fn remote(user_skills: Option<PathBuf>) -> Self {
+        Self {
+            files: Arc::new(NoFiles),
+            skills: Arc::new(LocalSkills::new(user_skills.into_iter().collect())),
+            commands: Arc::new(CommandSource),
+        }
+    }
+
+    /// The default factory: local sources for local workspaces, [`Sources::remote`] otherwise.
+    pub fn factory(user_skills: Option<PathBuf>) -> SourceFactory {
+        Arc::new(
+            move |root: &Path, local: bool| {
+                if local { Self::local(root, user_skills.clone()) } else { Self::remote(user_skills.clone()) }
+            },
+        )
+    }
+}
+
+/// Builds the sources for a workspace (its root, and whether it is on this machine). The TUI calls
+/// it for the launch directory and again whenever it attaches a session in another workspace.
+pub type SourceFactory = Arc<dyn Fn(&Path, bool) -> Sources + Send + Sync>;
+
+/// No file completion (a remote workspace, until a harness-backed source exists).
+pub struct NoFiles;
+
+impl Source for NoFiles {
+    fn complete(&self, _request: &Request) -> BoxFuture<Vec<Candidate>> {
+        Box::pin(async { Vec::new() })
+    }
+}
+
+type Build<T> = Shared<BoxFuture<Option<Arc<T>>>>;
+
+/// A value built by one blocking task and shared while fresh: concurrent or cancelled requests
+/// never start a second build (the work runs to completion once, whoever still waits for it).
+pub struct SingleFlight<T> {
+    state: Mutex<Option<(Instant, Build<T>)>>,
+    builds: AtomicUsize,
+}
+
+impl<T: Send + Sync + 'static> SingleFlight<T> {
+    /// Nothing built yet.
+    pub fn new() -> Self {
+        Self { state: Mutex::new(None), builds: AtomicUsize::new(0) }
+    }
+
+    /// The value built less than `ttl` ago, or a new build of it.
+    pub fn get(&self, ttl: Duration, build: impl FnOnce() -> T + Send + 'static) -> Build<T> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((at, shared)) = state.as_ref()
+            && at.elapsed() < ttl
+        {
+            return shared.clone();
+        }
+        self.builds.fetch_add(1, Ordering::Relaxed);
+        let task = tokio::task::spawn_blocking(move || Arc::new(build()));
+        let future: BoxFuture<Option<Arc<T>>> = Box::pin(async move { task.await.ok() });
+        let shared = future.shared();
+        *state = Some((Instant::now(), shared.clone()));
+        shared
+    }
+
+    /// How many builds have started.
+    #[cfg(test)]
+    pub fn builds(&self) -> usize {
+        self.builds.load(Ordering::Relaxed)
+    }
+}
+
+impl<T: Send + Sync + 'static> Default for SingleFlight<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A finished completion, tagged with its generation.
@@ -188,6 +273,12 @@ impl Broker {
     /// Keeps superseded requests running (tests use it to prove the app's fence on its own).
     pub fn keep_superseded(&mut self) {
         self.cancel_superseded = false;
+    }
+
+    /// Uses `sources` from now on (a session in another workspace was attached).
+    pub fn set_sources(&mut self, sources: Sources) {
+        self.cancel();
+        self.sources = sources;
     }
 
     /// Starts `request`, cancelling the previous one.
@@ -274,19 +365,25 @@ impl Source for CommandSource {
 }
 
 /// A workspace entry in the file index: its relative path (`/` after directories).
-type Index = Arc<Vec<String>>;
+type Index = Vec<String>;
 
-/// Files and directories of a local workspace: an `ignore` walk (gitignore-aware, bounded,
-/// cached for [`INDEX_TTL`]) ranked by `nucleo`.
+/// Files and directories of a local workspace: an `ignore` walk (gitignore-aware, bounded, built
+/// once per [`INDEX_TTL`] however many requests ask) ranked by `nucleo`.
 pub struct LocalFiles {
     root: PathBuf,
-    cache: Arc<Mutex<Option<(Instant, Index)>>>,
+    index: Arc<SingleFlight<Index>>,
 }
 
 impl LocalFiles {
     /// Files under `root`.
     pub fn new(root: PathBuf) -> Self {
-        Self { root, cache: Arc::new(Mutex::new(None)) }
+        Self { root, index: Arc::new(SingleFlight::new()) }
+    }
+
+    /// How many index builds have started.
+    #[cfg(test)]
+    pub fn builds(&self) -> usize {
+        self.index.builds()
     }
 }
 
@@ -334,25 +431,11 @@ fn file_candidates(index: &[String], query: &str) -> Vec<Candidate> {
 impl Source for LocalFiles {
     fn complete(&self, request: &Request) -> BoxFuture<Vec<Candidate>> {
         let root = self.root.clone();
-        let cache = Arc::clone(&self.cache);
+        let index = self.index.get(INDEX_TTL, move || walk(&root));
         let query = request.context.query.clone();
         Box::pin(async move {
-            let fresh = cache
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-                .filter(|(at, _)| at.elapsed() < INDEX_TTL)
-                .map(|(_, index)| Arc::clone(index));
-            tokio::task::spawn_blocking(move || {
-                let index = fresh.unwrap_or_else(|| {
-                    let index: Index = Arc::new(walk(&root));
-                    *cache.lock().unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), Arc::clone(&index)));
-                    index
-                });
-                file_candidates(&index, &query)
-            })
-            .await
-            .unwrap_or_default()
+            let Some(index) = index.await else { return Vec::new() };
+            tokio::task::spawn_blocking(move || file_candidates(&index, &query)).await.unwrap_or_default()
         })
     }
 }
@@ -388,24 +471,41 @@ pub fn front_matter(text: &str) -> (Option<String>, Option<String>) {
     (name, description)
 }
 
-/// Skills under the given directories (`<dir>/<skill>/SKILL.md`, ADR 0014).
+/// Skills under the given directories (`<dir>/<skill>/SKILL.md`, ADR 0014): at most
+/// [`MAX_SKILLS`] per directory, [`FRONT_MATTER_BYTES`] of each file, scanned once per
+/// [`INDEX_TTL`] however many requests ask.
 pub struct LocalSkills {
     dirs: Vec<PathBuf>,
+    list: Arc<SingleFlight<Vec<Skill>>>,
 }
 
 impl LocalSkills {
     /// Skills in `dirs`.
     pub fn new(dirs: Vec<PathBuf>) -> Self {
-        Self { dirs }
+        Self { dirs, list: Arc::new(SingleFlight::new()) }
     }
+
+    /// How many scans have started.
+    #[cfg(test)]
+    pub fn builds(&self) -> usize {
+        self.list.builds()
+    }
+}
+
+/// The first `limit` bytes of a file as text (a skill's front matter is at its top).
+fn read_prefix(path: &Path, limit: u64) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn scan_skills(dirs: &[PathBuf]) -> Vec<Skill> {
     let mut skills = Vec::new();
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else { continue };
-        for entry in entries.flatten() {
-            let Ok(text) = std::fs::read_to_string(entry.path().join("SKILL.md")) else { continue };
+        for entry in entries.flatten().take(MAX_SKILLS) {
+            let Some(text) = read_prefix(&entry.path().join("SKILL.md"), FRONT_MATTER_BYTES) else { continue };
             let (name, description) = front_matter(&text);
             let name = name.unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
             if !skills.iter().any(|s: &Skill| s.name == name) {
@@ -419,25 +519,22 @@ fn scan_skills(dirs: &[PathBuf]) -> Vec<Skill> {
 impl Source for LocalSkills {
     fn complete(&self, request: &Request) -> BoxFuture<Vec<Candidate>> {
         let dirs = self.dirs.clone();
+        let list = self.list.get(INDEX_TTL, move || scan_skills(&dirs));
         let query = request.context.query.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let skills = scan_skills(&dirs);
-                let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
-                rank(&query, names, false)
-                    .into_iter()
-                    .take(MAX_CANDIDATES)
-                    .filter_map(|(name, _)| skills.iter().find(|s| s.name == name))
-                    .map(|s| Candidate {
-                        label: format!("${}", s.name),
-                        insert: format!("${} ", s.name),
-                        detail: s.description.clone(),
-                        kind: Kind::Skill,
-                    })
-                    .collect()
-            })
-            .await
-            .unwrap_or_default()
+            let Some(skills) = list.await else { return Vec::new() };
+            let names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+            rank(&query, names, false)
+                .into_iter()
+                .take(MAX_CANDIDATES)
+                .filter_map(|(name, _)| skills.iter().find(|s| s.name == name))
+                .map(|s| Candidate {
+                    label: format!("${}", s.name),
+                    insert: format!("${} ", s.name),
+                    detail: super::text::truncate(&s.description, 200),
+                    kind: Kind::Skill,
+                })
+                .collect()
         })
     }
 }
@@ -519,5 +616,55 @@ mod tests {
         assert_eq!(first.generation, 2);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(rx.try_recv().is_err(), "the superseded request never answers");
+    }
+
+    /// REV10 #10: skill scans read a bounded prefix of each file and a bounded number of skills.
+    #[test]
+    fn rev10_skill_scans_are_bounded() {
+        let dir = std::env::temp_dir().join(format!("aim-skills-{}", uuid::Uuid::new_v4().simple()));
+        let big = dir.join("big");
+        std::fs::create_dir_all(&big).unwrap();
+        let mut text = String::from("---\nname: big\ndescription: Large body\n---\n");
+        text.push_str(&"x".repeat(4 * 1024 * 1024));
+        std::fs::write(big.join("SKILL.md"), &text).unwrap();
+        let prefix = read_prefix(&big.join("SKILL.md"), FRONT_MATTER_BYTES).unwrap();
+        assert!(prefix.len() <= usize::try_from(FRONT_MATTER_BYTES).unwrap());
+        for n in 0..(MAX_SKILLS + 20) {
+            let skill = dir.join(format!("s{n:04}"));
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("SKILL.md"), format!("---\nname: s{n}\n---\n")).unwrap();
+        }
+        let skills = scan_skills(std::slice::from_ref(&dir));
+        assert!(skills.len() <= MAX_SKILLS, "{} skills", skills.len());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// REV10 #10: concurrent cold requests (and cancelled ones) share one index build.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rev10_cold_requests_share_one_build() {
+        let dir = std::env::temp_dir().join(format!("aim-files-{}", uuid::Uuid::new_v4().simple()));
+        for n in 0..200 {
+            let sub = dir.join(format!("d{}", n % 10));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join(format!("f{n}.rs")), "").unwrap();
+        }
+        let files = LocalFiles::new(dir.clone());
+        let request = |q: &str| Request {
+            generation: 1,
+            context: Context { trigger: Trigger::File, query: q.into(), start: 0, end: 0 },
+            hints: Vec::new(),
+        };
+        // Start and drop some (cancelled by the broker), then run many at once.
+        for q in ["a", "b", "c"] {
+            drop(files.complete(&request(q)));
+        }
+        let all = futures_util::future::join_all((0..16).map(|n| files.complete(&request(&format!("f{n}"))))).await;
+        assert!(all.iter().all(|c| !c.is_empty()));
+        assert_eq!(files.builds(), 1, "one walk served every request");
+        let skills = LocalSkills::new(vec![dir.clone()]);
+        let skill_request = Request { context: Context { trigger: Trigger::Skill, ..request("x").context }, ..request("x") };
+        futures_util::future::join_all((0..16).map(|_| skills.complete(&skill_request))).await;
+        assert_eq!(skills.builds(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

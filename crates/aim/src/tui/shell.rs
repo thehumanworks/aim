@@ -16,7 +16,7 @@ use ratatui::layout::Rect;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use super::app::{App, AppConfig, Effect, Input, Layout};
-use super::complete::{Broker, Completed, Sources};
+use super::complete::{Broker, Completed, SourceFactory};
 use super::history;
 use super::inline::{self, Caret, Inline, Reflow};
 use super::schedule::{Frame, Scheduler};
@@ -35,8 +35,8 @@ pub struct Options {
     pub fullscreen: bool,
     /// The prompt history file (`None`: no history, e.g. ephemeral).
     pub history: Option<PathBuf>,
-    /// Completion sources.
-    pub sources: Sources,
+    /// Builds completion sources for a workspace (the launch directory, then each attached one).
+    pub sources: SourceFactory,
     /// Close the sessions this UI opened on exit (in-process hosts; a daemon keeps them).
     pub close_on_exit: bool,
     /// Keep superseded completion requests running (tests of the app's fence).
@@ -94,6 +94,26 @@ fn trace_resize(width: u16, height: u16) {
     }
 }
 
+/// Whether the terminal is one that answers the kitty keyboard query (`AIM_TUI_KEYBOARD=kitty`
+/// forces it, `legacy` refuses it). Unknown terminals keep legacy keys: Alt+Enter and Ctrl+J still
+/// insert newlines.
+fn keyboard_protocol_known(get: impl Fn(&str) -> Option<String>) -> bool {
+    match get("AIM_TUI_KEYBOARD").as_deref() {
+        Some("legacy") => return false,
+        Some("kitty") => return true,
+        _ => {}
+    }
+    if get("TMUX").is_some() {
+        return false;
+    }
+    let term = get("TERM").unwrap_or_default();
+    let program = get("TERM_PROGRAM").unwrap_or_default();
+    ["KITTY_WINDOW_ID", "WEZTERM_PANE", "ALACRITTY_WINDOW_ID"].iter().any(|key| get(key).is_some())
+        || matches!(term.as_str(), "xterm-kitty" | "xterm-ghostty" | "alacritty")
+        || term.starts_with("foot")
+        || matches!(program.as_str(), "WezTerm" | "ghostty" | "iTerm.app")
+}
+
 const RESTORE: &str = "\x1b[?2026l\x1b[0m\x1b[?1049l\x1b[?2004l\x1b[?7h\x1b[?25h";
 
 /// Terminal modes that must be undone however the TUI ends.
@@ -117,9 +137,11 @@ impl Modes {
         Ok(Self { keyboard: false })
     }
 
-    /// Asks for disambiguated keys (Shift+Enter) when the terminal speaks the kitty protocol.
+    /// Asks for disambiguated keys (Shift+Enter) on terminals known to speak the kitty keyboard
+    /// protocol. The query waits for the terminal's answer (up to crossterm's two-second timeout),
+    /// so it is never sent to a terminal that might not answer.
     fn enhance_keyboard(&mut self) {
-        if env("AIM_TUI_KEYBOARD").as_deref() == Some("legacy") {
+        if !keyboard_protocol_known(env) {
             return;
         }
         if matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true)) {
@@ -274,6 +296,7 @@ struct Runner {
     client: Arc<dyn SessionClient>,
     inputs: UnboundedSender<Input>,
     broker: Broker,
+    sources: SourceFactory,
     forwarder: Option<tokio::task::JoinHandle<()>>,
     opened: Vec<String>,
     history: Option<PathBuf>,
@@ -297,8 +320,14 @@ impl Runner {
     fn one(&mut self, effect: Effect) {
         let client = Arc::clone(&self.client);
         match effect {
-            Effect::Create(spec) => self.spawn(async move { Input::Created(client.create(spec).await.map_err(|e| e.message)) }),
-            Effect::Attach { session, resync } => self.attach(session, resync),
+            Effect::Create { spec, attempt } => {
+                self.spawn(async move { Input::Created { attempt, result: client.create(spec).await.map_err(|e| e.message) } });
+            }
+            Effect::Attach { session, resync, attempt } => self.attach(session, resync, attempt),
+            Effect::Rebind { workspace, local } => {
+                let sources = (self.sources)(std::path::Path::new(&workspace), local);
+                self.broker.set_sources(sources);
+            }
             Effect::Prompt { id, session, parts } => {
                 self.spawn(async move { Input::PromptDone { id, result: client.prompt(session, parts).await.map_err(|e| e.message) } });
             }
@@ -331,7 +360,7 @@ impl Runner {
         }
     }
 
-    fn attach(&mut self, session: String, resync: bool) {
+    fn attach(&mut self, session: String, resync: bool, attempt: u64) {
         if let Some(old) = self.forwarder.take() {
             old.abort();
         }
@@ -343,19 +372,19 @@ impl Runner {
         self.forwarder = Some(tokio::spawn(async move {
             match client.attach(session.clone()).await {
                 Ok((result, mut updates)) => {
-                    let attached = Input::Attached { summary: result.summary, transcript: result.transcript, resync };
+                    let attached = Input::Attached { summary: result.summary, transcript: result.transcript, resync, attempt };
                     if inputs.send(attached).is_err() {
                         return;
                     }
                     while let Some(update) = updates.next().await {
-                        if inputs.send(Input::Update { session: session.clone(), update }).is_err() {
+                        if inputs.send(Input::Update { session: session.clone(), attempt, update }).is_err() {
                             return;
                         }
                     }
-                    let _gone = inputs.send(Input::StreamEnded { session });
+                    let _gone = inputs.send(Input::StreamEnded { session, attempt });
                 }
                 Err(error) => {
-                    let _gone = inputs.send(Input::AttachFailed(error.message));
+                    let _gone = inputs.send(Input::AttachFailed { attempt, error: error.message });
                 }
             }
         }));
@@ -372,10 +401,12 @@ impl Runner {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while let Ok(Some(input)) = tokio::time::timeout_at(deadline, inputs.recv()).await {
             match input {
-                Input::Update { session, update: SessionUpdate::StateChanged { state: SessionState::Closed } } if session == current => {
+                Input::Update { session, update: SessionUpdate::StateChanged { state: SessionState::Closed }, .. }
+                    if session == current =>
+                {
                     break;
                 }
-                Input::StreamEnded { session } if session == current => break,
+                Input::StreamEnded { session, .. } if session == current => break,
                 _ => {}
             }
         }
@@ -390,24 +421,35 @@ pub async fn run(client: Arc<dyn SessionClient>, options: Options) -> Result<i32
     let size = crossterm::terminal::size().map_err(|e| format!("not a terminal: {e}"))?;
     let hyperlinks = hyperlinks();
     let history = options.history.as_deref().map(history::load).unwrap_or_default();
-    let config = AppConfig { spec: options.spec.clone(), hyperlinks, home: env("HOME") };
+    let config = AppConfig { spec: options.spec.clone(), hyperlinks, home: env("HOME"), persist_history: options.history.is_some() };
     let mut app = App::new(Theme::detect(env), config, history, options.fullscreen);
     app.handle(Input::Resize(size.0, size.1));
 
     let mut modes = Modes::enter().map_err(|e| format!("terminal: {e}"))?;
     let mut screen = Screen::new(size, hyperlinks);
     screen.paint(&mut app).map_err(|e| format!("terminal: {e}"))?;
-    modes.enhance_keyboard();
 
     let (inputs, mut received) = mpsc::unbounded_channel::<Input>();
     let (completions, mut completed) = mpsc::unbounded_channel::<Completed>();
-    let mut broker = Broker::new(options.sources.clone(), completions);
+    let local = options.spec.location == aim_proto::daemon::Location::Local;
+    let launch = (options.sources)(std::path::Path::new(&options.spec.workspace), local);
+    let mut broker = Broker::new(launch, completions);
     if options.keep_superseded_completions {
         broker.keep_superseded();
     }
-    let mut runner = Runner { client, inputs, broker, forwarder: None, opened: Vec::new(), history: options.history.clone() };
+    let mut runner = Runner {
+        client,
+        inputs,
+        broker,
+        sources: Arc::clone(&options.sources),
+        forwarder: None,
+        opened: Vec::new(),
+        history: options.history.clone(),
+    };
+    // The session starts before the keyboard query, which may wait for the terminal's answer.
     let first = app.start(options.attach.clone());
     runner.run(first);
+    modes.enhance_keyboard();
 
     let mut events = EventStream::new();
     let mut scheduler = Scheduler::default();
@@ -509,5 +551,25 @@ fn handle_received(app: &mut App, runner: &mut Runner, scheduler: &mut Scheduler
         scheduler.stream(Instant::now());
     } else {
         scheduler.urgent(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keyboard_protocol_known;
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| (*v).to_owned())
+    }
+
+    /// REV10 #16: only terminals known to answer get the keyboard query.
+    #[test]
+    fn rev10_the_keyboard_query_goes_only_to_terminals_that_answer() {
+        assert!(!keyboard_protocol_known(env(&[("TERM", "xterm-256color")])), "unknown terminals are not asked");
+        assert!(keyboard_protocol_known(env(&[("TERM", "xterm-kitty")])));
+        assert!(keyboard_protocol_known(env(&[("TERM_PROGRAM", "ghostty")])));
+        assert!(!keyboard_protocol_known(env(&[("TERM_PROGRAM", "ghostty"), ("TMUX", "/tmp/t,1,0")])), "not through tmux");
+        assert!(keyboard_protocol_known(env(&[("TERM", "dumb"), ("AIM_TUI_KEYBOARD", "kitty")])));
+        assert!(!keyboard_protocol_known(env(&[("TERM", "xterm-kitty"), ("AIM_TUI_KEYBOARD", "legacy")])));
     }
 }

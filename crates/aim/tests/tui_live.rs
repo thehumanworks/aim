@@ -87,3 +87,52 @@ fn live_tui_codex_turn() {
 fn live_tui_openrouter_turn() {
     live_turns("openrouter", &[]);
 }
+
+/// A persistent run goes through the daemon (`main.rs` connects to or spawns `aim daemon`): the
+/// turn completes, the prompt reaches this `AIM_HOME`'s history file, and the daemon outlives the
+/// TUI (`close_on_exit = false`) until it is stopped.
+#[test]
+#[ignore = "live: codex credentials (or AIM_LIVE_PROVIDER=openrouter), network and a built aimx"]
+fn live_tui_daemon_turn() {
+    let _built = aimx();
+    let provider = std::env::var("AIM_LIVE_PROVIDER").unwrap_or_else(|_| "codex".into());
+    let mut args = vec!["-p", provider.as_str()];
+    if provider == "codex" {
+        args.extend(["-e", "low"]);
+    }
+    // aim keeps its state in a private directory (0700), as `~/.aim` is.
+    let home = std::env::temp_dir().join(format!("aim-live-daemon-{}", std::process::id()));
+    let _fresh = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("private home");
+    let home_env = home.to_string_lossy().into_owned();
+    let env = [("AIM_HOME", home_env.as_str())];
+    let mut tui = Tui::start_live(&Start { rows: 30, cols: 110, args: &args, env: &env, ..Start::default() });
+    let ready = tui.since_spawn_until(Duration::from_secs(60), |s| s.contains("idle"));
+    let ready = ready.unwrap_or_else(|| panic!("the session did not start:\n{}", tui.screen()));
+    assert!(!tui.screen().contains("ephemeral"), "a persistent session");
+    tui.type_text("What is 17 + 25? Reply with only the number.");
+    tui.send("\r");
+    tui.wait("the turn to start", Duration::from_secs(30), |s| s.contains("running"));
+    let turn = wait_idle_after(&tui, "42", Duration::from_secs(180));
+    tui.send("/quit\r");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while tui.child.try_wait().expect("child state").is_none() {
+        assert!(Instant::now() < deadline, "the TUI did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let history = std::fs::read_to_string(home.join("history")).expect("the history file");
+    assert_eq!(history, "What is 17 + 25? Reply with only the number.\n");
+    let status =
+        std::process::Command::new(env!("CARGO_BIN_EXE_aim")).args(["daemon", "status"]).env("AIM_HOME", &home).output().expect("status");
+    assert!(status.status.success(), "the daemon still runs after the TUI exits");
+    let stopped =
+        std::process::Command::new(env!("CARGO_BIN_EXE_aim")).args(["daemon", "stop"]).env("AIM_HOME", &home).status().expect("stop");
+    assert!(stopped.success());
+    let _cleaned = std::fs::remove_dir_all(&home);
+    println!(
+        "live daemon ({provider}): session ready {:.0} ms after spawn (daemon spawned) · turn {:.1} s",
+        ready.as_secs_f64() * 1_000.0,
+        turn.as_secs_f64()
+    );
+}

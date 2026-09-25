@@ -59,7 +59,6 @@ impl Row {
     }
 
     /// Display width in columns.
-    #[cfg(test)]
     pub fn width(&self) -> usize {
         self.runs.iter().map(|r| r.text.width()).sum()
     }
@@ -227,6 +226,38 @@ pub fn wrap_text(text: &str, style: Style, width: usize, first: &[Run], rest: &[
         rows.extend(wrap(&[Run::new(line, style)], width, prefix, rest, mode));
     }
     rows
+}
+
+/// Cuts `row` to at most `width` columns (at a grapheme boundary), ending with `…` when anything
+/// was cut. Every rendered row goes through it: prefixes, labels and wide graphemes can otherwise
+/// exceed the width, and a terminal with autowrap off would clip them silently.
+pub fn clamp(row: Row, width: usize) -> Row {
+    if row.width() <= width {
+        return row;
+    }
+    let mut out = Row::blank();
+    if width == 0 {
+        return out;
+    }
+    let budget = width - 1;
+    let mut used = 0;
+    let mut style = Style::new();
+    'runs: for run in row.runs {
+        style = run.style;
+        let mut kept = String::new();
+        for g in run.text.graphemes(true) {
+            let w = g.width();
+            if used + w > budget {
+                out.push(Run { text: kept, style: run.style, link: run.link });
+                break 'runs;
+            }
+            kept.push_str(g);
+            used += w;
+        }
+        out.push(Run { text: kept, style: run.style, link: run.link });
+    }
+    out.push(Run::new("…", style));
+    out
 }
 
 /// Shortens `text` to at most `max` columns, ending with `…` when cut.

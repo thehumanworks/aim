@@ -46,23 +46,26 @@ fn summary(id: &str, state: SessionState) -> SessionSummary {
 }
 
 fn new_app(persistence: Persistence) -> App {
-    let config = AppConfig { spec: spec(persistence), hyperlinks: false, home: None };
+    let config =
+        AppConfig { spec: spec(persistence), hyperlinks: false, home: None, persist_history: persistence == Persistence::Persistent };
     App::new(Theme::plain(), config, Vec::new(), false)
 }
 
 /// An app attached to session `s1`, idle, with nothing in it.
 fn attached() -> App {
     let mut app = new_app(Persistence::Ephemeral);
-    assert_eq!(app.start(None), [Effect::Create(spec(Persistence::Ephemeral))]);
-    let effects = app.handle(Input::Created(Ok(summary("s1", SessionState::Idle))));
-    assert_eq!(effects, [Effect::Attach { session: "s1".into(), resync: false }]);
-    let effects = app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript: Vec::new(), resync: false });
+    assert_eq!(app.start(None), [Effect::Create { spec: spec(Persistence::Ephemeral), attempt: 1 }]);
+    let effects = app.handle(Input::Created { attempt: 1, result: Ok(summary("s1", SessionState::Idle)) });
+    assert_eq!(effects, [Effect::Attach { session: "s1".into(), resync: false, attempt: 2 }]);
+    let effects =
+        app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript: Vec::new(), resync: false, attempt: 2 });
     assert!(effects.is_empty());
     app
 }
 
 fn update(app: &mut App, update: SessionUpdate) -> Vec<Effect> {
-    app.handle(Input::Update { session: "s1".into(), update })
+    let attempt = app.attempt;
+    app.handle(Input::Update { session: "s1".into(), attempt, update })
 }
 
 fn running() -> App {
@@ -157,8 +160,8 @@ fn steering_goes_sending_queued_delivered_and_clears_when_idle() {
     let block = view::block(&app, 60, 20);
     assert!(block.rows.iter().any(|r| r.to_string().contains("⧗ queued also run clippy")));
     update(&mut app, SessionUpdate::SteerDelivered { count: 1 });
-    assert_eq!(states(&app), [SteerState::Delivered]);
     update(&mut app, SessionUpdate::ItemAdded { item: user("also run clippy") });
+    assert_eq!(states(&app), [SteerState::Delivered], "the delivered user item names the chip");
     update(&mut app, SessionUpdate::StateChanged { state: SessionState::Idle });
     assert!(app.steers.is_empty());
     assert!(app.composer.is_empty(), "delivered steering is not refilled");
@@ -169,6 +172,7 @@ fn delivery_before_the_prompt_answer_neither_duplicates_nor_refills() {
     let mut app = running();
     let id = steer(&mut app, "check the docs");
     update(&mut app, SessionUpdate::SteerDelivered { count: 1 });
+    update(&mut app, SessionUpdate::ItemAdded { item: user("check the docs") });
     app.handle(Input::PromptDone { id, result: Ok(PromptOutcome::Steered) });
     assert_eq!(states(&app), [SteerState::Delivered], "the late answer does not add a second chip");
     update(&mut app, SessionUpdate::StateChanged { state: SessionState::Idle });
@@ -230,7 +234,7 @@ fn cancel_interrupts_then_settles_and_keeps_what_streamed() {
     assert_eq!(notices(&app), ["cancelled"]);
     assert_eq!(app.hint, None);
     assert_eq!(app.take_history(60).iter().filter(|r| r.text().contains("⏺ echo")).count(), 1);
-    assert!(app.transcript.pending().next().is_none());
+    assert!(app.transcript.held().next().is_none());
 }
 
 #[test]
@@ -273,7 +277,7 @@ fn a_failed_prompt_puts_its_text_back() {
 fn commands_set_the_config_and_are_remembered() {
     let mut app = new_app(Persistence::Persistent);
     app.start(None);
-    app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript: Vec::new(), resync: false });
+    app.handle(Input::Attached { summary: persistent_summary("s1"), transcript: Vec::new(), resync: false, attempt: app.attempt });
     typed(&mut app, "/model gpt-x");
     let effects = app.handle(press(KeyCode::Enter));
     assert!(effects.contains(&Effect::SaveHistory("/model gpt-x".into())));
@@ -368,7 +372,7 @@ fn the_environment_block_never_shows_on_attach() {
         Item::User { parts: vec![Part::Text { text: format!("{ENV}\n\nfrom aim run") }] },
         Item::User { parts: vec![Part::Text { text: ENV.into() }] },
     ];
-    app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript, resync: false });
+    app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript, resync: false, attempt: app.attempt });
     let users: Vec<&Entry> = app.transcript.entries().iter().filter(|e| matches!(e, Entry::User { .. })).collect();
     assert_eq!(users, [&Entry::User { text: "first".into() }, &Entry::User { text: "from aim run".into() }]);
     let printed: Vec<String> = app.take_history(60).iter().map(Row::text).collect();
@@ -379,10 +383,10 @@ fn the_environment_block_never_shows_on_attach() {
 fn a_dropped_stream_reattaches_and_applies_only_new_items() {
     let mut app = attached();
     update(&mut app, SessionUpdate::ItemAdded { item: user("a") });
-    let effects = app.handle(Input::StreamEnded { session: "s1".into() });
-    assert_eq!(effects, [Effect::Attach { session: "s1".into(), resync: true }]);
+    let effects = app.handle(Input::StreamEnded { session: "s1".into(), attempt: app.attempt });
+    assert_eq!(effects, [Effect::Attach { session: "s1".into(), resync: true, attempt: app.attempt }]);
     let transcript = vec![user("a"), user("b")];
-    app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript, resync: true });
+    app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript, resync: true, attempt: app.attempt });
     let users = app.transcript.entries().iter().filter(|e| matches!(e, Entry::User { .. })).count();
     assert_eq!(users, 2, "`a` once, then `b`");
     assert!(notices(&app).iter().any(|n| n.starts_with("reconnected")));
@@ -391,7 +395,7 @@ fn a_dropped_stream_reattaches_and_applies_only_new_items() {
 #[test]
 fn updates_of_another_session_are_ignored() {
     let mut app = attached();
-    app.handle(Input::Update { session: "other".into(), update: SessionUpdate::TextDelta { delta: "x".into() } });
+    app.handle(Input::Update { session: "other".into(), attempt: app.attempt, update: SessionUpdate::TextDelta { delta: "x".into() } });
     assert!(app.live_text.is_empty());
 }
 
@@ -412,7 +416,12 @@ fn a_prompt_before_the_session_exists_is_sent_once_attached() {
     app.start(None);
     typed(&mut app, "early");
     assert!(prompts(&app.handle(press(KeyCode::Enter))).is_empty());
-    let effects = app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript: Vec::new(), resync: false });
+    let effects = app.handle(Input::Attached {
+        summary: summary("s1", SessionState::Idle),
+        transcript: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
     assert_eq!(prompts(&effects), [(1, "early".to_owned())]);
 }
 
@@ -435,11 +444,12 @@ fn the_picker_filters_and_attaches_another_session() {
     app.handle(Input::Sessions(Ok(vec![summary("s1", SessionState::Idle), other])));
     typed(&mut app, "elsewhere");
     assert_eq!(app.picker.as_ref().unwrap().visible().len(), 1);
-    assert_eq!(app.handle(press(KeyCode::Enter)), [Effect::Attach { session: "s2".into(), resync: false }]);
+    let effects = app.handle(press(KeyCode::Enter));
+    assert_eq!(effects, [Effect::Attach { session: "s2".into(), resync: false, attempt: app.attempt }]);
     assert!(app.picker.is_none());
     let mut s2 = summary("s2", SessionState::Idle);
     s2.meta.workspace = "/elsewhere".into();
-    app.handle(Input::Attached { summary: s2, transcript: vec![user("old prompt")], resync: false });
+    app.handle(Input::Attached { summary: s2, transcript: vec![user("old prompt")], resync: false, attempt: app.attempt });
     assert_eq!(app.session.as_ref().unwrap().id, "s2");
     assert!(notices(&app).iter().any(|n| n.starts_with("session s2")));
     assert!(app.transcript.entries().contains(&Entry::User { text: "old prompt".into() }), "the attached transcript is replayed");
@@ -492,4 +502,246 @@ fn a_successful_request_does_not_advance_the_turn_clock() {
     app.handle(Input::Tick);
     app.handle(Input::Noop);
     assert_eq!(app.turn_seconds, 1);
+}
+
+// ---- REV10 regressions (each written to fail on the reviewed code) ----
+
+fn eph_summary(id: &str) -> SessionSummary {
+    let mut s = summary(id, SessionState::Idle);
+    s.persistence = Persistence::Ephemeral;
+    s
+}
+
+fn persistent_summary(id: &str) -> SessionSummary {
+    let mut s = summary(id, SessionState::Idle);
+    s.persistence = Persistence::Persistent;
+    s
+}
+
+fn saves(effects: &[Effect]) -> Vec<String> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SaveHistory(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// REV10 #1 (blocker): a persistent TUI attached to an ephemeral session neither shows disk history
+/// nor writes the session's prompts to it.
+#[test]
+fn rev10_ephemeral_session_prompts_never_reach_disk_history() {
+    let config = AppConfig { spec: spec(Persistence::Persistent), hyperlinks: false, home: None, persist_history: true };
+    let mut app = App::new(Theme::plain(), config, vec!["old secret".into()], false);
+    app.start(Some("e1".into()));
+    app.handle(press(KeyCode::Up));
+    assert!(app.composer.is_empty(), "no disk history before the session's mode is known");
+    app.handle(Input::Attached { summary: eph_summary("e1"), transcript: Vec::new(), resync: false, attempt: app.attempt });
+    app.handle(press(KeyCode::Up));
+    assert!(app.composer.is_empty(), "disk history stays hidden in an ephemeral session");
+    typed(&mut app, "private prompt");
+    let mut effects = app.handle(press(KeyCode::Enter));
+    typed(&mut app, "/model gpt-x");
+    effects.extend(app.handle(press(KeyCode::Enter)));
+    assert!(saves(&effects).is_empty(), "{effects:?}");
+    assert_eq!(prompts(&effects).len(), 1);
+}
+
+/// REV10 #2: returned steering keeps an unsent paste chip's content.
+#[test]
+fn rev10_returned_steering_keeps_a_pasted_draft() {
+    let mut app = running();
+    let id = steer(&mut app, "steer me");
+    app.handle(Input::PromptDone { id, result: Ok(PromptOutcome::Steered) });
+    let big = "x".repeat(1_500);
+    app.handle(Input::Paste(big.clone()));
+    update(&mut app, SessionUpdate::SteersReturned { steers: vec![vec![Part::Text { text: "steer me".into() }]] });
+    update(&mut app, SessionUpdate::StateChanged { state: SessionState::Idle });
+    let sent = prompts(&app.handle(press(KeyCode::Enter)));
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].1.contains(&big), "the paste went out in full: {:?}", sent[0].1.get(..60));
+}
+
+/// REV10 #3: text put back into the composer invalidates the completion popup.
+#[test]
+fn rev10_returned_text_fences_the_completion_popup() {
+    let mut app = running();
+    let id = steer(&mut app, "hello");
+    app.handle(Input::PromptDone { id, result: Ok(PromptOutcome::Steered) });
+    let old = completion_generation(&typed(&mut app, "@s")).unwrap();
+    app.handle(Input::Completed(Completed { generation: old, candidates: vec![candidate("src/main.rs")] }));
+    assert!(app.popup.open());
+    update(&mut app, SessionUpdate::SteersReturned { steers: vec![vec![Part::Text { text: "hello".into() }]] });
+    app.handle(press(KeyCode::Tab));
+    assert!(app.composer.text().starts_with("hello"), "Tab did not edit the returned text: {:?}", app.composer.text());
+    app.handle(Input::Completed(Completed { generation: old, candidates: vec![candidate("docs/")] }));
+    assert!(!app.popup.items.iter().any(|c| c.label == "docs/"), "an old answer cannot fill the popup");
+}
+
+/// REV10 #4: a resync reconciles the partial text and steering against the snapshot.
+#[test]
+fn rev10_resync_reconciles_partial_text_and_steering() {
+    let mut app = running();
+    update(&mut app, SessionUpdate::ItemAdded { item: user("go") });
+    update(&mut app, SessionUpdate::TextDelta { delta: "partial ans".into() });
+    let id = steer(&mut app, "and this");
+    app.handle(Input::PromptDone { id, result: Ok(PromptOutcome::Steered) });
+    // The stream drops the delivery, the finished answer and Idle; a resync brings the snapshot.
+    let effects = app.handle(Input::StreamEnded { session: "s1".into(), attempt: app.attempt });
+    assert_eq!(effects, [Effect::Attach { session: "s1".into(), resync: true, attempt: app.attempt }]);
+    let answer = Item::Assistant { id: None, parts: vec![Part::Text { text: "the full answer".into() }], native: None };
+    let snapshot = vec![user("go"), user("and this"), answer];
+    app.handle(Input::Attached { summary: summary("s1", SessionState::Idle), transcript: snapshot, resync: true, attempt: app.attempt });
+    assert!(app.live_text.is_empty(), "no stale partial beside the snapshot");
+    let answers: Vec<&Entry> = app.transcript.entries().iter().filter(|e| matches!(e, Entry::Assistant { .. })).collect();
+    assert_eq!(answers, [&Entry::Assistant { text: "the full answer".into(), interrupted: false }]);
+    assert!(app.steers.is_empty(), "the steer was delivered: {:?}", app.steers);
+    assert!(app.composer.is_empty(), "delivered steering is not refilled");
+}
+
+fn picker_to(app: &mut App, target: &str) -> Vec<Effect> {
+    typed(app, "/sessions");
+    app.handle(press(KeyCode::Enter));
+    app.handle(Input::Sessions(Ok(vec![summary("s1", SessionState::Idle), summary(target, SessionState::Idle)])));
+    typed(app, target);
+    app.handle(press(KeyCode::Enter))
+}
+
+/// REV10 #5: a prompt typed while switching sessions goes to the new session only.
+#[test]
+fn rev10_a_prompt_during_a_switch_goes_to_the_new_session() {
+    let mut app = attached();
+    let effects = picker_to(&mut app, "s2");
+    assert!(effects.iter().any(|e| matches!(e, Effect::Attach { session, .. } if session == "s2")));
+    typed(&mut app, "for B");
+    let sent = app.handle(press(KeyCode::Enter));
+    assert!(!sent.iter().any(|e| matches!(e, Effect::Prompt { session, .. } if session == "s1")), "{sent:?}");
+    let effects = app.handle(Input::Attached {
+        summary: summary("s2", SessionState::Idle),
+        transcript: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
+    let to_b: Vec<&Effect> = effects.iter().filter(|e| matches!(e, Effect::Prompt { session, .. } if session == "s2")).collect();
+    assert_eq!(to_b.len(), 1, "{effects:?}");
+}
+
+/// REV10 #6: the old session's stream ending does not undo a requested switch.
+#[test]
+fn rev10_an_old_stream_end_does_not_cancel_a_switch() {
+    let mut app = attached();
+    let old = app.attempt;
+    picker_to(&mut app, "s2");
+    let effects = app.handle(Input::StreamEnded { session: "s1".into(), attempt: old });
+    assert!(effects.is_empty(), "no re-attach to the old session: {effects:?}");
+}
+
+/// REV10 #7: several prompts before the first attach are all kept; a failed start returns them.
+#[test]
+fn rev10_prompts_before_attach_are_all_kept() {
+    let mut app = new_app(Persistence::Ephemeral);
+    app.start(None);
+    for text in ["first", "second"] {
+        typed(&mut app, text);
+        assert!(prompts(&app.handle(press(KeyCode::Enter))).is_empty());
+    }
+    let effects = app.handle(Input::Attached {
+        summary: summary("s1", SessionState::Idle),
+        transcript: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
+    let sent: Vec<String> = prompts(&effects).into_iter().map(|(_, t)| t).collect();
+    assert_eq!(sent, ["first", "second"]);
+
+    let mut app = new_app(Persistence::Ephemeral);
+    app.start(None);
+    typed(&mut app, "keep me");
+    app.handle(press(KeyCode::Enter));
+    app.handle(Input::Created { attempt: app.attempt, result: Err("no provider".into()) });
+    assert_eq!(app.composer.text(), "keep me", "the unsent prompt is editable again");
+}
+
+/// REV10 #8: a delayed answer to the turn's first prompt cannot take a later steer's delivery.
+#[test]
+fn rev10_a_delayed_initial_ack_does_not_steal_a_delivery() {
+    let mut app = attached();
+    typed(&mut app, "A");
+    let a = prompts(&app.handle(press(KeyCode::Enter)))[0].0;
+    update(&mut app, SessionUpdate::StateChanged { state: SessionState::Running });
+    update(&mut app, SessionUpdate::ItemAdded { item: user("A") });
+    let b = steer(&mut app, "B");
+    update(&mut app, SessionUpdate::SteerDelivered { count: 1 });
+    update(&mut app, SessionUpdate::ItemAdded { item: user("B") });
+    app.handle(Input::PromptDone { id: a, result: Ok(PromptOutcome::Started { turn: 1 }) });
+    app.handle(Input::PromptDone { id: b, result: Ok(PromptOutcome::Steered) });
+    update(&mut app, SessionUpdate::StateChanged { state: SessionState::Idle });
+    assert!(app.composer.is_empty(), "B was delivered, not returned: {:?}", app.composer.text());
+    assert!(app.steers.is_empty());
+}
+
+/// REV10 #11: `/new` keeps the attached session's provider and location.
+#[test]
+fn rev10_new_keeps_the_attached_provider_and_location() {
+    let mut app = new_app(Persistence::Persistent);
+    app.start(Some("r1".into()));
+    let mut remote = summary("r1", SessionState::Idle);
+    remote.meta.provider = "openrouter".into();
+    remote.meta.location = "ssh:box".into();
+    remote.meta.workspace = "/srv/app".into();
+    app.handle(Input::Attached { summary: remote, transcript: Vec::new(), resync: false, attempt: app.attempt });
+    typed(&mut app, "/new");
+    let effects = app.handle(press(KeyCode::Enter));
+    let spec = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Create { spec, .. } => Some(spec.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(spec.provider, "openrouter");
+    assert_eq!(spec.location, Location::Ssh { destination: "box".into() });
+    assert_eq!(spec.workspace, "/srv/app");
+}
+
+/// REV10 #12: a finished call behind a running one stays visible in the block.
+#[test]
+fn rev10_a_finished_call_behind_a_running_one_stays_visible() {
+    let mut app = running();
+    for (id, name) in [("a", "slow"), ("b", "fast")] {
+        update(
+            &mut app,
+            SessionUpdate::ItemAdded {
+                item: Item::ToolCall { call_id: id.into(), name: name.into(), arguments: "{}".into(), native: None },
+            },
+        );
+    }
+    update(&mut app, SessionUpdate::ItemAdded { item: Item::ToolResult { call_id: "b".into(), result: ToolResult::text("fast result") } });
+    let block = view::block(&app, 60, 30);
+    let text: Vec<String> = block.rows.iter().map(ToString::to_string).collect();
+    assert!(text.iter().any(|r| r.contains("fast result")), "{text:?}");
+    assert!(text.iter().any(|r| r.contains("⏺ slow")), "{text:?}");
+}
+
+/// REV10 #15: attaching a session in another workspace rebinds completion to it (and a remote
+/// one to non-workspace sources only).
+#[test]
+fn rev10_attaching_another_workspace_rebinds_completion() {
+    let mut app = attached();
+    assert!(!app.outbox.iter().any(|e| matches!(e, Effect::Rebind { .. })), "same workspace: no rebind");
+    let mut other = persistent_summary("b1");
+    other.meta.workspace = "/elsewhere".into();
+    app.handle(Input::Attached { summary: other, transcript: Vec::new(), resync: false, attempt: app.attempt });
+    let old = app.attempt;
+    typed(&mut app, "/sessions");
+    app.handle(press(KeyCode::Enter));
+    let mut remote = persistent_summary("r1");
+    remote.meta.location = "ssh:box".into();
+    remote.meta.workspace = "/srv".into();
+    app.handle(Input::Sessions(Ok(vec![remote.clone()])));
+    app.handle(press(KeyCode::Enter));
+    assert!(app.attempt > old);
+    let effects = app.handle(Input::Attached { summary: remote, transcript: Vec::new(), resync: false, attempt: app.attempt });
+    assert!(effects.contains(&Effect::Rebind { workspace: "/srv".into(), local: false }), "{effects:?}");
 }
