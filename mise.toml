@@ -75,9 +75,51 @@ run = ["cargo fmt --all", "verusfmt crates/aim-kernel/src/*.rs"]
 description = "Live smoke tests against real services (needs credentials; required before merging integrations)"
 run = "cargo test --workspace --locked -- --ignored live_"
 
+[tasks.build]
+description = "Build the release binaries (aim, aimx, aim-coderun); stop the daemon if they changed"
+# The three binaries always go together. A daemon left over from an older build would keep serving
+# the old code, so it is stopped whenever a build replaced any of them (not on a no-op build).
+run = '''
+set -e
+marker=target/release/.aim-build-marker
+mkdir -p target/release && touch "$marker"
+cargo build --release --locked -p aim -p aimx -p aim-coderun
+for bin in aim aimx aim-coderun; do
+  if [ "target/release/$bin" -nt "$marker" ]; then
+    target/release/aim daemon stop 2>/dev/null || true
+    break
+  fi
+done
+'''
+
+[tasks.tui]
+alias = "run"
+description = "Build, then start the TUI in the current directory; extra args go to aim (`mise run tui -- -p openrouter`)"
+depends = ["build"]
+raw = true
+dir = "{{cwd}}"
+run = "{{config_root}}/target/release/aim"
+
 [tasks."web:build"]
 description = "Build the browser bundle separately from the native quality gate (WASM link dominates routine checks)"
 run = "cd crates/aim-web && NO_COLOR=true trunk build --release --locked --offline && python externalize_bootstrap.py"
+
+[tasks."web:run"]
+description = "Build, then serve the web UI from a foreground daemon at $AIM_WEB_ADDR (default 127.0.0.1:8080)"
+# The web listener belongs to the daemon itself, so any running daemon is replaced; TUIs reattach
+# with /sessions. Browsers need a bearer from `mise run web:token`. Extra args go to `aim daemon`.
+depends = ["build", "web:build"]
+raw = true
+run = [
+  "target/release/aim daemon stop 2>/dev/null || true",
+  "echo \"aim web UI: http://${AIM_WEB_ADDR:-127.0.0.1:8080} (use exactly this Origin; a token comes from mise run web:token)\"",
+  "target/release/aim daemon --web \"${AIM_WEB_ADDR:-127.0.0.1:8080}\"",
+]
+
+[tasks."web:token"]
+description = "Issue one browser bearer for the web UI and print it once"
+depends = ["build"]
+run = "target/release/aim daemon token create"
 
 [tasks."locked:update"]
 description = "Re-record LOCKED spec digests after a maintainer-approved decision change (with its ADR)"

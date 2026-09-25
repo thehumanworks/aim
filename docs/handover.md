@@ -29,19 +29,21 @@ W25), and the [ADR index](adr/README.md).
 cd ~/projects/aim
 git pull                                   # main is 5618108 or later
 mise install                               # pinned toolchain; a no-op when already installed
-cargo build --release --locked -p aim -p aimx -p aim-coderun     # about 3 min
+mise run build                             # about 3 min; stops the daemon if a binary changed
 export PATH="$PWD/target/release:$PATH"    # aim finds aimx and aim-coderun next to itself
-aim daemon stop 2>/dev/null                # so the next `aim` starts a daemon from this build
 ```
+
+`mise run build` is `cargo build --release --locked -p aim -p aimx -p aim-coderun` followed by
+`aim daemon stop` whenever the build replaced a binary.
 
 - Release binaries are small: `aim` 19.5 MB, `aimx` 7.7 MB, `aim-coderun` 3.7 MB.
 - The three binaries always go together:
   - `aim`: the CLI, TUI and daemon;
   - `aimx`: the tool harness that every file, shell and search call goes through;
   - `aim-coderun`: the code-mode sandbox worker, macOS only.
-- After rebuilding, always run `aim daemon stop`. Persistent sessions live in a background daemon
-  that the TUI starts on demand, and a daemon left over from an old build would keep serving the
-  old code.
+- After rebuilding by hand, always run `aim daemon stop` (`mise run build` does it for you).
+  Persistent sessions live in a background daemon that the TUI starts on demand, and a daemon left
+  over from an old build would keep serving the old code.
 
 ### 2.2 Credentials
 
@@ -55,6 +57,8 @@ aim daemon stop 2>/dev/null                # so the next `aim` starts a daemon f
 ### 2.3 Run
 
 ```sh
+mise run tui                         # build, then the TUI in the current directory (alias `mise run run`)
+mise run tui -- -p openrouter        # arguments after `--` go to aim
 aim                                  # TUI, inline, codex, in the current directory
 aim -p openrouter -m openai/gpt-4.1-mini -C ~/some/repo
 aim --fullscreen                     # or toggle with /fullscreen
@@ -70,11 +74,13 @@ aim sessions                         # list sessions; `aim --session <id>` re-at
 - **The web UI**, in its own terminal:
 
   ```sh
-  mise run web:build                           # about 40 s; builds crates/aim-web/dist
-  aim daemon stop 2>/dev/null
-  aim daemon token create                      # prints a bearer once; copy it
-  aim daemon --web 127.0.0.1:8080              # foreground; the TUI shares this daemon
+  mise run web:token      # prints a bearer once; copy it (tokens persist in ~/.aim/web-tokens.json)
+  mise run web:run        # builds the binaries and crates/aim-web/dist, replaces any running daemon,
+                          # then serves at $AIM_WEB_ADDR (default 127.0.0.1:8080) in the foreground;
+                          # the TUI shares this daemon (reattach with /sessions)
   ```
+
+  `mise run web:build` builds only the bundle (about 40 s from cold).
 
   Open **exactly** `http://127.0.0.1:8080`. `localhost` is a different Origin and is refused.
   Paste the token when the page asks for it.
