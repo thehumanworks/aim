@@ -189,3 +189,15 @@ Recorded 2026-09-25 against claude-agent-acp 0.81.2 with the maintainer's Claude
   (`EndTurn`, one request), and `aim sessions` records the session as `acp:claude/opus[1m]`;
   `aim run -p acp:claude -m gpt-6 …` exits 1 with "acp:claude: model `gpt-6` is not offered;
   the agent offers …" listing all five values.
+
+After the review fixes (conflicts, lookup-based classification, profile variants, no echo of the
+request), re-run the same day:
+
+- `live_set_config`: passed; `no-such-model` refused with "the requested model is not offered;
+  the agent offers `default` (Default (recommended)), `opus[1m]` (Opus 5.5), …"; `opus` resolved
+  to `opus[1m]`; usage model `claude-opus-5-5`.
+- `live_acp_claude_session_with_model_alias`: passed; `gpt-6` refused with
+  "acp:claude: the requested model is not offered; …" (the request is not repeated); `opus`
+  starts on `opus[1m]` and replies "ok".
+- Release binary rebuilt: `aim run -p acp:claude -m opus …` prints "ok" (`EndTurn`, exit 0);
+  `-m gpt-6` exits 1 with the list.
