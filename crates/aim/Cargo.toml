@@ -30,9 +30,11 @@ futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
 ignore = "0.4"
 nix = { version = "0.31", default-features = false, features = ["user"] }
+model2vec-rs = { version = "=0.3.0", default-features = false, features = ["onig", "local-only"] }
 nucleo-matcher = "0.3"
 pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

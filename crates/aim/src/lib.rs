@@ -4,6 +4,7 @@
 //! - [`harness`] — the client side of `aim-harness/1`: tools executed by aimx.
 //! - [`store`] — session persistence (SQLite by default, memory for ephemeral sessions).
 //! - [`session`] — recording agent events into the durable session log.
+//! - [`search`] — persistent conversation search and read-only agent tools.
 //! - [`context`] — instructions and environment given to the model.
 //! - [`resources`] — project and user resources: instructions, rules, skills, agents, prompts, memory.
 //! - [`cli`] — the headless `aim run`.
@@ -28,6 +29,7 @@ pub mod media;
 pub mod providers;
 pub mod remote;
 pub mod resources;
+pub mod search;
 pub mod session;
 pub mod store;
 pub mod tui;

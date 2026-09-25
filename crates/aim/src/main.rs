@@ -127,6 +127,23 @@ enum Command {
         #[command(subcommand)]
         action: board_cli::BoardAction,
     },
+    /// Search the current user's persistent past conversations.
+    SearchSessions {
+        /// Rebuild the index from the lossless session log.
+        #[arg(long)]
+        reindex: bool,
+        /// Maximum excerpts to show.
+        #[arg(short, long, default_value_t = 8)]
+        limit: u32,
+        /// Restrict results to this workspace root.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Emit each result as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Search terms; omitted when only reindexing.
+        query: Vec<String>,
+    },
     /// Serve or inspect the local session daemon.
     Daemon {
         /// Unix socket path (default: `$AIM_HOME/run/daemon.sock`).
@@ -169,6 +186,25 @@ async fn search_cli(query: &str) -> Result<i32, String> {
     println!("{}", answer.text);
     for citation in answer.citations {
         println!("- {}: {}", citation.title, citation.url);
+    }
+    Ok(0)
+}
+
+async fn show_search(
+    engine: Arc<aim::search::SearchEngine>,
+    query: String,
+    limit: u32,
+    workspace: Option<String>,
+    json: bool,
+) -> Result<i32, String> {
+    let hits =
+        tokio::task::spawn_blocking(move || engine.search(&query, limit, workspace.as_deref())).await.map_err(|err| err.to_string())??;
+    for hit in hits {
+        if json {
+            println!("{}", serde_json::to_string(&hit).map_err(|err| err.to_string())?);
+        } else {
+            println!("{}:{} turn {} {} {}", hit.session, hit.seq, hit.turn, hit.kind, hit.snippet);
+        }
     }
     Ok(0)
 }
@@ -216,6 +252,40 @@ async fn tui(args: aim::tui::TuiArgs) -> Result<i32, String> {
     aim::tui::run(Arc::new(host), options).await
 }
 
+async fn search_sessions_command(
+    reindex: bool,
+    limit: u32,
+    workspace: Option<String>,
+    json: bool,
+    query: Vec<String>,
+) -> Result<i32, String> {
+    if query.is_empty() && !reindex {
+        return Err("provide search terms or --reindex".to_owned());
+    }
+    let database = cli::aim_home().join("aim.db");
+    let _store = SqliteStore::open(&database).map_err(|err| err.to_string())?;
+    let engine = tokio::task::spawn_blocking(move || aim::search::SearchEngine::open(&database)).await.map_err(|err| err.to_string())??;
+    let engine = Arc::new(engine);
+    if reindex {
+        let again = Arc::clone(&engine);
+        let count = tokio::task::spawn_blocking(move || again.reindex()).await.map_err(|err| err.to_string())??;
+        if query.is_empty() {
+            println!("indexed {count} chunks");
+            return Ok(0);
+        }
+    }
+    show_search(engine, query.join(" "), limit, workspace, json).await
+}
+
+async fn list_sessions(limit: u32) -> Result<i32, String> {
+    let store = SqliteStore::open(&cli::aim_home().join("aim.db")).map_err(|e| e.to_string())?;
+    let sessions = store.list(limit).await.map_err(|e| e.to_string())?;
+    for s in sessions {
+        eprintln!("{}  {}  {}/{}  {}", s.id, s.created_ms, s.provider, s.model, s.workspace);
+    }
+    Ok(0)
+}
+
 async fn main_async(args: Args) -> Result<i32, String> {
     let Some(command) = args.command else { return tui(args.tui).await };
     match command {
@@ -239,13 +309,9 @@ async fn main_async(args: Args) -> Result<i32, String> {
             }
             Ok(0)
         }
-        Command::Sessions { limit } => {
-            let store = SqliteStore::open(&cli::aim_home().join("aim.db")).map_err(|e| e.to_string())?;
-            let sessions = store.list(limit).await.map_err(|e| e.to_string())?;
-            for s in sessions {
-                eprintln!("{}  {}  {}/{}  {}", s.id, s.created_ms, s.provider, s.model, s.workspace);
-            }
-            Ok(0)
+        Command::Sessions { limit } => list_sessions(limit).await,
+        Command::SearchSessions { reindex, limit, workspace, json, query } => {
+            search_sessions_command(reindex, limit, workspace, json, query).await
         }
         Command::Board { action } => board_cli::run(&cli::aim_home(), action).await,
         Command::Daemon { socket, idle_exit, action } => {
