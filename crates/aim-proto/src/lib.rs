@@ -13,9 +13,11 @@
 //! - [`harness`] — `aim-harness/1`: the execution layer's methods.
 //! - [`tool`] — tool descriptors and results, shared by aimx, the agent layer and MCP.
 //! - [`conversation`] — provider-neutral conversation items, usage and rate limits.
+//! - [`event`] — durable session events (the append-only session log).
 pub mod content;
 pub mod conversation;
 pub mod error;
+pub mod event;
 pub mod harness;
 pub mod ids;
 pub mod rpc;

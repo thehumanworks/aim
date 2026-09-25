@@ -136,3 +136,15 @@ fn every_harness_method_has_a_json_schema() {
         assert!(params.is_object(), "{name} params schema");
     }
 }
+
+#[test]
+fn unknown_session_events_are_preserved_not_rejected() {
+    use aim_proto::event::{EventBody, SessionEvent};
+    let wire = json!({"schema": 9, "seq": 4, "turn": 2, "ts_ms": 1, "body": {"kind": "from_the_future", "x": [1, 2]}});
+    let event: SessionEvent = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(event.body, EventBody::Unknown(json!({"kind": "from_the_future", "x": [1, 2]})));
+    assert_eq!(serde_json::to_value(&event).unwrap(), wire, "round-trips verbatim");
+    let known = json!({"schema": 1, "seq": 1, "turn": 1, "ts_ms": 1, "body": {"kind": "turn_started"}});
+    let event: SessionEvent = serde_json::from_value(known).unwrap();
+    assert_eq!(event.body, EventBody::TurnStarted);
+}

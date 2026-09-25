@@ -17,6 +17,7 @@ aim-llm = { path = "../aim-llm" }
 aim-proto = { path = "../aim-proto" }
 aim-rpc = { path = "../aim-rpc" }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal"] }
