@@ -771,16 +771,19 @@ contract exists.
 M2–M4 are self-hosted with ordinary `aim run` sessions (codex and Claude workers in herdr panes,
 cross-model review). From M5, milestones are posted as blackboard jobs and executed by aim agents.
 
-**Status (2026-09-25, later).**
+**Status (2026-09-25, after W25).** Merged on `main` unless marked in flight.
 
 | M | State |
 | --- | --- |
-| M0, M1-proto | Done. 163 kernel obligations verified. Locked specs are `negotiate`, `path`, `compaction`, `policy` and `effort`. |
-| M1a | Done, with two review rounds (FIX4): identity-checked protected paths, fd-relative resolution, group kill and admission caps. Per-call scopes (ADR 0027 policy kernel) are not yet wired into aimx. |
-| M1b | SSH works: the connection manager, bootstrap, a resident remote aimx with reconnect and resume, the agentless fallback, and `aimx mcp`. Linux agentless fixes (FIX8) are in flight after a Claude verification on Debian and Alpine found a regression. |
-| M2-llm, M2a, M2b | Done. codex, OpenRouter and AI Gateway work locally and over SSH. `acp:claude` runs on aim's tools over MCP, locally and over SSH (strict authority, witness-gated). |
-| M3 | The daemon is done (auto-spawn, ordered attach, detach reasons). The TUI (W07) is in flight. |
-| M4 | Done: compaction (remote V2 or a local summary, a single overflow retry, the verified planner) and resources (instructions, rules, skills with `$mentions`, agent definitions with tool allowlists, prompts, memory index). |
-| M5 | The blackboard ledger and verified job lifecycle (W14) are in flight. |
-| M6 | The Jev effort controller is done (verified; advice overlaps tool execution). The router is a design only. |
-| M8 | codex web search, image generation and transcription are done. Conversation search (W16) is in flight. |
+| M0, M1-proto | Done. The kernel verifies 232 obligations with `--no-cheating`. The locked specs are `negotiate`, `path`, `compaction`, `policy`, `effort`, `job` (six specs, ADR 0048), and `agent_tools`, `dedup` and `discovery` (ADR 0050). `job::next` and `board::may_claim` lock after FIX15 (in flight). |
+| M1a | Done. Per-call `CallScope` is enforced on resolved targets through the policy kernel (ADR 0046), with prefix reads. There are WebSocket and HTTP transports with bearer tokens, TLS off loopback and Origin checks (ADR 0047). Tokens carry `CallScope` ceilings (ADR 0053), and `fs.reserve`/`finalize`/`cancel` reserve a paid write before generation (ADR 0054). |
+| M1b | Done. The connection manager, the bootstrap, and a resident remote aimx with reconnect and resume. The agentless fallback is live-tested on Debian and Alpine. `aimx mcp` exists, and `Location::Remote { url }` reaches a remote aimx over WebSocket or HTTP (ADR 0052). |
+| M2-llm, M2a, M2b | Done. codex, OpenRouter and AI Gateway work locally and over SSH, with endpoint overrides (§6.5). `acp:claude` runs on aim's tools over MCP (strict authority, witness-gated). |
+| M3 | Done. The daemon (auto-spawn, ordered and paged attach, detach reasons, indexed summaries) and the inline TUI with a fullscreen option (review fixes FIX13 and FIX14). UI surfaces and themes come with M7's UI protocol. |
+| M4 | Done: compaction (remote V2 or a local summary, a single overflow retry, the verified planner) and resources (instructions, rules, skills, agent definitions whose tool allowlists are verified, prompts, memory index). |
+| M5 | The blackboard ledger, the verified job lifecycle, and a worker runner in isolated worktrees with serialized integration in a detached worktree (ADR 0048). FIX15 (claim cost, cleanup, worker token isolation) is in flight. Subagents, DAG workflows and webhooks are not started. |
+| M6 | The Jev effort controller is done (verified; advice starts at the first tool call). The router is a design only. |
+| M7 | Code mode is done (a QuickJS/TS worker under Seatbelt, `run_code`, codex `exec`/`wait`, saved programs in git with narrowed grants). In flight: WASM plugins (W27), and the MCP client and `aim mcp` server composed into sessions (W19 → W29, ADR 0045). The UI protocol (ADR 0017) is not started. |
+| M8 | Done: conversation search (FTS5 + model2vec + RRF, lazy index open), and codex web search, image generation and transcription. |
+| M9 | The web UI's first slice is done: a daemon web listener with tokens, Origin, CSP and TLS/proxy, and a Leptos client with private sessions (ADR 0051). The gRPC adapter is not started. |
+| M10 | Benchmark tiers 1–2 are done (ADR 0024): a recording proxy, a wire tier in `mise run check`, and a live coding tier with hidden graders. aim is fastest at startup (26 ms) and leanest in RSS (25 MB), and 12/12 on the live tier. It loses on first-request size and prefix stability, which W26 (in flight) targets. `aim-gate` (W28, ADR 0020) is in flight. |
