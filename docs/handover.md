@@ -80,10 +80,10 @@ aim sessions                         # list sessions; `aim --session <id>` re-at
     then starts fresh like `/new`. `/new` keeps the old output above.
 - **Claude over ACP:** `-m opus` (or `Opus`, `claude-opus-5-5`) now resolves to the adapter's
   `opus[1m]`; an unknown model is refused with the list the agent offers (ADR 0075).
-- **Code mode is opt-in:** `AIM_CODE_MODE=on` (code tool plus a compact direct set) or `only`
-  (code tool only); unset or `off` means plain tools. With `on`/`only`, `acp:claude` gets aim's
-  code-mode relay instead of `aimx mcp`. The benchmark behind the default is in ADR 0076 and
-  `bench/plans/code-mode.md`.
+- **Code mode is on by default:** unset or `AIM_CODE_MODE=on` gives the code tool plus a compact
+  direct set, `only` the code tool alone, and `off` plain tools. With `on`/`only`, `acp:claude`
+  gets aim's code-mode relay instead of `aimx mcp`. The maintainer chose `on` over the benchmark
+  rule's `off`; both are in ADR 0076 §6 and `bench/plans/code-mode.md`.
 - **The web UI**, in its own terminal:
 
   ```sh

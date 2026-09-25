@@ -5,8 +5,9 @@
 - Baseline: 0018, 0056, 0066, 0012
 - Scope: Which tools a model is offered when code mode is off, on, or the only way to act: in
   native sessions, in `aim mcp`, and in strict `acp:claude` sessions. The model-visible code tool
-  description and nested results. The benchmark hook that selects a mode per arm, and the default
-  that benchmark chose (§6). Not `acp:claude-native`, whose tools are Claude's own.
+  description and nested results. The benchmark hook that selects a mode per arm, the
+  benchmark's verdict on the default, and the maintainer's decision (§6). Not
+  `acp:claude-native`, whose tools are Claude's own.
 
 ## Context
 
@@ -67,9 +68,10 @@ unrecognized value", so a pasted secret or a terminal escape never reaches the s
 - **`only`:** the code tool(s) and the program tools alone. Every other tool is reachable only
   inside a cell, and calling one directly fails with "no tool named".
 
-**The default** is one named constant, `aim_kernel::code_mode::DEFAULT_MODE = Off`. It was `On`
-provisionally until task T4b's pre-registered benchmark decided it (§6): code mode is opt-in.
-Changing it again is a one-line change plus this ADR's successor.
+**The default** is one named constant, `aim_kernel::code_mode::DEFAULT_MODE = On`: code mode is on
+unless `AIM_CODE_MODE=off` opts out. T4b's pre-registered benchmark rule chose `off`; the
+maintainer chose `on` anyway (§6). Changing it again is a one-line change plus this ADR's
+successor.
 
 ### 2. The decision is verified
 
@@ -206,7 +208,7 @@ turn observes them (ADR 0066 §2, "Direct callers").
   `tools.Write`).
 - A witness records its route, and it matches only a session with the same relay and route.
 
-`off` (the default, §6), or no worker, keeps `aimx mcp` exactly as before. `acp:claude-native` is
+`off` (the opt-out, §6), or no worker, keeps `aimx mcp` exactly as before. `acp:claude-native` is
 unchanged.
 
 **Timeouts.** `AimMcpServer` gives `run_code`, `exec`, `wait` and `run_program` at least a 330 s
@@ -251,7 +253,7 @@ committed wire baseline, so they are compared with `--no-gate`. The scripted moc
 `run_code` cell for its shell steps when a request offers `run_code` but no direct `Bash`, so the
 wire tier measures `only` too.
 
-### 6. The default is `off`: a pre-registered benchmark found no efficiency gain
+### 6. The default is `on`: the maintainer's decision over the benchmark rule's `off`
 
 The maintainer prefers code mode, provided a benchmark shows its effect on tool-calling efficiency
 first. T4b pre-registered the benchmark before any live run (`bench/plans/code-mode.md`, commit
@@ -316,8 +318,15 @@ request count as `off` and 3–4% more ITE. Neither cohort meets the per-provide
 per-provider default. Claude's requests come from its own transcript; the relay's nested calls
 are not observable (§4).
 
-**Decision:** `DEFAULT_MODE = Off`. `on` and `only` remain available through `AIM_CODE_MODE` for
-native sessions, `aim mcp` and the `acp:claude` relay.
+**The rule's verdict: `off`** (in cohort 2, as in cohort 1). Neither `on` nor `only` met (b), the
+efficiency criterion; `only` also failed (a) and (c).
+
+**Decision: `DEFAULT_MODE = On`, by the maintainer** (2026-09-25): "code mode should be the
+preferred default". The maintainer took this with the numbers above: on these tasks and models
+`on` is non-inferior in quality (24/27 against 23/27) and 12% cheaper than `off` on the
+fix-a-function tasks, but 17% dearer in ITE and 32% dearer in requests on the scripting tasks,
+where gpt-4.1-mini seldom scripts. `AIM_CODE_MODE=off` opts out; `only` stays an explicit choice.
+The benchmark is not re-run to fit the decision; the rule's `off` stays on record here.
 
 ## Consequences
 
@@ -349,7 +358,7 @@ line (+139 bytes) merged: the integration branch's `on` was 7,789 bytes there, a
 benchmark's fixed `/tmp` trial root, which is 44 bytes shorter.
 
 **The wire gate** (`mise run bench:wire`) failed on the integration branch, before and after this
-change. T4b repaired it and re-recorded the baseline on the decided default
+change. T4b repaired it and re-recorded the baseline at each default it shipped, last at `on`
 (`bench/results/t4b-main-baseline.json`; the attribution table is in `bench/README.md`, "Wire gate
 repair"). The mock now scripts a `run_code` cell for `only`, so every mode has a wire measurement.
 
@@ -357,11 +366,11 @@ repair"). The mock now scripts a `run_code` cell for `only`, so every mode has a
 
 - **What `only` costs.** The model reaches every workspace tool through a cell, so a single
   simple action costs a script. The benchmark measured it (§6).
-- **Code mode is opt-in.** With the default `off`, native sessions and `aim mcp` offer no
-  `run_code` (before this ADR both always did, where the worker was found), and a strict
-  `acp:claude` session uses `aimx mcp`, as before this ADR. `AIM_CODE_MODE=on` or `only` selects
-  the code tool and the relay. A default `off` session no longer sends the "# Code mode" section
-  (−241 bytes per request; W1 8,353 → 8,112 bytes).
+- **Code mode is on by default.** Native sessions and `aim mcp` offer `run_code` where the worker
+  is found, and a strict `acp:claude` session uses aim's code-mode relay. `AIM_CODE_MODE=off`
+  gives plain tools and `aimx mcp`; `only` gives the code tools alone. The "# Code mode" prompt
+  section goes only to sessions offered a code tool, so an `off` session does not pay its 241
+  bytes. W1 at the default is 7,745 bytes (`off` 8,112, `only` 4,998).
 - **Follow-ups the wire gate keeps visible** (`bench/README.md`, "Wire gate repair"):
   - `off` sessions do not get ADR 0056's shorter `Read`/`Bash`/`LS` descriptions, which only
     code-mode sessions apply (+427 bytes against `on`).
@@ -376,8 +385,8 @@ repair"). The mock now scripts a `run_code` cell for `only`, so every mode has a
 ## Verification
 
 **Proofs:** `mise run verify` (`crates/aim-kernel/src/code_mode.rs`, 23 obligations). The
-theorems take the default as an input, so they hold for `Off`. The benchmark has settled the
-default; the specs stay `DRAFT(ADR-0076)` until the maintainer locks them.
+theorems take the default as an input, so they hold for `On` as for `Off`. The specs stay
+`DRAFT(ADR-0076)` until the maintainer locks them.
 
 | Theorem | What it proves |
 |---|---|
@@ -467,7 +476,7 @@ private sshd; it spawns the `aim` binary, so the relay applies):
 - **`AIM_CODE_MODE=only`:** the SSH conformance write went through `run_code`, and Claude did the
   test's read, edit, glob, grep and run steps in two `mcp__aim__run_code` cells. The remote file
   changed and the local sentinel did not.
-- **`on` (the default before §6):** Claude called `Read`, `Edit` and `Bash` directly, and
+- **`on` (the default):** Claude called `Read`, `Edit` and `Bash` directly, and
   `run_code` for the hidden `Glob` and `Grep`.
 
 Both passed. The relay needs the adapter to pass its environment to MCP servers: `HOME`, `PATH`

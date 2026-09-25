@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(requested(None), CodeModeRequest::Unset);
         assert_eq!(requested(Some("sometimes")), CodeModeRequest::Invalid);
         assert_eq!(requested(Some("only")), CodeModeRequest::Set(Mode::Only));
-        assert_eq!(DEFAULT_MODE, Mode::Off, "T4b's benchmark decided the default (ADR 0076, bench/results/t4b-code-mode-*.json)");
+        assert_eq!(DEFAULT_MODE, Mode::On, "the maintainer's default (ADR 0076 §6); AIM_CODE_MODE=off opts out");
         let invalid = decide(requested(Some("onn")), true, true, true);
         assert_eq!((invalid.mode, invalid.code, invalid.fallback), (Mode::Off, false, None), "an invalid value turns code mode off");
         assert_eq!(
