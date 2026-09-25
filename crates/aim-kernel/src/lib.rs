@@ -19,6 +19,8 @@
 //! - **No floats, no async, no I/O, and vstd is the only dependency.**
 #![no_std]
 #![expect(clippy::indexing_slicing, reason = "every index in aim-kernel is proved in bounds by Verus")]
+#![expect(clippy::needless_range_loop, reason = "Verus loop invariants are stated over the index")]
+#![expect(clippy::semicolon_if_nothing_returned, reason = "Verus proof blocks erase to unit expressions in the plain build")]
 // Under Verus the ghost code is compiled too, and its derive expansion adds undocumented helper
 // fns. The plain build still enforces `missing_docs`, and `cargo xtask check` requires a doc
 // comment on every public spec and proof fn.
@@ -29,3 +31,4 @@ pub mod board;
 pub mod compaction;
 pub mod job;
 pub mod negotiate;
+pub mod turn;
