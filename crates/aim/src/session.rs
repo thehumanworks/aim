@@ -87,7 +87,10 @@ impl Recorder {
             AgentEvent::RateLimits { limits } => EventBody::RateLimits { limits: limits.clone() },
             AgentEvent::TurnEnded { stop } => EventBody::TurnEnded { stop: stop.clone() },
             AgentEvent::TurnFailed { message } => EventBody::TurnFailed { message: message.clone() },
-            AgentEvent::RequestStarted { .. }
+            AgentEvent::ConfigChanged { model, effort } => EventBody::ConfigChanged { model: model.clone(), effort: effort.clone() },
+            AgentEvent::StateChanged { .. }
+            | AgentEvent::TurnStarted { .. }
+            | AgentEvent::RequestStarted { .. }
             | AgentEvent::TextDelta { .. }
             | AgentEvent::ReasoningDelta { .. }
             | AgentEvent::ToolStarted { .. }

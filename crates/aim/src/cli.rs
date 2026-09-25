@@ -153,6 +153,9 @@ impl Human {
                 })
             }
             AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::StateChanged { .. }
+            | AgentEvent::TurnStarted { .. }
+            | AgentEvent::ConfigChanged { .. }
             | AgentEvent::ItemAdded { .. }
             | AgentEvent::SteerQueued
             | AgentEvent::SteerDelivered { .. }

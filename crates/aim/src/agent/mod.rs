@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use aim_kernel::turn::{CallId, Event as TurnEvent, Phase, Turn};
 use aim_llm::{EventStream, LlmError, ModelProvider, Request, StreamEvent};
-use aim_proto::conversation::{Item, Part, RateLimits, StopReason, Usage};
+use aim_proto::conversation::{Item, Part, StopReason};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolInput, ToolResult, ToolSpec};
 use futures_util::StreamExt as _;
@@ -56,81 +56,9 @@ pub struct AgentConfig {
     pub max_requests: u32,
 }
 
-/// What happens during a turn, for UIs and logs.
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentEvent {
-    /// A model request started (1-based within the turn).
-    RequestStarted {
-        /// Request number.
-        index: u32,
-    },
-    /// Assistant text as it streams.
-    TextDelta {
-        /// New text.
-        delta: String,
-    },
-    /// Reasoning summary as it streams.
-    ReasoningDelta {
-        /// New text.
-        delta: String,
-    },
-    /// A finished item was added to the transcript.
-    ItemAdded {
-        /// The item.
-        item: Item,
-    },
-    /// A tool call started running.
-    ToolStarted {
-        /// Provider call id.
-        call_id: String,
-        /// Tool name.
-        name: String,
-        /// Raw arguments.
-        arguments: String,
-    },
-    /// A tool call finished (or was answered while winding down).
-    ToolFinished {
-        /// Provider call id.
-        call_id: String,
-        /// Tool name.
-        name: String,
-        /// Its result.
-        result: ToolResult,
-    },
-    /// Steering was accepted and will go with the next request.
-    SteerQueued,
-    /// Queued steering went out with a request.
-    SteerDelivered {
-        /// How many steers.
-        count: usize,
-    },
-    /// Steering that was never sent, handed back (e.g. to refill the composer).
-    SteersReturned {
-        /// The steers, in the order they were typed.
-        steers: Vec<Vec<Part>>,
-    },
-    /// Token accounting of one model response.
-    Usage {
-        /// Usage.
-        usage: Usage,
-    },
-    /// Provider rate-limit state.
-    RateLimits {
-        /// Snapshot.
-        limits: RateLimits,
-    },
-    /// The turn is over.
-    TurnEnded {
-        /// Why.
-        stop: StopReason,
-    },
-    /// The turn failed; the transcript was settled first.
-    TurnFailed {
-        /// What went wrong (no secrets).
-        message: String,
-    },
-}
+/// What happens during a turn — the `aim-daemon/1` session update stream (the loop emits the
+/// protocol's updates directly, so the daemon forwards them unchanged).
+pub type AgentEvent = aim_proto::daemon::SessionUpdate;
 
 /// Why a turn failed. The transcript is left settled (every call answered) in every case.
 #[derive(Clone, Debug, PartialEq, Eq)]

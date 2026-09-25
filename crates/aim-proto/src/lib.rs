@@ -11,11 +11,13 @@
 //! - [`content`] — file and output bytes on the wire (UTF-8 text or base64).
 //! - [`ids`] — identifiers, idempotency keys and resume tokens.
 //! - [`harness`] — `aim-harness/1`: the execution layer's methods.
+//! - [`daemon`] — `aim-daemon/1`: clients ↔ the agent daemon (sessions and their updates).
 //! - [`tool`] — tool descriptors and results, shared by aimx, the agent layer and MCP.
 //! - [`conversation`] — provider-neutral conversation items, usage and rate limits.
 //! - [`event`] — durable session events (the append-only session log).
 pub mod content;
 pub mod conversation;
+pub mod daemon;
 pub mod error;
 pub mod event;
 pub mod harness;
