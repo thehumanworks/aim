@@ -27,7 +27,7 @@ client still builds.
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | review | Merged incl. REV-T4a fixes (`0186395`, merge `8c8ea26`); codex re-check running | Close on re-check verdict | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | in progress | Worker running (budget: OpenRouter ≤ $3, codex ≤ 12, acp:claude ≤ 16 runs) | Merge; decision into ADR 0076 | `agent/claude/code-mode-bench` · `../aim-wt/code-mode-bench` |
-| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | review | Merged incl. REV-T5 fixes (`c4a1b35`, merge `1deaa65`); kernel conflict rule proved; live re-run green; codex re-check running | Close on re-check verdict | `agent/claude/acp-models` · `../aim-wt/acp-models` |
+| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | done | Merged incl. REV-T5 fixes (`c4a1b35`); codex re-check: MERGE | Follow-up (not in this batch): adapter resets mode/effort on model switch | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
 | T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
 
@@ -132,3 +132,4 @@ client still builds.
   `aim mcp` and the relay end pending calls 2 s after client EOF (relay test: aimx, bash and sleep
   gone, no `survived` file); harness close lets aimx reap first; invalid AIM_CODE_MODE = off,
   reported once on stderr, proved. Branch: 256 verified; 593 tests passed. Codex re-check started.
+- 2026-09-25 — Codex REV-T5b (re-check; auth.json unchanged): VERDICT MERGE — B1–B5 fixed, theorems meaningful, 277 verified. (First attempt hung on an open stdin; rerun with `< /dev/null`.)
