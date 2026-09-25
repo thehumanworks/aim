@@ -69,8 +69,21 @@ aim sessions                         # list sessions; `aim --session <id>` re-at
 ```
 
 - **TUI keys:** `Enter` sends. `Ctrl-C` cancels a running turn, clears the composer when idle, and
-  quits when pressed twice. `/` opens the commands: `/model`, `/effort`, `/new`, `/sessions`,
-  `/cancel`, `/fullscreen`, `/help`, `/quit`. `/dictate` is listed but not wired in the TUI yet.
+  quits when pressed twice. `/` opens the commands: `/model`, `/effort`, `/provider`, `/new`,
+  `/clear`, `/sessions`, `/cancel`, `/fullscreen`, `/help`, `/quit`. `/dictate` is listed but not
+  wired in the TUI yet.
+  - `/model ` and `/effort ` complete from what the attached session offers: its provider's
+    catalog, or the models Claude Code advertises over ACP. `auto` is offered only where the
+    session accepts it (ADR 0074).
+  - `/provider <id>` starts a new session on another provider, with that provider's default model
+    and effort. `/clear` wipes the chat and the screen (scrollback where the terminal allows it),
+    then starts fresh like `/new`. `/new` keeps the old output above.
+- **Claude over ACP:** `-m opus` (or `Opus`, `claude-opus-5-5`) now resolves to the adapter's
+  `opus[1m]`; an unknown model is refused with the list the agent offers (ADR 0075).
+- **Code mode is opt-in:** `AIM_CODE_MODE=on` (code tool plus a compact direct set) or `only`
+  (code tool only); unset or `off` means plain tools. With `on`/`only`, `acp:claude` gets aim's
+  code-mode relay instead of `aimx mcp`. The benchmark behind the default is in ADR 0076 and
+  `bench/plans/code-mode.md`.
 - **The web UI**, in its own terminal:
 
   ```sh
@@ -102,6 +115,12 @@ aim sessions                         # list sessions; `aim --session <id>` re-at
 
 These need a human: judgement of feel and looks, your real machines and accounts. They are in
 priority order, and even the first three help a lot.
+
+0. **New in this batch (branch `agent/claude/tui-codemode-acp`):** in the TUI, try `/provider
+   openrouter` then `/model ` (the list should be OpenRouter's), `/effort ` on codex and on
+   `acp:claude`, and `/clear` in both inline and fullscreen. Run `aim -p acp:claude -m opus` and
+   check the status line. If you want code mode, run with `AIM_CODE_MODE=on` and ask for a
+   multi-file task (e.g. "count the TODOs in every file under src/").
 
 1. **Daily-drive the TUI on a real task, about 20 minutes.** Run `aim` in this repo or another
    repo you work on, with codex, and give it a genuine small change.
@@ -182,19 +201,20 @@ specs are recorded with `mise run locked:update` only after that review.
 | Branch | What | State when paused | Next step |
 |---|---|---|---|
 | `agent/claude/fix17-aimx` (`35ef4e2`) | aimx: authority bound per process and reservation, write-only scopes that cannot read, a reservation journal (ADR 0067) | Codex review REV19 said "MERGE AFTER FIXES B1–B5". All five were fixed, and the branch gate passed with 40/40 live aimx tests | Merge. An optional codex re-check of the B fixes |
-| `agent/claude/fix16-coderun` (`4a1b99c`) | Code-mode fixes after REV13a: exact terminate, cell lifetimes, deny-default Seatbelt, one output budget, nested-call events (ADR 0066) | Done, branch gate green. Codex review REV21 was stopped partway, and its findings so far need fixes: in-flight nested calls can run unobserved; close/terminate races; an oversized structured program return fails after its effects; two low program-store issues | Fix the REV21 findings, finish the review, merge |
+| `agent/claude/fix16-coderun` (`4a1b99c`) | Code-mode fixes after REV13a: exact terminate, cell lifetimes, deny-default Seatbelt, one output budget, nested-call events (ADR 0066) | Done, branch gate green. Codex review REV21 was stopped partway, and its findings so far need fixes: in-flight nested calls can run unobserved; close/terminate races; an oversized structured program return fails after its effects; two low program-store issues | **Merged as-is into `agent/claude/tui-codemode-acp` (maintainer decision, 2026-09-25); the REV21 findings are still open** — fix them on top |
 | `agent/kernel/fix18-integration` (`6198674`) | Crash-safe board integration, rescue refs, `aim board apply` (ADR 0068), and REV14 proof gaps | Done: 253 obligations, and the mutations fail as they should. Claude review REV22 was stopped partway, with a provisional **MERGE AFTER FIXES**. (1) **High:** one unreachable or bad recoverable row blocks all integration, including `discard-rescue`; it needs per-row reconcile. (2) Don't start a new result for a target that already has one waiting for apply. (3) Add a theorem that a job is finalized as Integrated only when the target equals the result, plus a theorem pinning the begin state, before locking | Fix 1–3, finish REV22 (mutations, board tests), merge, then lock `integration::{reconcile, next, cleanup_allowed}` |
 | `agent/aim/subagents` (`6aa7afe`) | Native subagents: the `agent` tool, child sessions with narrowed ceilings (ADR 0070) | Done, 242 obligations, live-tested. Claude review REV20 is complete: **MERGE AFTER FIXES**. **High:** a child escapes the parent's ceiling through code mode (`host.rs:349-359`); a fix candidate is in `scratchpad/reviews/REV20-probes/`. **Medium:** `exec`/`wait` are hidden from allowlisted agents; the 8-turn per-child cap never binds; the branch conflicts with `main` (board tests; the `ToolsFactory` signature against W30's UI tools) | Fix, rebase onto `main` (W30 is merged), merge, then lock `subagents::{admit_child_spec, charge_child_turn_spec}` |
 | `agent/plugins/wasm` (`04f0720`) | WASM plugins: `aim:plugin@0.1.0`, trust and grants, a lazy sandboxed `aim-plugind` worker (ADR 0057) | Done. `aim` is +1.7% in size; the worker is 40 MB and spawned only for plugins. Claude review REV23 was stopped partway, with a provisional **MERGE AFTER FIXES**: `aim plugin install` does not confine the manifest's `component` path to its own directory (an absolute or `../` path copies any local file into the plugin store). Everything else traced was sound | Confine the install path, finish REV23 (cross-plugin KV test, gate, live smoke), then merge |
-| `agent/perf/tokens` (`a1ca119`) | W26: catalog fetched once and off the first request, a compact code-mode index, a bounded Bash output view, and the REV15 benchmark fixes (ADR 0056) | Implemented, gate green. Live results: OpenRouter startup is 167 ms, down from 438, and the paired live pass rate is aim 6/6 against Codex CLI 5/6. Codex cold-HOME startup is a 418 ms median against a 300 ms target. The final report is not written yet | Write the report, then a Claude review |
+| `agent/perf/tokens` (`a1ca119`) | W26: catalog fetched once and off the first request, a compact code-mode index, a bounded Bash output view, and the REV15 benchmark fixes (ADR 0056) | Implemented, gate green. Live results: OpenRouter startup is 167 ms, down from 438, and the paired live pass rate is aim 6/6 against Codex CLI 5/6. Codex cold-HOME startup is a 418 ms median against a 300 ms target. The final report is not written yet | **Merged as-is into `agent/claude/tui-codemode-acp` (maintainer decision, 2026-09-25); the report and review are still owed.** T4b re-recorded its wire baseline (`bench/results/t4b-main-baseline.json`) |
 | `agent/gate/first` (`37e1f4c`) | W28: `aim-gate`: pinned validators, Seatbelt candidates, broker, paired benchmark, signed receipts, ledger, trial deploy (ADRs 0060–0062) | Mostly done: 252 obligations, 21 gate tests. The last live proposal was rejected because the gate's scratch directories were staged ($0.013 spent across three attempts) | Exclude the scratch directories when staging, rerun one trial, write the report, Claude review, lock five specs |
 | `agent/aimx/exec-sandbox` (`2eaeb89`, an empty checkpoint) | W31: Seatbelt/bubblewrap profiles for `exec.spawn`, the board worker's shell restored (ADR 0073) | Design only. Decisions 1–3 are answered; question 4 (how the board agent session carries its profile) is open, with a recommendation in `questions/daemon.md` | Answer question 4 and implement |
 | `agent/aim/workflows` (`d7cb439`) | W33: declarative DAG workflows with a verified scheduler and a board adapter (ADR 0071) | Implemented: 252 obligations, 13 unit tests, clippy clean. Not yet run: the crash-resume and live tests, and the full gate. There is an open question on board dependency semantics (its option A is implemented) | Finish the tests and gate, write the report, Claude review, lock four specs |
 | `agent/aimx/grpc` (`2f699f1`) | W34: aimx over gRPC (tonic, opaque frames, the same auth, TLS, scope and resume rules; ADR 0072) | Done: 81/81 conformance over gRPC, negative tests, and a live TLS OpenRouter edit. `aimx` +5 MB; `fs.read` takes 197 µs over gRPC and WebSocket, 80 µs over unix. The report is not written yet | Write the report, then a Claude review |
 
 
-**Suggested landing order:** FIX17, then FIX16, FIX18, W32, W27/W27b, W26, then W31 and W28 (they
-share the new `aim-sandbox` crate), then W33 and W34.
+**Suggested landing order:** FIX16 and W26 now land with `agent/claude/tui-codemode-acp`, ahead of
+FIX17 (expect conflicts in aimx and the harness when FIX17 is merged after it). Then FIX17, FIX18,
+W32, W27/W27b, then W31 and W28 (they share the new `aim-sandbox` crate), then W33 and W34.
 
 ## 5. Known limits and residual risks
 

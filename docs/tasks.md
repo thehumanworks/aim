@@ -26,7 +26,8 @@ client still builds.
 | T2 | `/clear` clears the chat and starts fresh | done | Merged with T1 (transcript, inline rows, row cache, screen + scrollback best effort, new session) | With T1 | with T1 |
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | done | Merged incl. REV-T4a and REV-T4a-b fixes (`e569a5e`) | Residual in ADR 0076: aimx needs a SIGTERM handler (orphan shells if it ignores close) | `agent/claude/code-mode` · `../aim-wt/code-mode` |
-| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | in progress | Worker running (budget: OpenRouter ≤ $3, codex ≤ 12, acp:claude ≤ 16 runs) | Merge; decision into ADR 0076 | `agent/claude/code-mode-bench` · `../aim-wt/code-mode-bench` |
+| T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | review | Merged (`ad49be0`, merge `02d987e`): wire gate passes; pre-registered benchmark chose default `off`; follow-up running (code-mode prompt section only when code tools are offered); codex REV-T4b running | Merge follow-up; close | `agent/claude/code-mode-bench` |
+| T4c | Per-session code mode: client-side `AIM_CODE_MODE` / `--code-mode` carried in the session spec, kept on resume and `/new`, shown in the status line; ACP relay follows it | in progress | T4a's worker (context kept), on `agent/claude/code-mode` | Merge; codex review | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | done | Merged incl. REV-T5 fixes (`c4a1b35`); codex re-check: MERGE | Follow-up (not in this batch): adapter resets mode/effort on model switch | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
 | T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
@@ -140,3 +141,30 @@ client still builds.
   the invalid-value warning echoes the whole env value. Sent back to the T4a worker.
 - 2026-09-25 — Codex REV-T1c (final re-check; auth.json unchanged): VERDICT MERGE. Note: the unit test's 50 ms wait makes its detection timing-dependent (the stress test backs it).
 - 2026-09-25 — REV-T4a-b residuals fixed (`e569a5e`, merged): 100-byte exec/wait floor, program + nested errors cut, MCP replies via bounded writer (test fails on the old server), env value not echoed. Residual documented: `aimx serve --stdio` has no SIGTERM handler.
+- 2026-09-25 — T4b done (`ad49be0`, merged `02d987e`). Wire gate: 35 regressions → passed. 26 were a
+  TMPDIR leak (+44 B in every codex/pi row; trials now under a fixed /tmp root); aim's growth is
+  attributed byte by byte (ui_* tools +773, batching +139, code-mode section +241, run_code
+  guidance +706). New baseline `t4b-main-baseline.json`, new cohort. Benchmark (pre-registered
+  `7a788e5`): gpt-4.1-mini 3 reps × 9 tasks — off 23/27, on 23/27 (+16% requests, +22% ITE on
+  scripting tasks; rule needed −25%), only 15/27; codex and acp:claude: equal requests, +3–4% ITE.
+  Decision: DEFAULT_MODE = Off (code mode opt-in via AIM_CODE_MODE). Spend: OpenRouter $0.53,
+  codex 12/12, Claude 13/16; auth.json unchanged. Merged-tree Verus 360 verified.
+- 2026-09-25 — Follow-up sent: the "# Code mode" prompt section only when code tools are offered
+  (−241 B/request at the default). Codex REV-T4b started.
+- 2026-09-25 — T4b follow-up merged (`1d6c157`): code-mode prompt section only where a code tool is
+  offered; W1 8,353 → 8,112 B; bound 8,160.
+- 2026-09-25 — Codex REV-T4b (auth.json unchanged): MERGE AFTER FIXES. Confirmed: plan preceded
+  the runs; decision recomputes to `off`; ledger reconciles; wire attribution coherent; default
+  routes through Off (360 verified). B1: the three new graders accept wrong reports (wrong paths /
+  wrong function names). Per the plan, grader changes after the smoke need a new cohort: fix
+  graders + false-pass tests, re-register, rerun the primary arms (~$0.55), re-grade secondaries
+  offline if their reports were kept. Sent back to the T4b worker.
+- 2026-09-25 — Full `mise run check` on `b10ad82` (all merges except T4b's grader fix): green — 1,036 tests passed, 0 failed; wire gate passed. Tree clean.
+- 2026-09-25 — Maintainer tried `export AIM_CODE_MODE=1; mise run tui` and got no code mode: the
+  running daemon (pid 5761, started 18:11) lacked the variable, and a no-op `mise run build` does
+  not restart it. Verified in-process: `AIM_CODE_MODE=1 aim run` offers run_code/save_program/
+  run_program/list_programs (and hides Glob/Grep/KillShell/session search); `off` does the reverse.
+- 2026-09-25 — Maintainer decisions: (1) make code mode per-session and client-carried with a
+  status-line indicator (T4c); (2) make code mode the DEFAULT (`on`), overriding the benchmark
+  rule's `off` — T4b's worker flips DEFAULT_MODE, re-records the wire baseline and records the
+  override in ADR 0076 next to the (rerun) numbers.
