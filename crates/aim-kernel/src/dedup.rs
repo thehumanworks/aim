@@ -1,7 +1,7 @@
 //! Per-key mutation replay decisions, with admission refusal distinct from execution (ADR 0050).
 //!
 //! The shell owns keys, keyed tombstone hashes, recorded results, and clocks. This model receives
-//! the observed phase and a validated stale-key flag; it cannot create or parse `UUIDv7` values.
+//! the observed phase and a parsed `UUIDv7` mint time; it cannot parse key bytes itself.
 use vstd::prelude::*;
 
 verus! {
@@ -36,6 +36,27 @@ pub enum BeginDecision {
     Full,
     /// Concurrent attempt capacity is full.
     Busy,
+}
+
+/// LOCKED(ADR-0055): a timestamped key is stale once its mint time plus the horizon is no
+/// later than now. Untimestamped keys cannot be classified stale after their tombstone expires.
+pub open spec fn minted_too_old_spec(minted: Option<u64>, now: u64, horizon_ms: u64) -> bool {
+    match minted {
+        Some(time) => (time as nat) + (horizon_ms as nat) <= now as nat,
+        None => false,
+    }
+}
+
+/// Classifies a shell-parsed `UUIDv7` mint time without overflowing the clock arithmetic.
+#[must_use]
+pub fn minted_too_old(minted: Option<u64>, now: u64, horizon_ms: u64) -> (stale: bool)
+    ensures
+        stale == minted_too_old_spec(minted, now, horizon_ms),
+{
+    match minted {
+        Some(time) => time <= now && horizon_ms <= now - time,
+        None => false,
+    }
 }
 
 /// LOCKED(ADR-0050): a retained attempt replays or waits; an evicted or stale absent key returns

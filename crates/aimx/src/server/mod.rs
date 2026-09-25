@@ -31,6 +31,7 @@ use self::token::TokenStore;
 use crate::authz::{Principal, ProtectedPaths};
 use crate::dedup::{Begin, DedupConfig, DedupTable};
 use crate::workspace::Workspace;
+use aim_kernel::dedup::minted_too_old;
 
 /// How far in the future a timestamped idempotency key may be minted (client clock skew).
 const MAX_KEY_SKEW: Duration = Duration::from_mins(5);
@@ -265,7 +266,7 @@ impl State {
                 "the idempotency key's UUIDv7 time is in the future; check the client's clock",
             )));
         }
-        let too_old = minted.is_some_and(|minted| minted.saturating_add(ms(self.config.key_horizon)) <= now);
+        let too_old = minted_too_old(minted, now, ms(self.config.key_horizon));
         let mut work = Some(work);
         loop {
             let mut done = self.dedup_done.subscribe();
