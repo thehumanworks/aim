@@ -17,5 +17,6 @@ pub mod edit;
 mod id;
 pub mod ring;
 pub mod server;
+pub mod ssh;
 pub mod tools;
 pub mod workspace;
