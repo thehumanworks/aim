@@ -25,7 +25,9 @@ The trusted gate can set `AIM_GATE_BENCH_PORT` to one decimal TCP port (1–6553
 mock proxy uses that port and announces readiness only after binding it; a mismatch or occupied
 port aborts rather than accepting another local service as the recorder. Without the variable,
 the benchmark retains its ephemeral-port behavior. The gate's Seatbelt profile permits only the
-selected loopback port.
+selected loopback port. For a pre-merge baseline without this hook, the gate runs its own pinned
+`bench/run.py` with `AIM_GATE_BENCH_SOURCE_ROOT` set to the canonical clone path. The runner's
+manifest and proxy stay pinned; only the subject binaries and source SHA come from that clone.
 
 ```sh
 python3 -B bench/run.py wire --out bench/history/all-peers.json \

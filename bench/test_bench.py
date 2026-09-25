@@ -12,7 +12,7 @@ from pathlib import Path
 
 from live_tasks import TASKS, grade, prepare
 from proxy import SseUsage, has_generated_delta, request_shape, usage_fields
-from run import PROXY, free_port, summary, wait_port
+from run import EVALUATOR_ROOT, PROXY, free_port, source_root, summary, wait_port
 from port import fixed_port, require_fixed_port
 
 
@@ -27,6 +27,18 @@ class RecorderTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 fixed_port(invalid)
         self.assertIsNone(fixed_port(None))
+
+    def test_gate_source_root_keeps_the_evaluator_runner_pinned(self):
+        with tempfile.TemporaryDirectory() as temp:
+            clone = Path(temp).resolve()
+            (clone / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            self.assertEqual(source_root(str(clone)), clone)
+            self.assertEqual(source_root(None), EVALUATOR_ROOT)
+            self.assertEqual(PROXY, EVALUATOR_ROOT / "bench/proxy.py")
+            with self.assertRaises(ValueError):
+                source_root("relative")
+            with self.assertRaises(ValueError):
+                source_root(str(clone / "missing"))
 
     def test_occupied_fixed_port_never_accepts_another_server_as_recorder(self):
         with socket.socket() as occupied, tempfile.TemporaryDirectory() as temp:

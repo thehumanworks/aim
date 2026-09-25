@@ -29,8 +29,27 @@ from pathlib import Path
 from live_tasks import grade, prepare
 from port import fixed_port
 
-ROOT = Path(__file__).resolve().parent.parent
-BENCH = ROOT / "bench"
+EVALUATOR_ROOT = Path(__file__).resolve().parent.parent
+
+
+def source_root(raw: str | None) -> Path:
+    """Select the evaluated clone while keeping this runner and its fixtures pinned."""
+    if raw is None:
+        return EVALUATOR_ROOT
+    path = Path(raw)
+    if not path.is_absolute():
+        raise ValueError("AIM_GATE_BENCH_SOURCE_ROOT must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("AIM_GATE_BENCH_SOURCE_ROOT is unavailable") from error
+    if path != resolved or not (resolved / "Cargo.toml").is_file():
+        raise ValueError("AIM_GATE_BENCH_SOURCE_ROOT must be a canonical Rust workspace")
+    return resolved
+
+
+ROOT = source_root(os.environ.get("AIM_GATE_BENCH_SOURCE_ROOT"))
+BENCH = EVALUATOR_ROOT / "bench"
 MANIFEST = BENCH / "manifest.toml"
 PROXY = BENCH / "proxy.py"
 CODEX_AUTH = Path.home() / ".codex"
@@ -38,7 +57,7 @@ BASE_ENV = os.environ.copy()
 
 
 def pinned(name: str) -> Path:
-    result = subprocess.run(["mise", "which", name], cwd=ROOT, capture_output=True, text=True, check=True)
+    result = subprocess.run(["mise", "which", name], cwd=EVALUATOR_ROOT, capture_output=True, text=True, check=True)
     return Path(result.stdout.strip()).resolve()
 
 
