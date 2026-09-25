@@ -46,6 +46,9 @@ async fn requests_before_initialize_are_unauthenticated() {
     let params = WorkspaceOpenParams { root: env.root.to_str().unwrap().into(), backend: BackendSpec::Local };
     let err = client.peer.call::<WorkspaceOpen>(params).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Unauthenticated);
+    let err =
+        client.peer.call::<aim_proto::harness::WatchStop>(aim_proto::harness::WatchStopParams { watch: "w".into() }).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unauthenticated);
 }
 
 #[tokio::test(flavor = "multi_thread")]

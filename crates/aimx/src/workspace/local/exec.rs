@@ -68,6 +68,9 @@ struct Proc {
     input: tokio::sync::Mutex<Input>,
     master: Option<Mutex<Master>>,
     timed_out: AtomicBool,
+    /// The group leader has been reaped (set before the output drains and the exit is recorded):
+    /// from here on the group id may be reused, so nothing is signalled.
+    leader_exited: AtomicBool,
     last_signal: AtomicI32,
 }
 
@@ -91,6 +94,7 @@ impl Proc {
             input: tokio::sync::Mutex::new(input),
             master: master.map(Mutex::new),
             timed_out: AtomicBool::new(false),
+            leader_exited: AtomicBool::new(false),
             last_signal: AtomicI32::new(0),
         }
     }
@@ -137,7 +141,7 @@ impl Proc {
     /// Signals the process group while the process runs (after it ended, the group id may be
     /// reused, so nothing is sent).
     fn signal(&self, signal: rustix::process::Signal) -> Outcome<()> {
-        if self.finished() {
+        if self.leader_exited.load(Ordering::SeqCst) || self.finished() {
             return Ok(());
         }
         let Some(pgid) = self.pgid else {
@@ -256,6 +260,7 @@ async fn supervise_pipes(proc: Arc<Proc>, mut child: tokio::process::Child, read
         }
         None => child.wait().await,
     };
+    proc.leader_exited.store(true, Ordering::SeqCst);
     drain(readers).await;
     let exit = if proc.timed_out.load(Ordering::SeqCst) {
         ExitStatus::TimedOut
@@ -284,6 +289,7 @@ async fn supervise_pty(
         }
         None => exited.await,
     };
+    proc.leader_exited.store(true, Ordering::SeqCst);
     if tokio::time::timeout(DRAIN_GRACE, drained).await.is_err() {
         tracing::debug!("pty output still open after exit; later output is dropped");
     }

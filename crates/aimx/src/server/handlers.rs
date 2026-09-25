@@ -331,13 +331,13 @@ impl Conn {
         .await
     }
 
-    #[expect(clippy::unused_self, reason = "every handler is a method of the connection, whether it needs it or not")]
-    fn watch_start(&self, _params: &WatchStartParams) -> Outcome<WatchStartResult> {
+    fn watch_start(&self, params: &WatchStartParams) -> Outcome<WatchStartResult> {
+        self.session()?.workspace(&params.workspace)?;
         Err(ProtoError::new(ErrorCode::Unavailable, "file watching is not available on this backend (caps.watch is false)"))
     }
 
-    #[expect(clippy::unused_self, reason = "every handler is a method of the connection, whether it needs it or not")]
     fn watch_stop(&self, params: &WatchStopParams) -> Outcome<()> {
+        self.session()?;
         Err(ProtoError::new(ErrorCode::NotFound, format!("unknown watch `{}`", params.watch)))
     }
 
