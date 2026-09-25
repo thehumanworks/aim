@@ -9,13 +9,14 @@
 //! - [`authz`] — principals, grants, path confinement and protected paths.
 //! - [`tools`] — the model-facing tools, written only against the `Workspace` traits.
 //! - [`server`] — `aim-harness/1` over unix sockets and stdio: sessions, resume, idempotency.
-//! - [`edit`], [`ring`], [`dedup`] — pure decision logic (kernel candidates): exact-edit
-//!   application, the output ring buffer and the idempotency table.
+//! - [`edit`], [`ring`], [`dedup`], [`page`] — pure decision logic (kernel candidates): exact-edit
+//!   application, the output ring buffer, the idempotency table and bounded listing pages.
 pub mod authz;
 pub mod dedup;
 pub mod edit;
 mod id;
 pub mod mcp;
+pub mod page;
 pub mod ring;
 pub mod server;
 pub mod ssh;

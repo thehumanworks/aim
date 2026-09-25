@@ -25,6 +25,7 @@ use sha2::{Digest as _, Sha256};
 use super::{Base, Follow, blocking, io_error};
 use crate::edit::apply_edits;
 use crate::id::{hex, random_hex};
+use crate::page::Page;
 use crate::workspace::{BoxFuture, CopyRequest, EditRequest, Fs, ListRequest, Outcome, WriteRequest};
 
 const BLOCK: usize = 64 * 1024;
@@ -255,30 +256,25 @@ fn edit(base: &Base, mutations: &Mutex<()>, path: &str, edits: &[ExactEdit], pre
 fn list(base: &Base, path: &str, limit: u32, page_token: Option<&str>, include_hidden: bool) -> Outcome<FsListResult> {
     let real = base.resolve(path, Follow::Final)?;
     let reader = fs::read_dir(&real).map_err(|err| io_error(&err, path))?;
-    let mut entries = Vec::new();
+    // Only the page (plus one, to know whether more follow) is held, however large the directory.
+    let mut page = Page::new(usize::try_from(limit).unwrap_or(usize::MAX), page_token);
     for entry in reader {
         let entry = entry.map_err(|err| io_error(&err, path))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !include_hidden && name.starts_with('.') {
+        if (!include_hidden && name.starts_with('.')) || !page.wants(&name) {
             continue;
         }
-        if page_token.is_some_and(|token| name.as_str() <= token) {
-            continue;
-        }
+        page.offer(name, entry);
+    }
+    let selected = page.finish();
+    let mut entries = Vec::with_capacity(selected.entries.len());
+    for (name, entry) in selected.entries {
         let file_type = entry.file_type().map_err(|err| io_error(&err, path))?;
         let kind = entry_kind(file_type);
         let size = if kind == EntryKind::File { entry.metadata().map_or(0, |m| m.len()) } else { 0 };
         entries.push(DirEntry { name, kind, size });
     }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    let limit = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
-    let next_page = if entries.len() > limit {
-        entries.truncate(limit);
-        entries.last().map(|e| e.name.clone())
-    } else {
-        None
-    };
-    Ok(FsListResult { entries, next_page })
+    Ok(FsListResult { entries, next_page: selected.next_page })
 }
 
 fn mkdir(base: &Base, mutations: &Mutex<()>, path: &str) -> Outcome<()> {
