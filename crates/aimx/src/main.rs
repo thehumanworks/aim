@@ -3,6 +3,8 @@
 //! - `aimx serve --unix PATH [--root DIR]… [--read-only]` serves `aim-harness/1` on a unix socket
 //!   (many connections; peers must run as the same OS user).
 //! - `aimx serve --stdio …` serves one connection on stdin/stdout (what SSH bootstrap runs).
+//! - `aimx serve --ws ADDR | --http ADDR` serves authenticated network peers.
+//! - `aimx token create --scope read|write` issues an owner token once.
 //! - `aimx version` prints the version and the protocol generations.
 //!
 //! Logs go to stderr (never stdout, which carries the protocol in `--stdio` mode); the level comes
@@ -14,6 +16,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use aim_rpc::{NoHandler, Peer, PeerConfig};
+use aimx::server::network::{NetworkOptions, NetworkProtocol};
+use aimx::server::token::{TokenScope, TokenStore};
 use aimx::server::{Server, ServerConfig, default_protected, local_principal};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -28,6 +32,11 @@ struct Cli {
 enum Cmd {
     /// Serve aim-harness/1.
     Serve(ServeArgs),
+    /// Manage bearer tokens for network harness clients.
+    Token {
+        #[command(subcommand)]
+        command: TokenCmd,
+    },
     /// Expose workspace tools as an MCP server.
     Mcp(McpArgs),
     /// Copy stdin/stdout to the resident server, starting it when needed.
@@ -38,12 +47,52 @@ enum Cmd {
     Version,
 }
 
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// Create a token, printing the secret once.
+    Create {
+        /// Authority granted in the served workspace roots.
+        #[arg(long, value_enum)]
+        scope: TokenScopeArg,
+        /// Token lifetime, in seconds.
+        #[arg(long, default_value_t = 30 * 24 * 60 * 60)]
+        ttl_secs: u64,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TokenScopeArg {
+    Read,
+    Write,
+}
+
 #[derive(Args)]
 #[expect(clippy::struct_excessive_bools, reason = "independent command-line switches are represented as booleans by clap")]
 struct ServeArgs {
     /// Listen on this unix socket.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["stdio", "resident", "resident_child"], required_unless_present_any = ["stdio", "resident", "resident_child"])]
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["stdio", "resident", "resident_child", "ws", "http"], required_unless_present_any = ["stdio", "resident", "resident_child", "ws", "http"])]
     unix: Option<PathBuf>,
+    /// Listen for WebSocket clients on this address.
+    #[arg(long, value_name = "ADDR", conflicts_with_all = ["http", "stdio", "resident", "resident_child", "ssh"])]
+    ws: Option<std::net::SocketAddr>,
+    /// Listen for HTTP JSON-RPC and SSE clients on this address.
+    #[arg(long, value_name = "ADDR", conflicts_with_all = ["ws", "stdio", "resident", "resident_child", "ssh"])]
+    http: Option<std::net::SocketAddr>,
+    /// Direct TLS server certificate (PEM).
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// Direct TLS server private key (PEM).
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// Declare that a protected reverse proxy supplies TLS for a public bind.
+    #[arg(long)]
+    behind_proxy: bool,
+    /// Exact browser Origin permitted to open a network connection (repeatable).
+    #[arg(long = "allow-origin")]
+    allowed_origins: Vec<String>,
+    /// Maximum simultaneous network connections.
+    #[arg(long, default_value_t = 64)]
+    max_connections: usize,
     /// Serve one connection on stdin/stdout.
     #[arg(long)]
     stdio: bool,
@@ -163,9 +212,32 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_owned())?;
     let roots = if args.roots.is_empty() { vec![PathBuf::from(&home)] } else { args.roots };
     let principal = local_principal(&roots, args.read_only).map_err(|err| format!("invalid --root: {err}"))?;
-    let config = ServerConfig::new(principal, default_protected(&home));
+    let mut protected = default_protected(&home);
+    protected = protected.with([format!("{home}/.aim/tokens.json"), format!("{home}/.aim/tokens.lock")]);
+    let config = ServerConfig::new(principal, protected);
     tracing::info!(principal = %config.principal.id, roots = ?config.principal.roots, read_only = config.principal.read_only, "starting aimx");
     let server = Server::new(config);
+    if let Some((address, protocol)) =
+        args.ws.map(|addr| (addr, NetworkProtocol::WebSocket)).or_else(|| args.http.map(|addr| (addr, NetworkProtocol::Http)))
+    {
+        let tls = args.tls_cert.zip(args.tls_key);
+        let options = NetworkOptions {
+            address,
+            protocol,
+            tls,
+            behind_proxy: args.behind_proxy,
+            allowed_origins: args.allowed_origins,
+            max_connections: args.max_connections,
+        };
+        let tokens = std::sync::Arc::new(TokenStore::under_home(std::path::Path::new(&home)));
+        return tokio::select! {
+            outcome = server.serve_network(options, tokens) => outcome.map_err(|err| format!("network listener: {err}")),
+            _ = tokio::signal::ctrl_c() => {
+                server.shutdown().await;
+                Ok(())
+            }
+        };
+    }
     match args.unix {
         Some(path) => {
             let listener = Server::bind_unix(&path).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -248,6 +320,33 @@ async fn main() -> ExitCode {
         Cmd::Version => {
             version();
             ExitCode::SUCCESS
+        }
+        Cmd::Token { command: TokenCmd::Create { scope, ttl_secs } } => {
+            let scope = match scope {
+                TokenScopeArg::Read => TokenScope::Read,
+                TokenScopeArg::Write => TokenScope::Write,
+            };
+            let result = std::env::var("HOME").map_err(|_| "HOME is not set".to_owned()).and_then(|home| {
+                TokenStore::under_home(std::path::Path::new(&home))
+                    .create(scope, Duration::from_secs(ttl_secs))
+                    .map_err(|err| err.to_string())
+            });
+            match result {
+                Ok(token) => {
+                    use std::io::Write as _;
+                    let mut output = std::io::stdout().lock();
+                    if output.write_all(token.as_bytes()).and_then(|()| output.write_all(b"\n")).is_ok() {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(err) => {
+                    use std::io::Write as _;
+                    drop(writeln!(std::io::stderr(), "{err}"));
+                    ExitCode::FAILURE
+                }
+            }
         }
         Cmd::Serve(args) => {
             init_logging();

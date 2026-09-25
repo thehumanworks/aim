@@ -17,19 +17,27 @@ aim-proto = { path = "../aim-proto" }
 aim-rpc = { path = "../aim-rpc" }
 clap = { version = "4.6", features = ["derive"] }
 futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.3"
 globset = "0.4"
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4.33"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 memchr = "2"
 portable-pty = "0.9"
 rustix = { version = "1.1", features = ["fs", "process"] }
+rustls = "0.23"
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "io-std", "process", "signal"] }
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

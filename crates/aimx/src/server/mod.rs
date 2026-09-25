@@ -6,7 +6,9 @@
 //! principal and the grant of the workspace it names.
 
 mod handlers;
+pub mod network;
 mod session;
+pub mod token;
 
 use std::collections::HashMap;
 use std::io;
@@ -25,6 +27,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{Semaphore, watch};
 
 use self::session::Session;
+use self::token::TokenStore;
 use crate::authz::{Principal, ProtectedPaths};
 use crate::dedup::{Begin, DedupConfig, DedupTable};
 use crate::workspace::Workspace;
@@ -406,13 +409,51 @@ impl Server {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        self.connect_with_auth(reader, writer, None, None)
+    }
+
+    /// Serves a network connection that must present an owner-issued bearer at `initialize`.
+    ///
+    /// The transport must also enforce its own handshake, Origin, and admission policy.
+    pub fn connect_network<R, W>(&self, reader: R, writer: W, tokens: Arc<TokenStore>) -> Peer
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        self.connect_with_auth(reader, writer, Some(tokens), None)
+    }
+
+    fn connect_network_bound<R, W>(&self, reader: R, writer: W, tokens: Arc<TokenStore>, principal_id: String) -> Peer
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        self.connect_with_auth(reader, writer, Some(tokens), Some(principal_id))
+    }
+
+    fn connect_with_auth<R, W>(&self, reader: R, writer: W, tokens: Option<Arc<TokenStore>>, principal_id: Option<String>) -> Peer
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let network = tokens.is_some();
         let conn_id = self.state.next_conn.fetch_add(1, Ordering::Relaxed);
         self.state.active_connections.fetch_add(1, Ordering::Relaxed);
-        let router = handlers::router(Arc::clone(&self.state), conn_id);
+        let router = handlers::router(Arc::clone(&self.state), conn_id, tokens, principal_id);
         let conn = Arc::clone(router.state());
         let state = Arc::clone(&self.state);
         let max = usize::try_from(self.state.config.max_message_bytes).unwrap_or(usize::MAX);
         let peer = Peer::spawn(reader, writer, router, PeerConfig { max_message_bytes: max, ..PeerConfig::default() });
+        if network {
+            let unauthenticated = Arc::clone(&conn);
+            let timed = peer.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if !unauthenticated.initialized() {
+                    timed.close();
+                }
+            });
+        }
         let watched = peer.clone();
         tokio::spawn(async move {
             watched.closed().await;

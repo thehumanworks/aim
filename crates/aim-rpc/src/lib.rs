@@ -13,8 +13,10 @@
 //!
 //! Framing is NDJSON (one compact JSON message per line) with a maximum message size.
 mod framing;
+pub mod http;
 mod peer;
 mod router;
+pub mod ws;
 
 pub use framing::DEFAULT_MAX_MESSAGE_BYTES;
 pub use peer::{Handler, NoHandler, NotificationCtx, Peer, PeerConfig, RequestCtx};
