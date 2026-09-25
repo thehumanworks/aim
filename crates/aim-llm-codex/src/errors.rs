@@ -28,9 +28,11 @@ const QUOTA_CODES: &[&str] = &[
 const RATE_CODES: &[&str] = &["rate_limit_exceeded", "slow_down"];
 /// Temporary server-side trouble.
 const OVERLOAD_CODES: &[&str] = &["server_is_overloaded", "overloaded", "server_error"];
-/// The request itself was refused (malformed, or a policy decision).
+/// The request itself was refused (a malformed prompt or a policy decision). These are codes;
+/// the generic `invalid_request_error` *type* is handled after the HTTP status, so a 401/403 with
+/// an OpenAI-shaped body stays `Auth`.
 const REJECT_CODES: &[&str] =
-    &["invalid_prompt", "cyber_policy", "bio_policy", "misalignment_policy_violation", "content_policy_violation", "invalid_request_error"];
+    &["invalid_prompt", "cyber_policy", "bio_policy", "misalignment_policy_violation", "content_policy_violation"];
 
 /// Everything known about one failure, from wherever it was reported.
 #[derive(Default)]
@@ -96,6 +98,8 @@ pub(crate) fn classify(failure: &Failure<'_>, context: &str, now: i64) -> LlmErr
             Some(408) => (Transport, hinted),
             Some(429) => (RateLimited, hinted),
             Some(400..=499) => (InvalidRequest, None),
+            // An in-stream refusal of the request itself: retrying cannot help.
+            None if is(&["invalid_request_error"]) => (InvalidRequest, None),
             // 5xx, anything unexpected, and unknown in-stream codes (codex retries these too).
             Some(_) | None => (Unavailable, hinted),
         }
@@ -336,6 +340,12 @@ mod tests {
     #[test]
     fn http_statuses_map_to_kinds() {
         assert_eq!(http(401, &[], "").kind, K::Auth);
+        // OpenAI-shaped bodies carry the generic `invalid_request_error` type; the status decides.
+        let openai_shaped = r#"{"error":{"type":"invalid_request_error","code":"invalid_api_key","message":"Incorrect API key"}}"#;
+        assert_eq!(http(401, &[], openai_shaped).kind, K::Auth);
+        assert_eq!(http(403, &[], openai_shaped).kind, K::Auth);
+        assert_eq!(http(400, &[], openai_shaped).kind, K::InvalidRequest);
+        assert_eq!(http(500, &[], r#"{"error":{"type":"invalid_request_error"}}"#).kind, K::Unavailable);
         assert_eq!(http(403, &[], r#"{"detail":"forbidden"}"#).kind, K::Auth);
         assert_eq!(http(403, &[("content-type", "text/html")], "<html>challenge</html>").kind, K::Unavailable);
         assert_eq!(http(403, &[("cf-mitigated", "challenge")], "").kind, K::Unavailable);
@@ -439,6 +449,9 @@ mod tests {
         for code in ["invalid_prompt", "cyber_policy", "bio_policy", "misalignment_policy_violation"] {
             assert_eq!(failed(code, "refused").kind, K::InvalidRequest, "{code}");
         }
+        // An in-stream `invalid_request_error` refuses the request itself: not retryable.
+        let refused = from_stream_event(&json!({"type":"error","error":{"type":"invalid_request_error","message":"Invalid input"}}), NOW);
+        assert_eq!(refused.kind, K::InvalidRequest);
         // Unknown codes are retryable, as in codex (`ApiError::Retryable`).
         assert_eq!(failed("mystery", "hm").kind, K::Unavailable);
         assert_eq!(from_stream_event(&json!({"type":"response.failed","response":{"id":"r"}}), NOW).kind, K::Unavailable);
