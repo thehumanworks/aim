@@ -1,0 +1,190 @@
+//! Sessions: what a client owns across connections (workspaces and processes), resume, and the
+//! push of process output to whichever connection is attached.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+use aim_proto::error::{ErrorCode, ProtoError};
+use aim_proto::harness::{ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, WorkspaceInfo};
+use aim_proto::ids::{ProcId, WorkspaceId};
+use aim_rpc::Peer;
+use tokio::sync::watch;
+
+use super::{State, lock};
+use crate::authz::{Grant, Principal};
+use crate::tools::ProcTable;
+use crate::workspace::{Outcome, Workspace};
+
+/// Output bytes pushed per `exec.output` batch read.
+const PUSH_BYTES: u64 = 256 * 1024;
+/// How long one forwarder read waits for new output.
+const PUSH_WAIT: Duration = Duration::from_secs(30);
+
+/// A workspace opened in a session.
+pub(crate) struct OpenWorkspace {
+    pub(crate) id: WorkspaceId,
+    pub(crate) info: WorkspaceInfo,
+    pub(crate) grant: Grant,
+    pub(crate) backend: Arc<dyn Workspace>,
+}
+
+/// The connection a session is attached to.
+#[derive(Clone, Debug)]
+struct Attachment {
+    conn: u64,
+    peer: Peer,
+}
+
+/// A client's session.
+pub(crate) struct Session {
+    pub(crate) token: String,
+    pub(crate) principal: Arc<Principal>,
+    workspaces: Mutex<HashMap<WorkspaceId, Arc<OpenWorkspace>>>,
+    pub(crate) procs: Arc<ProcTable>,
+    attached: watch::Sender<Option<Attachment>>,
+    detached_at: Mutex<Option<Instant>>,
+}
+
+impl Session {
+    fn new(token: String, principal: Arc<Principal>) -> Self {
+        Self {
+            token,
+            principal,
+            workspaces: Mutex::new(HashMap::new()),
+            procs: Arc::new(ProcTable::default()),
+            attached: watch::channel(None).0,
+            detached_at: Mutex::new(Some(Instant::now())),
+        }
+    }
+
+    /// Attaches the session to a connection; returns the peer it was attached to before (which the
+    /// caller closes: a resumed session belongs to one connection at a time).
+    pub(crate) fn attach(&self, conn: u64, peer: Peer) -> Option<Peer> {
+        *lock(&self.detached_at) = None;
+        self.attached.send_replace(Some(Attachment { conn, peer })).filter(|old| old.conn != conn).map(|old| old.peer)
+    }
+
+    /// Detaches connection `conn` (if it is still the attached one) and starts the resume clock.
+    pub(crate) fn detach(&self, conn: u64) {
+        let detached = self.attached.send_if_modified(|current| {
+            if current.as_ref().is_some_and(|a| a.conn == conn) {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        });
+        if detached {
+            *lock(&self.detached_at) = Some(Instant::now());
+        }
+    }
+
+    /// Whether the session has been detached for longer than `ttl`.
+    pub(crate) fn expired(&self, ttl: Duration) -> bool {
+        lock(&self.detached_at).is_some_and(|at| at.elapsed() > ttl)
+    }
+
+    pub(crate) fn workspace(&self, id: &WorkspaceId) -> Outcome<Arc<OpenWorkspace>> {
+        lock(&self.workspaces).get(id).cloned().ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("unknown workspace `{id}`")))
+    }
+
+    pub(crate) fn find_root(&self, root: &str) -> Option<Arc<OpenWorkspace>> {
+        lock(&self.workspaces).values().find(|ws| ws.info.root == root).cloned()
+    }
+
+    pub(crate) fn add_workspace(&self, workspace: Arc<OpenWorkspace>) {
+        lock(&self.workspaces).insert(workspace.id.clone(), workspace);
+    }
+
+    /// The workspace a process of this session runs in.
+    pub(crate) fn proc_workspace(&self, proc: &ProcId) -> Outcome<Arc<OpenWorkspace>> {
+        let id = self.procs.workspace(proc).ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")))?;
+        self.workspace(&id)
+    }
+
+    /// Ends the session: releases (kills) its processes and forgets its workspaces.
+    pub(crate) async fn close(&self) {
+        for (proc, workspace) in self.procs.all() {
+            if let Ok(workspace) = self.workspace(&workspace)
+                && let Some(exec) = workspace.backend.exec()
+                && let Err(err) = exec.release(&proc).await
+            {
+                tracing::debug!(%err, %proc, "releasing a process at session end failed");
+            }
+            self.procs.remove(&proc);
+        }
+        lock(&self.workspaces).clear();
+        self.attached.send_replace(None);
+    }
+
+    /// Pushes a process's output (`exec.output`) and exit (`exec.exited`) to the attached
+    /// connection, in `seq` order. While no connection is attached nothing is consumed; after a
+    /// reconnect the push resumes from the last delivered chunk (clients deduplicate by `seq`,
+    /// and `exec.read {after_seq}` remains the reconciliation read).
+    pub(crate) fn forward(self: &Arc<Self>, backend: Arc<dyn Workspace>, proc: ProcId) {
+        tokio::spawn(forward(Arc::downgrade(self), backend, proc));
+    }
+}
+
+async fn forward(session: Weak<Session>, backend: Arc<dyn Workspace>, proc: ProcId) {
+    let Some(mut attached) = session.upgrade().map(|s| s.attached.subscribe()) else { return };
+    drop(session);
+    let Some(exec) = backend.exec() else { return };
+    let mut cursor = 0u64;
+    loop {
+        let current = attached.borrow_and_update().clone();
+        let Some(Attachment { peer, .. }) = current else {
+            if attached.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
+        let read = tokio::select! {
+            read = exec.read(&proc, cursor, PUSH_BYTES, PUSH_WAIT) => read,
+            changed = attached.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+        // Released, or the session ended.
+        let Ok(read) = read else { return };
+        let mut delivered = true;
+        for chunk in read.chunks {
+            let seq = chunk.seq;
+            if peer.notify::<ExecOutput>(ExecOutputParams { proc: proc.clone(), chunk }).await.is_err() {
+                delivered = false;
+                break;
+            }
+            cursor = seq;
+        }
+        if delivered && let Some(status) = read.exit {
+            if peer.notify::<ExecExited>(ExecExitedParams { proc: proc.clone(), status, last_seq: cursor }).await.is_ok() {
+                return;
+            }
+            delivered = false;
+        }
+        // The connection went away: wait for the next one.
+        if !delivered && attached.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+impl State {
+    /// The live session for `token`, when it belongs to `principal` and is within its TTL.
+    pub(crate) fn resumable(&self, token: &str, principal: &Principal) -> Option<Arc<Session>> {
+        let sessions = lock(&self.sessions);
+        sessions.get(token).filter(|s| s.principal.id == principal.id && !s.expired(self.config.resume_ttl)).cloned()
+    }
+
+    /// Starts a new session.
+    pub(crate) fn new_session(&self, principal: Arc<Principal>) -> Outcome<Arc<Session>> {
+        let token = crate::id::secret_hex().ok_or_else(|| ProtoError::new(ErrorCode::Internal, "the OS random number generator failed"))?;
+        let session = Arc::new(Session::new(token.clone(), principal));
+        lock(&self.sessions).insert(token, Arc::clone(&session));
+        Ok(session)
+    }
+}

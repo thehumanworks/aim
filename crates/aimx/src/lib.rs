@@ -6,4 +6,16 @@
 //! Module map (OS access is confined to `workspace/local`, `ssh` and `server` —
 //! `cargo xtask check` enforces it):
 //! - [`workspace`] — the `Workspace`/`Fs`/`Exec`/`Search` traits and the local backend.
+//! - [`authz`] — principals, grants, path confinement and protected paths.
+//! - [`tools`] — the model-facing tools, written only against the `Workspace` traits.
+//! - [`server`] — `aim-harness/1` over unix sockets and stdio: sessions, resume, idempotency.
+//! - [`edit`], [`ring`], [`dedup`] — pure decision logic (kernel candidates): exact-edit
+//!   application, the output ring buffer and the idempotency table.
+pub mod authz;
+pub mod dedup;
+pub mod edit;
+mod id;
+pub mod ring;
+pub mod server;
+pub mod tools;
 pub mod workspace;
