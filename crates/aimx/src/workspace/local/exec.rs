@@ -22,7 +22,7 @@ use aim_proto::harness::{Command, ExecReadResult, ExitStatus, OutputChunk, Outpu
 use aim_proto::ids::ProcId;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::ChildStdin;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::{Base, Follow, blocking, io_error};
@@ -49,6 +49,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(super) struct LocalExec {
     base: Arc<Base>,
     ring_bytes: usize,
+    ptys: Option<Arc<Semaphore>>,
     procs: Mutex<HashMap<ProcId, Arc<Proc>>>,
 }
 
@@ -352,7 +353,13 @@ fn spawn_pipes(cwd: PathBuf, spec: &SpawnSpec<'_>, ring_bytes: usize) -> Outcome
     Ok(proc)
 }
 
-fn spawn_pty(cwd: PathBuf, spec: &SpawnSpec<'_>, size: PtySize, ring_bytes: usize) -> Outcome<Arc<Proc>> {
+fn spawn_pty(
+    cwd: PathBuf,
+    spec: &SpawnSpec<'_>,
+    size: PtySize,
+    ring_bytes: usize,
+    permit: Option<Arc<OwnedSemaphorePermit>>,
+) -> Outcome<Arc<Proc>> {
     let mut builder = match spec.command {
         Command::Argv { argv } => {
             if argv.is_empty() {
@@ -397,9 +404,11 @@ fn spawn_pty(cwd: PathBuf, spec: &SpawnSpec<'_>, size: PtySize, ring_bytes: usiz
 
     let (drained_tx, drained_rx) = oneshot::channel();
     let reading = Arc::clone(&proc);
+    let reader_permit = permit.clone();
     std::thread::Builder::new()
         .name("aimx-pty-read".to_owned())
         .spawn(move || {
+            let _permit = reader_permit;
             let mut block = vec![0u8; READ_BLOCK];
             loop {
                 match reader.read(&mut block) {
@@ -420,6 +429,7 @@ fn spawn_pty(cwd: PathBuf, spec: &SpawnSpec<'_>, size: PtySize, ring_bytes: usiz
     std::thread::Builder::new()
         .name("aimx-pty-wait".to_owned())
         .spawn(move || {
+            let _permit = permit;
             if exited_tx.send(child.wait()).is_err() {
                 tracing::debug!("pty supervisor gone before the child exited");
             }
@@ -431,8 +441,8 @@ fn spawn_pty(cwd: PathBuf, spec: &SpawnSpec<'_>, size: PtySize, ring_bytes: usiz
 }
 
 impl LocalExec {
-    pub(super) fn new(base: Arc<Base>, ring_bytes: usize) -> Self {
-        Self { base, ring_bytes, procs: Mutex::new(HashMap::new()) }
+    pub(super) fn new(base: Arc<Base>, ring_bytes: usize, ptys: Option<Arc<Semaphore>>) -> Self {
+        Self { base, ring_bytes, ptys, procs: Mutex::new(HashMap::new()) }
     }
 
     fn get(&self, proc: &ProcId) -> Outcome<Arc<Proc>> {
@@ -462,7 +472,17 @@ impl Exec for LocalExec {
             })
             .await?;
             let proc = match spec.pty {
-                Some(size) => spawn_pty(cwd, &spec, size, self.ring_bytes)?,
+                Some(size) => {
+                    // The permit lives as long as the pty's threads (it is released when both end).
+                    let permit =
+                        match &self.ptys {
+                            Some(ptys) => Some(Arc::new(Arc::clone(ptys).try_acquire_owned().map_err(|_| {
+                                ProtoError::new(ErrorCode::LimitExceeded, "as many pty processes run as may; end one first")
+                            })?)),
+                            None => None,
+                        };
+                    spawn_pty(cwd, &spec, size, self.ring_bytes, permit)?
+                }
                 None => spawn_pipes(cwd, &spec, self.ring_bytes)?,
             };
             let id = ProcId::new(format!("p{}", random_hex()));

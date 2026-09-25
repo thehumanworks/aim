@@ -15,6 +15,8 @@ mod handshake;
 #[cfg(test)]
 mod idempotency;
 #[cfg(test)]
+mod limits;
+#[cfg(test)]
 mod resume;
 #[cfg(test)]
 mod safety;

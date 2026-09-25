@@ -138,12 +138,16 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Outcome<ToolResult>
     };
     ctx.grant.exec()?;
     let exec = exec_of(ctx)?;
+    let slot = match ctx.procs.reserve() {
+        Ok(slot) => slot,
+        Err(err) => return model_error(err),
+    };
     if args.run_in_background {
         let proc = match spawn(ctx, exec, &args.command, None).await {
             Ok(proc) => proc,
             Err(err) => return model_error(err),
         };
-        ctx.procs.insert(proc.clone(), ctx.workspace_id.clone());
+        ctx.procs.insert(proc.clone(), ctx.workspace_id.clone(), slot);
         return Ok(ToolResult::text(format!(
             "Started in the background with id {proc}. Read its output with BashOutput; stop it with KillShell."
         )));
@@ -153,7 +157,7 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Outcome<ToolResult>
         Ok(proc) => proc,
         Err(err) => return model_error(err),
     };
-    ctx.procs.insert(proc.clone(), ctx.workspace_id.clone());
+    ctx.procs.insert(proc.clone(), ctx.workspace_id.clone(), slot);
     let mut output = HeadTail::new();
     let mut cursor = 0u64;
     let mut dropped = false;

@@ -21,6 +21,7 @@ use aim_proto::ids::{IdempotencyKey, ProcId, WorkspaceId};
 use aim_proto::tool::{ToolAnnotations, ToolInput, ToolLocation, ToolResult, ToolSpec};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::authz::Grant;
 use crate::workspace::{Outcome, Workspace};
@@ -59,25 +60,67 @@ impl ToolCtx {
 }
 
 /// Processes a session owns, with the workspace each runs in and how far `BashOutput` has read.
-#[derive(Debug, Default)]
+///
+/// It also admits them: every process holds a [`ProcSlot`] from the session's cap and the server's
+/// global cap from before it is spawned until it is released (or the session ends), whether or not
+/// it has exited, since an unreleased process keeps its output ring (and its process group).
+#[derive(Debug)]
 pub struct ProcTable {
     procs: Mutex<HashMap<ProcId, ProcEntry>>,
+    session: Arc<Semaphore>,
+    global: Arc<Semaphore>,
 }
 
-#[derive(Clone, Debug)]
+impl Default for ProcTable {
+    /// A table without a cap (for tests and embedders that admit processes elsewhere).
+    fn default() -> Self {
+        Self::new(Semaphore::MAX_PERMITS, Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)))
+    }
+}
+
+#[derive(Debug)]
 struct ProcEntry {
     workspace: WorkspaceId,
     cursor: u64,
+    _slot: ProcSlot,
+}
+
+/// A reservation for one live process: one of the session's slots and one of the server's.
+#[derive(Debug)]
+pub struct ProcSlot {
+    _session: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
 }
 
 impl ProcTable {
+    /// A table admitting at most `per_session` live processes, and only while `global` (shared
+    /// by every session of the server) has room.
+    #[must_use]
+    pub fn new(per_session: usize, global: Arc<Semaphore>) -> Self {
+        Self { procs: Mutex::new(HashMap::new()), session: Arc::new(Semaphore::new(per_session.min(Semaphore::MAX_PERMITS))), global }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ProcId, ProcEntry>> {
         self.procs.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records a process spawned in `workspace`.
-    pub fn insert(&self, proc: ProcId, workspace: WorkspaceId) {
-        self.lock().insert(proc, ProcEntry { workspace, cursor: 0 });
+    /// Reserves room for one more process, before spawning it.
+    ///
+    /// # Errors
+    /// `limit_exceeded` when the session or the server holds as many live processes as it may
+    /// (release one first).
+    pub fn reserve(&self) -> Outcome<ProcSlot> {
+        let full = |whose: &str| {
+            ProtoError::new(ErrorCode::LimitExceeded, format!("{whose} holds as many live processes as it may; release one first"))
+        };
+        let session = Arc::clone(&self.session).try_acquire_owned().map_err(|_| full("this session"))?;
+        let global = Arc::clone(&self.global).try_acquire_owned().map_err(|_| full("the server"))?;
+        Ok(ProcSlot { _session: session, _global: global })
+    }
+
+    /// Records a process spawned in `workspace` with the slot reserved for it.
+    pub fn insert(&self, proc: ProcId, workspace: WorkspaceId, slot: ProcSlot) {
+        self.lock().insert(proc, ProcEntry { workspace, cursor: 0, _slot: slot });
     }
 
     /// The workspace a process runs in, when the session owns it.
@@ -86,7 +129,7 @@ impl ProcTable {
         self.lock().get(proc).map(|entry| entry.workspace.clone())
     }
 
-    /// Forgets a process; whether it was known.
+    /// Forgets a process (freeing its slot); whether it was known.
     pub fn remove(&self, proc: &ProcId) -> bool {
         self.lock().remove(proc).is_some()
     }

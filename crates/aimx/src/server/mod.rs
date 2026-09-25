@@ -22,7 +22,7 @@ use aim_rpc::{Peer, PeerConfig};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use self::session::Session;
 use crate::authz::{Principal, ProtectedPaths};
@@ -61,13 +61,26 @@ pub struct ServerConfig {
     pub max_in_flight: usize,
     /// How long a disconnected session stays resumable.
     pub resume_ttl: Duration,
+    /// Maximum sessions (attached or awaiting resume); `initialize` answers `limit_exceeded`
+    /// beyond it.
+    pub max_sessions: usize,
+    /// Maximum workspaces one session may open.
+    pub max_workspaces_per_session: usize,
+    /// Maximum live (unreleased) processes per session, advertised as `Caps.max_concurrency`.
+    pub max_procs_per_session: u16,
+    /// Maximum live processes across all sessions.
+    pub max_procs: usize,
+    /// Maximum processes with a pseudo-terminal running at once (each holds two threads).
+    pub max_ptys: usize,
 }
 
 impl ServerConfig {
     /// Defaults for `principal`: 16 MiB messages, 2 MiB reads (JSON escaping can grow text up to
     /// six-fold, so a read always fits in a message), 8 MiB output rings, outcomes replayable for
     /// 10 minutes, keys valid for 24 hours (up to 2^20 of them: a sustained ~12 new keys per
-    /// second), 256 idempotent requests in flight, and a 30-minute resume TTL.
+    /// second), 256 idempotent requests in flight, and a 30-minute resume TTL; 256 sessions of up
+    /// to 64 workspaces and 64 live processes each, 256 live processes and 64 ptys in all (so
+    /// retained output is bounded by 256 output rings).
     #[must_use]
     pub fn new(principal: Principal, protected: ProtectedPaths) -> Self {
         Self {
@@ -82,6 +95,11 @@ impl ServerConfig {
             max_dedup_keys: 1 << 20,
             max_in_flight: 256,
             resume_ttl: Duration::from_mins(30),
+            max_sessions: 256,
+            max_workspaces_per_session: 64,
+            max_procs_per_session: 64,
+            max_procs: 256,
+            max_ptys: 64,
         }
     }
 
@@ -160,6 +178,10 @@ pub(crate) struct State {
     next_conn: AtomicU64,
     active_connections: AtomicU64,
     fixed_workspace: Option<Arc<dyn Workspace>>,
+    /// Live processes across sessions.
+    procs: Arc<Semaphore>,
+    /// Running pty processes.
+    ptys: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for State {
@@ -240,7 +262,14 @@ impl State {
                         let result = tokio::spawn(work)
                             .await
                             .unwrap_or_else(|err| Err(ProtoError::new(ErrorCode::Internal, format!("request failed: {err}"))));
-                        lock(&state.dedup).complete(&key, Recorded { result: result.clone(), session }, state.now_ms());
+                        // A request refused for a limit ran nothing (every mutation's effect is
+                        // atomic, or admitted before it starts), so it is not recorded: the same
+                        // key may be retried once there is room.
+                        if result.as_ref().is_err_and(|err| err.code == ErrorCode::LimitExceeded) {
+                            lock(&state.dedup).abandon(&key);
+                        } else {
+                            lock(&state.dedup).complete(&key, Recorded { result: result.clone(), session }, state.now_ms());
+                        }
                         state.dedup_done.send_modify(|v| *v = v.wrapping_add(1));
                         result
                     });
@@ -325,7 +354,6 @@ impl Server {
         let state = Arc::new(State {
             principal: Arc::new(config.principal.clone()),
             protected: Arc::new(canonicalize_protected(&config.protected)),
-            config,
             started: Instant::now(),
             sessions: Mutex::new(HashMap::new()),
             dedup: Mutex::new(DedupTable::new(dedup)),
@@ -333,6 +361,9 @@ impl Server {
             next_conn: AtomicU64::new(1),
             active_connections: AtomicU64::new(0),
             fixed_workspace,
+            procs: Arc::new(Semaphore::new(config.max_procs.min(Semaphore::MAX_PERMITS))),
+            ptys: Arc::new(Semaphore::new(config.max_ptys.min(Semaphore::MAX_PERMITS))),
+            config,
         });
         let every = (state.config.resume_ttl / 4).clamp(Duration::from_millis(50), Duration::from_secs(10));
         let weak = Arc::downgrade(&state);

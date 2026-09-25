@@ -41,18 +41,20 @@ pub(crate) struct Session {
     pub(crate) token: String,
     pub(crate) principal: Arc<Principal>,
     workspaces: Mutex<HashMap<WorkspaceId, Arc<OpenWorkspace>>>,
+    max_workspaces: usize,
     pub(crate) procs: Arc<ProcTable>,
     attached: watch::Sender<Option<Attachment>>,
     detached_at: Mutex<Option<Instant>>,
 }
 
 impl Session {
-    fn new(token: String, principal: Arc<Principal>) -> Self {
+    fn new(token: String, principal: Arc<Principal>, procs: ProcTable, max_workspaces: usize) -> Self {
         Self {
             token,
             principal,
             workspaces: Mutex::new(HashMap::new()),
-            procs: Arc::new(ProcTable::default()),
+            max_workspaces,
+            procs: Arc::new(procs),
             attached: watch::channel(None).0,
             detached_at: Mutex::new(Some(Instant::now())),
         }
@@ -93,8 +95,27 @@ impl Session {
         lock(&self.workspaces).values().find(|ws| ws.info.root == root).cloned()
     }
 
-    pub(crate) fn add_workspace(&self, workspace: Arc<OpenWorkspace>) {
-        lock(&self.workspaces).insert(workspace.id.clone(), workspace);
+    /// Whether the session may open another workspace.
+    ///
+    /// # Errors
+    /// `limit_exceeded` when it has as many open as it may.
+    pub(crate) fn may_add_workspace(&self) -> Outcome<()> {
+        if lock(&self.workspaces).len() >= self.max_workspaces {
+            return Err(ProtoError::new(
+                ErrorCode::LimitExceeded,
+                format!("this session has {} workspaces open, the most it may", self.max_workspaces),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn add_workspace(&self, workspace: Arc<OpenWorkspace>) -> Outcome<()> {
+        let mut workspaces = lock(&self.workspaces);
+        if workspaces.len() >= self.max_workspaces {
+            return Err(ProtoError::new(ErrorCode::LimitExceeded, "this session has as many workspaces open as it may"));
+        }
+        workspaces.insert(workspace.id.clone(), workspace);
+        Ok(())
     }
 
     /// The workspace a process of this session runs in.
@@ -181,10 +202,22 @@ impl State {
     }
 
     /// Starts a new session.
+    ///
+    /// # Errors
+    /// `limit_exceeded` when the server holds as many sessions (attached or awaiting resume) as it
+    /// may.
     pub(crate) fn new_session(&self, principal: Arc<Principal>) -> Outcome<Arc<Session>> {
         let token = crate::id::secret_hex().ok_or_else(|| ProtoError::new(ErrorCode::Internal, "the OS random number generator failed"))?;
-        let session = Arc::new(Session::new(token.clone(), principal));
-        lock(&self.sessions).insert(token, Arc::clone(&session));
+        let procs = ProcTable::new(usize::from(self.config.max_procs_per_session), Arc::clone(&self.procs));
+        let session = Arc::new(Session::new(token.clone(), principal, procs, self.config.max_workspaces_per_session));
+        let mut sessions = lock(&self.sessions);
+        if sessions.len() >= self.config.max_sessions {
+            return Err(ProtoError::new(
+                ErrorCode::LimitExceeded,
+                format!("the server holds {} sessions, the most it may; retry once one ends or its resume window passes", sessions.len()),
+            ));
+        }
+        sessions.insert(token, Arc::clone(&session));
         Ok(session)
     }
 }

@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::Caps;
+use tokio::sync::Semaphore;
 
 use self::exec::LocalExec;
 use self::fs::LocalFs;
@@ -39,11 +40,21 @@ pub struct LocalConfig {
     pub output_ring_bytes: usize,
     /// Paths never modified, checked against real (symlink-resolved) locations.
     pub protected: Arc<ProtectedPaths>,
+    /// Admission for pty processes (each holds a reader and a waiter thread while it runs);
+    /// `None` admits every one.
+    pub ptys: Option<Arc<Semaphore>>,
+    /// The live-process cap the caller enforces, advertised as `Caps.max_concurrency`.
+    pub max_concurrency: Option<u16>,
 }
 
 impl Default for LocalConfig {
     fn default() -> Self {
-        Self { output_ring_bytes: DEFAULT_OUTPUT_RING_BYTES, protected: Arc::new(ProtectedPaths::default()) }
+        Self {
+            output_ring_bytes: DEFAULT_OUTPUT_RING_BYTES,
+            protected: Arc::new(ProtectedPaths::default()),
+            ptys: None,
+            max_concurrency: None,
+        }
     }
 }
 
@@ -72,9 +83,9 @@ impl LocalWorkspace {
         let canonical = canonical_root(root).await?;
         let base = Arc::new(Base { root: PathBuf::from(&canonical), protected: config.protected });
         Ok(Self {
-            caps: local_caps(),
+            caps: Caps { max_concurrency: config.max_concurrency, ..local_caps() },
             fs: LocalFs::new(Arc::clone(&base)),
-            exec: LocalExec::new(Arc::clone(&base), config.output_ring_bytes),
+            exec: LocalExec::new(Arc::clone(&base), config.output_ring_bytes, config.ptys),
             search: LocalSearch::new(base),
             root: canonical,
         })
@@ -101,7 +112,7 @@ pub async fn canonical_root(root: &str) -> Outcome<String> {
     .await
 }
 
-/// What this host's backend can do.
+/// What this host's backend can do (with no concurrency cap; the server sets its own).
 #[must_use]
 pub fn local_caps() -> Caps {
     Caps {

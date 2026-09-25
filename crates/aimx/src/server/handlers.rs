@@ -210,19 +210,22 @@ impl Conn {
         if let Some(open) = session.find_root(&root) {
             return Ok(open.info.clone());
         }
+        session.may_add_workspace()?;
         let backend: Arc<dyn crate::workspace::Workspace> = if let Some(fixed) = &self.state.fixed_workspace {
             Arc::clone(fixed)
         } else {
             let config = LocalConfig {
                 output_ring_bytes: usize::try_from(self.state.config.output_ring_bytes).unwrap_or(usize::MAX),
                 protected: Arc::clone(&self.state.protected),
+                ptys: Some(Arc::clone(&self.state.ptys)),
+                max_concurrency: Some(self.state.config.max_procs_per_session),
             };
             Arc::new(LocalWorkspace::open(&root, config).await?)
         };
         let id = WorkspaceId::new(format!("w{}", crate::id::random_hex()));
         let info = WorkspaceInfo { id: id.clone(), root: root.clone(), caps: backend.caps().clone() };
         let grant = Grant::new(Arc::clone(&session.principal), Arc::clone(&self.state.protected), root, normalize(&params.root));
-        session.add_workspace(Arc::new(OpenWorkspace { id, info: info.clone(), grant, backend }));
+        session.add_workspace(Arc::new(OpenWorkspace { id, info: info.clone(), grant, backend }))?;
         Ok(info)
     }
 
@@ -379,8 +382,9 @@ impl Conn {
                 timeout: p.timeout_ms.map(Duration::from_millis),
                 key: &p.idempotency_key,
             };
+            let slot = owner.procs.reserve()?;
             let proc = exec.spawn(spec).await?;
-            owner.procs.insert(proc.clone(), ws.id.clone());
+            owner.procs.insert(proc.clone(), ws.id.clone(), slot);
             owner.forward(Arc::clone(&ws.backend), proc.clone());
             Ok(ExecSpawnResult { proc })
         })
