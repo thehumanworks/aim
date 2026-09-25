@@ -150,6 +150,27 @@ enum Command {
         /// Unix socket path (default: `$AIM_HOME/run/daemon.sock`).
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Serve the browser app and daemon protocol over WebSocket at this address.
+        #[arg(long, value_name = "ADDR")]
+        web: Option<std::net::SocketAddr>,
+        /// Built browser asset directory (default: this checkout's `crates/aim-web/dist`).
+        #[arg(long, value_name = "DIR")]
+        web_assets: Option<PathBuf>,
+        /// Direct TLS certificate for the web listener (PEM).
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// Direct TLS private key for the web listener (PEM).
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
+        /// Declare an operator-managed protected TLS reverse proxy for a non-loopback bind.
+        #[arg(long)]
+        behind_proxy: bool,
+        /// Exact browser Origin allowed to open a WebSocket (repeatable).
+        #[arg(long = "allow-origin")]
+        allowed_origins: Vec<String>,
+        /// Maximum concurrent browser connections.
+        #[arg(long, default_value_t = 64)]
+        max_web_connections: usize,
         /// Stop after this many seconds without connections or running turns.
         #[arg(long)]
         idle_exit: Option<u64>,
@@ -165,6 +186,21 @@ enum DaemonAction {
     Status,
     /// Send SIGTERM to the running daemon.
     Stop,
+    /// Manage browser access tokens.
+    Token {
+        #[command(subcommand)]
+        action: DaemonTokenAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonTokenAction {
+    /// Issue one bearer and display it once.
+    Create {
+        /// Bearer lifetime in seconds.
+        #[arg(long, default_value_t = 30 * 24 * 60 * 60)]
+        ttl_secs: u64,
+    },
 }
 
 fn provider(name: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, String), String> {
@@ -316,10 +352,28 @@ async fn main_async(args: Args) -> Result<i32, String> {
             search_sessions_command(reindex, limit, workspace, json, query).await
         }
         Command::Board { action } => board_cli::run(&cli::aim_home(), action).await,
-        Command::Daemon { socket, idle_exit, action } => {
+        Command::Daemon {
+            socket,
+            web,
+            web_assets,
+            tls_cert,
+            tls_key,
+            behind_proxy,
+            allowed_origins,
+            max_web_connections,
+            idle_exit,
+            action,
+        } => {
             let home = cli::aim_home();
             let socket = socket.unwrap_or_else(|| socket_path(&home));
             match action {
+                Some(DaemonAction::Token { action: DaemonTokenAction::Create { ttl_secs } }) => {
+                    let token = server::WebTokenStore::under_home(&home)
+                        .create(Duration::from_secs(ttl_secs))
+                        .map_err(|e| format!("creating daemon web token: {e}"))?;
+                    println!("{token}");
+                    Ok(0)
+                }
                 Some(DaemonAction::Status) => {
                     let client = DaemonClient::connect(&socket).await.map_err(|e| e.to_string())?;
                     let sessions =
@@ -356,6 +410,12 @@ async fn main_async(args: Args) -> Result<i32, String> {
                     Ok(0)
                 }
                 None => {
+                    if web.is_some() && idle_exit.is_some() {
+                        return Err("--idle-exit is unavailable with --web while browser clients may be attached".into());
+                    }
+                    if web.is_none() && (web_assets.is_some() || tls_cert.is_some() || behind_proxy || !allowed_origins.is_empty()) {
+                        return Err("web asset and security flags require --web".into());
+                    }
                     let logs = home.join("logs");
                     std::fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
                     std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
@@ -374,15 +434,30 @@ async fn main_async(args: Args) -> Result<i32, String> {
                         let host = Arc::clone(&host);
                         async move { host.shutdown().await }
                     };
-                    match server::serve_with_shutdown(
-                        &home,
-                        &socket,
-                        idle_exit.map(Duration::from_secs),
-                        host as Arc<dyn SessionClient>,
-                        on_shutdown,
-                    )
-                    .await
-                    {
+                    let session_client: Arc<dyn SessionClient> = Arc::<SessionHost>::clone(&host);
+                    let outcome = if let Some(address) = web {
+                        let options = server::WebOptions {
+                            address,
+                            tls: tls_cert.zip(tls_key),
+                            behind_proxy,
+                            allowed_origins,
+                            asset_dir: web_assets.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../aim-web/dist")),
+                            token_store: Arc::new(server::WebTokenStore::under_home(&home)),
+                            max_connections: max_web_connections,
+                        };
+                        let web = server::serve_web(&home, Arc::clone(&session_client), options);
+                        let unix = server::serve_with_shutdown(&home, &socket, None, session_client, on_shutdown);
+                        tokio::select! {
+                            result = unix => result,
+                            result = web => {
+                                host.shutdown().await.map_err(|err| err.to_string())?;
+                                result
+                            }
+                        }
+                    } else {
+                        server::serve_with_shutdown(&home, &socket, idle_exit.map(Duration::from_secs), session_client, on_shutdown).await
+                    };
+                    match outcome {
                         Ok(()) | Err(aim_proto::error::ProtoError { code: aim_proto::error::ErrorCode::Conflict, .. }) => Ok(0),
                         Err(err) => Err(err.to_string()),
                     }

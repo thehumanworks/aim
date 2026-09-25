@@ -34,8 +34,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
+pub use super::web_token::WebTokenStore;
 use crate::board::{Board as BoardService, Error as BoardError};
 use crate::host::{SessionClient, UpdateStream};
+
+mod web;
+pub use web::{WebOptions, serve_web};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -76,6 +80,7 @@ struct Forwarder {
 
 struct Connection {
     initialized: AtomicBool,
+    web_tokens: Option<Arc<WebTokenStore>>,
     forwarders: Mutex<HashMap<String, Arc<Forwarder>>>,
     snapshots: Mutex<HashMap<String, SnapshotBytes>>,
     ordering: Arc<tokio::sync::Mutex<()>>,
@@ -349,10 +354,11 @@ impl Dedup {
 #[expect(clippy::too_many_lines, reason = "all daemon protocol routes are registered together")]
 fn routes(connection: Arc<Connection>) -> GuardedRouter {
     let router = Router::new(Arc::clone(&connection))
-        .method::<DaemonInitialize, _, _>(|state, _, params| async move {
+        .method::<DaemonInitialize, _, _>(|state, ctx, params| async move {
             if state.initialized.load(Ordering::Acquire) {
                 return Err(error(ErrorCode::Conflict, "already initialized"));
             }
+            let token_lifetime = state.web_tokens.as_ref().map(|tokens| tokens.authenticate(params.auth.as_ref())).transpose()?;
             let ours = Generations::new(DAEMON_GENERATIONS.0, DAEMON_GENERATIONS.1)
                 .ok_or_else(|| error(ErrorCode::Internal, "invalid server generations"))?;
             let theirs = Generations::new(params.generations.min, params.generations.max)
@@ -361,6 +367,13 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
                 negotiate(ours, theirs).ok_or_else(|| error(ErrorCode::UnsupportedGeneration, "no shared daemon generation"))?;
             if state.initialized.swap(true, Ordering::AcqRel) {
                 return Err(error(ErrorCode::Conflict, "already initialized"));
+            }
+            if let Some(lifetime) = token_lifetime {
+                let peer = ctx.peer.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(lifetime).await;
+                    peer.close();
+                });
             }
             Ok(DaemonInitializeResult {
                 generation,
@@ -585,6 +598,7 @@ fn serve_connection(
     }
     let connection = Arc::new(Connection {
         initialized: AtomicBool::new(false),
+        web_tokens: None,
         forwarders: Mutex::new(HashMap::new()),
         snapshots: Mutex::new(HashMap::new()),
         ordering: Arc::new(tokio::sync::Mutex::new(())),
@@ -596,6 +610,45 @@ fn serve_connection(
     });
     let (read, write) = stream.into_split();
     Ok(Peer::spawn(read, write, routes(connection), PeerConfig { max_message_bytes: MAX_DAEMON_MESSAGE_BYTES, ..PeerConfig::default() }))
+}
+
+fn serve_web_peer<S>(
+    stream: S,
+    host: Arc<dyn SessionClient>,
+    board: Arc<BoardService>,
+    dedup: Arc<Dedup>,
+    tokens: Arc<WebTokenStore>,
+) -> Peer
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let connection = Arc::new(Connection {
+        initialized: AtomicBool::new(false),
+        web_tokens: Some(tokens),
+        forwarders: Mutex::new(HashMap::new()),
+        snapshots: Mutex::new(HashMap::new()),
+        ordering: Arc::new(tokio::sync::Mutex::new(())),
+        host,
+        board,
+        board_forwarders: Mutex::new(HashMap::new()),
+        dedup,
+        worker: Mutex::new(None),
+    });
+    let (read, write) = tokio::io::split(stream);
+    let initialized = Arc::clone(&connection);
+    let peer =
+        Peer::spawn(read, write, routes(connection), PeerConfig { max_message_bytes: MAX_DAEMON_MESSAGE_BYTES, ..PeerConfig::default() });
+    let deadline = peer.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(10)) => {}
+            () = deadline.closed() => return,
+        }
+        if !initialized.initialized.load(Ordering::Acquire) {
+            deadline.close();
+        }
+    });
+    peer
 }
 
 /// Serves a supplied session host until a signal or optional idle timeout.

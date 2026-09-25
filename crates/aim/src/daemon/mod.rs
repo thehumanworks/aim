@@ -3,6 +3,7 @@
 pub mod client;
 pub mod server;
 pub mod spawn;
+mod web_token;
 
 use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
