@@ -3,10 +3,11 @@
 # Live smoke tests (`mise run smoke`) need the maintainer's credentials and run outside CI.
 name: ci
 
+# Manual for now: GitHub refuses to start jobs on this account until its Actions billing/spending
+# limit is fixed (2026-09-25). Restore the `push`/`pull_request` triggers once it is — until then
+# agents run `mise run check` and `mise run verify` locally before every push (AGENTS.md).
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
