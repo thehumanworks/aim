@@ -109,6 +109,9 @@ fn a_button_press_reaches_the_agent() {
     tui.type_text("ask me");
     tui.send("\r");
     tui.wait("the dialog", Duration::from_secs(20), |s| s.contains("Waiting for you.") && s.contains("[ Deploy ]") && s.contains("idle"));
+    // The dialog took the focus; tab keeps it on its only button even if a stray key cleared it.
+    tui.send("\t");
+    std::thread::sleep(Duration::from_millis(50));
     tui.send("\r");
     tui.wait("the agent's answer", Duration::from_secs(20), |s| s.contains("heard:") && s.contains("idle") && !s.contains("running"));
     let rows = tui.quit();

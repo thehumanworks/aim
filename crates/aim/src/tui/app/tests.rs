@@ -1065,8 +1065,9 @@ mod surfaces {
         assert!(call < detail && detail < later, "{printed:?}");
     }
 
+    /// ADR 0017's `unknown_component_fallback`: a component outside the catalog shows its fallback.
     #[test]
-    fn unknown_components_show_their_fallback_in_the_tui() {
+    fn unknown_component_fallback() {
         let mut app = attached();
         let spark = json!([{"id": "root", "component": "Sparkline", "values": [1, 2], "fallback": "trend up"}]);
         update(&mut app, create("s", "transcript", spark));
