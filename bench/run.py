@@ -213,12 +213,39 @@ def isolated_env(home: Path) -> dict[str, str]:
     return env
 
 
+CODE_MODES = ("off", "on", "only")
+
+
+def split_arm(harness: str) -> tuple[str, str | None]:
+    """An aim harness may name its code-mode arm (ADR 0076): `aim_openrouter@only` is
+    `aim_openrouter` run with `AIM_CODE_MODE=only`. Other harnesses take no arm."""
+    base, separator, arm = harness.partition("@")
+    if not separator:
+        return harness, None
+    if not base.startswith("aim_") or arm not in CODE_MODES:
+        raise ValueError(f"unknown harness arm {harness}; aim harnesses take @off, @on or @only")
+    return base, arm
+
+
+def code_mode(arm: str | None) -> str | None:
+    """The `AIM_CODE_MODE` an aim run gets: its arm, else the caller's `AIM_CODE_MODE`, else the
+    legacy `AIM_BENCH_CODE_MODE=off`; `None` leaves aim's default."""
+    if arm is not None:
+        return arm
+    if BASE_ENV.get("AIM_CODE_MODE"):
+        return BASE_ENV["AIM_CODE_MODE"]
+    return "off" if BASE_ENV.get("AIM_BENCH_CODE_MODE") == "off" else None
+
+
 def invocation(harness: str, paths: dict[str, Path], home: Path, url: str, model: str, prompt: str, mode: str,
                effort: str | None, workspace: Path) -> tuple[dict[str, str], list[str]]:
+    harness, arm = split_arm(harness)
     env = isolated_env(home)
     env["PATH"] = str(paths["python"].parent) + os.pathsep + env.get("PATH", "")
     if harness.startswith("aim_"):
-        env["AIM_CODERUN"] = str(home / "missing-worker") if BASE_ENV.get("AIM_BENCH_CODE_MODE") == "off" else str(paths["aim_coderun"])
+        env["AIM_CODERUN"] = str(paths["aim_coderun"])
+        if (selected := code_mode(arm)) is not None:
+            env["AIM_CODE_MODE"] = selected
         if "AIM_BASH_MODEL_END_BYTES" in BASE_ENV:
             env["AIM_BASH_MODEL_END_BYTES"] = BASE_ENV["AIM_BASH_MODEL_END_BYTES"]
     if harness == "aim_openrouter":
@@ -298,8 +325,9 @@ def path_map(args: argparse.Namespace) -> dict[str, Path]:
 def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], mode: str, model: str,
              effort: str | None, timeout: int, spend_cap_usd: float | None = None,
              request_reserve_usd: float = 0.0) -> dict:
+    base, _ = split_arm(harness)
     borrowed_auth = CODEX_AUTH / "auth.json"
-    auth_before = executable_hash(borrowed_auth) if harness == "aim_codex" and borrowed_auth.exists() else None
+    auth_before = executable_hash(borrowed_auth) if base == "aim_codex" and borrowed_auth.exists() else None
     with temporary_workspace() as root:
         home, workspace = root / "home", root / "work"
         home.mkdir()
@@ -312,15 +340,15 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
                 (workspace / "big.txt").write_text("".join(f"{line:05d} benchmark line\n" for line in range(5000)))
         port = free_port()
         url = f"http://127.0.0.1:{port}"
-        upstream = "chatgpt.com" if harness == "aim_codex" else "openrouter.ai"
-        incoming = "/backend-api/codex" if harness == "aim_codex" else "/v1"
-        upstream_base = "/backend-api/codex" if harness == "aim_codex" else "/api/v1"
+        upstream = "chatgpt.com" if base == "aim_codex" else "openrouter.ai"
+        incoming = "/backend-api/codex" if base == "aim_codex" else "/v1"
+        upstream_base = "/backend-api/codex" if base == "aim_codex" else "/api/v1"
         recorder = root / "requests.jsonl"
         pgid_file = root / "harness-pgid"
         proxy_command = [sys.executable, "-B", str(PROXY), "--port", str(port), "--out", str(recorder),
                          "--mode", "mock" if mode == "wire" else "live", "--model", model,
                          "--scenario", case.get("scenario", "reply"), "--steps", str(case.get("steps", 0)),
-                         "--command", case.get("command", "true"), "--harness", harness, "--upstream-host", upstream,
+                         "--command", case.get("command", "true"), "--harness", base, "--upstream-host", upstream,
                          "--incoming-base", incoming, "--upstream-base", upstream_base,
                          "--pgid-file", str(pgid_file)]
         if spend_cap_usd is not None:
@@ -407,7 +435,7 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
                   "ite": ite, "request_response_sizes": [[row["request_wire_bytes"], row["response_bytes"]] for row in rows],
                   "response_statuses": [row["status"] for row in rows]}
         result.update(update_diagnostics(stdout))
-        if harness == "aim_codex":
+        if base == "aim_codex":
             result["borrowed_codex_auth_unchanged"] = auth_before is not None and executable_hash(borrowed_auth) == auth_before
         if mode == "live":
             result["passed"] = process.returncode == 0 and not timed_out and grade(case["id"], workspace)
@@ -464,7 +492,11 @@ def main() -> None:
     tier = manifest[args.tier]
     harnesses = args.harnesses.split(",") if args.harnesses else tier["harnesses"]
     paths = path_map(args)
-    missing = [name for name in harnesses if name.split("_")[0] not in paths and name not in {"aim_openrouter", "aim_codex", "codex_openrouter"}]
+    try:
+        bases = [split_arm(name)[0] for name in harnesses]
+    except ValueError as error:
+        parser.error(str(error))
+    missing = [name for name in bases if name.split("_")[0] not in paths and name not in {"aim_openrouter", "aim_codex", "codex_openrouter"}]
     if missing:
         parser.error(f"missing pinned peer artifacts for: {', '.join(missing)}")
     for path in paths.values():
@@ -497,20 +529,21 @@ def main() -> None:
         for repetition in range(repetitions):
             rotated = harnesses[(case_index + repetition) % len(harnesses):] + harnesses[:(case_index + repetition) % len(harnesses)]
             for harness in rotated:
-                reserve = tier.get("max_request_spend_usd", 0.0) if args.tier == "live" and harness != "aim_codex" else 0.0
-                if args.tier == "live" and harness != "aim_codex" and budget_used + reserve > tier["max_spend_usd"]:
+                base, _ = split_arm(harness)
+                reserve = tier.get("max_request_spend_usd", 0.0) if args.tier == "live" and base != "aim_codex" else 0.0
+                if args.tier == "live" and base != "aim_codex" and budget_used + reserve > tier["max_spend_usd"]:
                     break
-                if harness == "aim_codex" and args.tier == "live":
+                if base == "aim_codex" and args.tier == "live":
                     if subscription_runs >= tier["max_subscription_runs"]:
                         continue
                     subscription_runs += 1
-                model = tier["model"] if args.tier == "wire" else tier["codex_model"] if harness == "aim_codex" else tier["openrouter_model"]
-                effort = tier["effort"] if args.tier == "wire" else tier["codex_effort"] if harness == "aim_codex" else None
-                remaining = tier["max_spend_usd"] - budget_used if args.tier == "live" and harness != "aim_codex" else None
+                model = tier["model"] if args.tier == "wire" else tier["codex_model"] if base == "aim_codex" else tier["openrouter_model"]
+                effort = tier["effort"] if args.tier == "wire" else tier["codex_effort"] if base == "aim_codex" else None
+                remaining = tier["max_spend_usd"] - budget_used if args.tier == "live" and base != "aim_codex" else None
                 row = run_once(harness, case, repetition, paths, args.tier, model, effort, tier.get("timeout_seconds", 90),
                                spend_cap_usd=remaining, request_reserve_usd=reserve)
                 runs.append(row)
-                if args.tier == "live" and harness != "aim_codex":
+                if args.tier == "live" and base != "aim_codex":
                     if row["missing_success_cost"]:
                         budget_used = tier["max_spend_usd"]
                     else:

@@ -44,6 +44,10 @@ The task driver resolves pinned executable paths before replacing `HOME`, so pee
 silently use workstation-global `latest` shims. Each run gets a fresh HOME and workspace.
 The build includes `aim`, `aimx`, and `aim-coderun`, and `AIM_CODERUN` is set explicitly for
 both aim providers; the tool set cannot depend on whether another cargo task built the worker.
+Code mode (ADR 0076) is chosen per arm: `--harnesses aim_openrouter@off,aim_openrouter@on,aim_openrouter@only`
+runs aim with `AIM_CODE_MODE` set to each; an arm-less aim harness gets the caller's
+`AIM_CODE_MODE` (the legacy `AIM_BENCH_CODE_MODE=off` still means `off`), else aim's default.
+Arms are not in the committed wire baseline, so compare them with `--no-gate`.
 One scripted mock prewarm per harness is retained separately in the result; timed trials use
 fresh HOMEs but warmed binary/OS caches.
 Temporary harness output is discarded. The recorder persists only request/response sizes,
