@@ -58,7 +58,17 @@ checksum = "sha256:4f5df791c3aedd2e1375806beeea8930bf2b966f28a400e023e519c1594db
 url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-unknown-linux-musl.tar.gz"
 url_api = "https://api.github.com/repos/openai/codex/releases/assets/586825288"
 
+[tools.codex."platforms.linux-x64-baseline"]
+checksum = "sha256:4f5df791c3aedd2e1375806beeea8930bf2b966f28a400e023e519c1594db334"
+url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/openai/codex/releases/assets/586825288"
+
 [tools.codex."platforms.linux-x64-musl"]
+checksum = "sha256:4f5df791c3aedd2e1375806beeea8930bf2b966f28a400e023e519c1594db334"
+url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/openai/codex/releases/assets/586825288"
+
+[tools.codex."platforms.linux-x64-musl-baseline"]
 checksum = "sha256:4f5df791c3aedd2e1375806beeea8930bf2b966f28a400e023e519c1594db334"
 url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-unknown-linux-musl.tar.gz"
 url_api = "https://api.github.com/repos/openai/codex/releases/assets/586825288"
@@ -73,7 +83,17 @@ checksum = "sha256:cc2ff55dd48eed8112e161b15005899c66353e3e7f122fad6883a2e30e646
 url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/openai/codex/releases/assets/586830776"
 
+[tools.codex."platforms.macos-x64-baseline"]
+checksum = "sha256:cc2ff55dd48eed8112e161b15005899c66353e3e7f122fad6883a2e30e646396"
+url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/openai/codex/releases/assets/586830776"
+
 [tools.codex."platforms.windows-x64"]
+checksum = "sha256:42920eaa55fd39b2949f39a0a4a0cd434850709e10ef03d3525b713e6cdc0af0"
+url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-pc-windows-msvc.tar.gz"
+url_api = "https://api.github.com/repos/openai/codex/releases/assets/586827636"
+
+[tools.codex."platforms.windows-x64-baseline"]
 checksum = "sha256:42920eaa55fd39b2949f39a0a4a0cd434850709e10ef03d3525b713e6cdc0af0"
 url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-pc-windows-msvc.tar.gz"
 url_api = "https://api.github.com/repos/openai/codex/releases/assets/586827636"
@@ -88,7 +108,17 @@ checksum = "sha256:f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e70
 url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz"
 url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890635"
 
+[tools."github:trunk-rs/trunk"."platforms.linux-x64-baseline"]
+checksum = "sha256:f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b"
+url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890635"
+
 [tools."github:trunk-rs/trunk"."platforms.linux-x64-musl"]
+checksum = "sha256:a67f4054b249fe9acc5fabc25de1aebf19783aca3ad6ff64bf34d7da44d0ea20"
+url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890638"
+
+[tools."github:trunk-rs/trunk"."platforms.linux-x64-musl-baseline"]
 checksum = "sha256:a67f4054b249fe9acc5fabc25de1aebf19783aca3ad6ff64bf34d7da44d0ea20"
 url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz"
 url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890638"
@@ -103,7 +133,17 @@ checksum = "sha256:f1ba0e3bbe24e0ae219c6d22c33e24e2825c1608dd27c2556e323495110f1
 url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890623"
 
+[tools."github:trunk-rs/trunk"."platforms.macos-x64-baseline"]
+checksum = "sha256:f1ba0e3bbe24e0ae219c6d22c33e24e2825c1608dd27c2556e323495110f1a95"
+url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890623"
+
 [tools."github:trunk-rs/trunk"."platforms.windows-x64"]
+checksum = "sha256:cd6ac15b9daff0365e5695036791ef2ce3c63f61c014f5a8c532363266e4569c"
+url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890632"
+
+[tools."github:trunk-rs/trunk"."platforms.windows-x64-baseline"]
 checksum = "sha256:cd6ac15b9daff0365e5695036791ef2ce3c63f61c014f5a8c532363266e4569c"
 url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890632"
@@ -121,7 +161,17 @@ checksum = "sha256:7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447
 url = "https://github.com/verus-lang/verus/releases/download/release/0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip"
 url_api = "https://api.github.com/repos/verus-lang/verus/releases/assets/578150623"
 
+[tools."github:verus-lang/verus"."platforms.linux-x64-baseline"]
+checksum = "sha256:7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33"
+url = "https://github.com/verus-lang/verus/releases/download/release/0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip"
+url_api = "https://api.github.com/repos/verus-lang/verus/releases/assets/578150623"
+
 [tools."github:verus-lang/verus"."platforms.linux-x64-musl"]
+checksum = "sha256:7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33"
+url = "https://github.com/verus-lang/verus/releases/download/release/0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip"
+url_api = "https://api.github.com/repos/verus-lang/verus/releases/assets/578150623"
+
+[tools."github:verus-lang/verus"."platforms.linux-x64-musl-baseline"]
 checksum = "sha256:7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33"
 url = "https://github.com/verus-lang/verus/releases/download/release/0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip"
 url_api = "https://api.github.com/repos/verus-lang/verus/releases/assets/578150623"
@@ -136,7 +186,17 @@ checksum = "sha256:ff27d61a5a714826c7a07a5aa72ef5f1f8f1a1dd69bcf5c3bb4d33be91998
 url = "https://github.com/verus-lang/verus/releases/download/release/0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-macos.zip"
 url_api = "https://api.github.com/repos/verus-lang/verus/releases/assets/578151176"
 
+[tools."github:verus-lang/verus"."platforms.macos-x64-baseline"]
+checksum = "sha256:ff27d61a5a714826c7a07a5aa72ef5f1f8f1a1dd69bcf5c3bb4d33be91998df9"
+url = "https://github.com/verus-lang/verus/releases/download/release/0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-macos.zip"
+url_api = "https://api.github.com/repos/verus-lang/verus/releases/assets/578151176"
+
 [tools."github:verus-lang/verus"."platforms.windows-x64"]
+checksum = "sha256:50df4c0e648be8a37f820b84d2f72bd17a8695fb33fff2a588504ecd71b9a72f"
+url = "https://github.com/verus-lang/verus/releases/download/release/0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-win.zip"
+url_api = "https://api.github.com/repos/verus-lang/verus/releases/assets/578151475"
+
+[tools."github:verus-lang/verus"."platforms.windows-x64-baseline"]
 checksum = "sha256:50df4c0e648be8a37f820b84d2f72bd17a8695fb33fff2a588504ecd71b9a72f"
 url = "https://github.com/verus-lang/verus/releases/download/release/0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-win.zip"
 url_api = "https://api.github.com/repos/verus-lang/verus/releases/assets/578151475"
@@ -151,7 +211,17 @@ checksum = "sha256:f121d81acd3d967315ca6a4a460f6550d4a8dea05c1d24787b184a751c8a6
 url = "https://github.com/verus-lang/verusfmt/releases/download/v0.7.3/verusfmt-x86_64-unknown-linux-gnu.tar.xz"
 url_api = "https://api.github.com/repos/verus-lang/verusfmt/releases/assets/553871386"
 
+[tools."github:verus-lang/verusfmt"."platforms.linux-x64-baseline"]
+checksum = "sha256:f121d81acd3d967315ca6a4a460f6550d4a8dea05c1d24787b184a751c8a6c35"
+url = "https://github.com/verus-lang/verusfmt/releases/download/v0.7.3/verusfmt-x86_64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/verus-lang/verusfmt/releases/assets/553871386"
+
 [tools."github:verus-lang/verusfmt"."platforms.linux-x64-musl"]
+checksum = "sha256:f121d81acd3d967315ca6a4a460f6550d4a8dea05c1d24787b184a751c8a6c35"
+url = "https://github.com/verus-lang/verusfmt/releases/download/v0.7.3/verusfmt-x86_64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/verus-lang/verusfmt/releases/assets/553871386"
+
+[tools."github:verus-lang/verusfmt"."platforms.linux-x64-musl-baseline"]
 checksum = "sha256:f121d81acd3d967315ca6a4a460f6550d4a8dea05c1d24787b184a751c8a6c35"
 url = "https://github.com/verus-lang/verusfmt/releases/download/v0.7.3/verusfmt-x86_64-unknown-linux-gnu.tar.xz"
 url_api = "https://api.github.com/repos/verus-lang/verusfmt/releases/assets/553871386"
@@ -166,7 +236,17 @@ checksum = "sha256:f7e20a5c95f36a15e930a036d89c89ee394f28a0386934d90a333b4da339e
 url = "https://github.com/verus-lang/verusfmt/releases/download/v0.7.3/verusfmt-x86_64-apple-darwin.tar.xz"
 url_api = "https://api.github.com/repos/verus-lang/verusfmt/releases/assets/553871330"
 
+[tools."github:verus-lang/verusfmt"."platforms.macos-x64-baseline"]
+checksum = "sha256:f7e20a5c95f36a15e930a036d89c89ee394f28a0386934d90a333b4da339e62d"
+url = "https://github.com/verus-lang/verusfmt/releases/download/v0.7.3/verusfmt-x86_64-apple-darwin.tar.xz"
+url_api = "https://api.github.com/repos/verus-lang/verusfmt/releases/assets/553871330"
+
 [tools."github:verus-lang/verusfmt"."platforms.windows-x64"]
+checksum = "sha256:e337687f30f5ece3bc250951e7e88e6a7eb9a1501e90cfa52bb1e93f8f7ea031"
+url = "https://github.com/verus-lang/verusfmt/releases/download/v0.7.3/verusfmt-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/verus-lang/verusfmt/releases/assets/553871384"
+
+[tools."github:verus-lang/verusfmt"."platforms.windows-x64-baseline"]
 checksum = "sha256:e337687f30f5ece3bc250951e7e88e6a7eb9a1501e90cfa52bb1e93f8f7ea031"
 url = "https://github.com/verus-lang/verusfmt/releases/download/v0.7.3/verusfmt-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/verus-lang/verusfmt/releases/assets/553871384"
@@ -179,13 +259,22 @@ specifiers = ["0.4.1"]
 [tools.lightpanda."platforms.linux-x64"]
 url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-linux"
 
+[tools.lightpanda."platforms.linux-x64-baseline"]
+url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-linux"
+
 [tools.lightpanda."platforms.linux-x64-musl"]
+url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-linux"
+
+[tools.lightpanda."platforms.linux-x64-musl-baseline"]
 url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-linux"
 
 [tools.lightpanda."platforms.macos-arm64"]
 url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-aarch64-macos"
 
 [tools.lightpanda."platforms.macos-x64"]
+url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-macos"
+
+[tools.lightpanda."platforms.macos-x64-baseline"]
 url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-macos"
 
 [[tools.node]]
@@ -197,7 +286,15 @@ specifiers = ["26.8.1"]
 checksum = "sha256:b2b76660fa4ded4e0b2a41ee3c0c651cd52ea8170ead91ebac1e147ac3d55643"
 url = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-x64.tar.gz"
 
+[tools.node."platforms.linux-x64-baseline"]
+checksum = "sha256:b2b76660fa4ded4e0b2a41ee3c0c651cd52ea8170ead91ebac1e147ac3d55643"
+url = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-linux-x64.tar.gz"
+
 [tools.node."platforms.linux-x64-musl"]
+checksum = "sha256:13135a6a2106f9d111fa9b48c8801ed119ad43e7e1d00de17d77a9c44899aada"
+url = "https://unofficial-builds.nodejs.org/download/release/v26.8.1/node-v26.8.1-linux-x64-musl.tar.gz"
+
+[tools.node."platforms.linux-x64-musl-baseline"]
 checksum = "sha256:13135a6a2106f9d111fa9b48c8801ed119ad43e7e1d00de17d77a9c44899aada"
 url = "https://unofficial-builds.nodejs.org/download/release/v26.8.1/node-v26.8.1-linux-x64-musl.tar.gz"
 
@@ -209,7 +306,15 @@ url = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-darwin-arm64.tar.gz"
 checksum = "sha256:fe9c6dbf9c8e1b4443803d75e2a20366e420dae650c747dbb116b22975751baf"
 url = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-darwin-x64.tar.gz"
 
+[tools.node."platforms.macos-x64-baseline"]
+checksum = "sha256:fe9c6dbf9c8e1b4443803d75e2a20366e420dae650c747dbb116b22975751baf"
+url = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-darwin-x64.tar.gz"
+
 [tools.node."platforms.windows-x64"]
+checksum = "sha256:57693d8e93d1b04e7b7de46aca53ecd63e97564e73de36a68428d7ff08d83587"
+url = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-win-x64.zip"
+
+[tools.node."platforms.windows-x64-baseline"]
 checksum = "sha256:57693d8e93d1b04e7b7de46aca53ecd63e97564e73de36a68428d7ff08d83587"
 url = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-win-x64.zip"
 
@@ -217,6 +322,11 @@ url = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-win-x64.zip"
 version = "0.81.2"
 backend = "npm:@agentclientprotocol/claude-agent-acp"
 specifiers = ["0.81.2"]
+
+[[tools."npm:@modelcontextprotocol/server-everything"]]
+version = "2026.8.31"
+backend = "npm:@modelcontextprotocol/server-everything"
+specifiers = ["2026.8.31"]
 
 [[tools.pi]]
 version = "0.87.1"
@@ -228,7 +338,17 @@ checksum = "sha256:80d78dd62d50049a006b981d994c61255bcc10e730b0c278d4ea0a7559097
 url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-linux-x64.tar.gz"
 url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094203"
 
+[tools.pi."platforms.linux-x64-baseline"]
+checksum = "sha256:80d78dd62d50049a006b981d994c61255bcc10e730b0c278d4ea0a755909764c"
+url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094203"
+
 [tools.pi."platforms.linux-x64-musl"]
+checksum = "sha256:80d78dd62d50049a006b981d994c61255bcc10e730b0c278d4ea0a755909764c"
+url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094203"
+
+[tools.pi."platforms.linux-x64-musl-baseline"]
 checksum = "sha256:80d78dd62d50049a006b981d994c61255bcc10e730b0c278d4ea0a755909764c"
 url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-linux-x64.tar.gz"
 url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094203"
@@ -243,7 +363,17 @@ checksum = "sha256:01d8ee28d7114fec4f4eeedbb7561f790853040e9bfbdeebe79437ab66ea5
 url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-darwin-x64.tar.gz"
 url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094201"
 
+[tools.pi."platforms.macos-x64-baseline"]
+checksum = "sha256:01d8ee28d7114fec4f4eeedbb7561f790853040e9bfbdeebe79437ab66ea51f5"
+url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-darwin-x64.tar.gz"
+url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094201"
+
 [tools.pi."platforms.windows-x64"]
+checksum = "sha256:aab2ba67baf8ff97a52d05b62d88e9e65a840c6ea8fa1029a28d62d210d4e5fc"
+url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-windows-x64.zip"
+url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094243"
+
+[tools.pi."platforms.windows-x64-baseline"]
 checksum = "sha256:aab2ba67baf8ff97a52d05b62d88e9e65a840c6ea8fa1029a28d62d210d4e5fc"
 url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-windows-x64.zip"
 url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094243"
@@ -258,7 +388,17 @@ checksum = "sha256:bd0d0568ccded07bbf1c87727230dc5dd0187e706a87da23c4de78388a229
 url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
+[tools.python."platforms.linux-x64-baseline"]
+checksum = "sha256:bd0d0568ccded07bbf1c87727230dc5dd0187e706a87da23c4de78388a229b78"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
 [tools.python."platforms.linux-x64-musl"]
+checksum = "sha256:8ea6ca8a46e2e0b824a29ddaf208388dea7ede6808d8ceccd02b547882c92b3a"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-unknown-linux-musl-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
+[tools.python."platforms.linux-x64-musl-baseline"]
 checksum = "sha256:8ea6ca8a46e2e0b824a29ddaf208388dea7ede6808d8ceccd02b547882c92b3a"
 url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-unknown-linux-musl-install_only_stripped.tar.gz"
 provenance = "github-attestations"
@@ -273,7 +413,17 @@ checksum = "sha256:82745f483d2bcf39ade058ec0dbd44659d583454ea9c4562b66dae7d718ae
 url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-apple-darwin-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
+[tools.python."platforms.macos-x64-baseline"]
+checksum = "sha256:82745f483d2bcf39ade058ec0dbd44659d583454ea9c4562b66dae7d718ae100"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-apple-darwin-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
 [tools.python."platforms.windows-x64"]
+checksum = "sha256:1493fc4185edf84bbd4305c15c5fbac2d4fcd4ddd7eb6273903669a5d3106178"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
+[tools.python."platforms.windows-x64-baseline"]
 checksum = "sha256:1493fc4185edf84bbd4305c15c5fbac2d4fcd4ddd7eb6273903669a5d3106178"
 url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
 provenance = "github-attestations"

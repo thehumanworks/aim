@@ -62,6 +62,7 @@ Rules (enforced by `mise run check`):
 | [0040](0040-daemon-recovery-and-paged-attachments.md) | Recover daemon attachments and page large session histories. |
 | [0041](0041-indexed-session-summaries.md) | Index durable session summaries. |
 | [0042](0042-bound-media-services-and-private-opt-in.md) | Bound media output and require private-session opt-in. |
+| [0045](0045-trusted-mcp-edges.md) | Bind MCP imports to source hash and run location; serve aim tools over both MCP lifecycles. |
 | [0046](0046-per-call-harness-authority.md) | Carry narrowing authority on harness calls and sessions. |
 | [0047](0047-remote-harness-websocket-and-http.md) | Carry the harness protocol over bounded WebSocket and HTTP sessions. |
 | [0048](0048-board-workers-and-integration.md) | Run fenced board attempts in isolated worktrees and integrate accepted evidence serially. |
