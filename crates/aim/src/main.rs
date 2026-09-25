@@ -256,6 +256,7 @@ enum McpAction {
     },
 }
 
+#[derive(Subcommand)]
 enum PluginAction {
     /// List installed or project plugins and their exact-hash trust state.
     List {

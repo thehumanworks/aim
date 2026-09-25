@@ -11,9 +11,13 @@ fn live_openrouter_calls_composed_kv_plugin() {
     let workspace = tempfile::tempdir().unwrap();
     let aim = std::path::Path::new(env!("CARGO_BIN_EXE_aim"));
     let aimx = aim.with_file_name("aimx");
+    let plugind = aim.with_file_name("aim-plugind");
     assert!(aimx.is_file(), "build aimx before the live plugin test");
+    assert!(plugind.is_file(), "build aim-plugind before the live plugin test");
     let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/examples/kv_counter");
-    let invoke = |args: &[&str]| Command::new(aim).args(args).env("AIM_HOME", home.path()).env("AIM_AIMX", &aimx).output().unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new(aim).args(args).env("AIM_HOME", home.path()).env("AIM_AIMX", &aimx).env("AIM_PLUGIND", &plugind).output().unwrap()
+    };
     let installed = invoke(&["plugin", "install", example.to_str().unwrap()]);
     assert!(installed.status.success(), "plugin install failed");
     let trusted = invoke(&["plugin", "trust", "kv_counter"]);

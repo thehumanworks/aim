@@ -1,11 +1,12 @@
 //! Component boundary tests using the checked-in SDK example components.
 #![expect(clippy::unwrap_used, reason = "test failures should stop at the failed fixture or assertion")]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use aim_plugin::{BoxFuture, PluginDelegate, PluginSource, PluginToolHost, TrustStore};
+use aim_plugin::{BoxFuture, PluginDelegate, PluginSource, TrustStore};
+use aim_plugind::runtime::PluginToolHost;
 use aim_proto::error::ProtoError;
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::ToolResult;
@@ -44,27 +45,40 @@ fn key() -> IdempotencyKey {
     IdempotencyKey::new("outer-key")
 }
 
+fn load(
+    trust: &TrustStore,
+    sources: Vec<PluginSource>,
+    delegate: Arc<dyn PluginDelegate>,
+    allowed: HashSet<String>,
+) -> Result<PluginToolHost, aim_plugin::PluginError> {
+    let grants: BTreeMap<String, BTreeSet<String>> = sources
+        .iter()
+        .filter_map(|source| trust.grants(&source.hash()).map(|capabilities| (source.hash(), capabilities.clone())))
+        .collect();
+    PluginToolHost::load(trust.home(), &grants, sources, delegate, allowed)
+}
+
 #[tokio::test]
 async fn project_source_requires_exact_hash_and_edited_bytes_lose_trust() {
     let dir = tempfile::tempdir().unwrap();
     let mut trust = TrustStore::load(dir.path()).unwrap();
     let src = source("kv_counter", true);
     let delegate = Arc::new(Delegate::default());
-    let host = PluginToolHost::load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
+    let host = load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
     assert!(host.specs().is_empty());
     trust.grant(&src.hash(), ["tools.provide".into(), "kv".into()]).unwrap();
-    let host = PluginToolHost::load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
+    let host = load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
     assert_eq!(host.specs().len(), 1);
     let mut formatted = src.clone();
     formatted.manifest_text.push('\n');
     assert_eq!(formatted.hash(), src.hash(), "formatting alone does not change canonical trust identity");
     let mut reworded = src.clone();
     reworded.manifest_text = reworded.manifest_text.replace("Increase a named durable counter", "Raise a named durable counter");
-    let host = PluginToolHost::load(&trust, vec![reworded], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
+    let host = load(&trust, vec![reworded], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
     assert!(host.specs().is_empty(), "an edited manifest needs new trust even when component bytes are unchanged");
     let mut edited = src;
     edited.component.push(0);
-    let host = PluginToolHost::load(&trust, vec![edited], delegate, HashSet::new()).unwrap();
+    let host = load(&trust, vec![edited], delegate, HashSet::new()).unwrap();
     assert!(host.specs().is_empty());
 }
 
@@ -76,10 +90,10 @@ async fn kv_guest_persists_across_session_host_recreation() {
     trust.grant(&src.hash(), ["tools.provide".into(), "kv".into()]).unwrap();
     let delegate = Arc::new(Delegate::default());
     let name = "plugin__kv_counter__increment".to_owned();
-    let host = PluginToolHost::load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
+    let host = load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
     let first = host.call(name.clone(), json!({"key":"a"}), key()).await.unwrap();
     assert_eq!(first, ToolResult::text("a: 1"));
-    let host = PluginToolHost::load(&trust, vec![src], delegate, HashSet::new()).unwrap();
+    let host = load(&trust, vec![src], delegate, HashSet::new()).unwrap();
     let second = host.call(name, json!({"key":"a"}), key()).await.unwrap();
     assert_eq!(second, ToolResult::text("a: 2"));
 }
@@ -91,7 +105,7 @@ async fn changed_manifest_description_fails_guest_registration() {
     let mut src = source("kv_counter", false);
     src.manifest_text = src.manifest_text.replace("Increase a named durable counter", "Raise a named durable counter");
     trust.grant(&src.hash(), ["tools.provide".into(), "kv".into()]).unwrap();
-    let host = PluginToolHost::load(&trust, vec![src], Arc::new(Delegate::default()), HashSet::new()).unwrap();
+    let host = load(&trust, vec![src], Arc::new(Delegate::default()), HashSet::new()).unwrap();
     let error = host.call("plugin__kv_counter__increment".into(), json!({"key":"a"}), key()).await.unwrap_err();
     assert!(error.message.contains("registration differs"));
 }
@@ -103,7 +117,7 @@ async fn concurrent_session_calls_do_not_lose_kv_updates() {
     let src = source("kv_counter", false);
     trust.grant(&src.hash(), ["tools.provide".into(), "kv".into()]).unwrap();
     let delegate = Arc::new(Delegate::default());
-    let host = PluginToolHost::load(&trust, vec![src], delegate, HashSet::new()).unwrap();
+    let host = load(&trust, vec![src], delegate, HashSet::new()).unwrap();
     let mut tasks = tokio::task::JoinSet::new();
     for number in 0..16 {
         let host = host.clone();
@@ -128,17 +142,14 @@ async fn delegated_tool_needs_both_hash_grant_and_agent_allowlist() {
     let delegate = Arc::new(Delegate::default());
     let name = "plugin__delegate_read__delegate_read".to_owned();
     let args = json!({"file_path":"note.txt"});
-    let host =
-        PluginToolHost::load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::from(["read".into()]))
-            .unwrap();
+    let host = load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::from(["read".into()])).unwrap();
     assert!(host.call(name.clone(), args.clone(), key()).await.is_err());
     assert!(delegate.calls.lock().unwrap().is_empty());
     trust.grant(&src.hash(), ["tools.provide".into(), "tools.call:read".into()]).unwrap();
-    let host = PluginToolHost::load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
+    let host = load(&trust, vec![src.clone()], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::new()).unwrap();
     assert!(host.call(name.clone(), args.clone(), key()).await.is_err());
     assert!(delegate.calls.lock().unwrap().is_empty());
-    let host =
-        PluginToolHost::load(&trust, vec![src], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::from(["read".into()])).unwrap();
+    let host = load(&trust, vec![src], Arc::clone(&delegate) as Arc<dyn PluginDelegate>, HashSet::from(["read".into()])).unwrap();
     assert_eq!(host.call(name, args, key()).await.unwrap(), ToolResult::text("delegated"));
     let calls = delegate.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
@@ -153,7 +164,7 @@ async fn runaway_component_exhausts_fuel_without_hanging_session() {
     let src = source("runaway", false);
     trust.grant(&src.hash(), ["tools.provide".into()]).unwrap();
     let delegate = Arc::new(Delegate::default());
-    let host = PluginToolHost::load(&trust, vec![src], delegate, HashSet::new()).unwrap();
+    let host = load(&trust, vec![src], delegate, HashSet::new()).unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), host.call("plugin__runaway__runaway".into(), json!({}), key()))
         .await
         .unwrap()

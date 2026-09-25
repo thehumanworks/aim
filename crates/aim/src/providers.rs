@@ -23,11 +23,13 @@ use aim_llm::ModelProvider;
 use aim_llm_codex::CodexProvider;
 use aim_llm_codex::media::{MediaClient, MediaConfig};
 use aim_llm_openai::{OpenAiProvider, Profile};
-use sha2::Digest as _;
-use aim_plugin::{PluginDelegate, PluginManifest, PluginSource, PluginToolHost, SessionMetadata, TrustStore};
+use aim_plugin::{PluginManifest, PluginSource, SessionMetadata, TrustStore};
 use aim_proto::harness::EntryKind;
+use aim_proto::tool::{ToolAnnotations, ToolInput, ToolSpec};
+use sha2::Digest as _;
 
 use crate::agent::ToolHost;
+use crate::plugin_worker::PluginWorker;
 use crate::resources::files::{Files, MAX_BINARY_BYTES, Read};
 
 /// A provider endpoint override from the environment (endpoints are configuration data: a
@@ -119,7 +121,13 @@ pub fn services() -> crate::host::NativeServices {
     let decider = std::env::var_os("TYPESAFE_API_KEY")
         .is_some_and(|value| !value.is_empty())
         .then(|| Arc::new(crate::jev::JevDecider) as Arc<dyn crate::jev::Decider>);
-    crate::host::NativeServices { media: Some(media), decider, tools: vec![search_tools(), board_tools(), mcp_tools()], plugins: Some(plugin_tools()), code: code_mode() }
+    crate::host::NativeServices {
+        media: Some(media),
+        decider,
+        tools: vec![search_tools(), board_tools(), mcp_tools()],
+        plugins: Some(plugin_tools()),
+        code: code_mode(),
+    }
 }
 
 /// Code mode, when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this
@@ -234,7 +242,7 @@ struct LazySearch {
 }
 
 impl ToolHost for LazySearch {
-    fn specs(&self) -> Vec<aim_proto::tool::ToolSpec> {
+    fn specs(&self) -> Vec<ToolSpec> {
         crate::search::tools::specs()
     }
 
@@ -299,7 +307,7 @@ fn board_tools_at(aim_home: PathBuf) -> crate::host::ToolsFactory {
             let run_id = format!("native-{:x}", digest.finalize());
             let path = aim_home.join("aim.db");
             let board = tokio::task::spawn_blocking(move || crate::board::Board::open(&path)).await.ok()?.ok()?;
-            let host: Arc<dyn crate::agent::ToolHost> =
+            let host: Arc<dyn ToolHost> =
                 Arc::new(crate::board::tools::BoardTools::reviewer(board, run_id.clone(), format!("session:{run_id}")));
             Some(host)
         })
@@ -380,11 +388,11 @@ fn global_plugin_sources(home: &Path) -> Vec<PluginSource> {
     sources
 }
 
-struct PluginToolAdapter(Arc<PluginToolHost>);
+struct PluginToolAdapter(Vec<Arc<PluginWorker>>);
 
 impl ToolHost for PluginToolAdapter {
-    fn specs(&self) -> Vec<aim_proto::tool::ToolSpec> {
-        self.0.specs()
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.0.iter().flat_map(|worker| worker.specs()).collect()
     }
 
     fn call(
@@ -393,21 +401,20 @@ impl ToolHost for PluginToolAdapter {
         arguments: serde_json::Value,
         key: aim_proto::ids::IdempotencyKey,
     ) -> crate::agent::tools::BoxFuture<Result<aim_proto::tool::ToolResult, aim_proto::error::ProtoError>> {
-        self.0.call(name, arguments, key)
+        let worker = self.0.iter().find(|worker| worker.specs().iter().any(|spec| spec.name == name)).cloned();
+        Box::pin(async move {
+            let worker =
+                worker.ok_or_else(|| aim_proto::error::ProtoError::new(aim_proto::error::ErrorCode::NotFound, "plugin tool not found"))?;
+            worker.call(name, arguments, key).await
+        })
     }
 }
 
-struct PluginDelegateAdapter(Arc<dyn ToolHost>);
-
-impl PluginDelegate for PluginDelegateAdapter {
-    fn call(
-        &self,
-        name: String,
-        arguments: serde_json::Value,
-        key: aim_proto::ids::IdempotencyKey,
-    ) -> aim_plugin::BoxFuture<Result<aim_proto::tool::ToolResult, aim_proto::error::ProtoError>> {
-        self.0.call(name, arguments, key)
-    }
+fn plugin_worker_path() -> Option<PathBuf> {
+    std::env::var_os("AIM_PLUGIND")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok().map(|exe| exe.with_file_name("aim-plugind")))
+        .filter(|path| path.is_file())
 }
 
 fn plugin_tools() -> crate::host::PluginToolsFactory {
@@ -438,12 +445,6 @@ fn plugin_tools() -> crate::host::PluginToolsFactory {
             sources.retain(|source| !source.project || trust.grants(&source.hash()).is_some());
             let mut names = HashSet::new();
             sources.retain(|source| PluginManifest::parse(&source.manifest_text).is_ok_and(|manifest| names.insert(manifest.name)));
-            let allowed = delegate.specs().into_iter().map(|tool| tool.name).collect();
-            let bridge: Arc<dyn PluginDelegate> = Arc::new(PluginDelegateAdapter(delegate));
-            let Ok(plugin) = PluginToolHost::load(&trust, sources, bridge, allowed) else {
-                tracing::warn!("plugin manifests or grants are invalid; omitting plugins");
-                return None;
-            };
             let metadata = SessionMetadata {
                 session_id: None,
                 provider: Some(spec.provider),
@@ -454,12 +455,48 @@ fn plugin_tools() -> crate::host::PluginToolsFactory {
                     aim_proto::daemon::Persistence::Ephemeral => "ephemeral".to_owned(),
                 }),
             };
-            let plugin = plugin.with_session_metadata(metadata);
-            if plugin.specs().is_empty() {
+            let Some(executable) = plugin_worker_path() else {
+                tracing::warn!("aim-plugind is unavailable; omitting plugin tools");
                 return None;
+            };
+            let mut workers = Vec::new();
+            for source in sources {
+                let Ok(manifest) = PluginManifest::parse(&source.manifest_text) else { continue };
+                let grants: std::collections::BTreeSet<String> = trust
+                    .grants(&source.hash())
+                    .map_or_else(Default::default, |saved| saved.intersection(&manifest.capabilities).cloned().collect());
+                if !grants.contains("tools.provide") {
+                    continue;
+                }
+                let specs = manifest
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        let input_schema = serde_json::from_str(&tool.input_schema).ok()?;
+                        Some(ToolSpec {
+                            name: format!("plugin__{}__{}", manifest.name, tool.name),
+                            description: tool.description.clone(),
+                            input_schema,
+                            input: ToolInput::Json,
+                            annotations: ToolAnnotations::default(),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let Some(specs) = specs else { continue };
+                if specs.is_empty() {
+                    continue;
+                }
+                workers.push(Arc::new(PluginWorker::new(
+                    executable.clone(),
+                    home.clone(),
+                    source,
+                    grants,
+                    specs,
+                    metadata.clone(),
+                    Arc::clone(&delegate),
+                )));
             }
-            plugin.prewarm();
-            Some(Arc::new(PluginToolAdapter(Arc::new(plugin))) as Arc<dyn ToolHost>)
+            if workers.is_empty() { None } else { Some(Arc::new(PluginToolAdapter(workers)) as Arc<dyn ToolHost>) }
         })
     })
 }

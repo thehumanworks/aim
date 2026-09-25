@@ -29,6 +29,8 @@ pub mod jev;
 pub mod login;
 pub mod mcp;
 pub mod media;
+pub mod plugin_sandbox;
+pub mod plugin_worker;
 pub mod programs;
 pub mod providers;
 pub mod remote;

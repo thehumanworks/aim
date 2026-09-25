@@ -90,7 +90,7 @@ run = "cargo xtask locked --update"
 [tasks."bench:wire"]
 description = "Offline ADR 0024 wire cohort: pinned peers, scripted proxy, no credentials"
 run = [
-  "CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo build -p aim -p aimx -p aim-coderun --bins --locked",
+  "CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo build -p aim -p aimx -p aim-coderun -p aim-plugind --bins --locked",
   "python3 -B -m unittest discover -s bench -p 'test_*.py'",
   "python3 -B bench/run.py wire --out bench/history/latest-wire.json",
 ]
@@ -98,6 +98,6 @@ run = [
 [tasks."bench:live"]
 description = "Manual paid coding cohort with manifest spend and subscription-run caps"
 run = [
-  "CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo build -p aim -p aimx -p aim-coderun --bins --locked",
+  "CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo build -p aim -p aimx -p aim-coderun -p aim-plugind --bins --locked",
   "python3 -B bench/run.py live --out bench/history/latest-live.json",
 ]

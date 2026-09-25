@@ -242,6 +242,7 @@ pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory,
 ///   session applies its recorded agent again and never widens the ceiling it recorded;
 /// - `$skill` mentions in prompts inject the skill into the user turn ([`WithSkills`]).
 #[must_use]
+#[expect(clippy::too_many_lines, reason = "session backend composition keeps the ordered resource and authority steps visible")]
 pub fn native_backends_with(
     providers: ProviderFactory,
     workspaces: WorkspaceFactory,
@@ -320,10 +321,8 @@ pub fn native_backends_with(
             };
             let project = workspace.project.clone();
             let Connected { mut tools, location, shutdown, .. } = workspace;
-            // Media services are composed before the agent's allowlist, which then applies to them
-            // too. A missing credential omits the tools rather than making every call fail. Private
-            // and ephemeral sessions do not send prompts to them: there is no per-session opt-in
-            // yet, so theirs stays off (ADR 0042).
+            // Media joins before the agent allowlist; missing credentials omit it. Private and
+            // ephemeral sessions keep it off until they have per-session opt-in (ADR 0042).
             if let Some(media) = &services.media
                 && let Some(media) = media().await
             {
@@ -332,8 +331,14 @@ pub fn native_backends_with(
             let mut tools_spec = spec.clone();
             tools_spec.workspace = root.clone();
             tools = with_extra_tools(tools, &services.tools, &tools_spec).await;
-            tools = with_plugin_tools(tools, services.plugins.as_ref(), &spec, project, agent.as_ref().map(|(def, policy)| (def, policy)))
-                .await;
+            tools = with_plugin_tools(
+                tools,
+                services.plugins.as_ref(),
+                &tools_spec,
+                project,
+                agent.as_ref().map(|(def, policy)| (def, policy)),
+            )
+            .await;
             let code_permitted = agent.as_ref().is_none_or(|(_, policy)| policy.permits("run_code"));
             let (mut tools, record) = match &agent {
                 Some((agent, policy)) => (narrowed(tools, agent, policy), Some(policy.record(&agent.meta.name))),
