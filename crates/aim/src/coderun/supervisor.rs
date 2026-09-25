@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use aim_coderun::budget::truncate_middle;
 use aim_coderun::protocol::{CallTool, CellOutput, Execute, ExecuteCell, ExecuteResult, Output, ToolCall, ToolCallResult};
 use aim_proto::daemon::SessionUpdate;
 use aim_proto::error::{ErrorCode, ProtoError};
@@ -252,7 +253,9 @@ async fn nested_call(bridges: Arc<Bridges>, call: ToolCall) -> Result<ToolCallRe
     if let Some(finished) = finished.as_mut() {
         finished.result = Some(match &result {
             Ok(result) => result.clone(),
-            Err(error) => ToolResult::error(format!("{}: {}", error.code, error.message)),
+            // A nested failure is recorded within a cell's largest output budget, as the model
+            // sees failures (codex re-check B1); successful results are bounded by their tools.
+            Err(error) => ToolResult::error(truncate_middle(&format!("{}: {}", error.code, error.message), super::MAX_OUTPUT_BYTES)),
         });
     }
     drop(finished);

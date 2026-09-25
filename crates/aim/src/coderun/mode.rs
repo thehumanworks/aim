@@ -55,8 +55,12 @@ pub fn requested(value: Option<&str>) -> CodeModeRequest {
 #[must_use]
 pub fn invalid_warning(value: Option<&str>) -> Option<String> {
     let value = value?;
-    (requested(Some(value)) == CodeModeRequest::Invalid)
-        .then(|| format!("{ENV}={value:?} is not off, on or only (or 0, 1, false, true); code mode is off"))
+    (requested(Some(value)) == CodeModeRequest::Invalid).then(|| {
+        // Environment content is echoed only when it is short and plain (codex re-check N1).
+        let plain = value.len() <= 16 && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+        let shown = if plain { format!("{ENV}=\"{value}\"") } else { format!("{ENV} holds an unrecognized value, which") };
+        format!("{shown} is not off, on or only (or 0, 1, false, true); code mode is off")
+    })
 }
 
 fn env_value() -> Option<String> {
@@ -190,6 +194,11 @@ mod tests {
             Some("AIM_CODE_MODE=\"onn\" is not off, on or only (or 0, 1, false, true); code mode is off")
         );
         assert_eq!(invalid_warning(Some("only")), None);
+        for hidden in ["sk-live-0123456789abcdef", "on\u{1b}[2J", "o n", "x".repeat(17).as_str()] {
+            let warning = invalid_warning(Some(hidden)).expect("invalid");
+            assert!(!warning.contains(hidden), "{warning}");
+            assert!(warning.starts_with("AIM_CODE_MODE holds an unrecognized value, which is not off"), "{warning}");
+        }
         assert_eq!(invalid_warning(None), None);
     }
 
