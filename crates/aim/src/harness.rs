@@ -4,28 +4,140 @@
 //! `aimx serve --stdio --root <dir>` as a child — the same command SSH runs on a remote host — and
 //! opens the workspace. It is a [`ToolHost`]: the native loop's harness tool calls go through it.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{
-    BackendSpec, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams, ToolsList,
-    ToolsListParams, WorkspaceInfo, WorkspaceOpen, WorkspaceOpenParams,
+    BackendSpec, ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, ExecRead, ExecReadParams, ExecReadResult, GenerationRange,
+    Initialize, InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams, ToolsList, ToolsListParams, WatchEvent,
+    WatchEventParams, WorkspaceInfo, WorkspaceOpen, WorkspaceOpenParams,
 };
 use aim_proto::ids::IdempotencyKey;
+use aim_proto::rpc::Notification as _;
 use aim_proto::tool::{ToolResult, ToolSpec};
-use aim_rpc::{NoHandler, Peer, PeerConfig};
+use aim_rpc::{Handler, NotificationCtx, Peer, PeerConfig, RequestCtx};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 
 use crate::agent::tools::{BoxFuture, ToolHost};
+
+const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
+
+/// A notification from the connected harness.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HarnessNotification {
+    /// A sequenced process-output chunk.
+    ExecOutput(ExecOutputParams),
+    /// A process exit and its final output sequence.
+    ExecExited(ExecExitedParams),
+    /// A sequenced workspace watch event.
+    WatchEvent(WatchEventParams),
+    /// Progress payload. The /1 contract has no typed progress schema yet.
+    Progress(Value),
+    /// This subscriber's queue filled; reconcile output with exec.read and rescan watches.
+    Lagged {
+        /// Number of notifications dropped for this subscriber.
+        dropped: u64,
+    },
+}
+
+struct Subscriber {
+    tx: mpsc::Sender<HarnessNotification>,
+    dropped: Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+struct NotificationFanout {
+    subscribers: Mutex<Vec<Subscriber>>,
+}
+
+impl NotificationFanout {
+    fn subscribe(&self) -> HarnessSubscription {
+        let (tx, rx) = mpsc::channel(NOTIFICATION_QUEUE_CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut subscribers = self.subscribers.lock().unwrap_or_else(PoisonError::into_inner);
+        subscribers.retain(|subscriber| !subscriber.tx.is_closed());
+        subscribers.push(Subscriber { tx, dropped: Arc::clone(&dropped) });
+        HarnessSubscription { rx, dropped }
+    }
+
+    fn publish(&self, event: &HarnessNotification) {
+        self.subscribers.lock().unwrap_or_else(PoisonError::into_inner).retain(|subscriber| match subscriber.tx.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let _previous = subscriber.dropped.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| Some(count.saturating_add(1)));
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
+    }
+}
+
+/// One bounded notification queue. Every subscriber receives its own copy.
+pub struct HarnessSubscription {
+    rx: mpsc::Receiver<HarnessNotification>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl HarnessSubscription {
+    /// Receives the next notification, or a lag marker once older queued events are drained.
+    pub async fn recv(&mut self) -> Option<HarnessNotification> {
+        if let Ok(event) = self.rx.try_recv() {
+            return Some(event);
+        }
+        let dropped = self.dropped.swap(0, Ordering::AcqRel);
+        if dropped > 0 {
+            return Some(HarnessNotification::Lagged { dropped });
+        }
+        self.rx.recv().await
+    }
+}
+
+struct ClientHandler {
+    notifications: Arc<NotificationFanout>,
+}
+
+impl Handler for ClientHandler {
+    fn request(
+        &self,
+        _ctx: RequestCtx,
+        _method: String,
+        _params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, ProtoError>> + Send>> {
+        Box::pin(async { Err(ProtoError::new(ErrorCode::MethodNotFound, "client does not serve requests")) })
+    }
+
+    fn notification(&self, _ctx: NotificationCtx, method: String, params: Value) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let event = match method.as_str() {
+            ExecOutput::NAME => serde_json::from_value(params).map(HarnessNotification::ExecOutput),
+            ExecExited::NAME => serde_json::from_value(params).map(HarnessNotification::ExecExited),
+            WatchEvent::NAME => serde_json::from_value(params).map(HarnessNotification::WatchEvent),
+            "$/progress" => Ok(HarnessNotification::Progress(params)),
+            _ => return Box::pin(async {}),
+        };
+        if let Ok(event) = event {
+            self.notifications.publish(&event);
+        } else {
+            tracing::warn!("harness sent a malformed notification");
+        }
+        Box::pin(async {})
+    }
+}
 
 /// A connected harness with one open workspace.
 pub struct HarnessClient {
     peer: Peer,
+    // Keep the resume token in init; reconnect support is deferred to the SSH integration.
     init: InitializeResult,
     workspace: WorkspaceInfo,
     tools: Vec<ToolSpec>,
+    notifications: Arc<NotificationFanout>,
     child: Option<Child>,
 }
 
@@ -66,7 +178,8 @@ impl HarnessClient {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let peer = Peer::spawn(reader, writer, NoHandler, PeerConfig::default());
+        let notifications = Arc::new(NotificationFanout::default());
+        let peer = Peer::spawn(reader, writer, ClientHandler { notifications: Arc::clone(&notifications) }, PeerConfig::default());
         let (min, max) = aim_proto::HARNESS_GENERATIONS;
         let init = peer
             .call::<Initialize>(InitializeParams {
@@ -76,9 +189,14 @@ impl HarnessClient {
                 resume: None,
             })
             .await?;
+        let max_outgoing = match usize::try_from(init.limits.max_message_bytes) {
+            Ok(bytes) => bytes,
+            Err(_) => usize::MAX,
+        };
+        peer.set_max_outgoing_bytes(max_outgoing);
         let workspace = peer.call::<WorkspaceOpen>(WorkspaceOpenParams { root: root.to_owned(), backend: BackendSpec::Local }).await?;
         let tools = peer.call::<ToolsList>(ToolsListParams::default()).await?.tools;
-        Ok(Self { peer, init, workspace, tools, child: None })
+        Ok(Self { peer, init, workspace, tools, notifications, child: None })
     }
 
     /// The handshake result (negotiated generation, principal, limits).
@@ -97,6 +215,22 @@ impl HarnessClient {
     #[must_use]
     pub const fn peer(&self) -> &Peer {
         &self.peer
+    }
+
+    /// Subscribes to bounded push notifications. After a lag marker or sequence gap, call
+    /// [`Self::read_output`] with the last seen process sequence; use its `dropped_before` field to
+    /// detect output already lost from the harness ring. A watch gap requires a fresh scan.
+    #[must_use]
+    pub fn subscribe_notifications(&self) -> HarnessSubscription {
+        self.notifications.subscribe()
+    }
+
+    /// Pulls process output after a sequence number, including output missed by push delivery.
+    ///
+    /// # Errors
+    /// A transport, protocol or harness error.
+    pub async fn read_output(&self, params: ExecReadParams) -> Result<ExecReadResult, ProtoError> {
+        self.peer.call::<ExecRead>(params).await
     }
 
     /// Ends the connection and stops a spawned harness.
