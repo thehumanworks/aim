@@ -150,3 +150,11 @@ client still builds.
   codex 12/12, Claude 13/16; auth.json unchanged. Merged-tree Verus 360 verified.
 - 2026-09-25 — Follow-up sent: the "# Code mode" prompt section only when code tools are offered
   (−241 B/request at the default). Codex REV-T4b started.
+- 2026-09-25 — T4b follow-up merged (`1d6c157`): code-mode prompt section only where a code tool is
+  offered; W1 8,353 → 8,112 B; bound 8,160.
+- 2026-09-25 — Codex REV-T4b (auth.json unchanged): MERGE AFTER FIXES. Confirmed: plan preceded
+  the runs; decision recomputes to `off`; ledger reconciles; wire attribution coherent; default
+  routes through Off (360 verified). B1: the three new graders accept wrong reports (wrong paths /
+  wrong function names). Per the plan, grader changes after the smoke need a new cohort: fix
+  graders + false-pass tests, re-register, rerun the primary arms (~$0.55), re-grade secondaries
+  offline if their reports were kept. Sent back to the T4b worker.
