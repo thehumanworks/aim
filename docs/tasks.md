@@ -173,3 +173,8 @@ client still builds.
   scripting requests off 5.56 / on 7.33; rule verdict `off`. Shipped DEFAULT_MODE = On (maintainer).
   Wire at default: W1 7,745 B, 14 tools; bound 7,793. OpenRouter total $0.94 of $3; no new
   codex/Claude runs; auth.json unchanged. Branch Verus 360 verified.
+- 2026-09-25 — Codex REV-T4b2 (re-check; auth.json unchanged): original false passes fixed; cohort 2
+  properly registered; verdict and override recorded separately; 360 verified. MERGE AFTER FIXES:
+  B1 `callers` accepts duplicate call sites; B2 `todo_table` rejects correct tables with the File
+  column not first or linked paths. Sent back: fix, then re-grade cohort 2's kept reports offline
+  (cohort 3 only if reports were not kept); default stays On.
