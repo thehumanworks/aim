@@ -30,6 +30,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::session::{OpenWorkspace, Session};
+use super::token::TokenStore;
 use super::{State, lock};
 use crate::authz::confine::normalize;
 use crate::authz::{Access, Grant};
@@ -54,6 +55,8 @@ pub(super) struct Conn {
     state: Arc<State>,
     id: u64,
     session: Mutex<Option<Arc<Session>>>,
+    tokens: Option<Arc<TokenStore>>,
+    expected_principal_id: Option<String>,
 }
 
 fn internal(err: impl std::fmt::Display) -> ProtoError {
@@ -81,8 +84,8 @@ macro_rules! route {
 }
 
 /// The router of one connection.
-pub(super) fn router(state: Arc<State>, id: u64) -> Router<Conn> {
-    let router = Router::new(Conn { state, id, session: Mutex::new(None) })
+pub(super) fn router(state: Arc<State>, id: u64, tokens: Option<Arc<TokenStore>>, expected_principal_id: Option<String>) -> Router<Conn> {
+    let router = Router::new(Conn { state, id, session: Mutex::new(None), tokens, expected_principal_id })
         .method::<Initialize, _, _>(|conn: Arc<Conn>, ctx: RequestCtx, params| async move { conn.initialize(&ctx, &params) })
         .method::<ToolsList, _, _>(|conn: Arc<Conn>, _ctx: RequestCtx, _params| async move { conn.tools_list() });
     let router = route!(router, WorkspaceOpen, workspace_open);
@@ -112,6 +115,10 @@ pub(super) fn router(state: Arc<State>, id: u64) -> Router<Conn> {
 }
 
 impl Conn {
+    pub(super) fn initialized(&self) -> bool {
+        lock(&self.session).is_some()
+    }
+
     /// The connection ended: detach its session (which stays resumable for the TTL).
     pub(super) fn disconnected(&self) {
         if let Some(session) = lock(&self.session).take() {
@@ -198,7 +205,24 @@ impl Conn {
             )
             .with_detail(serde_json::json!({ "server": { "min": min, "max": max } }))
         })?;
-        let principal = Arc::clone(&self.state.principal);
+        let (principal, expires_in) = if let Some(tokens) = &self.tokens {
+            let (principal, lifetime) = tokens.authenticate_with_lifetime(params.auth.as_ref(), &self.state.principal)?;
+            (Arc::new(principal), Some(lifetime))
+        } else {
+            (Arc::clone(&self.state.principal), None)
+        };
+        if self.expected_principal_id.as_ref().is_some_and(|expected| expected != &principal.id) {
+            return Err(ProtoError::new(ErrorCode::Unauthenticated, "HTTP bearer differs from initialize bearer"));
+        }
+        if let Some(lifetime) = expires_in {
+            let peer = ctx.peer.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = tokio::time::sleep(lifetime) => peer.close(),
+                    () = peer.closed() => {},
+                }
+            });
+        }
         let resumed_session =
             params.resume.as_ref().and_then(|token| self.state.resume_and_attach(token.as_str(), &principal, self.id, ctx.peer.clone()));
         let resumed = resumed_session.is_some();
