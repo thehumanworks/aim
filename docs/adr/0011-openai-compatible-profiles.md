@@ -43,14 +43,14 @@ docs/architecture.md §6.5.
   object stays in `Usage.native`. Usage a profile asked for is required: budgets and cost
   accounting never see a completed turn with zero usage the server did not report. This is a
   `Protocol` error, not an "unknown usage" value. `aim-proto`'s `Usage` has no such state, both
-  gateways send usage on every streamed turn (verbatim captures, seven live tests), and an
+  gateways send usage on every streamed turn (all verbatim captures and live tests), and an
   endpoint that cannot report usage says so with `supports_stream_usage = false`.
 - Derive available models and caps from endpoint catalogs when provided; a configured slug
   remains explicit when discovery is absent. A listed model still needs a live turn before
   aim claims it is usable. A capability the catalog does not state is assumed absent: in
   particular a model is sent tool-result images only when its catalog entry lists image input.
-  The agent layer does not call `catalog()` today, so the provider fetches it itself the first
-  time a request carries a tool-result image for a model it has not seen.
+  The provider does not rely on its caller having listed the catalog: the first time a request
+  carries a tool-result image for a model it has not seen, it fetches the catalog itself.
 
 *Amended 2026-09-25, same day:* the profile settings below record what `crates/aim-llm-openai`
 implements after its cross-model reviews. The first version named `key_env` (the field is
@@ -122,8 +122,10 @@ behavior, so the adapter must surface unsupported features instead of approximat
   `openai/gpt-oss-20b` the placeholder and vision `openai/gpt-4.1-mini` the image; the image
   forced onto the text-only model is rejected with 404 "No endpoints found that support image
   input").
-  The first version of this ADR named them `live_openrouter_chat` and `live_ai_gateway_chat`.
+  The first version of this ADR named `live_openrouter_chat` and `live_ai_gateway_chat`, which
+  never existed.
 - Unit and local-HTTP tests in the crate cover explicit wire selection, key-env lookup without
   logging, environment-referenced headers (sent per request, scrubbed from errors, never
   serialized), quirk application, unknown-key rejection, verbatim stream captures of both
-  gateways and error mapping. Preset override precedence is untested because merging is not implemented.
+  gateways and error mapping. Preset override precedence is untested because merging is not
+  implemented.
