@@ -83,12 +83,11 @@ fn no_existing(path: &Path) -> Result<()> {
 }
 
 fn exact_source(source: &Path, sha: &str, tree: &str) -> Result<()> {
-    ensure!(fs::symlink_metadata(source)?.is_dir(), "source clone must be a real directory");
-    ensure!(fs::symlink_metadata(source.join(".git"))?.is_dir(), "source must be a fresh Git clone");
-    let canonical = fs::canonicalize(source).context("canonicalize source clone")?;
+    ensure!(fs::symlink_metadata(source)?.is_dir(), "trusted source repository must be a real directory");
+    let canonical = fs::canonicalize(source).context("canonicalize trusted source repository")?;
     let top = git_text(&canonical, &["rev-parse", "--show-toplevel"])?;
-    ensure!(Path::new(&top) == canonical, "source is not the clone root");
-    ensure!(git_text(&canonical, &["rev-parse", "HEAD"])? == sha, "source clone HEAD differs from requested commit");
+    ensure!(Path::new(&top) == canonical, "trusted source is not a repository root");
+    ensure!(git_text(&canonical, &["cat-file", "-t", sha])? == "commit", "requested object is not a commit");
     ensure!(git_text(&canonical, &["rev-parse", &format!("{sha}^{{tree}}")])? == tree, "Git tree differs from expected tree");
     Ok(())
 }
@@ -176,19 +175,20 @@ fn safe_parent(root: &Path, relative: &Path) -> Result<PathBuf> {
 
 /// Stage exactly the requested commit's raw Git blobs under `root/<sha>`.
 ///
-/// `source_clone` must be a fresh checkout at `sha`. Candidate checkout filters and untracked
-/// files are ignored. Relative symlinks must resolve inside the staged tree; gitlinks are refused.
-/// The caller owns `root`.
+/// `trusted_repo` is the gate's repository outside the candidate sandbox, never a candidate-
+/// writable clone. Only raw objects at `sha` are staged; working-tree files are ignored.
+/// Relative symlinks must resolve inside the staged tree; gitlinks are refused. The caller owns
+/// `root`.
 ///
 /// # Errors
-/// Invalid root, SHA/tree, clone, tree entry, or write failure.
-pub fn stage_exact(root: &Path, source_clone: &Path, sha: &str, expected_tree: &str) -> Result<Artifact> {
+/// Invalid root, SHA/tree, trusted repository, tree entry, or write failure.
+pub fn stage_exact(root: &Path, trusted_repo: &Path, sha: &str, expected_tree: &str) -> Result<Artifact> {
     validate_sha(sha)?;
     validate_sha(expected_tree)?;
     let root = checked_root(root)?;
-    let source = fs::canonicalize(source_clone).context("source clone missing")?;
-    ensure!(!root.starts_with(&source) && !source.starts_with(&root), "source clone overlaps deployment root");
-    exact_source(source_clone, sha, expected_tree)?;
+    let source = fs::canonicalize(trusted_repo).context("trusted source repository missing")?;
+    ensure!(!root.starts_with(&source) && !source.starts_with(&root), "trusted source overlaps deployment root");
+    exact_source(trusted_repo, sha, expected_tree)?;
     let entries = tree_entries(&source, sha)?;
     let mut links = HashMap::new();
     let mut files = HashSet::new();
@@ -367,6 +367,16 @@ mod tests {
         rollback(&root, &first_sha)?;
         assert_eq!(read_current(&root)?, Some(first_sha));
         assert_eq!(fs::read_to_string(first.path.join("app.txt"))?, "first");
+        Ok(())
+    }
+
+    #[test]
+    fn stages_non_head_commit_from_trusted_repository() -> Result<()> {
+        let (_temporary, repository, root) = fixture()?;
+        let (first_sha, first_tree) = commit(&repository, "first")?;
+        let (_second_sha, _second_tree) = commit(&repository, "second")?;
+        let staged = stage_exact(&root, &repository, &first_sha, &first_tree)?;
+        assert_eq!(fs::read_to_string(staged.path.join("app.txt"))?, "first");
         Ok(())
     }
 

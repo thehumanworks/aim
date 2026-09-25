@@ -10,11 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use serde_json::{Value, json};
 
-/// Only this text-only model may be used for paid proposals.
-pub const MODEL: &str = "openai/gpt-4.1-mini";
 /// A nonsecret value placed in the candidate's `OPENROUTER_API_KEY`.
 pub const SENTINEL_KEY: &str = "gate-broker";
 const MAX_BODY: usize = 64 * 1024;
@@ -33,6 +31,8 @@ const TOKEN_OVERHEAD_RESERVE: u64 = 4096;
 pub struct BrokerConfig {
     /// Real OpenRouter credential, held in gate memory.
     pub api_key: String,
+    /// Exact operator-pinned model id permitted for this proposal.
+    pub model: String,
     /// Exact upstream chat-completions URL. Production accepts only OpenRouter HTTPS.
     pub upstream_url: String,
     /// Whole-proposal budget in cents; zero disables paid access, 50 is the hard ceiling.
@@ -74,6 +74,12 @@ impl Broker {
     /// Disabled/invalid configuration, unavailable port, or HTTP client construction failure.
     pub fn start(config: BrokerConfig) -> Result<Self> {
         ensure!((1..=50).contains(&config.max_cents), "paid proposal cap must be 1..=50 cents");
+        ensure!(
+            !config.model.is_empty()
+                && config.model.len() <= 128
+                && config.model.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')),
+            "invalid pinned proposal model"
+        );
         ensure!(!config.api_key.is_empty() && !config.api_key.contains(['\r', '\n']), "invalid OpenRouter credential");
         valid_upstream(&config.upstream_url)?;
         let client = reqwest::blocking::Client::builder()
@@ -126,7 +132,7 @@ impl Broker {
     #[must_use]
     pub fn spent_cents(&self) -> u32 {
         let budget = self.budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        budget.used_micro.div_ceil(MICROS_PER_CENT) as u32
+        u32::try_from(budget.used_micro.div_ceil(MICROS_PER_CENT)).unwrap_or(u32::MAX)
     }
 
     /// Metered usage and any remaining conservative reserve.
@@ -141,21 +147,25 @@ impl Broker {
     }
 
     /// Stop the listener after the current request, if any, has completed.
-    pub fn stop(mut self) {
-        self.shutdown();
+    ///
+    /// # Errors
+    /// The worker panicked before accounting completed.
+    pub fn stop(&mut self) -> Result<()> {
+        self.shutdown()
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> Result<()> {
         self.stopping.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
-            let _joined = worker.join();
+            worker.join().map_err(|_| anyhow::anyhow!("broker worker panicked"))?;
         }
+        Ok(())
     }
 }
 
 impl Drop for Broker {
     fn drop(&mut self) {
-        self.shutdown();
+        let _result = self.shutdown();
     }
 }
 
@@ -224,10 +234,10 @@ fn prohibited_media(value: &Value) -> bool {
     }
 }
 
-fn outbound_body(body: &[u8]) -> Result<(Vec<u8>, u64)> {
+fn outbound_body(body: &[u8], model: &str) -> Result<(Vec<u8>, u64)> {
     let mut value: Value = serde_json::from_slice(body)?;
     let map = value.as_object_mut().ok_or_else(|| anyhow::anyhow!("request must be an object"))?;
-    ensure!(map.get("model").and_then(Value::as_str) == Some(MODEL), "proposal model is not permitted");
+    ensure!(map.get("model").and_then(Value::as_str) == Some(model), "proposal model is not permitted");
     ensure!(map.get("stream") == Some(&Value::Bool(true)), "proposal must stream");
     ensure!(map.get("stream_options").and_then(|value| value.get("include_usage")) == Some(&Value::Bool(true)), "stream usage is required");
     let output = match map.get("max_tokens") {
@@ -272,6 +282,11 @@ fn chunk(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "finite nonnegative cost is bounded to 0.5 USD before conversion to microdollars"
+)]
 fn usage_micro(line: &[u8]) -> Option<u64> {
     let data = line.strip_prefix(b"data: ")?;
     let value: Value = serde_json::from_slice(data).ok()?;
@@ -296,7 +311,7 @@ fn relay(mut upstream: impl std::io::Read, stream: &mut TcpStream) -> Result<u64
         if count == 0 {
             break;
         }
-        for byte in &buf[..count] {
+        for byte in buf.get(..count).context("upstream read exceeded buffer")? {
             line.push(*byte);
             ensure!(line.len() <= MAX_SSE_LINE, "upstream SSE line too large");
             if *byte == b'\n' {
@@ -318,18 +333,15 @@ fn relay(mut upstream: impl std::io::Read, stream: &mut TcpStream) -> Result<u64
     }
     ensure!(done && line.is_empty(), "upstream stream ended without usage and DONE");
     chunk(stream, b"")?;
-    Ok(cost.expect("DONE requires usage"))
+    cost.context("DONE requires usage")
 }
 
 fn handle(mut stream: TcpStream, client: &reqwest::blocking::Client, config: &BrokerConfig, budget: &Mutex<Budget>) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let body = match read_request(&mut stream).and_then(|body| outbound_body(&body)) {
-        Ok(body) => body,
-        Err(_) => {
-            let _reply = reply(&mut stream, "400 Bad Request");
-            return Ok(());
-        }
+    let Ok(body) = read_request(&mut stream).and_then(|body| outbound_body(&body, &config.model)) else {
+        let _reply = reply(&mut stream, "400 Bad Request");
+        return Ok(());
     };
     let (body, reserve) = body;
     {
@@ -377,6 +389,8 @@ fn handle(mut stream: TcpStream, client: &reqwest::blocking::Client, config: &Br
 mod tests {
     use super::*;
 
+    const TEST_MODEL: &str = "openai/gpt-4.1-mini";
+
     fn fake_upstream() -> (String, JoinHandle<bool>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}/api/v1/chat/completions", listener.local_addr().unwrap().port());
@@ -403,7 +417,7 @@ mod tests {
             let safe = text.contains("Bearer upstream-secret")
                 && !text.contains(SENTINEL_KEY)
                 && parsed["provider"]["max_price"] == json!({"prompt":1,"completion":2})
-                && parsed["model"] == MODEL
+                && parsed["model"] == TEST_MODEL
                 && parsed["max_tokens"] == MAX_OUTPUT_TOKENS;
             let sse = b"data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"r\",\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":5,\"cost\":0.00002}}\n\ndata: [DONE]\n\n";
             write!(
@@ -432,14 +446,16 @@ mod tests {
     #[test]
     fn streams_usage_and_substitutes_credential() {
         let (upstream_url, worker) = fake_upstream();
-        let broker = Broker::start(BrokerConfig { api_key: "upstream-secret".into(), upstream_url, max_cents: 1 }).unwrap();
-        let body = json!({"model": MODEL, "stream": true, "stream_options": {"include_usage": true},
+        let mut broker =
+            Broker::start(BrokerConfig { api_key: "upstream-secret".into(), model: TEST_MODEL.into(), upstream_url, max_cents: 1 })
+                .unwrap();
+        let body = json!({"model": TEST_MODEL, "stream": true, "stream_options": {"include_usage": true},
             "messages": [{"role":"user","content":"hello"}], "cache_control": {"type":"ephemeral"}});
         let result = call(broker.port(), &body);
         assert!(result.contains("200 OK") && result.contains("data: [DONE]"));
+        broker.stop().unwrap();
         assert_eq!(broker.spent_cents(), 1);
         assert_eq!(broker.usage(), BrokerUsage { requests: 1, billed_micro_usd: 20, reserved_micro_usd: 0 });
-        broker.stop();
         assert!(worker.join().unwrap());
     }
 
@@ -447,11 +463,12 @@ mod tests {
     fn rejects_expensive_or_unbounded_request_before_upstream() {
         let broker = Broker::start(BrokerConfig {
             api_key: "upstream-secret".into(),
+            model: TEST_MODEL.into(),
             upstream_url: "http://127.0.0.1:9/api/v1/chat/completions".into(),
             max_cents: 1,
         })
         .unwrap();
-        let mut body = json!({"model": MODEL, "stream": true, "stream_options": {"include_usage": true}, "max_tokens": 2048,
+        let mut body = json!({"model": TEST_MODEL, "stream": true, "stream_options": {"include_usage": true}, "max_tokens": 2048,
             "messages": [{"role":"user","content":"x".repeat(20_000)}]});
         assert!(call(broker.port(), &body).contains("429 Too Many Requests"));
         body["max_tokens"] = json!(2049);
@@ -493,15 +510,17 @@ mod tests {
             .unwrap();
             stream.write_all(sse).unwrap();
         });
-        let broker = Broker::start(BrokerConfig { api_key: "upstream-secret".into(), upstream_url, max_cents: 1 }).unwrap();
-        let body = json!({"model": MODEL, "stream": true, "stream_options": {"include_usage": true}, "messages": [{"role":"user","content":"hello"}]});
+        let mut broker =
+            Broker::start(BrokerConfig { api_key: "upstream-secret".into(), model: TEST_MODEL.into(), upstream_url, max_cents: 1 })
+                .unwrap();
+        let body = json!({"model": TEST_MODEL, "stream": true, "stream_options": {"include_usage": true}, "messages": [{"role":"user","content":"hello"}]});
         let first = call(broker.port(), &body);
         assert!(!first.contains("data: [DONE]"));
+        broker.stop().unwrap();
         assert_eq!(broker.spent_cents(), 1);
         assert_eq!(broker.usage().requests, 1);
         assert_eq!(broker.usage().billed_micro_usd, 0);
         assert!(broker.usage().reserved_micro_usd > 0);
-        assert!(call(broker.port(), &body).contains("429 Too Many Requests"));
         worker.join().unwrap();
     }
 }

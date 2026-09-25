@@ -1,15 +1,18 @@
 //! Trusted gate orchestration. All final artifact evidence is produced after candidate exit.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use aim_gate_validators::{ProtectedManifest, ValidationConfig, validate};
 use aim_kernel::gate::{Boundary, Event, GateView, advance};
 use anyhow::{Context as _, Result, ensure};
 use ring::rand::{SecureRandom as _, SystemRandom};
+use rustix::fs::{Mode, OFlags, open};
 
 use crate::bench;
-use crate::broker::{Broker, BrokerConfig, MODEL};
+use crate::broker::{Broker, BrokerConfig};
+use crate::cache;
 use crate::checkpoint;
 use crate::deploy;
 use crate::formats::{
@@ -20,6 +23,8 @@ use crate::formats::{
 use crate::promotion;
 use crate::runner::{Sandbox, bench_port, fresh_checkout, trusted, validate_sha};
 use crate::sandbox::Network;
+
+const MAX_BUNDLE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Operator-owned bootstrap paths. None may be inside the candidate clone.
 #[derive(Clone, Debug)]
@@ -36,8 +41,12 @@ pub struct InitOptions {
     pub readable_roots: Vec<PathBuf>,
     /// Directories searched for executables inside Seatbelt.
     pub executable_roots: Vec<PathBuf>,
+    /// macOS SDK for sandboxed native builds, inside one of the readable roots.
+    pub sdk_root: Option<PathBuf>,
     /// Paid proposal cap in cents, at most 50; zero disables paid proposals.
     pub paid_spend_cap_cents: u32,
+    /// Catalog model id selected by the operator for the paid tier.
+    pub proposal_model: Option<String>,
     /// Gate-owned step overrides for tiny fixture repositories; normal CLI passes `None`.
     pub commands: Option<Commands>,
     /// Fake protected manifest for tiny fixture repos; normal CLI passes `None`.
@@ -89,12 +98,14 @@ impl GateRuntime {
             cargo_registry,
             cargo_git,
             mise_data,
+            sdk_root: options.sdk_root.map(fs::canonicalize).transpose().context("canonicalize gate SDK root")?,
             executable_roots: options.executable_roots,
             commands: options.commands.unwrap_or_default(),
             bench_result: PathBuf::from("bench/history/latest-wire.json"),
             bench_harness: "aim_openrouter".to_owned(),
             thresholds: Thresholds::default(),
             paid_spend_cap_cents: options.paid_spend_cap_cents,
+            proposal_model: options.proposal_model,
         };
         config.validate(&home)?;
         config.evaluator_digest = current_evaluator_digest(&config)?;
@@ -152,6 +163,7 @@ impl GateRuntime {
     pub fn propose(&self, goal: &str) -> Result<String> {
         ensure!(!goal.trim().is_empty() && goal.len() <= 4096, "proposal goal is empty or too long");
         ensure!(self.config.paid_spend_cap_cents > 0, "paid proposals are disabled in gate config");
+        let model = self.config.proposal_model.as_deref().context("paid proposal model is missing")?;
         ensure!(current_evaluator_digest(&self.config)? == self.config.evaluator_digest, "pinned evaluator changed before proposal");
         let mut random = [0_u8; 12];
         SystemRandom::new().fill(&mut random).map_err(|_| anyhow::anyhow!("candidate id entropy unavailable"))?;
@@ -164,14 +176,15 @@ impl GateRuntime {
         fresh_checkout(&self.config.repository, &base_sha, &candidate, &self.home, &self.config)?;
         let branch = format!("gate/cand/{id}");
         let offline = Sandbox::new(&candidate, &self.home, &self.config, Network::Off)?;
-        offline.run(&crate::formats::CommandSpec::new("git", &["switch", "-c", &branch]))?;
-        offline.run(&self.config.commands.build)?;
+        offline.run(&crate::formats::CommandSpec::new("git", &["switch", "-c", &branch])).context("sandboxed proposal branch creation")?;
+        offline.run(&self.config.commands.build).context("sandboxed proposal binary build")?;
         let aim = candidate.join("target/debug/aim");
         let aimx = candidate.join("target/debug/aimx");
         ensure!(aim.is_file() && aimx.is_file(), "proposal build omitted aim or aimx binary");
         let key = std::env::var("OPENROUTER_API_KEY").context("gate process lacks OpenRouter credential")?;
         let mut broker = Broker::start(BrokerConfig {
             api_key: key,
+            model: model.to_owned(),
             upstream_url: "https://openrouter.ai/api/v1/chat/completions".to_owned(),
             max_cents: self.config.paid_spend_cap_cents,
         })?;
@@ -186,7 +199,7 @@ impl GateRuntime {
                 "--provider".into(),
                 "openrouter".into(),
                 "--model".into(),
-                MODEL.into(),
+                model.into(),
                 "-C".into(),
                 candidate.to_str().context("candidate path is not UTF-8")?.into(),
                 "--aimx".into(),
@@ -252,15 +265,38 @@ impl GateRuntime {
             ))?;
         }
         offline.clean_scratch()?;
-        let candidate_sha = trusted("git", &["rev-parse", "HEAD"], &candidate)?;
+        let candidate_sha = offline.run(&crate::formats::CommandSpec::new("git", &["rev-parse", "HEAD"]))?.output.trim().to_owned();
         validate_sha(&candidate_sha)?;
         ensure!(candidate_sha != base_sha, "proposal produced no candidate commit");
-        let clone_path = candidate.to_str().context("proposal clone path is not UTF-8")?;
+        let candidate_tree = offline.run(&crate::formats::CommandSpec::new("git", &["rev-parse", "HEAD^{tree}"]))?.output.trim().to_owned();
+        validate_sha(&candidate_tree)?;
+        let bundle_path = candidate.join(".gate-candidate.bundle");
+        match fs::symlink_metadata(&bundle_path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => anyhow::bail!("candidate occupied gate bundle path"),
+            Err(err) => return Err(err).context("inspect candidate bundle path"),
+        }
+        let bundle_source = bundle_path.to_str().context("candidate bundle path is not UTF-8")?;
+        offline.run(&crate::formats::CommandSpec::new("git", &["bundle", "create", bundle_source, "HEAD"]))?;
+        // Import only bundle data, never run trusted Git against candidate-writable `.git/config`.
+        let mut input = File::from(
+            open(&bundle_path, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()).context("open candidate bundle without symlink")?,
+        );
+        ensure!(input.metadata()?.is_file(), "candidate bundle is not a regular file");
+        let mut private_bundle = tempfile::NamedTempFile::new_in(temp.path()).context("create private gate bundle")?;
+        let copied = std::io::copy(&mut input.by_ref().take(MAX_BUNDLE_BYTES + 1), private_bundle.as_file_mut())?;
+        ensure!(copied <= MAX_BUNDLE_BYTES, "candidate bundle exceeds gate limit");
+        private_bundle.as_file().sync_all().context("sync private gate bundle")?;
+        let private_path = private_bundle.path().to_str().context("private bundle path is not UTF-8")?;
         let refspec = format!("HEAD:refs/heads/{branch}");
-        trusted("git", &["fetch", "--no-tags", clone_path, &refspec], &self.config.repository)?;
+        trusted("git", &["fetch", "--no-tags", private_path, &refspec], &self.config.repository)?;
         ensure!(
             trusted("git", &["rev-parse", &format!("refs/heads/{branch}")], &self.config.repository)? == candidate_sha,
             "candidate import readback mismatch"
+        );
+        ensure!(
+            trusted("git", &["rev-parse", &format!("{candidate_sha}^{{tree}}")], &self.config.repository)? == candidate_tree,
+            "candidate imported tree differs from confined commit"
         );
         self.record_candidate(&id, &base_sha, &candidate_sha)?;
         Ok(id)
@@ -284,6 +320,7 @@ impl GateRuntime {
         let candidate = temp.path().join("candidate");
         fresh_checkout(&self.config.repository, &base_sha, &base, &self.home, &self.config)?;
         fresh_checkout(&self.config.repository, sha, &candidate, &self.home, &self.config)?;
+        let _reused_baseline = cache::restore(&self.home, &base_sha, &self.config.evaluator_digest, &base.join("target"))?;
         let base_sandbox = Sandbox::new(&base, &self.home, &self.config, Network::Off)?;
         let candidate_sandbox = Sandbox::new(&candidate, &self.home, &self.config, Network::Off)?;
         let base_inventory = base_sandbox.run(&self.config.commands.test_inventory)?.output;
@@ -343,7 +380,8 @@ impl GateRuntime {
         }
         let final_report = validate(&base, &candidate, &validation).map_err(anyhow::Error::msg)?;
         ensure!(final_report.passed(), "generated files violate protected validator: {}", final_report.findings.join("; "));
-        let tree_hash = trusted("git", &["rev-parse", &format!("{sha}^{{tree}}")], &candidate)?;
+        cache::store(&self.home, &base_sha, &self.config.evaluator_digest, &base.join("target"))?;
+        let tree_hash = trusted("git", &["rev-parse", &format!("{sha}^{{tree}}")], &self.config.repository)?;
         validate_sha(&tree_hash)?;
         let rollback_sha = self.ensure_predecessor(&base, &base_sha)?;
         let environment_digest = current_environment_digest(&self.config, &self.home)?;
@@ -366,6 +404,7 @@ impl GateRuntime {
             bench,
             passed: true,
         };
+        ensure!(current_evaluator_digest(&self.config)? == self.config.evaluator_digest, "pinned evaluator changed before receipt signing");
         let receipt = sign_receipt(&self.home, body)?;
         verify_receipt(&self.home, &receipt, &self.config.evaluator_digest)?;
         let view = GateView::proposed(u64::MAX, 1, 1, true).context("no runnable gate predecessor")?;
@@ -464,9 +503,9 @@ impl GateRuntime {
         }
         let sandbox = Sandbox::new(base_clone, &self.home, &self.config, Network::Off)?;
         sandbox.run(&self.config.commands.canary).context("baseline is not a runnable rollback target")?;
-        let tree = trusted("git", &["rev-parse", &format!("{base_sha}^{{tree}}")], base_clone)?;
+        let tree = trusted("git", &["rev-parse", &format!("{base_sha}^{{tree}}")], &self.config.repository)?;
         validate_sha(&tree)?;
-        let artifact = deploy::stage_exact(root, base_clone, base_sha, &tree)?;
+        let artifact = deploy::stage_exact(root, &self.config.repository, base_sha, &tree)?;
         ensure!(deploy::activate(root, &artifact)?.is_none(), "baseline deployment raced another writer");
         ensure!(deploy::read_current(root)?.as_deref() == Some(base_sha), "baseline pointer readback mismatch");
         Ok(base_sha.to_owned())

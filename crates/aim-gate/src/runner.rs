@@ -62,6 +62,9 @@ fn complete(mut command: Command, timeout: Duration) -> Result<CommandResult> {
     command.stdout(Stdio::from(OwnedFd::from(writer))).stderr(Stdio::from(OwnedFd::from(stderr)));
     command.process_group(0);
     let mut child = command.spawn().context("spawn sandbox command")?;
+    // `Command` retains its configured stdio handles after spawn. Release the parent's writer
+    // copies so the reader can observe EOF when the child process group has exited.
+    drop(command);
     let leader_done = Arc::new(AtomicBool::new(false));
     let output_done = Arc::clone(&leader_done);
     let output = thread::spawn(move || drain(reader, &output_done));
@@ -119,6 +122,7 @@ pub struct Sandbox {
     cargo_registry: Option<PathBuf>,
     cargo_git: Option<PathBuf>,
     mise_data: Option<PathBuf>,
+    sdk_root: Option<PathBuf>,
 }
 
 impl Sandbox {
@@ -166,6 +170,7 @@ impl Sandbox {
             cargo_registry: config.cargo_registry.clone(),
             cargo_git: config.cargo_git.clone(),
             mise_data: config.mise_data.clone(),
+            sdk_root: config.sdk_root.clone(),
         })
     }
 
@@ -218,6 +223,16 @@ impl Sandbox {
         command.env("CARGO_NET_OFFLINE", "true");
         command.env("CARGO_INCREMENTAL", "0");
         command.env("CARGO_PROFILE_DEV_DEBUG", "0");
+        // `rust-objcopy` in this pinned macOS toolchain cannot resolve libLLVM under Seatbelt;
+        // debug=0 already omits debug payloads, so skip the redundant strip subprocess.
+        command.env("CARGO_PROFILE_DEV_STRIP", "none");
+        command.env("GIT_CONFIG_NOSYSTEM", "1");
+        command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        command.env("GIT_AUTHOR_NAME", "aim-gate");
+        command.env("GIT_AUTHOR_EMAIL", "aim-gate@noreply.local");
+        command.env("GIT_COMMITTER_NAME", "aim-gate");
+        command.env("GIT_COMMITTER_EMAIL", "aim-gate@noreply.local");
         command.env("MISE_YES", "1");
         command.env("MISE_CONFIG_DIR", self.root.join(".gate-mise"));
         command.env("MISE_GLOBAL_CONFIG_FILE", "/dev/null");
@@ -225,6 +240,9 @@ impl Sandbox {
         command.env("MISE_CACHE_DIR", home.join(".mise-cache"));
         if let Some(mise_data) = &self.mise_data {
             command.env("MISE_DATA_DIR", mise_data);
+        }
+        if let Some(sdk_root) = &self.sdk_root {
+            command.env("SDKROOT", sdk_root);
         }
         command.env("PATH", &self.executable_path);
         if let Some(port) = self.broker_port {
@@ -293,8 +311,13 @@ pub fn fresh_checkout(repository: &Path, sha: &str, destination: &Path, gate_hom
     let dest = destination.to_str().context("clone path is not UTF-8")?;
     trusted("git", &["clone", "--local", "--no-hardlinks", "--no-checkout", "--", repo, dest], repository)?;
     let sandbox = Sandbox::new(destination, gate_home, config, Network::Off)?;
-    sandbox.run(&CommandSpec::new("git", &["-c", "core.hooksPath=/dev/null", "checkout", "--detach", sha]))?;
-    ensure!(trusted("git", &["rev-parse", "HEAD"], destination)? == sha, "fresh checkout SHA readback mismatch");
+    sandbox
+        .run(&CommandSpec::new("git", &["-c", "core.hooksPath=/dev/null", "checkout", "--detach", sha]))
+        .context("sandboxed Git checkout")?;
+    ensure!(
+        sandbox.run(&CommandSpec::new("git", &["rev-parse", "HEAD"])).context("sandboxed Git commit readback")?.output.trim() == sha,
+        "fresh checkout SHA readback mismatch"
+    );
     Ok(())
 }
 

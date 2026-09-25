@@ -140,6 +140,8 @@ pub struct GateConfig {
     pub cargo_git: Option<PathBuf>,
     /// Read-only installed Mise toolchains, not the owner's config directory.
     pub mise_data: Option<PathBuf>,
+    /// Pinned macOS SDK used by sandboxed native builds, inside a readable toolchain root.
+    pub sdk_root: Option<PathBuf>,
     /// Exact directories searched for executables inside the sandbox.
     pub executable_roots: Vec<PathBuf>,
     /// Evaluator-owned commands.
@@ -154,6 +156,9 @@ pub struct GateConfig {
     pub thresholds: Thresholds,
     /// Paid OpenRouter budget in cents. Zero disables the paid tier.
     pub paid_spend_cap_cents: u32,
+    /// Catalog model id chosen by the operator for paid proposals.
+    #[serde(default)]
+    pub proposal_model: Option<String>,
 }
 
 impl GateConfig {
@@ -173,6 +178,15 @@ impl GateConfig {
         );
         ensure!(self.evaluator_digest.len() == 64 && hex::decode(&self.evaluator_digest).is_ok(), "invalid evaluator digest");
         ensure!(self.paid_spend_cap_cents <= 50, "paid spend cap exceeds the W28 limit");
+        if self.paid_spend_cap_cents > 0 {
+            let model = self.proposal_model.as_deref().context("paid proposal model is missing")?;
+            ensure!(
+                !model.is_empty()
+                    && model.len() <= 128
+                    && model.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')),
+                "invalid paid proposal model"
+            );
+        }
         ensure!(self.fixture_manifest.is_none() || self.paid_spend_cap_cents == 0, "fixture validator cannot enable paid proposals");
         ensure!(
             !self.bench_result.is_absolute() && !self.bench_result.components().any(|c| matches!(c, std::path::Component::ParentDir)),
@@ -204,6 +218,14 @@ impl GateConfig {
             let real = fs::canonicalize(root).with_context(|| format!("gate read root unavailable: {}", root.display()))?;
             ensure!(!real.starts_with(&home) && !home.starts_with(&real), "read root overlaps gate home");
             ensure!(real != Path::new("/"), "read root cannot be filesystem root");
+        }
+        if let Some(sdk_root) = &self.sdk_root {
+            let sdk = fs::canonicalize(sdk_root).context("gate SDK root unavailable")?;
+            ensure!(
+                self.readable_roots.iter().any(|root| fs::canonicalize(root).is_ok_and(|readable| sdk.starts_with(readable))),
+                "gate SDK root must be inside a readable toolchain root"
+            );
+            ensure!(sdk.join("SDKSettings.json").is_file(), "gate SDK root is not a macOS SDK");
         }
         for root in [&self.cargo_registry, &self.cargo_git, &self.mise_data].into_iter().flatten() {
             let real = fs::canonicalize(root).with_context(|| format!("gate cache unavailable: {}", root.display()))?;
@@ -290,6 +312,9 @@ pub fn current_environment_digest(config: &GateConfig, home: &Path) -> Result<St
         hasher.update(fs::read(real).context("read selected gate executable")?);
     }
     hasher.update(fs::read(config.evaluator_root.join("mise.lock")).context("read locked toolchain pins")?);
+    if let Some(sdk_root) = &config.sdk_root {
+        hasher.update(fs::read(sdk_root.join("SDKSettings.json")).context("read pinned SDK settings")?);
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 

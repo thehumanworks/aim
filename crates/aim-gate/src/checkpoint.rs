@@ -166,10 +166,7 @@ fn remote_url(repo: &Path, name: &str) -> Result<String> {
     let key = format!("remote.{name}.url");
     let url = git_text(repo, &["config", "--local", "--get", &key], None, None)?;
     ensure!(!url.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | b'\0')), "unsafe gate remote URL");
-    let github = matches!(
-        url.as_str(),
-        "https://github.com/thehumanworks/aim" | "https://github.com/thehumanworks/aim.git" | "git@github.com:thehumanworks/aim.git"
-    );
+    let github = matches!(url.as_str(), "https://github.com/thehumanworks/aim" | "https://github.com/thehumanworks/aim.git");
     let local = cfg!(test) && Path::new(&url).is_absolute() && fs::canonicalize(&url).is_ok_and(|path| path == Path::new(&url));
     ensure!(github || local, "gate remote must be the private origin or a canonical local repository");
     Ok(url)
@@ -214,7 +211,7 @@ fn git_text(repo: &Path, args: &[&str], input: Option<&[u8]>, remote: Option<&st
 fn git(repo: &Path, args: &[&str], input: Option<&[u8]>, remote: Option<&str>) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     command.current_dir(repo).env_clear();
-    for key in ["PATH", "HOME", "TMPDIR", "SSH_AUTH_SOCK"] {
+    for key in ["PATH", "HOME", "TMPDIR"] {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
@@ -312,6 +309,8 @@ mod tests {
         checkpoint("origin", &source, &home, first.seq, &first.hash).unwrap();
         let next = event(&home, "next");
         git(&source, &["config", "remote.origin.url", "ext::sh -c evil"], None, None).unwrap();
+        assert!(checkpoint("origin", &source, &home, next.seq, &next.hash).is_err());
+        git(&source, &["config", "remote.origin.url", "git@github.com:thehumanworks/aim.git"], None, None).unwrap();
         assert!(checkpoint("origin", &source, &home, next.seq, &next.hash).is_err());
         git(&source, &["config", "remote.origin.url", remote.to_str().unwrap()], None, None).unwrap();
 

@@ -1,5 +1,6 @@
 //! Pure Seatbelt profile construction shared by the gate and future local executor policy.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
@@ -41,8 +42,21 @@ impl Policy {
     /// requested port is zero.
     pub fn render(&self) -> Result<String, &'static str> {
         let mut result = String::from(
-            "(version 1)\n(deny default)\n(allow process-fork)\n(allow process-exec)\n(allow sysctl-read)\n(allow file-read* (literal \"/\"))\n",
+            "(version 1)\n(deny default)\n(allow process-fork)\n(allow process-exec)\n(allow sysctl-read)\n(allow file-read* (literal \"/\"))\n(allow file-write* (literal \"/dev/null\"))\n",
         );
+        // Darwin tools need metadata access along each permitted path (for example, Clang
+        // resolves its installed directory). Literal parents grant traversal, not subtree reads.
+        let mut parents = BTreeSet::new();
+        for path in self.readable.iter().chain(&self.writable) {
+            quote_path(path)?;
+            for parent in path.ancestors().skip(1).filter(|parent| *parent != Path::new("/")) {
+                parents.insert(parent.to_path_buf());
+            }
+        }
+        for parent in parents {
+            writeln!(&mut result, "(allow file-read* (literal {}))", quote_path(&parent)?)
+                .map_err(|_| "Seatbelt output allocation failed")?;
+        }
         for path in &self.readable {
             result.push_str("(allow file-read* (subpath ");
             result.push_str(&quote_path(path)?);
@@ -122,7 +136,9 @@ mod tests {
         let profile = policy.render().unwrap();
         assert!(profile.contains("(deny default)"));
         assert!(profile.contains("(allow file-read* (literal \"/\"))"));
+        assert!(profile.contains("(allow file-read* (literal \"/workspace\"))"));
         assert!(profile.contains("(allow sysctl-read)"));
+        assert!(profile.contains("(allow file-write* (literal \"/dev/null\"))"));
         assert!(!profile.contains("(subpath \"/\")"));
         assert!(profile.contains("(remote ip \"localhost:41111\")"));
         assert!(!profile.contains("localhost:*"));
