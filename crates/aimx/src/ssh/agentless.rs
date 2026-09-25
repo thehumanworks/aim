@@ -89,7 +89,7 @@ impl AgentlessWorkspace {
             root,
             home: platform.home,
             caps,
-            channels: Arc::new(Semaphore::new(9)),
+            channels: Arc::new(Semaphore::new(3)),
             process_slots: Arc::new(Semaphore::new(6)),
             mutations: Mutex::new(()),
             processes: Mutex::new(BTreeMap::new()),
@@ -97,11 +97,16 @@ impl AgentlessWorkspace {
     }
 
     async fn run(&self, script: &str, input: &[u8]) -> Outcome<Vec<u8>> {
+        let (status, output) = self.run_status(script, input).await?;
+        if status == 0 { Ok(output) } else { Err(error(ErrorCode::Unavailable, "remote command failed")) }
+    }
+
+    async fn run_status(&self, script: &str, input: &[u8]) -> Outcome<(i32, Vec<u8>)> {
         let _permit = tokio::time::timeout(Duration::from_secs(5), self.channels.acquire())
             .await
             .map_err(|_| error(ErrorCode::Unavailable, "SSH channel capacity exhausted"))?
             .map_err(|_| error(ErrorCode::Unavailable, "SSH channels closed"))?;
-        self.connection.run(script, input).await
+        self.connection.run_with_status(script, input, false).await
     }
 
     async fn safe(&self, path: &str, may_create: bool) -> Outcome<String> {
@@ -116,7 +121,7 @@ impl AgentlessWorkspace {
         } else {
             format!("[ -e {0} ] || [ -L {0} ] || exit 44; realpath -- {0}", quote(path))
         };
-        let (status, output) = self.connection.run_with_status(&script, &[], false).await?;
+        let (status, output) = self.run_status(&script, &[]).await?;
         if status != 0 {
             return Err(error(if status == 44 { ErrorCode::NotFound } else { ErrorCode::Unavailable }, "remote path cannot be resolved"));
         }
@@ -172,7 +177,7 @@ impl AgentlessWorkspace {
             "p={}; if [ -L \"$p\" ]; then printf 'symlink\\n0'; elif [ -f \"$p\" ]; then printf 'file\\n'; wc -c < \"$p\"; elif [ -d \"$p\" ]; then printf 'dir\\n0'; elif [ -e \"$p\" ]; then printf 'other\\n0'; else exit 44; fi",
             quote(path)
         );
-        let (status, output) = self.connection.run_with_status(&script, &[], false).await?;
+        let (status, output) = self.run_status(&script, &[]).await?;
         if status != 0 {
             return Err(error(if status == 44 { ErrorCode::NotFound } else { ErrorCode::Unavailable }, "remote metadata failed"));
         }
@@ -203,7 +208,7 @@ impl AgentlessWorkspace {
             "p={}; [ -f \"$p\" ] || exit 43; n=$(wc -c < \"$p\") || exit; if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < \"$p\"); elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < \"$p\"); else exit 127; fi; printf '%s\\n%s\\n' \"$n\" \"${{h%% *}}\"; {body}",
             quote(&target)
         );
-        let (status, output) = self.connection.run_with_status(&script, &[], false).await?;
+        let (status, output) = self.run_status(&script, &[]).await?;
         if status == 43 {
             return Err(error(ErrorCode::Conflict, "remote path is not a file"));
         }
@@ -276,8 +281,7 @@ impl AgentlessWorkspace {
                 "mv -f -- \"$t\" \"$p\" || exit;"
             }
         );
-        let _permit = self.channels.acquire().await.map_err(|_| error(ErrorCode::Unavailable, "SSH channels closed"))?;
-        let (status, _) = self.connection.run_with_status(&script, &bytes, false).await?;
+        let (status, _) = self.run_status(&script, &bytes).await?;
         if status == 42 {
             return Err(error(ErrorCode::PreconditionFailed, "remote file changed"));
         }
@@ -481,7 +485,7 @@ impl Fs for AgentlessWorkspace {
         Box::pin(async move {
             let _mutation = self.mutations.lock().await;
             let target = self.safe(path, true).await?;
-            let (status, _) = self.connection.run_with_status(&format!("mkdir -p -- {}", quote(&target)), &[], false).await?;
+            let (status, _) = self.run_status(&format!("mkdir -p -- {}", quote(&target)), &[]).await?;
             if status == 0 { Ok(()) } else { Err(error(ErrorCode::Conflict, "remote mkdir failed")) }
         })
     }
@@ -498,7 +502,7 @@ impl Fs for AgentlessWorkspace {
             } else {
                 format!("if [ -d {quoted} ] && [ ! -L {quoted} ]; then rmdir -- {quoted}; else rm -f -- {quoted}; fi")
             };
-            let (status, _) = self.connection.run_with_status(&script, &[], false).await?;
+            let (status, _) = self.run_status(&script, &[]).await?;
             if status == 0 { Ok(()) } else { Err(error(ErrorCode::Conflict, "remote remove failed")) }
         })
     }
@@ -603,7 +607,7 @@ impl Exec for AgentlessWorkspace {
             let marker_check = format!("test -s {}", quote(&remote_marker));
             let mut ready = false;
             for _ in 0..10 {
-                if self.connection.run(&marker_check, &[]).await.is_ok() {
+                if self.run(&marker_check, &[]).await.is_ok() {
                     ready = true;
                     break;
                 }
@@ -755,7 +759,7 @@ impl Exec for AgentlessWorkspace {
                 drop(remote_signal(&self.connection, &process.remote_marker, Signal::Kill).await);
             }
             drop(process.child.lock().await.start_kill());
-            drop(self.connection.run(&format!("rm -f -- {}", quote(&process.remote_marker)), &[]).await);
+            drop(self.run(&format!("rm -f -- {}", quote(&process.remote_marker)), &[]).await);
             Ok(())
         })
     }
@@ -823,7 +827,7 @@ impl Search for AgentlessWorkspace {
             let match_cap = query.max_matches.saturating_add(1).max(1);
             let args =
                 format!("{args} | awk -v cap={match_cap} '{{ print; if ($0 ~ /\"type\":\"match\"/) {{ n++; if (n >= cap) exit }} }}'");
-            let output = self.connection.run_with_status(&args, &[], false).await?;
+            let output = self.run_status(&args, &[]).await?;
             if output.0 > 1 {
                 return Err(error(ErrorCode::Unavailable, "remote search failed"));
             }
