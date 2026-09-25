@@ -122,6 +122,56 @@ fn optional_string(arguments: &Value, field: &str) -> Result<Option<String>, Pro
     }
 }
 
+/// A live image reservation that is cancelled if the generation stops early. A `generate_image`
+/// future dropped mid-flight (an interrupted turn replaces the running tool call) cancels it on a
+/// spawned task, so neither its marker nor its slot outlives the call (`REV13a` M4, ADR 0067).
+struct ReservationGuard {
+    workspace: Arc<dyn ToolHost>,
+    reservation: Option<String>,
+    cancel_key: IdempotencyKey,
+}
+
+impl ReservationGuard {
+    fn new(workspace: Arc<dyn ToolHost>, reservation: String, cancel_key: IdempotencyKey) -> Self {
+        Self { workspace, reservation: Some(reservation), cancel_key }
+    }
+
+    /// The reservation, still armed.
+    fn reservation(&self) -> String {
+        self.reservation.clone().unwrap_or_default()
+    }
+
+    /// The reservation was finalized: nothing to cancel.
+    fn disarm(&mut self) {
+        self.reservation = None;
+    }
+
+    /// Cancels now, logging a failure as `what`.
+    async fn cancel(mut self, what: &str) {
+        if let Some(reservation) = self.reservation.take()
+            && let Err(cleanup) = self.workspace.cancel_blob(reservation, self.cancel_key.clone()).await
+        {
+            tracing::warn!(%cleanup, "could not cancel image reservation after {what}");
+        }
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else { return };
+        let cancel = self.workspace.cancel_blob(reservation, self.cancel_key.clone());
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(cleanup) = cancel.await {
+                    tracing::warn!(%cleanup, "could not cancel the reservation of a dropped image generation");
+                }
+            });
+        } else {
+            tracing::warn!("a dropped image generation left its reservation: no runtime to cancel it");
+        }
+    }
+}
+
 fn image_path(arguments: &Value) -> Result<Option<String>, ProtoError> {
     let path = optional_string(arguments, "path")?;
     if path.as_deref().is_some_and(|path| path.contains('\0') || path.ends_with('/') || path.split('/').any(|part| part == "..")) {
@@ -208,30 +258,28 @@ impl ToolHost for Dispatcher {
                         Ok(reservation) => reservation,
                         Err(error) => return Ok(ToolResult::error(format!("Image destination cannot be reserved: {error}"))),
                     };
-                    let cancel = || workspace.cancel_blob(reservation.clone(), IdempotencyKey::new(format!("{}/cancel", key.as_str())));
+                    // From here on, every way out (including this future being dropped) ends the
+                    // reservation: finalized, or cancelled.
+                    let cancel_key = IdempotencyKey::new(format!("{}/cancel", key.as_str()));
+                    let mut guard = ReservationGuard::new(Arc::clone(&workspace), reservation, cancel_key);
                     let image = match media.generate_image(prompt, size, quality).await {
                         Ok(image) => image,
                         Err(error) => {
-                            if let Err(cleanup) = cancel().await {
-                                tracing::warn!(%cleanup, "could not cancel image reservation after provider failure");
-                            }
+                            guard.cancel("provider failure").await;
                             return Ok(ToolResult::error(error.to_string()));
                         }
                     };
                     if image.bytes.len() > MAX_IMAGE_BYTES {
-                        if let Err(cleanup) = cancel().await {
-                            tracing::warn!(%cleanup, "could not cancel oversized image reservation");
-                        }
+                        guard.cancel("an oversized image").await;
                         return Ok(ToolResult::error("Image was generated but is too large for the harness frame; it was not saved"));
                     }
                     let media_type = image.media_type;
                     let finalize_key = IdempotencyKey::new(format!("{}/finalize", key.as_str()));
-                    if let Err(error) = workspace.finalize_blob(reservation.clone(), image.bytes, finalize_key).await {
-                        if let Err(cleanup) = cancel().await {
-                            tracing::warn!(%cleanup, "could not cancel image reservation after finalize failure");
-                        }
+                    if let Err(error) = workspace.finalize_blob(guard.reservation(), image.bytes, finalize_key).await {
+                        guard.cancel("finalize failure").await;
                         return Ok(ToolResult::error(format!("Image was generated but could not be saved: {error}")));
                     }
+                    guard.disarm();
                     Ok(ToolResult::text(format!("Generated {media_type} image saved to {requested}. Read the path to inspect it.")))
                 })
             }
@@ -277,6 +325,7 @@ mod tests {
         fail_with: Option<ErrorCode>,
         fail_finalize_with: Option<ErrorCode>,
         reserved: Mutex<Option<String>>,
+        cancels: AtomicUsize,
         attempts: AtomicUsize,
         calls: Mutex<Vec<String>>,
         writes: Mutex<Vec<(String, Vec<u8>)>>,
@@ -315,6 +364,7 @@ mod tests {
 
         fn cancel_blob(&self, _reservation: String, _key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
             *self.reserved.lock().unwrap() = None;
+            self.cancels.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
     }
@@ -470,6 +520,56 @@ mod tests {
         assert!(serde_json::to_string(&result).unwrap().contains("generated but could not be saved"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(workspace.writes.lock().unwrap().is_empty());
+    }
+
+    /// A provider that never answers, to drop a generation mid-flight.
+    struct Hanging;
+
+    impl MediaService for Hanging {
+        fn search_enabled(&self) -> bool {
+            false
+        }
+
+        fn image_enabled(&self) -> bool {
+            true
+        }
+
+        fn web_search(&self, _query: String) -> BoxFuture<Result<SearchAnswer, LlmError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn generate_image(&self, _prompt: String, _size: Option<String>, _quality: Option<String>) -> BoxFuture<Result<Image, LlmError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// `REV13a` M4: dropping the tool call during generation cancels its reservation.
+    #[tokio::test]
+    async fn dropped_generation_cancels_its_reservation() {
+        let workspace = Arc::new(Workspace::default());
+        let dispatcher = Dispatcher::with_policy(Arc::clone(&workspace) as Arc<dyn ToolHost>, Arc::new(Hanging), true);
+        let call = dispatcher.call("generate_image".into(), json!({"prompt":"sun","path":"art/sun.png"}), key());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), call).await.is_err(), "the provider never answers");
+        for _ in 0..100 {
+            if workspace.reserved.lock().unwrap().is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*workspace.reserved.lock().unwrap(), None, "the dropped call's reservation was cancelled");
+        assert_eq!(workspace.cancels.load(Ordering::SeqCst), 1);
+        assert!(workspace.writes.lock().unwrap().is_empty());
+    }
+
+    /// A finalized image is never cancelled afterwards.
+    #[tokio::test]
+    async fn a_finalized_generation_is_not_cancelled() {
+        let workspace = Arc::new(Workspace::default());
+        let dispatcher = Dispatcher::with_policy(Arc::clone(&workspace) as Arc<dyn ToolHost>, Arc::new(Service::default()), true);
+        dispatcher.call("generate_image".into(), json!({"prompt":"sun","path":"art/sun.png"}), key()).await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(workspace.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(workspace.writes.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

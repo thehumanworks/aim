@@ -33,6 +33,9 @@ use crate::agent::tools::{BoxFuture, ToolHost};
 
 const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
 const HTTP_BRIDGE_CAPACITY: usize = 128;
+/// How long a spawned aimx may take to end its session after the connection closes (it cancels
+/// unused file reservations then, ADR 0054 and 0067) before it is killed.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn validate_network_url(raw: &str, cleartext: &str, encrypted: &str) -> Result<(), ProtoError> {
     let url = reqwest::Url::parse(raw).map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "invalid harness URL"))?;
@@ -589,13 +592,18 @@ impl HarnessClient {
         self.peer.call::<ExecRead>(params).await
     }
 
-    /// Ends the connection and stops a spawned harness.
+    /// Ends the connection and stops a spawned harness. Closing the connection is the harness's
+    /// end of input: it ends its session, which cancels unused file reservations, and exits. It is
+    /// killed only if it has not exited within [`SHUTDOWN_GRACE`] (`REV13a` M5).
     pub async fn shutdown(mut self) {
         self.peer.close();
         if let Some(mut child) = self.child.take()
-            && let Err(err) = child.kill().await
+            && !matches!(tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await, Ok(Ok(_)))
         {
-            tracing::debug!(%err, "harness child already exited");
+            tracing::warn!("the harness did not exit after its connection closed; killing it");
+            if let Err(err) = child.kill().await {
+                tracing::debug!(%err, "harness child already exited");
+            }
         }
     }
 }
@@ -754,6 +762,41 @@ mod tests {
         resumed.shutdown().await;
         serving.abort();
         server.shutdown().await;
+    }
+
+    /// `REV13a` M5: shutting a spawned aimx down lets it end its session first, which cancels its
+    /// unused reservation markers (it used to be killed right after the connection closed).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_lets_a_spawned_aimx_cancel_unused_reservations() {
+        use crate::agent::tools::ToolHost as _;
+        let aimx = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("aimx");
+        assert!(aimx.exists(), "build aimx (same profile) before this test: {}", aimx.display());
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let root = std::fs::canonicalize(dir.path().join("ws")).unwrap();
+        let mut child = tokio::process::Command::new(&aimx)
+            .args(["serve", "--stdio", "--root"])
+            .arg(&root)
+            .env("HOME", &home)
+            .env("AIMX_LOG", "off")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let mut client = HarnessClient::connect(stdout, stdin, root.to_str().unwrap()).await.unwrap();
+        client.child = Some(child);
+        let key = aim_proto::ids::IdempotencyKey::new(format!("{}/reserve", uuid::Uuid::now_v7()));
+        client.reserve_blob("art/sun.png".into(), key).await.unwrap();
+        assert!(root.join("art/sun.png").exists());
+        client.shutdown().await;
+        assert!(!root.join("art/sun.png").exists(), "the unused marker must be cancelled before aimx stops");
+        let journal = std::fs::read_dir(home.join(".aim/aimx/reservations")).unwrap().count();
+        assert_eq!(journal, 0, "the reservation journal is empty again");
     }
 
     #[tokio::test]
