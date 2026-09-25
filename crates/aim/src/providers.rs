@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use aim_llm::ModelProvider;
 use aim_llm_codex::CodexProvider;
+use aim_llm_codex::media::{MediaClient, MediaConfig};
 use aim_llm_openai::{OpenAiProvider, Profile};
 
 /// Default model for `codex`.
@@ -58,6 +59,26 @@ pub fn build(id: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, S
         "acp:claude" | "acp:claude-native" => Err(format!("`{id}` is an agent (Claude Code), not a model provider: run it as a session")),
         other => Err(format!("unknown provider `{other}` (known: {})", KNOWN.join(", "))),
     }
+}
+
+/// The services native sessions get on this machine (ADR 0038):
+/// - Codex media tools (web search, image generation), when codex credentials exist at a
+///   session's start;
+/// - Jev effort advice (ADR 0013), when `TYPESAFE_API_KEY` is set; the host attaches it to
+///   persistent sessions only.
+#[must_use]
+pub fn services() -> crate::host::NativeServices {
+    let media: crate::host::MediaFactory = Arc::new(|| {
+        Box::pin(async {
+            let media = MediaClient::with_provider(codex().ok()?, MediaConfig::default());
+            // A missing credential omits the tools rather than making every call fail.
+            media.has_credentials().await.then(|| Arc::new(media) as Arc<dyn crate::media::MediaService>)
+        })
+    });
+    let decider = std::env::var_os("TYPESAFE_API_KEY")
+        .is_some_and(|value| !value.is_empty())
+        .then(|| Arc::new(crate::jev::JevDecider) as Arc<dyn crate::jev::Decider>);
+    crate::host::NativeServices { media: Some(media), decider }
 }
 
 /// Every backend this build can host: `acp:*` agents, else the native loop with [`build`]'s

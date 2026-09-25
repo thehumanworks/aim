@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use aim_llm::{LlmErrorKind, ModelProvider};
 use aim_llm_codex::media::{MediaClient, MediaConfig};
@@ -26,15 +28,18 @@ use aim_proto::daemon::{
     SessionListParams, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::event::{EffortSource, EventBody, SessionEvent, SessionMeta};
+use aim_proto::event::{EffortSource, EventBody, SessionAgent, SessionEvent, SessionMeta};
 use futures_core::Stream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AgentConfig, Backend, ToolHost};
+use crate::agent::{Agent, AgentConfig, Backend, InForce, ToolHost};
 use crate::context;
 use crate::harness::HarnessClient;
+use crate::jev::Decider;
+use crate::media::{Dispatcher, MediaService};
 use crate::remote::RemoteHarness;
+use crate::resources::agents::ToolPolicy;
 use crate::resources::backend::WithSkills;
 use crate::resources::tools::AllowedTools;
 use crate::resources::{self, Files, HarnessFiles, ResourceConfig};
@@ -115,12 +120,24 @@ pub fn aimx_workspaces(aimx: PathBuf) -> WorkspaceFactory {
 
 /// What a session's backend is built from.
 pub struct BackendRequest {
-    /// The session (a resumed one carries its stored provider, model and effort).
+    /// The session (a resumed one carries its stored provider, model, effort and agent).
     pub spec: SessionSpec,
     /// Its id: fresh, or the resumed session's.
     pub session_id: String,
     /// The transcript so far (empty for a new session).
     pub transcript: Vec<Item>,
+    /// What a resumed session recorded; `None` for a new session.
+    pub recorded: Option<Recorded>,
+}
+
+/// What a resumed session recorded, which its backend must honour again (ADR 0038).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recorded {
+    /// Its named agent and the tool ceiling in force at creation: the agent must still be
+    /// applicable, and its tools can only narrow further.
+    pub agent: Option<SessionAgent>,
+    /// Who chose its effort last.
+    pub effort_source: EffortSource,
 }
 
 /// A session's backend, ready to run turns, and what the session records about it.
@@ -133,6 +150,8 @@ pub struct Built {
     pub root: String,
     /// Where the workspace is (`local`, `ssh:<destination>`).
     pub location: String,
+    /// The named agent and its tool ceiling in force, recorded in a new session's metadata.
+    pub agent: Option<SessionAgent>,
     /// Ends what the backend's session needs besides the backend itself (e.g. the workspace
     /// connection); run after the backend has shut down.
     pub shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send>,
@@ -141,15 +160,32 @@ pub struct Built {
 /// Builds sessions' backends: the native loop, Claude Code over ACP, or a fake in tests.
 pub type BackendFactory = Arc<dyn Fn(BackendRequest) -> BoxFuture<Result<Built, ProtoError>> + Send + Sync>;
 
-/// The native loop: a provider from `providers` and tools from a workspace `workspaces`
-/// connects, with aim's instructions and the session's resources (the project's through the
-/// workspace, the user's from `~/.aim`; see [`native_backends_with`]).
-#[must_use]
-pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory, max_requests: u32) -> BackendFactory {
-    native_backends_with(providers, workspaces, max_requests, ResourceConfig::user(crate::cli::aim_home()))
+/// Provides a session's media service when one is available at its start (e.g. credentials
+/// exist); `None` offers no media tools.
+pub type MediaFactory = Arc<dyn Fn() -> BoxFuture<Option<Arc<dyn MediaService>>> + Send + Sync>;
+
+/// Services a native session may use besides its provider and workspace. They are injected, so
+/// tests get none unless they ask (ADR 0038); [`crate::providers::services`] wires this machine's.
+#[derive(Clone, Default)]
+pub struct NativeServices {
+    /// Credential-local media tools (web search, image generation), composed before an agent's
+    /// allowlist so it applies to them too.
+    pub media: Option<MediaFactory>,
+    /// Automatic effort advice (Jev). Attached only to persistent sessions (ADR 0013), and heeded
+    /// only while their effort is automatic.
+    pub decider: Option<Arc<dyn Decider>>,
 }
 
-/// [`native_backends`] with explicit resource settings (tests use a temporary user home, or none).
+/// The native loop: a provider from `providers` and tools from a workspace `workspaces`
+/// connects, with aim's instructions, the session's resources (the project's through the
+/// workspace, the user's from `~/.aim`) and this machine's services ([`native_backends_with`]).
+#[must_use]
+pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory, max_requests: u32) -> BackendFactory {
+    native_backends_with(providers, workspaces, max_requests, ResourceConfig::user(crate::cli::aim_home()), crate::providers::services())
+}
+
+/// [`native_backends`] with explicit resource settings (tests use a temporary user home, or none)
+/// and services (tests use none or fakes).
 ///
 /// A session's resources are discovered once, when it starts ([`resources::discover`]), and
 /// shape it:
@@ -157,7 +193,8 @@ pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory,
 ///   index ([`context::instructions`]);
 /// - `SessionSpec::agent` selects an agent definition: its model and effort are defaults
 ///   (explicit session values win; they apply on the agent's own provider), its `tools` narrow
-///   the session's tools ([`AllowedTools`]), and its instructions follow the others;
+///   the session's tools ([`AllowedTools`]), and its instructions follow the others. A resumed
+///   session applies its recorded agent again and never widens the ceiling it recorded;
 /// - `$skill` mentions in prompts inject the skill into the user turn ([`WithSkills`]).
 #[must_use]
 pub fn native_backends_with(
@@ -165,12 +202,14 @@ pub fn native_backends_with(
     workspaces: WorkspaceFactory,
     max_requests: u32,
     resources: ResourceConfig,
+    services: NativeServices,
 ) -> BackendFactory {
     let resources = Arc::new(resources);
     Arc::new(move |request: BackendRequest| {
-        let (providers, workspaces, resources) = (Arc::clone(&providers), Arc::clone(&workspaces), Arc::clone(&resources));
+        let (providers, workspaces, resources, services) =
+            (Arc::clone(&providers), Arc::clone(&workspaces), Arc::clone(&resources), services.clone());
         Box::pin(async move {
-            let BackendRequest { spec, session_id, transcript } = request;
+            let BackendRequest { spec, session_id, transcript, recorded } = request;
             let (provider, default_model) =
                 providers(&spec.provider, spec.model.as_deref()).map_err(|e| err(ErrorCode::InvalidParams, e))?;
             let workspace = workspaces(&spec).await?;
@@ -181,12 +220,12 @@ pub fn native_backends_with(
                     None => context::context_window(provider.as_ref(), &guess).await,
                 }
             };
-            let (catalog, window) =
+            let (catalog, mut window) =
                 tokio::join!(resources::discover(&resources, workspace.project.as_deref(), &workspace.location, ""), window);
             for diagnostic in &catalog.diagnostics {
                 tracing::info!(path = %diagnostic.path, problem = ?diagnostic.problem, "resource: {}", diagnostic.message);
             }
-            let agent = match session_agent(&catalog, spec.agent.as_deref()) {
+            let agent = match session_agent(&catalog, spec.agent.as_deref(), recorded.as_ref().and_then(|r| r.agent.as_ref())) {
                 Ok(agent) => agent,
                 Err(error) => {
                     (workspace.shutdown)().await;
@@ -194,7 +233,7 @@ pub fn native_backends_with(
                 }
             };
             let (model, effort) = match &agent {
-                Some(agent) => {
+                Some((agent, _)) => {
                     let defaults = agent.defaults(&spec.provider, spec.model.as_deref(), spec.effort.as_deref());
                     if let Some(note) = &defaults.note {
                         tracing::warn!("{note}");
@@ -203,91 +242,123 @@ pub fn native_backends_with(
                 }
                 None => (spec.model.clone().unwrap_or(default_model), spec.effort.clone()),
             };
-            // Establish a real index before the first provider request. Some catalogs omit a
-            // default, so use their lowest supported level rather than guessing what the remote
-            // endpoint would choose for `effort: None`.
-            let auto_effort = if spec.persistence == Persistence::Persistent
-                && effort.is_none()
-                && std::env::var_os("TYPESAFE_API_KEY").is_some_and(|value| !value.is_empty())
-            {
-                provider.catalog().await.ok().and_then(|models| {
-                    models.into_iter().find(|entry| entry.id == model).and_then(|entry| {
-                        if !(2..=10).contains(&entry.efforts.len()) {
-                            return None;
-                        }
-                        entry.default_effort.filter(|default| entry.efforts.contains(default)).or_else(|| entry.efforts.first().cloned())
-                    })
-                })
+            // The skill budget is a share of the window of the model the session runs, which an
+            // agent may have chosen (REV8-15).
+            if resources.skill_budget.is_none() && model != guess {
+                window = context::context_window(provider.as_ref(), &model).await;
+            }
+            // Automatic unless the session or its agent set an effort; a resume keeps its source.
+            let effort_source = recorded.as_ref().map_or(
+                if effort.is_some() { EffortSource::Explicit } else { EffortSource::Auto },
+                |recorded| recorded.effort_source,
+            );
+            // Advice is for persistent sessions only (ADR 0013). The decider is attached whatever
+            // the source, so `effort: "auto"` can hand the effort back later.
+            let decider = if spec.persistence == Persistence::Persistent { services.decider.clone() } else { None };
+            let start = if effort_source == EffortSource::Auto && effort.is_none() && decider.is_some() {
+                starting_effort(provider.as_ref(), &model).await
             } else {
                 None
             };
             let budget = resources.skill_budget.unwrap_or_else(|| resources::instructions::skill_budget(window));
-            let prefix = context::instructions(&catalog, agent.as_ref(), budget);
+            let prefix = context::instructions(&catalog, agent.as_ref().map(|(agent, _)| agent), budget);
             for diagnostic in &prefix.diagnostics {
                 tracing::info!(path = %diagnostic.path, "instructions: {}", diagnostic.message);
             }
             let root = workspace.root.clone();
             let cache_key = match &agent {
                 // A different tool profile and prefix must not share a prompt-cache key.
-                Some(agent) => format!("aim:{root}:agent:{}", agent.meta.name),
+                Some((agent, _)) => format!("aim:{root}:agent:{}", agent.meta.name),
                 None => format!("aim:{root}"),
             };
             let Connected { mut tools, location, shutdown, .. } = workspace;
-            // Codex media services are credential-local and can be offered to any native provider.
-            // A missing credential omits the tools rather than making every call fail at runtime.
-            // They are composed before the agent's allowlist, which then applies to them too.
-            if let Ok(codex) = crate::providers::codex() {
-                let media = MediaClient::with_provider(codex, MediaConfig::default());
-                if media.has_credentials().await {
-                    tools = Arc::new(crate::media::Dispatcher::new(tools, Arc::new(media)));
-                }
+            // Media services are composed before the agent's allowlist, which then applies to them
+            // too. A missing credential omits the tools rather than making every call fail. Private
+            // and ephemeral sessions do not send prompts to them: there is no per-session opt-in
+            // yet, so theirs stays off (ADR 0042).
+            if let Some(media) = &services.media
+                && let Some(media) = media().await
+            {
+                tools = Arc::new(Dispatcher::with_policy(tools, media, spec.persistence == Persistence::Persistent));
             }
-            let tools: Arc<dyn ToolHost> = match &agent {
-                Some(agent) if !agent.tools.is_unrestricted() => {
-                    let allowed = AllowedTools::new(tools, agent.tools.clone(), agent.meta.name.clone());
-                    let unknown = allowed.unknown();
-                    if !unknown.is_empty() {
-                        tracing::warn!(agent = %agent.meta.name, ?unknown, "the agent allows tools this workspace does not offer");
-                    }
-                    Arc::new(allowed)
-                }
-                _ => tools,
+            let (tools, record) = match &agent {
+                Some((agent, policy)) => (narrowed(tools, agent, policy), Some(policy.record(&agent.meta.name))),
+                None => (tools, None),
             };
             let config = AgentConfig {
                 model: model.clone(),
                 instructions: prefix.text,
-                effort: effort.or_else(|| auto_effort.clone()),
+                effort: effort.or(start),
                 tier: None,
                 session_id,
                 cache_key: Some(cache_key),
                 parallel_tool_calls: true,
                 max_requests,
             };
-            let mut native = Agent::with_transcript(provider, tools, config, transcript);
-            if auto_effort.is_some() {
-                native = native.with_decider(Arc::new(crate::jev::JevDecider));
+            let mut native = Agent::with_transcript(provider, tools, config, transcript).with_effort_source(effort_source);
+            if let Some(decider) = decider {
+                native = native.with_decider(decider);
             }
             let backend: Box<dyn Backend> = Box::new(WithSkills::new(Box::new(native), Arc::new(catalog)));
-            Ok(Built { backend, model, root, location, shutdown })
+            Ok(Built { backend, model, root, location, agent: record, shutdown })
         })
     })
 }
 
-/// The agent definition a session asked for, if it can be applied.
-fn session_agent(catalog: &resources::Catalog, name: Option<&str>) -> Result<Option<resources::agents::AgentDef>, ProtoError> {
-    let Some(name) = name else {
-        return Ok(None);
+/// The level automatic effort starts from before its first decision: the catalog's default, else
+/// its lowest level (some catalogs omit a default; guessing what the endpoint would choose for
+/// `effort: None` would give the controller no real index).
+async fn starting_effort(provider: &dyn ModelProvider, model: &str) -> Option<String> {
+    let entry = provider.catalog().await.ok()?.into_iter().find(|entry| entry.id == model)?;
+    if !(2..=10).contains(&entry.efforts.len()) {
+        return None;
+    }
+    entry.default_effort.filter(|default| entry.efforts.contains(default)).or_else(|| entry.efforts.first().cloned())
+}
+
+/// `tools` narrowed to `policy`, the ceiling of `agent`.
+fn narrowed(tools: Arc<dyn ToolHost>, agent: &resources::agents::AgentDef, policy: &ToolPolicy) -> Arc<dyn ToolHost> {
+    if policy.is_unrestricted() {
+        return tools;
+    }
+    let allowed = AllowedTools::new(tools, policy.clone(), agent.meta.name.clone());
+    let unknown = allowed.unknown();
+    if !unknown.is_empty() {
+        tracing::warn!(agent = %agent.meta.name, ?unknown, "the agent allows tools this workspace does not offer");
+    }
+    Arc::new(allowed)
+}
+
+/// The agent definition a session asked for, with the tool ceiling that applies: its policy,
+/// narrowed by the ceiling a resumed session recorded. A resumed session whose agent cannot be
+/// applied again is refused rather than resumed without its ceiling (ADR 0038).
+fn session_agent(
+    catalog: &resources::Catalog,
+    name: Option<&str>,
+    recorded: Option<&SessionAgent>,
+) -> Result<Option<(resources::agents::AgentDef, ToolPolicy)>, ProtoError> {
+    let name = match (name, recorded) {
+        (None, None) => return Ok(None),
+        (Some(name), None) => name,
+        (Some(name), Some(recorded)) if recorded.name == name => name,
+        (_, Some(recorded)) => {
+            return Err(err(ErrorCode::InvalidParams, format!("the session was created as agent `{}` and resumes only as it", recorded.name)));
+        }
     };
+    let resumed = if recorded.is_some() { "; the session was created as this agent and cannot resume without it" } else { "" };
     let Some(agent) = catalog.agent(name) else {
         let known = catalog.agents.iter().map(|a| a.meta.name.as_str()).collect::<Vec<_>>().join(", ");
         return Err(err(
             ErrorCode::NotFound,
-            format!("no agent definition `{name}` (known: {})", if known.is_empty() { "none" } else { &known }),
+            format!("no agent definition `{name}` (known: {}){resumed}", if known.is_empty() { "none" } else { &known }),
         ));
     };
     match &agent.importable {
-        Ok(()) => Ok(Some(agent.clone())),
-        Err(why) => Err(err(ErrorCode::InvalidParams, format!("agent `{name}` ({}) cannot be applied: {why}", agent.meta.path))),
+        Ok(()) => {
+            let policy = recorded.map_or_else(|| agent.tools.clone(), |recorded| agent.tools.intersect(&ToolPolicy::recorded(recorded)));
+            Ok(Some((agent.clone(), policy)))
+        }
+        Err(why) => Err(err(ErrorCode::InvalidParams, format!("agent `{name}` ({}) cannot be applied: {why}{resumed}", agent.meta.path))),
     }
 }
 
@@ -303,9 +374,11 @@ pub trait SessionClient: Send + Sync {
     fn prompt(&self, session: String, parts: Vec<Part>) -> BoxFuture<Result<PromptOutcome, ProtoError>>;
     /// Cancels the running turn.
     fn cancel(&self, session: String) -> BoxFuture<Result<(), ProtoError>>;
-    /// Changes model or effort. When idle it applies at once and a refusal (e.g. an effort the
-    /// model does not offer) is the error; while a turn runs it is accepted and applies as the turn
-    /// ends (a refusal then is logged, and `ConfigChanged` always announces the state in force).
+    /// Changes model or effort (`effort: "auto"` hands the effort back to aim). When idle it
+    /// applies at once: a refusal (e.g. an effort the model does not offer) is an `invalid_params`
+    /// error, and a log that cannot keep it is `internal` (the session closes). While a turn runs
+    /// it is accepted and applies as the turn ends, reported as `ConfigChanged` or `ConfigRejected`
+    /// on the update stream. `ConfigChanged` always announces the state in force (ADR 0038).
     fn set_config(&self, params: SessionConfigParams) -> BoxFuture<Result<(), ProtoError>>;
     /// Stops the session's agent; the log remains.
     fn close(&self, session: String) -> BoxFuture<Result<(), ProtoError>>;
@@ -336,9 +409,17 @@ enum Control {
     SetConfig {
         model: Option<String>,
         effort: Option<String>,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<(), ConfigFailure>>,
     },
     Close,
+}
+
+/// Why a config change did not apply.
+enum ConfigFailure {
+    /// The backend refused it (`invalid_params`); a partial change was announced first.
+    Refused(String),
+    /// The session log could not keep it (`internal`); the session closes (ADR 0036, 0038).
+    Store(String),
 }
 
 struct Live {
@@ -356,6 +437,10 @@ fn err(code: ErrorCode, message: impl Into<String>) -> ProtoError {
     ProtoError::new(code, message)
 }
 
+fn shutting_down() -> ProtoError {
+    err(ErrorCode::Unavailable, "the host is shutting down")
+}
+
 /// Hosts live sessions.
 #[derive(Clone)]
 pub struct SessionHost {
@@ -363,9 +448,12 @@ pub struct SessionHost {
     sessions: Arc<Mutex<HashMap<String, Arc<Live>>>>,
     /// Serializes resuming stored sessions so one is never started twice.
     resuming: Arc<tokio::sync::Mutex<()>>,
-    /// `true` once shutdown began. Starting a session holds a read guard until the session is
-    /// live, so shutdown (a write guard) waits for starts in flight and later starts are refused.
-    closing: Arc<tokio::sync::RwLock<bool>>,
+    /// Set once shutdown began: no session starts afterwards, and a start already in flight tears
+    /// itself down instead of going live.
+    closing: Arc<AtomicBool>,
+    /// Held (read) by each start until its session is live or abandoned, so shutdown (write) can
+    /// wait for starts in flight within its deadline.
+    starting: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl SessionHost {
@@ -376,28 +464,41 @@ impl SessionHost {
             config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             resuming: Arc::new(tokio::sync::Mutex::new(())),
-            closing: Arc::new(tokio::sync::RwLock::new(false)),
+            closing: Arc::new(AtomicBool::new(false)),
+            starting: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
-    /// Closes every live session and waits for each actor and workspace shutdown to finish.
+    /// Closes every live session and waits for each actor and workspace shutdown to finish, within
+    /// ten seconds ([`SessionHost::shutdown_within`]).
     ///
     /// # Errors
-    /// Returns `timeout` if an actor or workspace does not finish within ten seconds.
+    /// Returns `timeout` past the deadline.
     pub async fn shutdown(&self) -> Result<(), ProtoError> {
-        // Waits for sessions that are still starting; none can start afterwards.
-        *self.closing.write().await = true;
-        let live: Vec<Arc<Live>> = lock(&self.sessions).values().cloned().collect();
-        for session in live {
-            let _closed = session.control.send(Control::Close);
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        self.shutdown_within(Duration::from_secs(10)).await
+    }
+
+    /// Refuses new sessions, then — all within `deadline` — waits for sessions still starting,
+    /// closes every live session, and waits for each actor and workspace shutdown. A start that is
+    /// still in flight at the deadline tears itself down when it finishes; it never goes live.
+    ///
+    /// # Errors
+    /// Returns `timeout` when the deadline passes first.
+    pub async fn shutdown_within(&self, deadline: Duration) -> Result<(), ProtoError> {
+        self.closing.store(true, Ordering::SeqCst);
+        tokio::time::timeout(deadline, async {
+            // Every start in flight either saw `closing` and gave up, or is live by now.
+            drop(self.starting.write().await);
+            let live: Vec<Arc<Live>> = lock(&self.sessions).values().cloned().collect();
+            for session in live {
+                let _closed = session.control.send(Control::Close);
+            }
             while !lock(&self.sessions).is_empty() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .map_err(|_| err(ErrorCode::Timeout, "session shutdown exceeded ten seconds"))
+        .map_err(|_| err(ErrorCode::Timeout, format!("session shutdown exceeded {} ms", deadline.as_millis())))
     }
 
     fn live(&self, id: &str) -> Result<Arc<Live>, ProtoError> {
@@ -405,16 +506,20 @@ impl SessionHost {
     }
 
     async fn start(&self, spec: SessionSpec, resume: Option<Resume>) -> Result<SessionSummary, ProtoError> {
-        let open = self.closing.read().await;
-        if *open {
-            return Err(err(ErrorCode::Unavailable, "the host is shutting down"));
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(shutting_down());
+        }
+        let started = self.starting.read().await;
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(shutting_down());
         }
         let session_id = resume.as_ref().map_or_else(session::new_session_id, |r| r.meta.id.clone());
         // The user sees the whole history; the model continues from its compacted context.
         let transcript = resume.as_ref().map(|r| items_of(&r.events)).unwrap_or_default();
         let context = resume.as_ref().map(|r| model_items_of(&r.events)).unwrap_or_default();
-        let request = BackendRequest { spec: spec.clone(), session_id: session_id.clone(), transcript: context };
-        let Built { mut backend, model, root, location, shutdown } = (self.config.backends)(request).await?;
+        let prior = resume.as_ref().map(|r| Recorded { agent: r.meta.agent.clone(), effort_source: last_config(&r.meta, &r.events).2 });
+        let request = BackendRequest { spec: spec.clone(), session_id: session_id.clone(), transcript: context, recorded: prior };
+        let Built { mut backend, model, root, location, agent, shutdown } = (self.config.backends)(request).await?;
 
         let store: Arc<dyn SessionStore> = match spec.persistence {
             Persistence::Persistent => Arc::clone(&self.config.store),
@@ -422,7 +527,9 @@ impl SessionHost {
         };
         let opened = if let Some(resume) = resume {
             let recorder = Recorder::resume(Arc::clone(&store), &resume.meta, &resume.events);
-            Ok((resume.meta, recorder))
+            // The log already says what is in force; nothing is recorded.
+            let announced = backend.set_config(None, None).await.ok();
+            Ok((resume.meta, recorder, announced))
         } else {
             let meta = SessionMeta {
                 id: session_id,
@@ -433,28 +540,33 @@ impl SessionHost {
                 model,
                 title: None,
                 parent: None,
-                agent: None,
+                agent,
             };
             let created = Recorder::create(Arc::clone(&store), meta.clone()).await;
             match created {
                 Ok(mut recorder) => {
                     // Record the configuration in force, so a resumed session continues with the
-                    // same model and effort (Recorder::resume and last_config read it back).
+                    // same model, effort and effort source (Recorder::resume and last_config read
+                    // it back).
                     match backend.set_config(None, None).await {
-                        Ok((model, effort)) => recorder
-                            .record(EventBody::ConfigChanged { model, effort, effort_source: EffortSource::Explicit })
+                        Ok(in_force) => recorder
+                            .record(EventBody::ConfigChanged {
+                                model: in_force.model.clone(),
+                                effort: in_force.effort.clone(),
+                                effort_source: in_force.effort_source,
+                            })
                             .await
-                            .map(|()| (meta, recorder)),
+                            .map(|()| (meta, recorder, Some(in_force))),
                         Err(message) => {
                             tracing::warn!(%message, "the backend could not report its configuration");
-                            Ok((meta, recorder))
+                            Ok((meta, recorder, None))
                         }
                     }
                 }
                 Err(e) => Err(e),
             }
         };
-        let (meta, recorder) = match opened {
+        let (meta, recorder, announced) = match opened {
             Ok(opened) => opened,
             Err(e) => {
                 backend.shutdown().await;
@@ -462,6 +574,12 @@ impl SessionHost {
                 return Err(err(ErrorCode::Internal, e.to_string()));
             }
         };
+        // Shutdown began while this session was starting: it must not go live.
+        if self.closing.load(Ordering::SeqCst) {
+            backend.shutdown().await;
+            shutdown().await;
+            return Err(shutting_down());
+        }
 
         let summary = SessionSummary {
             meta: meta.clone(),
@@ -474,7 +592,7 @@ impl SessionHost {
         let (control, control_rx) = mpsc::unbounded_channel();
         let live = Arc::new(Live { summary: Mutex::new(summary.clone()), transcript: Mutex::new(transcript), updates, control });
         lock(&self.sessions).insert(meta.id.clone(), Arc::clone(&live));
-        let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location };
+        let actor = Actor { live: Arc::clone(&live), backend, recorder, broken: None, root, location, announced };
         let sessions = Arc::clone(&self.sessions);
         let id = meta.id.clone();
         tokio::spawn(async move {
@@ -485,7 +603,7 @@ impl SessionHost {
                 sessions.remove(&id);
             }
         });
-        drop(open);
+        drop(started);
         Ok(summary)
     }
 
@@ -496,7 +614,7 @@ impl SessionHost {
             return Ok(live);
         }
         let (meta, events) = self.config.store.load(id.to_owned()).await.map_err(|e| err(ErrorCode::NotFound, e.to_string()))?;
-        let (model, effort) = last_config(&meta, &events);
+        let (model, effort, _) = last_config(&meta, &events);
         let location = match meta.location.strip_prefix("ssh:") {
             Some(destination) => Location::Ssh { destination: destination.to_owned() },
             None => Location::Local,
@@ -507,7 +625,8 @@ impl SessionHost {
             provider: meta.provider.clone(),
             model: Some(model),
             effort,
-            agent: None,
+            // The agent is applied again, within the ceiling it recorded (ADR 0038).
+            agent: meta.agent.as_ref().map(|agent| agent.name.clone()),
             persistence: Persistence::Persistent,
         };
         self.start(spec, Some(Resume { meta, events })).await?;
@@ -521,16 +640,16 @@ struct Resume {
     events: Vec<SessionEvent>,
 }
 
-/// The model and effort in force at the end of a stored log.
-fn last_config(meta: &SessionMeta, events: &[SessionEvent]) -> (String, Option<String>) {
+/// The model, effort and effort source in force at the end of a stored log.
+fn last_config(meta: &SessionMeta, events: &[SessionEvent]) -> (String, Option<String>, EffortSource) {
     events
         .iter()
         .rev()
         .find_map(|e| match &e.body {
-            EventBody::ConfigChanged { model, effort, .. } => Some((model.clone(), effort.clone())),
+            EventBody::ConfigChanged { model, effort, effort_source } => Some((model.clone(), effort.clone(), *effort_source)),
             _ => None,
         })
-        .unwrap_or_else(|| (meta.model.clone(), None))
+        .unwrap_or_else(|| (meta.model.clone(), None, EffortSource::Explicit))
 }
 
 /// A session's actor: the only owner of its agent, harness and recorder.
@@ -544,6 +663,9 @@ struct Actor {
     broken: Option<String>,
     root: String,
     location: String,
+    /// The configuration last announced (`ConfigChanged`), to tell whether a refused change left
+    /// something changed (ADR 0038).
+    announced: Option<InForce>,
 }
 
 fn set_state(live: &Live, state: SessionState) {
@@ -560,7 +682,8 @@ fn set_state(live: &Live, state: SessionState) {
 /// under the transcript lock so `attach` sees each item exactly once.
 ///
 /// Once the log is `broken`, nothing more is recorded, and the turn's terminal event is reported as
-/// the store failure: a client never sees a successful turn whose log is incomplete.
+/// the store failure: a client never sees a successful turn whose log is incomplete. Nor does it
+/// see a configuration the log could not keep (ADR 0038).
 async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<String>, update: SessionUpdate) {
     if broken.is_none()
         && let Err(e) = recorder.observe(&update).await
@@ -572,6 +695,7 @@ async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<Strin
         (Some(why), SessionUpdate::TurnEnded { .. } | SessionUpdate::TurnFailed { .. }) => {
             SessionUpdate::TurnFailed { message: why.clone() }
         }
+        (Some(_), SessionUpdate::ConfigChanged { .. }) => return,
         (_, update) => update,
     };
     if let SessionUpdate::ItemAdded { item } = &update {
@@ -581,6 +705,15 @@ async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<Strin
         return;
     }
     let _unwatched = live.updates.send(update);
+}
+
+fn in_force_of(update: &SessionUpdate) -> Option<InForce> {
+    match update {
+        SessionUpdate::ConfigChanged { model, effort, effort_source } => {
+            Some(InForce { model: model.clone(), effort: effort.clone(), effort_source: *effort_source })
+        }
+        _ => None,
+    }
 }
 
 impl Actor {
@@ -593,13 +726,10 @@ impl Actor {
                     // The requester learns the turn number before it runs.
                     let _gone = reply.send(PromptOutcome::Started { turn });
                     let closing = self.run_turn(parts, &mut control, &mut pending_config).await;
-                    // Changes asked for during the turn apply now, before any later control. Their
-                    // requesters were already answered; a refusal is logged, and the state in force
-                    // is what `ConfigChanged` announces.
-                    if let Some((model, effort)) = pending_config.take()
-                        && let Err(message) = self.apply_config(model, effort).await
-                    {
-                        tracing::warn!(session = self.recorder.session(), %message, "a deferred config change was refused");
+                    // Changes asked for during the turn apply now, before any later control, and
+                    // each has an outcome on the stream (ADR 0038).
+                    if let Some((model, effort)) = pending_config.take() {
+                        self.settle_pending(model, effort, closing).await;
                     }
                     if closing {
                         break;
@@ -620,16 +750,52 @@ impl Actor {
         self.backend.shutdown().await;
     }
 
-    /// Applies a config change and announces what is now in force.
-    async fn apply_config(&mut self, model: Option<String>, effort: Option<String>) -> Result<(), String> {
-        let (model, effort) = self.backend.set_config(model, effort).await?;
-        publish(
-            &self.live,
-            &mut self.recorder,
-            &mut self.broken,
-            SessionUpdate::ConfigChanged { model, effort, effort_source: EffortSource::Explicit },
-        )
-        .await;
+    /// Applies a change accepted during the turn that just ended and reports its outcome:
+    /// `ConfigChanged` when it applied, `ConfigRejected` otherwise. A session that is closing, or
+    /// whose log failed, does not apply it and does not wait on its backend.
+    async fn settle_pending(&mut self, model: Option<String>, effort: Option<String>, closing: bool) {
+        let message = if closing || self.broken.is_some() {
+            "cancelled: the session closed before the change could apply".to_owned()
+        } else {
+            match self.apply_config(model.clone(), effort.clone()).await {
+                Ok(()) => return,
+                Err(ConfigFailure::Refused(message) | ConfigFailure::Store(message)) => message,
+            }
+        };
+        tracing::info!(session = self.recorder.session(), %message, "a deferred config change was not applied");
+        publish(&self.live, &mut self.recorder, &mut self.broken, SessionUpdate::ConfigRejected { model, effort, message }).await;
+    }
+
+    /// Applies a config change and announces what is now in force. After a refusal it asks the
+    /// backend what is in force, since a backend that applies a change in steps (ACP) may have
+    /// applied part of it, and announces that first (ADR 0038).
+    async fn apply_config(&mut self, model: Option<String>, effort: Option<String>) -> Result<(), ConfigFailure> {
+        match self.backend.set_config(model, effort).await {
+            Ok(in_force) => self.announce(in_force).await.map_err(ConfigFailure::Store),
+            Err(message) => {
+                if let Ok(now) = self.backend.set_config(None, None).await
+                    && self.announced.as_ref() != Some(&now)
+                {
+                    self.announce(now).await.map_err(ConfigFailure::Store)?;
+                }
+                Err(ConfigFailure::Refused(message))
+            }
+        }
+    }
+
+    /// Records and broadcasts `in_force`; an error when the log could not keep it (nothing is
+    /// broadcast then, and the session closes).
+    async fn announce(&mut self, in_force: InForce) -> Result<(), String> {
+        let update = SessionUpdate::ConfigChanged {
+            model: in_force.model.clone(),
+            effort: in_force.effort.clone(),
+            effort_source: in_force.effort_source,
+        };
+        publish(&self.live, &mut self.recorder, &mut self.broken, update).await;
+        if let Some(why) = &self.broken {
+            return Err(why.clone());
+        }
+        self.announced = Some(in_force);
         Ok(())
     }
 
@@ -640,7 +806,7 @@ impl Actor {
         control: &mut mpsc::UnboundedReceiver<Control>,
         pending_config: &mut Option<(Option<String>, Option<String>)>,
     ) -> bool {
-        let Self { live, backend, recorder, broken, root, location } = self;
+        let Self { live, backend, recorder, broken, root, location, announced } = self;
         if let Err(e) = recorder.begin_turn().await {
             // Nothing ran: report the failure as this turn's only terminal event and close.
             let why = format!("store: the session log could not be written ({e}); the session is closed");
@@ -679,6 +845,10 @@ impl Actor {
                         break;
                     }
                     Some(update) = events_rx.recv() => {
+                        // A decision can change the effort mid-turn.
+                        if let Some(in_force) = in_force_of(&update) {
+                            *announced = Some(in_force);
+                        }
                         publish(live, recorder, broken, update).await;
                         if broken.is_some() {
                             // The log failed: stop the turn; it winds down and reports the failure.
@@ -707,6 +877,9 @@ impl Actor {
         }
         drop(events_tx);
         while let Some(update) = events_rx.recv().await {
+            if let Some(in_force) = in_force_of(&update) {
+                *announced = Some(in_force);
+            }
             publish(live, recorder, broken, update).await;
         }
         // Steering that arrived as the turn finished was never read: hand it back.
@@ -875,7 +1048,8 @@ impl SessionClient for SessionHost {
                 .map_err(|_| err(ErrorCode::Unavailable, "session closed"))?;
             match answer.await {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(message)) => Err(err(ErrorCode::InvalidParams, message)),
+                Ok(Err(ConfigFailure::Refused(message))) => Err(err(ErrorCode::InvalidParams, message)),
+                Ok(Err(ConfigFailure::Store(message))) => Err(err(ErrorCode::Internal, message)),
                 Err(_) => Err(err(ErrorCode::Unavailable, "session closed")),
             }
         })

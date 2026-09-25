@@ -31,6 +31,7 @@ use aim_acp::{
 use aim_proto::conversation::{Item, Part, StopReason};
 use aim_proto::daemon::{Location, Persistence, SessionSpec, SessionUpdate};
 use aim_proto::error::{ErrorCode, ProtoError};
+use aim_proto::event::EffortSource;
 use aim_proto::harness::{FsRead, FsReadParams, FsRemove, FsRemoveParams};
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::ToolResult;
@@ -38,7 +39,7 @@ use futures_util::StreamExt as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{AgentError, AgentEvent, Backend, BackendFuture};
+use crate::agent::{AgentError, AgentEvent, Backend, BackendFuture, InForce};
 use crate::context;
 use crate::harness::HarnessClient;
 use crate::host::{BackendFactory, BackendRequest, BoxFuture, Built};
@@ -292,6 +293,12 @@ impl AcpBackend {
         current_config(self.session.config_options())
     }
 
+    /// The configuration in force; an ACP agent's effort is always the user's choice.
+    fn in_force(&self) -> InForce {
+        let (model, effort) = self.config();
+        InForce { model, effort, effort_source: EffortSource::Explicit }
+    }
+
     /// Runs one prompt to its stop, queueing steering that arrives meanwhile.
     /// Runs one prompt to its stop, queueing steering that arrives meanwhile. `delivering` are
     /// the steers this prompt carries: they count as delivered only once the prompt has started,
@@ -411,24 +418,35 @@ impl Backend for AcpBackend {
         })
     }
 
-    fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<(String, Option<String>), String>> {
+    fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<InForce, String>> {
         Box::pin(async move {
-            // Check both values against what the agent advertises before changing anything, so a
-            // refused effort cannot leave a changed model behind.
+            // Check both values against what the agent advertises before changing anything. This
+            // cannot make the change atomic: the effort options may change with the model.
             for (key, value) in [(ConfigKey::Model, &model), (ConfigKey::Effort, &effort)] {
                 if let Some(value) = value {
                     check_option(self.session.config_options(), &key, value)?;
                 }
             }
+            let mut steps = Vec::new();
             if let Some(model) = model {
-                self.session.set_config(&ConfigKey::Model, &model).await.map_err(|e| e.to_string())?;
+                steps.push((ConfigKey::Model, model));
             }
             if let Some(effort) = effort {
-                self.session.set_config(&ConfigKey::Effort, &effort).await.map_err(|e| e.to_string())?;
+                steps.push((ConfigKey::Effort, effort));
+            }
+            for (key, value) in steps {
+                if let Err(error) = self.session.set_config(&key, &value).await {
+                    // An earlier step may have applied (ADR 0038). ACP has no way to read the
+                    // configuration back: take any `config_option_update` the agent sent since its
+                    // last answer, so `config()` reports what the agent last said. Idle updates
+                    // carry nothing a turn needs (the bridge ignores them).
+                    drop(self.session.take_idle_events());
+                    return Err(format!("{} `{value}`: {error}", key.label()));
+                }
             }
             // Switching models can change other options (e.g. the mode): report what the agent
             // settled on, not what was asked.
-            Ok(self.config())
+            Ok(self.in_force())
         })
     }
 
@@ -519,6 +537,10 @@ pub fn with_acp_at(native: BackendFactory, aimx: PathBuf) -> BackendFactory {
             if matches!(spec.persistence, Persistence::Ephemeral) {
                 return Err(unavailable("ephemeral Claude Code sessions need the private-mode check (not yet)"));
             }
+            if spec.agent.is_some() {
+                // Fail closed: nothing here would enforce the agent's tool ceiling (ADR 0038).
+                return Err(unavailable("named agents cannot be applied to Claude Code sessions yet; their tool ceiling would not be enforced"));
+            }
             if !transcript.is_empty() {
                 return Err(unavailable(
                     "this session's context lives in Claude Code, and resuming it (session/load) is not wired yet; start a new session",
@@ -540,7 +562,7 @@ pub fn with_acp_at(native: BackendFactory, aimx: PathBuf) -> BackendFactory {
             };
             let (model, _) = backend.config();
             let shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send> = Box::new(|| Box::pin(async {}));
-            Ok(Built { backend: Box::new(backend), model, root, location, shutdown })
+            Ok(Built { backend: Box::new(backend), model, root, location, agent: None, shutdown })
         });
         fut
     })
@@ -548,7 +570,69 @@ pub fn with_acp_at(native: BackendFactory, aimx: PathBuf) -> BackendFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::authority_prompt;
+    use aim_acp::{AcpAgentConfig, AcpClient, SessionOptions};
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    use super::{AcpBackend, authority_prompt};
+    use crate::agent::Backend as _;
+
+    /// Options of an agent whose effort `high` exists only with model `a`.
+    fn options(model: &str) -> Value {
+        let efforts: &[&str] = if model == "a" { &["low", "high"] } else { &["low"] };
+        json!([
+            {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": model,
+             "options": [{"value": "a", "name": "A"}, {"value": "b", "name": "B"}]},
+            {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "low",
+             "options": efforts.iter().map(|e| json!({"value": e, "name": e})).collect::<Vec<_>>()}
+        ])
+    }
+
+    /// A scripted ACP agent answering `initialize`, `session/new` and `session/set_config_option`.
+    async fn scripted_agent() -> AcpBackend {
+        let (client_io, agent_io) = tokio::io::duplex(1 << 16);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let (agent_read, mut agent_write) = tokio::io::split(agent_io);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(agent_read).lines();
+            let mut model = "a".to_owned();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(message) = serde_json::from_str::<Value>(&line) else { break };
+                let Some(id) = message.get("id").cloned() else { continue };
+                let result = match message["method"].as_str() {
+                    Some("initialize") => json!({"protocolVersion": 1}),
+                    Some("session/new") => json!({"sessionId": "s1", "configOptions": options(&model)}),
+                    Some("session/set_config_option") => {
+                        if message["params"]["configId"] == "model" {
+                            model = message["params"]["value"].as_str().unwrap_or_default().to_owned();
+                        }
+                        json!({"configOptions": options(&model)})
+                    }
+                    _ => json!({}),
+                };
+                let reply = json!({"jsonrpc": "2.0", "id": id, "result": result});
+                if agent_write.write_all(format!("{reply}\n").as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = AcpClient::builder(AcpAgentConfig::claude()).connect(client_read, client_write).await.unwrap();
+        let session = client.new_session(SessionOptions::new("/tmp/aim-acp-config")).await.unwrap();
+        AcpBackend { client, session, scratch: None }
+    }
+
+    #[tokio::test]
+    async fn a_failed_effort_step_reports_the_changed_model() {
+        let mut backend = scripted_agent().await;
+        // Both values are valid for model `a`, so the check passes; the model step then changes
+        // the effort options and the effort step fails (REV8-3).
+        let refused = backend.set_config(Some("b".into()), Some("high".into())).await.unwrap_err();
+        assert!(refused.contains("high"), "{refused}");
+        let now = backend.set_config(None, None).await.unwrap();
+        assert_eq!((now.model.as_str(), now.effort.as_deref()), ("b", Some("low")), "what the agent really has in force");
+        // `auto` is not an effort this agent offers.
+        assert!(backend.set_config(None, Some("auto".into())).await.unwrap_err().contains("not offered"));
+    }
 
     #[test]
     fn remote_authority_prompt_labels_project_instructions() {

@@ -11,6 +11,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use aim_proto::conversation::{Part, StopReason};
+use aim_proto::daemon::AUTO_EFFORT;
+use aim_proto::event::EffortSource;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +20,17 @@ use super::{Agent, AgentError, AgentEvent};
 
 /// A boxed, sendable future borrowing the backend.
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The model and effort a backend has in force.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InForce {
+    /// Model id.
+    pub model: String,
+    /// Effort, if set.
+    pub effort: Option<String>,
+    /// Who chooses the effort from now on (ADR 0038).
+    pub effort_source: EffortSource,
+}
 
 /// Runs a session's turns.
 pub trait Backend: Send {
@@ -35,11 +48,14 @@ pub trait Backend: Send {
     ) -> BackendFuture<'a, Result<StopReason, AgentError>>;
 
     /// Changes the model and/or effort for the next turn; returns what is now in force.
-    /// `set_config(None, None)` changes nothing and reports the configuration in force.
+    /// `set_config(None, None)` changes nothing and reports the configuration in force. An effort
+    /// of [`AUTO_EFFORT`] hands the effort back to aim where the backend supports that.
     ///
     /// # Errors
-    /// A message for the user when the backend refused the change (nothing changed).
-    fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<(String, Option<String>), String>>;
+    /// A message for the user when the backend refused the change. A backend that applies a
+    /// change in several steps (ACP) may have applied part of it before failing: callers learn
+    /// what is in force with `set_config(None, None)` (ADR 0038).
+    fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<InForce, String>>;
 
     /// Whether the first prompt of a session should open with aim's environment block (a backend
     /// with its own system prompt and context, like Claude Code, says no).
@@ -64,8 +80,11 @@ impl Backend for Agent {
         Box::pin(self.run_turn_steered(input, events, cancel, steer))
     }
 
-    fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<(String, Option<String>), String>> {
+    fn set_config(&mut self, model: Option<String>, effort: Option<String>) -> BackendFuture<'_, Result<InForce, String>> {
         Box::pin(async move {
+            // `auto` hands the effort back to aim: the level in force is where decisions start.
+            let auto = effort.as_deref() == Some(AUTO_EFFORT);
+            let effort = if auto { None } else { effort };
             if model.is_some() || effort.is_some() {
                 // Capabilities are data: check the change against the provider's catalog before
                 // anything changes. Without a catalog (it failed, or lists nothing) the change is
@@ -85,8 +104,10 @@ impl Backend for Agent {
                     }
                 }
             }
-            if effort.is_some() {
-                self.set_explicit_effort();
+            if auto {
+                self.set_effort_source(EffortSource::Auto);
+            } else if effort.is_some() {
+                self.set_effort_source(EffortSource::Explicit);
             }
             if model.is_some() {
                 self.forget_window();
@@ -98,7 +119,7 @@ impl Backend for Agent {
             if effort.is_some() {
                 config.effort = effort;
             }
-            Ok((config.model.clone(), config.effort.clone()))
+            Ok(self.in_force())
         })
     }
 }

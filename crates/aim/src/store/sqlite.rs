@@ -21,7 +21,7 @@ const DB_SCHEMA: i64 = 2;
 type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 
 enum Command {
-    Create(SessionMeta, Reply<()>),
+    Create(Box<SessionMeta>, Reply<()>),
     Append(String, Vec<SessionEvent>, Reply<()>),
     Load(String, Reply<(SessionMeta, Vec<SessionEvent>)>),
     List(u32, Reply<Vec<SessionMeta>>),
@@ -363,7 +363,7 @@ impl SqliteStore {
 
 impl SessionStore for SqliteStore {
     fn create(&self, meta: SessionMeta) -> BoxFuture<Result<(), StoreError>> {
-        self.ask(|reply| Command::Create(meta, reply))
+        self.ask(|reply| Command::Create(Box::new(meta), reply))
     }
 
     fn append(&self, session: String, events: Vec<SessionEvent>) -> BoxFuture<Result<(), StoreError>> {

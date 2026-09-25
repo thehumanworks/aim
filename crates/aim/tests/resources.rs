@@ -14,17 +14,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aim::agent::tools::{BoxFuture, ToolHost};
-use aim::host::{Connected, HostConfig, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends_with};
+use aim::host::{Connected, HostConfig, NativeServices, SessionClient, SessionHost, UpdateStream, WorkspaceFactory, native_backends_with};
+use aim::media::MediaService;
+use aim_llm_codex::media::{Image, SearchAnswer};
 use aim::resources::files::{FileText, FilesFuture, Read};
 use aim::resources::{
     self, Bounds, Catalog, Files, HarnessFiles, LocalFiles, MemoryFiles, Problem, ResourceConfig, Scope, Source, Trust, instructions,
 };
-use aim::store::MemoryStore;
+use aim::store::{MemoryStore, SessionStore as _};
 use aim_llm::{BoxFuture as LlmFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, StreamEvent};
 use aim_proto::content::Content;
 use aim_proto::conversation::{Item, Part, StopReason, Usage};
 use aim_proto::daemon::{Location, Persistence, SessionSpec, SessionState, SessionUpdate};
 use aim_proto::error::{ErrorCode, ProtoError};
+use aim_proto::event::SessionAgent;
 use aim_proto::harness::{ContentHash, DirEntry, FsList, FsListResult, FsRead, FsReadMany, FsReadManyResult, FsReadResult, ReadManyEntry};
 use aim_proto::ids::{IdempotencyKey, WorkspaceId};
 use aim_proto::tool::{ToolAnnotations, ToolResult, ToolSpec};
@@ -441,6 +444,7 @@ async fn user_resources_are_read_locally() {
 struct Scripted {
     responses: Mutex<VecDeque<Vec<Result<StreamEvent, LlmError>>>>,
     seen: Mutex<Vec<Request>>,
+    models: Vec<ModelInfo>,
 }
 
 impl ModelProvider for Scripted {
@@ -449,7 +453,8 @@ impl ModelProvider for Scripted {
     }
 
     fn catalog(&self) -> LlmFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
-        Box::pin(async { Ok(Vec::new()) })
+        let models = self.models.clone();
+        Box::pin(async move { Ok(models) })
     }
 
     fn stream(&self, request: Request) -> LlmFuture<'_, Result<EventStream, LlmError>> {
@@ -515,7 +520,17 @@ fn fixture_with(
     script: Vec<Vec<Result<StreamEvent, LlmError>>>,
     connect: impl Fn(&SessionSpec) -> Connected + Send + Sync + 'static,
 ) -> Fixture {
-    let provider = Arc::new(Scripted { responses: Mutex::new(script.into()), seen: Mutex::default() });
+    fixture_on(Arc::new(MemoryStore::default()), Vec::new(), script, NativeServices::default(), connect)
+}
+
+fn fixture_on(
+    store: Arc<MemoryStore>,
+    models: Vec<ModelInfo>,
+    script: Vec<Vec<Result<StreamEvent, LlmError>>>,
+    services: NativeServices,
+    connect: impl Fn(&SessionSpec) -> Connected + Send + Sync + 'static,
+) -> Fixture {
+    let provider = Arc::new(Scripted { responses: Mutex::new(script.into()), seen: Mutex::default(), models });
     let connect = Arc::new(connect);
     let workspaces: WorkspaceFactory = Arc::new(move |spec: &SessionSpec| {
         let connected = connect(spec);
@@ -523,12 +538,13 @@ fn fixture_with(
     });
     let for_factory = Arc::clone(&provider);
     let host = SessionHost::new(HostConfig {
-        store: Arc::new(MemoryStore::default()),
+        store,
         backends: native_backends_with(
             Arc::new(move |_name, _model| Ok((Arc::clone(&for_factory) as Arc<dyn ModelProvider>, "m1".to_owned()))),
             workspaces,
             8,
             ResourceConfig::default(),
+            services,
         ),
         update_capacity: 256,
     });
@@ -662,6 +678,179 @@ async fn unknown_and_unimportable_agents_are_refused() {
     assert!(f.provider.seen.lock().unwrap()[0].tools.is_empty(), "Grep and Glob are not offered by this workspace");
 }
 
+/// Media that is always available; counts its calls.
+#[derive(Default)]
+struct FakeMedia {
+    calls: Mutex<Vec<String>>,
+}
+
+impl MediaService for FakeMedia {
+    fn search_enabled(&self) -> bool {
+        true
+    }
+
+    fn image_enabled(&self) -> bool {
+        true
+    }
+
+    fn web_search(&self, query: String) -> BoxFuture<Result<SearchAnswer, LlmError>> {
+        self.calls.lock().unwrap().push(format!("web_search {query}"));
+        Box::pin(async { Ok(SearchAnswer { text: "found".into(), citations: Vec::new(), queries: Vec::new() }) })
+    }
+
+    fn generate_image(&self, prompt: String, _size: Option<String>, _quality: Option<String>) -> BoxFuture<Result<Image, LlmError>> {
+        self.calls.lock().unwrap().push(format!("generate_image {prompt}"));
+        Box::pin(async { Err(LlmError::new(LlmErrorKind::Unavailable, "no images in tests")) })
+    }
+}
+
+fn with_media(media: &Arc<FakeMedia>) -> NativeServices {
+    let media = Arc::clone(media);
+    NativeServices {
+        media: Some(Arc::new(move || {
+            let media = Arc::clone(&media) as Arc<dyn MediaService>;
+            Box::pin(async move { Some(media) })
+        })),
+        decider: None,
+    }
+}
+
+/// A host over `store` whose sessions see `files` as their project, `tools` and `media`.
+fn project_host(
+    store: &Arc<MemoryStore>,
+    files: Vec<(&'static str, String)>,
+    script: Vec<Vec<Result<StreamEvent, LlmError>>>,
+    tools: &Arc<FakeTools>,
+    media: &Arc<FakeMedia>,
+) -> Fixture {
+    let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(files));
+    let tools = Arc::clone(tools);
+    fixture_on(Arc::clone(store), Vec::new(), script, with_media(media), move |spec| Connected {
+        tools: Arc::clone(&tools) as Arc<dyn ToolHost>,
+        root: spec.workspace.clone(),
+        location: "local".into(),
+        project: Some(Arc::clone(&files)),
+        shutdown: Box::new(|| Box::pin(async {})),
+    })
+}
+
+fn persistent(agent: &str) -> SessionSpec {
+    SessionSpec { persistence: Persistence::Persistent, ..spec(Some(agent)) }
+}
+
+/// A project whose `reader` agent allows `tools`, or has no `reader` (`None`).
+fn reader_project(tools: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut files: Vec<(&'static str, String)> = vec![("AGENTS.md", "Root: be terse.".into())];
+    if let Some(tools) = tools {
+        files.push((
+            ".agents/agents/reader.md",
+            format!("---\nschema: aim.agent/v1\nname: reader\ndescription: Reads, never writes.\ntools: [{tools}]\n---\nYou only read files.\n"),
+        ));
+    }
+    files
+}
+
+#[tokio::test]
+async fn a_resumed_named_agent_keeps_its_tool_ceiling() {
+    let store = Arc::new(MemoryStore::default());
+    let (tools, media) = (Arc::new(FakeTools::default()), Arc::new(FakeMedia::default()));
+    let first = project_host(&store, reader_project(Some("Read")), vec![text("hi")], &tools, &media);
+    let id = first.host.create(persistent("reader")).await.unwrap().meta.id;
+    let (_, mut updates) = first.host.attach(id.clone()).await.unwrap();
+    first.host.prompt(id.clone(), vec![Part::Text { text: "hello".into() }]).await.unwrap();
+    until_idle(&mut updates).await;
+    first.host.shutdown().await.unwrap();
+    let (meta, _) = store.load(id.clone()).await.unwrap();
+    assert_eq!(meta.agent, Some(SessionAgent { name: "reader".into(), allow: Some(vec!["Read".into()]), deny: Vec::new() }));
+
+    // A restarted daemon resumes the session: the model asks for Write and a media tool (REV8-2).
+    let script = vec![vec![call("c1", "Write"), call("c2", "generate_image"), completed(StopReason::ToolUse)], text("done")];
+    let second = project_host(&store, reader_project(Some("Read")), script, &tools, &media);
+    let (_, mut updates) = second.host.attach(id.clone()).await.unwrap();
+    second.host.prompt(id.clone(), vec![Part::Text { text: "write it".into() }]).await.unwrap();
+    let got = until_idle(&mut updates).await;
+    let seen = second.provider.seen.lock().unwrap().clone();
+    assert_eq!(seen[0].tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["Read"], "Write and media are not offered");
+    assert_eq!(seen[0].cache_key.as_deref(), Some("aim:/w:agent:reader"));
+    assert!(seen[0].instructions.ends_with("# Agent: reader\n\nYou only read files.\n"), "{}", seen[0].instructions);
+    assert!(tools.calls.lock().unwrap().is_empty(), "Write never reached the workspace");
+    assert!(media.calls.lock().unwrap().is_empty(), "no media call left the machine");
+    let denied =
+        got.iter().filter(|u| matches!(u, SessionUpdate::ToolFinished { result, .. } if result.is_error && format!("{:?}", result.content).contains("denied"))).count();
+    assert_eq!(denied, 2, "{got:?}");
+    second.host.shutdown().await.unwrap();
+
+    // Widening the definition later cannot widen the session it was recorded for.
+    let third = project_host(&store, reader_project(Some("Read, Write, generate_image")), vec![text("ok")], &tools, &media);
+    let (_, mut updates) = third.host.attach(id.clone()).await.unwrap();
+    third.host.prompt(id, vec![Part::Text { text: "again".into() }]).await.unwrap();
+    until_idle(&mut updates).await;
+    let offered: Vec<String> = third.provider.seen.lock().unwrap()[0].tools.iter().map(|t| t.name.clone()).collect();
+    assert_eq!(offered, ["Read"]);
+}
+
+#[tokio::test]
+async fn a_resumed_agent_session_is_refused_when_its_definition_is_gone() {
+    let store = Arc::new(MemoryStore::default());
+    let (tools, media) = (Arc::new(FakeTools::default()), Arc::new(FakeMedia::default()));
+    let first = project_host(&store, reader_project(Some("Read")), vec![text("hi")], &tools, &media);
+    let id = first.host.create(persistent("reader")).await.unwrap().meta.id;
+    first.host.shutdown().await.unwrap();
+    // Fail closed: without its definition the session is not resumed with every tool.
+    let mut unimportable = reader_project(None);
+    unimportable.push((".claude/agents/reader.md", "---\nname: reader\ndescription: Browses.\ntools: Read, WebFetch\n---\nBrowse.\n".into()));
+    for (project, code) in [(reader_project(None), ErrorCode::NotFound), (unimportable, ErrorCode::InvalidParams)] {
+        let later = project_host(&store, project, vec![text("unrestricted")], &tools, &media);
+        let refused = later.host.attach(id.clone()).await.err().unwrap();
+        assert_eq!(refused.code, code, "{refused:?}");
+        assert!(refused.message.contains("cannot resume without it"), "{}", refused.message);
+        assert!(later.provider.seen.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn the_skill_budget_follows_the_agent_model() {
+    let model = |id: &str, window: u64| ModelInfo {
+        id: id.into(),
+        display_name: id.into(),
+        context_window: Some(window),
+        efforts: Vec::new(),
+        default_effort: None,
+        tiers: Vec::new(),
+        tools: true,
+        images: false,
+        hidden: false,
+        native: None,
+    };
+    let mut project: Vec<(String, String)> = (0..120)
+        .map(|i| {
+            let description = format!("Skill number {i} {}", "does a very particular thing with great care ".repeat(6));
+            (format!(".agents/skills/skill-{i:03}/SKILL.md"), format!("---\nname: skill-{i:03}\ndescription: {description}\n---\nbody\n"))
+        })
+        .collect();
+    project.push((
+        ".agents/agents/small.md".into(),
+        "---\nschema: aim.agent/v1\nname: small\ndescription: Uses the small model.\nprovider: scripted\nmodel: small-model\n---\nBe brief.\n".into(),
+    ));
+    let files: Arc<dyn Files> = Arc::new(MemoryFiles::new(project));
+    // The provider's default model has a large window; the agent's model a small one (REV8-15).
+    let models = vec![model("m1", 1_000_000), model("small-model", 25_600)];
+    let f = fixture_on(Arc::new(MemoryStore::default()), models, vec![text("ok")], NativeServices::default(), move |spec| Connected {
+        tools: Arc::new(FakeTools::default()) as Arc<dyn ToolHost>,
+        root: spec.workspace.clone(),
+        location: "local".into(),
+        project: Some(Arc::clone(&files)),
+        shutdown: Box::new(|| Box::pin(async {})),
+    });
+    turns(&f, spec(Some("small")), &["hi"]).await;
+    let seen = f.provider.seen.lock().unwrap().clone();
+    assert_eq!(seen[0].model, "small-model");
+    let budget = instructions::skill_budget(Some(25_600));
+    let listing: usize =
+        seen[0].instructions.lines().filter(|l| l.starts_with("- skill-") || l.starts_with("- …and")).map(|l| l.len() + 1).sum();
+    assert!(listing <= budget, "the catalog ({listing} bytes) must fit the agent model's budget ({budget})");
+}
+
 // ------------------------------------------------------------------------------------------------
 // live smoke (ADR 0022): `mise exec -- cargo test -p aim --test resources -- --ignored live_ --nocapture`
 // ------------------------------------------------------------------------------------------------
@@ -746,6 +935,7 @@ async fn live_read_only_agent_on_openrouter() {
             aim::host::aimx_workspaces(aimx.clone()),
             8,
             ResourceConfig::user(home.path()),
+            NativeServices::default(),
         ),
         update_capacity: 4096,
     });

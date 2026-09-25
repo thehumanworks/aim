@@ -219,7 +219,7 @@ async fn acp_sessions_require_authority_and_persistence_gates() {
     };
     let refuse = |spec: SessionSpec, transcript: Vec<Item>| {
         let factory = Arc::clone(&factory);
-        async move { factory(BackendRequest { spec, session_id: "s".into(), transcript }).await.err().map(|e| e.code) }
+        async move { factory(BackendRequest { spec, session_id: "s".into(), transcript, recorded: None }).await.err().map(|e| e.code) }
     };
     let ssh = SessionSpec { location: Location::Ssh { destination: "host".into() }, ..base.clone() };
     assert_eq!(refuse(ssh, Vec::new()).await, Some(ErrorCode::Unavailable));
@@ -227,6 +227,11 @@ async fn acp_sessions_require_authority_and_persistence_gates() {
     let native_ssh =
         SessionSpec { provider: "acp:claude-native".into(), location: Location::Ssh { destination: "host".into() }, ..base.clone() };
     assert_eq!(refuse(native_ssh, Vec::new()).await, Some(ErrorCode::Unavailable));
+    // A named agent's ceiling cannot be enforced over ACP yet: refused before anything starts.
+    let named = SessionSpec { agent: Some("reader".into()), ..base.clone() };
+    let refused = factory(BackendRequest { spec: named, session_id: "s".into(), transcript: Vec::new(), recorded: None }).await.err().unwrap();
+    assert_eq!(refused.code, ErrorCode::Unavailable);
+    assert!(refused.message.contains("named agents"), "{}", refused.message);
     let ephemeral = SessionSpec { persistence: Persistence::Ephemeral, ..base.clone() };
     assert_eq!(refuse(ephemeral, Vec::new()).await, Some(ErrorCode::Unavailable));
     let resumed = vec![Item::User { parts: vec![Part::Text { text: "hi".into() }] }];

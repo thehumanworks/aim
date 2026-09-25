@@ -40,7 +40,7 @@ pub mod tools;
 #[cfg(test)]
 mod jev_tests;
 
-pub use backend::{Backend, BackendFuture};
+pub use backend::{Backend, BackendFuture, InForce};
 pub use tools::ToolHost;
 
 use crate::jev::{Advice, Bundle, Decider};
@@ -212,17 +212,35 @@ impl Agent {
     }
 
     /// Enable bounded advice for a persistent session. The host never calls this for private or
-    /// ephemeral sessions.
+    /// ephemeral sessions. Advice applies only while the effort is automatic
+    /// ([`Agent::with_effort_source`]; by default it is automatic unless the configuration sets an
+    /// effort).
     #[must_use]
     pub fn with_decider(mut self, decider: Arc<dyn Decider>) -> Self {
         self.decider = Some(decider);
-        self.explicit_effort = false;
         self
     }
 
-    /// Mark a user-set effort as an override of external advice.
-    pub(crate) fn set_explicit_effort(&mut self) {
-        self.explicit_effort = true;
+    /// Who chooses the effort: the user (`Explicit`, advice is ignored) or aim (`Auto`).
+    #[must_use]
+    pub fn with_effort_source(mut self, source: EffortSource) -> Self {
+        self.set_effort_source(source);
+        self
+    }
+
+    /// Sets who chooses the effort from now on.
+    pub(crate) fn set_effort_source(&mut self, source: EffortSource) {
+        self.explicit_effort = source.is_explicit();
+    }
+
+    /// The model and effort in force, and who chooses the effort.
+    #[must_use]
+    pub fn in_force(&self) -> InForce {
+        InForce {
+            model: self.config.model.clone(),
+            effort: self.config.effort.clone(),
+            effort_source: if self.explicit_effort { EffortSource::Explicit } else { EffortSource::Auto },
+        }
     }
 
     fn recent_digest(&self, goal: &str) -> Option<String> {
