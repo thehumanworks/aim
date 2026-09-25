@@ -111,6 +111,8 @@ struct Response {
     dispatched: Vec<Dispatched>,
     finished: HashMap<CallId, ToolResult>,
     running: Running,
+    /// Text or reasoning of this response was shown: it cannot be retried transparently.
+    streamed: bool,
 }
 
 /// Advice and the catalog entry it was computed against.
@@ -495,8 +497,14 @@ impl Agent {
                     None => break,
                     Some(Err(err)) => return Ended::Failed(AgentError::Provider(err)),
                     Some(Ok(event)) => match event {
-                        StreamEvent::TextDelta { delta, .. } => emit(ctx.events, AgentEvent::TextDelta { delta }),
-                        StreamEvent::ReasoningDelta { delta, .. } => emit(ctx.events, AgentEvent::ReasoningDelta { delta }),
+                        StreamEvent::TextDelta { delta, .. } => {
+                            response.streamed = true;
+                            emit(ctx.events, AgentEvent::TextDelta { delta });
+                        }
+                        StreamEvent::ReasoningDelta { delta, .. } => {
+                            response.streamed = true;
+                            emit(ctx.events, AgentEvent::ReasoningDelta { delta });
+                        }
                         StreamEvent::RateLimits { limits } => emit(ctx.events, AgentEvent::RateLimits { limits }),
                         StreamEvent::Completed { usage, stop: s, .. } => {
                             self.measured = Some((usage.input_tokens.saturating_add(usage.output_tokens), self.items.len()));
@@ -646,7 +654,8 @@ impl Agent {
             emit(events, AgentEvent::RequestStarted { index: requests });
             // A context overflow, reported when the request is made or as the stream's first
             // failure, is answered once: compact, then retry the same request. Only a response that
-            // produced nothing is retried, so no output or tool effect is replayed.
+            // produced nothing — no item, no tool call, no visible text or reasoning — is retried,
+            // so no output or tool effect is replayed or shown twice (REV8-6).
             let stop = loop {
                 let produced_before = self.items.len();
                 let attempt = {
@@ -664,7 +673,7 @@ impl Agent {
                     },
                     Err(err) => AgentError::Provider(err),
                 };
-                let untouched = response.dispatched.is_empty() && self.items.len() == produced_before;
+                let untouched = response.dispatched.is_empty() && !response.streamed && self.items.len() == produced_before;
                 match failure {
                     AgentError::Provider(err) if err.kind == LlmErrorKind::ContextOverflow && !overflow_retried && untouched => {
                         overflow_retried = true;
