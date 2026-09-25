@@ -330,3 +330,44 @@ fn rev10_a_silent_terminal_does_not_stall_startup_or_keys() {
     assert!(sent.elapsed() < Duration::from_millis(500), "the key painted after {:?}", sent.elapsed());
     tui.quit();
 }
+
+// ---- REV12 regressions ----
+
+/// REV12 (residual of REV10 #1): a TUI attached to an ephemeral session never reads the history
+/// file; a persistent one reads it once attached.
+#[test]
+fn rev12_the_history_file_is_read_only_for_persistent_sessions() {
+    let home = std::env::temp_dir().join(format!("aim-tui-rev12-{}", std::process::id()));
+    let _fresh = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("history"), "old secret\n").unwrap();
+    let trace = home.join("trace.log");
+    let (home_env, trace_env) = (home.to_string_lossy().into_owned(), trace.to_string_lossy().into_owned());
+    let env = [("AIM_HOME", home_env.as_str()), ("AIM_TUI_TRACE", trace_env.as_str())];
+    for (ephemeral, expect_read) in [(true, false), (false, true)] {
+        let _stale = std::fs::remove_file(&trace);
+        let script = json!({"responses": [], "seed_ephemeral": ephemeral});
+        let tui = Tui::start(&script, &Start { env: &env, ..Start::default() });
+        tui.wait_for("idle");
+        std::thread::sleep(Duration::from_millis(150));
+        tui.quit();
+        let log = std::fs::read_to_string(&trace).unwrap_or_default();
+        assert_eq!(log.contains("history loaded"), expect_read, "ephemeral={ephemeral}: {log}");
+    }
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+/// REV12 (residual of REV10 #16): a silent terminal that claims to be kitty stalls nothing.
+#[test]
+fn rev12_a_silent_terminal_claiming_kitty_does_not_stall() {
+    let script = json!({"responses": []});
+    let env = [("TERM", "xterm-kitty")];
+    let tui = Tui::start(&script, &Start { silent: true, env: &env, ..Start::default() });
+    let ready = tui.since_spawn_until(Duration::from_secs(10), |s| s.contains("idle")).unwrap();
+    assert!(ready < Duration::from_millis(1_500), "the session was ready after {ready:?}");
+    let sent = std::time::Instant::now();
+    tui.send("k");
+    tui.wait("the key", Duration::from_secs(5), |s| s.contains("› k"));
+    assert!(sent.elapsed() < Duration::from_millis(500), "the key painted after {:?}", sent.elapsed());
+    tui.quit();
+}

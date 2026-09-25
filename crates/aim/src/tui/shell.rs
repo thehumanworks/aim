@@ -138,16 +138,13 @@ impl Modes {
     }
 
     /// Asks for disambiguated keys (Shift+Enter) on terminals known to speak the kitty keyboard
-    /// protocol. The query waits for the terminal's answer (up to crossterm's two-second timeout),
-    /// so it is never sent to a terminal that might not answer.
+    /// protocol. No capability query is sent: waiting for its answer stalls input on a terminal
+    /// that does not answer (crossterm waits two seconds), while a terminal that does not know the
+    /// push ignores it. Unknown terminals keep legacy keys.
     fn enhance_keyboard(&mut self) {
-        if !keyboard_protocol_known(env) {
-            return;
-        }
-        if matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true)) {
-            let pushed =
-                crossterm::execute!(std::io::stdout(), PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
-            self.keyboard = pushed.is_ok();
+        if keyboard_protocol_known(env) {
+            let flags = PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES);
+            self.keyboard = crossterm::execute!(std::io::stdout(), flags).is_ok();
         }
     }
 }
@@ -291,8 +288,16 @@ impl Screen {
     }
 }
 
+/// Requests whose order the session must see: prompts (a turn, then its steering) and config
+/// changes (which turn a model applies to). One task sends them, each after the previous answer.
+enum Ordered {
+    Prompt { id: u64, session: String, parts: Vec<aim_proto::conversation::Part> },
+    Config(aim_proto::daemon::SessionConfigParams),
+}
+
 /// Executes the app's effects.
 struct Runner {
+    ordered: UnboundedSender<Ordered>,
     client: Arc<dyn SessionClient>,
     inputs: UnboundedSender<Input>,
     broker: Broker,
@@ -303,6 +308,34 @@ struct Runner {
 }
 
 impl Runner {
+    fn new(
+        client: Arc<dyn SessionClient>,
+        inputs: UnboundedSender<Input>,
+        broker: Broker,
+        sources: SourceFactory,
+        history: Option<PathBuf>,
+    ) -> Self {
+        let (ordered, mut lane) = mpsc::unbounded_channel::<Ordered>();
+        let (lane_client, lane_inputs) = (Arc::clone(&client), inputs.clone());
+        tokio::spawn(async move {
+            while let Some(request) = lane.recv().await {
+                let input = match request {
+                    Ordered::Prompt { id, session, parts } => {
+                        Input::PromptDone { id, result: lane_client.prompt(session, parts).await.map_err(|e| e.message) }
+                    }
+                    Ordered::Config(params) => match lane_client.set_config(params).await {
+                        Ok(()) => Input::Noop,
+                        Err(e) => Input::Failed(format!("could not change the configuration: {}", e.message)),
+                    },
+                };
+                if lane_inputs.send(input).is_err() {
+                    return;
+                }
+            }
+        });
+        Self { ordered, client, inputs, broker, sources, forwarder: None, opened: Vec::new(), history }
+    }
+
     fn spawn(&self, work: impl Future<Output = Input> + Send + 'static) {
         let inputs = self.inputs.clone();
         tokio::spawn(async move {
@@ -328,27 +361,27 @@ impl Runner {
                 let sources = (self.sources)(std::path::Path::new(&workspace), local);
                 self.broker.set_sources(sources);
             }
-            Effect::Prompt { id, session, parts } => {
-                self.spawn(async move { Input::PromptDone { id, result: client.prompt(session, parts).await.map_err(|e| e.message) } });
-            }
+            Effect::Prompt { id, session, parts } => self.send_ordered(Ordered::Prompt { id, session, parts }),
             Effect::Cancel(session) => self.spawn(async move {
                 match client.cancel(session).await {
                     Ok(()) => Input::Noop,
                     Err(e) => Input::Failed(format!("cancel: {}", e.message)),
                 }
             }),
-            Effect::SetConfig(params) => self.spawn(async move {
-                match client.set_config(params).await {
-                    Ok(()) => Input::Noop,
-                    Err(e) => Input::Failed(format!("could not change the configuration: {}", e.message)),
-                }
-            }),
+            Effect::SetConfig(params) => self.send_ordered(Ordered::Config(params)),
             Effect::ListSessions => self.spawn(async move {
                 let params = SessionListParams { limit: Some(200), workspace: None };
                 Input::Sessions(client.list(params).await.map_err(|e| e.message))
             }),
             Effect::Complete(request) => self.broker.request(&request),
             Effect::CancelCompletion => self.broker.cancel(),
+            Effect::LoadHistory => {
+                if let Some(path) = &self.history {
+                    let entries = history::load(path);
+                    trace("history loaded");
+                    let _gone = self.inputs.send(Input::HistoryLoaded(entries));
+                }
+            }
             Effect::SaveHistory(entry) => {
                 if let Some(path) = &self.history
                     && let Err(error) = history::append(path, &entry)
@@ -357,6 +390,12 @@ impl Runner {
                 }
             }
             Effect::Quit => {}
+        }
+    }
+
+    fn send_ordered(&self, request: Ordered) {
+        if self.ordered.send(request).is_err() {
+            let _gone = self.inputs.send(Input::Failed("the session connection is gone".into()));
         }
     }
 
@@ -420,9 +459,8 @@ impl Runner {
 pub async fn run(client: Arc<dyn SessionClient>, options: Options) -> Result<i32, String> {
     let size = crossterm::terminal::size().map_err(|e| format!("not a terminal: {e}"))?;
     let hyperlinks = hyperlinks();
-    let history = options.history.as_deref().map(history::load).unwrap_or_default();
     let config = AppConfig { spec: options.spec.clone(), hyperlinks, home: env("HOME"), persist_history: options.history.is_some() };
-    let mut app = App::new(Theme::detect(env), config, history, options.fullscreen);
+    let mut app = App::new(Theme::detect(env), config, options.fullscreen);
     app.handle(Input::Resize(size.0, size.1));
 
     let mut modes = Modes::enter().map_err(|e| format!("terminal: {e}"))?;
@@ -437,15 +475,7 @@ pub async fn run(client: Arc<dyn SessionClient>, options: Options) -> Result<i32
     if options.keep_superseded_completions {
         broker.keep_superseded();
     }
-    let mut runner = Runner {
-        client,
-        inputs,
-        broker,
-        sources: Arc::clone(&options.sources),
-        forwarder: None,
-        opened: Vec::new(),
-        history: options.history.clone(),
-    };
+    let mut runner = Runner::new(client, inputs, broker, Arc::clone(&options.sources), options.history.clone());
     // The session starts before the keyboard query, which may wait for the terminal's answer.
     let first = app.start(options.attach.clone());
     runner.run(first);
@@ -571,5 +601,78 @@ mod tests {
         assert!(!keyboard_protocol_known(env(&[("TERM_PROGRAM", "ghostty"), ("TMUX", "/tmp/t,1,0")])), "not through tmux");
         assert!(keyboard_protocol_known(env(&[("TERM", "dumb"), ("AIM_TUI_KEYBOARD", "kitty")])));
         assert!(!keyboard_protocol_known(env(&[("TERM", "xterm-kitty"), ("AIM_TUI_KEYBOARD", "legacy")])));
+    }
+
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use aim_proto::conversation::Part;
+    use aim_proto::daemon::{PromptOutcome, SessionAttachResult, SessionConfigParams, SessionListParams, SessionSpec, SessionSummary};
+    use aim_proto::error::{ErrorCode, ProtoError};
+
+    use super::super::app::{Effect, Input};
+    use super::super::complete::{Broker, Sources};
+    use super::Runner;
+    use crate::host::{BoxFuture, SessionClient, UpdateStream};
+
+    /// A session client whose prompts reach the "server" after a per-text network delay.
+    #[derive(Default)]
+    struct Recording {
+        received: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn refused<T: Send + 'static>() -> BoxFuture<Result<T, ProtoError>> {
+        Box::pin(async { Err(ProtoError::new(ErrorCode::Unavailable, "not in this test")) })
+    }
+
+    impl SessionClient for Recording {
+        fn create(&self, _: SessionSpec) -> BoxFuture<Result<SessionSummary, ProtoError>> {
+            refused()
+        }
+        fn list(&self, _: SessionListParams) -> BoxFuture<Result<Vec<SessionSummary>, ProtoError>> {
+            refused()
+        }
+        fn attach(&self, _: String) -> BoxFuture<Result<(SessionAttachResult, UpdateStream), ProtoError>> {
+            refused()
+        }
+        fn prompt(&self, _: String, parts: Vec<Part>) -> BoxFuture<Result<PromptOutcome, ProtoError>> {
+            let text = crate::tui::transcript::user_text(&parts);
+            let delay = if text == "first" { 80 } else { 0 };
+            let received = Arc::clone(&self.received);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                received.lock().unwrap().push(text);
+                Ok(PromptOutcome::Started { turn: 1 })
+            })
+        }
+        fn cancel(&self, _: String) -> BoxFuture<Result<(), ProtoError>> {
+            refused()
+        }
+        fn set_config(&self, _: SessionConfigParams) -> BoxFuture<Result<(), ProtoError>> {
+            refused()
+        }
+        fn close(&self, _: String) -> BoxFuture<Result<(), ProtoError>> {
+            refused()
+        }
+    }
+
+    fn prompt(id: u64, text: &str) -> Effect {
+        Effect::Prompt { id, session: "s".into(), parts: vec![Part::Text { text: text.into() }] }
+    }
+
+    /// REV12 (residual of REV10 #7): queued prompts reach the session in the order they were
+    /// sent, whatever each request's latency.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rev12_prompts_reach_the_session_in_order() {
+        let client = Arc::new(Recording::default());
+        let received = Arc::clone(&client.received);
+        let (inputs, mut answers) = tokio::sync::mpsc::unbounded_channel::<Input>();
+        let (completions, _completed) = tokio::sync::mpsc::unbounded_channel();
+        let mut runner = Runner::new(client, inputs, Broker::new(Sources::remote(None), completions), Sources::factory(None), None);
+        runner.run(vec![prompt(1, "first"), prompt(2, "second")]);
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), answers.recv()).await.unwrap().unwrap();
+        }
+        assert_eq!(*received.lock().unwrap(), ["first", "second"]);
     }
 }

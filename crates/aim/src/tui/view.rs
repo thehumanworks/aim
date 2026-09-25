@@ -154,18 +154,35 @@ fn live_rows(app: &App, width: usize, budget: usize) -> Vec<Row> {
     rows.split_off(skip)
 }
 
+/// Held-back entries within [`HELD_ROWS`]. When they do not fit, running calls shrink to their
+/// head row and finished ones keep their results; what still does not fit is counted, running
+/// calls first, so a finished result is never hidden behind calls still running.
 fn held_rows(app: &App, width: usize) -> Vec<Row> {
     let opts = EntryOpts { render: RenderOpts { width, hyperlinks: false }, collapse_reasoning: false };
-    let mut rows: Vec<Row> = Vec::new();
-    for entry in app.transcript.held() {
-        let mut entry_rows = render_entry(entry, &app.theme, opts);
-        entry_rows.pop();
-        rows.extend(entry_rows);
+    let rendered: Vec<(bool, Vec<Row>)> = app
+        .transcript
+        .held()
+        .map(|entry| {
+            let mut rows = render_entry(entry, &app.theme, opts);
+            rows.pop();
+            (entry.finished(), rows)
+        })
+        .collect();
+    if rendered.iter().map(|(_, rows)| rows.len()).sum::<usize>() <= HELD_ROWS {
+        return rendered.into_iter().flat_map(|(_, rows)| rows).collect();
     }
-    if rows.len() > HELD_ROWS {
-        let hidden = rows.len() - (HELD_ROWS - 1);
-        rows.truncate(HELD_ROWS - 1);
-        rows.push(Row::plain(truncate(&format!("  … {hidden} more rows until the running call finishes"), width), app.theme.muted));
+    let finished: Vec<Row> = rendered.iter().filter(|(done, _)| *done).flat_map(|(_, rows)| rows.iter().cloned()).collect();
+    let running: Vec<Row> = rendered.iter().filter(|(done, _)| !*done).filter_map(|(_, rows)| rows.first().cloned()).collect();
+    let room = HELD_ROWS - 1;
+    let shown_finished = finished.len().min(room);
+    let shown_running = running.len().min(room - shown_finished);
+    let hidden_running = running.len() - shown_running;
+    let hidden_finished = finished.len() - shown_finished;
+    let mut rows: Vec<Row> = running.into_iter().take(shown_running).collect();
+    rows.extend(finished.into_iter().take(shown_finished));
+    if hidden_running + hidden_finished > 0 {
+        let note = format!("  … {hidden_running} more running, {hidden_finished} more rows");
+        rows.push(clamp(Row::plain(note, app.theme.muted), width));
     }
     rows
 }
@@ -242,9 +259,9 @@ pub fn block(app: &App, width: u16, max_rows: u16) -> Block {
     room = room.saturating_sub(usize::from(rule));
     let gap = room > 0;
     room = room.saturating_sub(usize::from(gap));
-    let popup: Vec<Row> = popup_rows(app, w).into_iter().take(room).collect();
+    let popup: Vec<Row> = popup_rows(app, w).into_iter().take(room).map(|row| clamp(row, w)).collect();
     room = room.saturating_sub(popup.len());
-    let chips: Vec<Row> = chip_rows(app, w).into_iter().take(room).collect();
+    let chips: Vec<Row> = chip_rows(app, w).into_iter().take(room).map(|row| clamp(row, w)).collect();
     room = room.saturating_sub(chips.len());
     let tools: Vec<Row> = held_rows(app, w).into_iter().take(room).collect();
     room = room.saturating_sub(tools.len());
@@ -459,7 +476,7 @@ mod tests {
             persistence: Persistence::Persistent,
         };
         let config = AppConfig { spec, hyperlinks: false, home: Some("/home/me".into()), persist_history: false };
-        let mut app = App::new(Theme::plain(), config, Vec::new(), false);
+        let mut app = App::new(Theme::plain(), config, false);
         app.handle(Input::Resize(50, 30));
         app.start(None);
         let attempt = app.attempt();
@@ -641,5 +658,40 @@ mod tests {
         assert_eq!(short_path("/Users/me/projects/aim", Some("/Users/me")), "~/projects/aim");
         assert_eq!(short_path("/a/b/c/d/e", None), "…/d/e");
         assert_eq!(short_path("/Users/meta", Some("/Users/me")), "/Users/meta");
+    }
+
+    /// REV12 (residual of REV10 #13): every block row fits a narrow viewport, popup and chips too.
+    #[test]
+    fn rev12_every_block_row_fits_a_narrow_viewport() {
+        let mut app = app();
+        up(&mut app, SessionUpdate::StateChanged { state: SessionState::Running });
+        up(&mut app, SessionUpdate::TextDelta { delta: "streaming words that are long".into() });
+        up(
+            &mut app,
+            SessionUpdate::ItemAdded {
+                item: Item::ToolCall { call_id: "c".into(), name: "a_long_tool".into(), arguments: r#"{"path":"x"}"#.into(), native: None },
+            },
+        );
+        for c in "a steering message".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Enter);
+        app.handle(Input::PromptDone { id: 1, result: Ok(PromptOutcome::Steered) });
+        for c in "@sr".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let candidates = vec![Candidate {
+            label: "src/a/very/long/path/main.rs".into(),
+            insert: "@src/main.rs ".into(),
+            detail: "a long detail".into(),
+            kind: Kind::File,
+        }];
+        app.handle(Input::Completed(Completed { generation: app.generation(), candidates }));
+        for width in [8_u16, 10, 13] {
+            let block = block(&app, width, 30);
+            for row in &block.rows {
+                assert!(row.width() <= usize::from(width), "width {width}: {:?} is {} wide", row.to_string(), row.width());
+            }
+        }
     }
 }

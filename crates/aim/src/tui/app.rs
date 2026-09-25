@@ -87,6 +87,8 @@ pub enum Input {
     Tick,
     /// A request succeeded with nothing to show.
     Noop,
+    /// The history file's prompts (answers [`Effect::LoadHistory`]).
+    HistoryLoaded(Vec<String>),
 }
 
 /// What the app asks the shell to do.
@@ -136,6 +138,8 @@ pub enum Effect {
     CancelCompletion,
     /// Append a prompt to the history file.
     SaveHistory(String),
+    /// Read the history file (asked once, when a persistent session is first attached).
+    LoadHistory,
     /// Exit.
     Quit,
 }
@@ -344,8 +348,11 @@ pub struct App {
     quit_armed: bool,
     quitting: bool,
     next_prompt: u64,
-    /// Prompts submitted while no session was attached (or one was being switched to).
-    queued: Vec<String>,
+    /// Prompts and session commands submitted while no session was attached (or one was being
+    /// switched to), for the session being opened, in order.
+    queued: Vec<Queued>,
+    /// Whether the history file has been asked for.
+    history_requested: bool,
     /// The latest create or attach attempt; answers of older ones are ignored.
     attempt: u64,
     /// History from the file: shown only while a persistent session is attached.
@@ -362,6 +369,23 @@ pub struct App {
     efforts: Vec<String>,
 }
 
+/// Something typed for a session that is still being opened.
+#[derive(Clone, Debug)]
+enum Queued {
+    /// A prompt.
+    Prompt(String),
+    /// `/model` or `/effort`, as typed.
+    Config { raw: String, model: Option<String>, effort: Option<String> },
+}
+
+impl Queued {
+    fn text(&self) -> &str {
+        match self {
+            Self::Prompt(text) | Self::Config { raw: text, .. } => text,
+        }
+    }
+}
+
 /// `local` or `ssh:<destination>`, as session metadata records a location.
 fn location_of(text: &str) -> Location {
     match text.strip_prefix("ssh:") {
@@ -375,9 +399,9 @@ fn text_parts(text: String) -> Vec<Part> {
 }
 
 impl App {
-    /// A new app; `history` is the history file's prompts, oldest first. They are offered only
-    /// once a persistent session is attached (never in an ephemeral one).
-    pub fn new(theme: Theme, config: AppConfig, history: Vec<String>, fullscreen: bool) -> Self {
+    /// A new app. The history file is not read here: it is asked for ([`Effect::LoadHistory`])
+    /// only when a persistent session is first attached, and never offered in an ephemeral one.
+    pub fn new(theme: Theme, config: AppConfig, fullscreen: bool) -> Self {
         let composer = Composer::default();
         let bound = (config.spec.workspace.clone(), config.spec.location == Location::Local);
         let mut models = Vec::new();
@@ -410,8 +434,9 @@ impl App {
             quitting: false,
             next_prompt: 1,
             queued: Vec::new(),
+            history_requested: false,
             attempt: 0,
-            disk_history: history,
+            disk_history: Vec::new(),
             private_history: Vec::new(),
             bound,
             pending_deliveries: 0,
@@ -553,6 +578,16 @@ impl App {
                 self.notice(Level::Error, error);
                 Vec::new()
             }
+            Input::HistoryLoaded(entries) => {
+                // Prompts sent to persistent sessions before the file arrived come after it.
+                let mut history = entries;
+                history.append(&mut self.disk_history);
+                self.disk_history = history;
+                if self.session.as_ref().is_some_and(|s| s.persistence == Persistence::Persistent) {
+                    self.composer.set_history(self.disk_history.clone());
+                }
+                Vec::new()
+            }
             Input::Tick => {
                 if self.running() {
                     self.turn_seconds = self.turn_seconds.saturating_add(1);
@@ -579,7 +614,7 @@ impl App {
     /// Creating or attaching failed: prompts waiting for it go back to the composer.
     fn connection_failed(&mut self, message: &str) {
         self.connecting = false;
-        let queued = std::mem::take(&mut self.queued);
+        let queued: Vec<String> = std::mem::take(&mut self.queued).iter().map(|q| q.text().to_owned()).collect();
         if !queued.is_empty() {
             self.refill(&queued);
         }
@@ -590,6 +625,10 @@ impl App {
     /// Offers the history that fits the attached session: the file's for a persistent session,
     /// this run's ephemeral prompts (memory only) for an ephemeral one.
     fn expose_history(&mut self, persistence: Persistence) {
+        if persistence == Persistence::Persistent && self.config.persist_history && !self.history_requested {
+            self.history_requested = true;
+            self.outbox.push(Effect::LoadHistory);
+        }
         let history = match persistence {
             Persistence::Persistent => self.disk_history.clone(),
             Persistence::Ephemeral => self.private_history.clone(),
@@ -674,8 +713,11 @@ impl App {
         }
         let mut effects = Vec::new();
         self.hint = None;
-        for text in std::mem::take(&mut self.queued) {
-            effects.extend(self.dispatch(text));
+        for queued in std::mem::take(&mut self.queued) {
+            effects.extend(match queued {
+                Queued::Prompt(text) => self.dispatch(text),
+                Queued::Config { raw, model, effort } => self.configure(&raw, model, effort),
+            });
         }
         effects
     }
@@ -931,20 +973,36 @@ impl App {
     /// Sends text as a prompt (or steering while a turn runs). While no session is attached, or
     /// one is being switched to, it waits in order for that session.
     fn send(&mut self, text: String) -> Vec<Effect> {
-        if self.connecting || self.session.is_none() {
-            self.queued.push(text);
-            let n = self.queued.len();
-            self.hint =
-                Some(if n == 1 { "sends when the session is ready".into() } else { format!("{n} prompts send when the session is ready") });
+        if self.waiting_for_session() {
+            self.queue(Queued::Prompt(text));
             return Vec::new();
         }
         self.dispatch(text)
     }
 
+    /// No session to send to yet, or one is being switched to.
+    fn waiting_for_session(&self) -> bool {
+        self.connecting || self.session.is_none()
+    }
+
+    fn queue(&mut self, queued: Queued) {
+        self.queued.push(queued);
+        let n = self.queued.len();
+        self.hint =
+            Some(if n == 1 { "sends when the session is ready".into() } else { format!("{n} entries send when the session is ready") });
+    }
+
+    /// Applies `/model` or `/effort` to the attached session (and records it in its history).
+    fn configure(&mut self, raw: &str, model: Option<String>, effort: Option<String>) -> Vec<Effect> {
+        let Some(session) = self.session.as_ref().map(|s| s.id.clone()) else { return Vec::new() };
+        self.remember(raw);
+        vec![Effect::SetConfig(SessionConfigParams { session, model, effort })]
+    }
+
     /// Sends text to the attached session and records it in that session's history.
     fn dispatch(&mut self, text: String) -> Vec<Effect> {
         let Some((session, state)) = self.session.as_ref().map(|s| (s.id.clone(), s.state)) else {
-            self.queued.push(text);
+            self.queued.push(Queued::Prompt(text));
             return Vec::new();
         };
         if state == SessionState::Closed {
@@ -973,13 +1031,9 @@ impl App {
                 return Vec::new();
             };
             let (name, arg) = (command.name, arg.to_owned());
-            // Commands with an argument are worth recalling; `/quit` and friends are not.
-            if command.takes_argument() {
-                self.remember(&raw);
-            }
             self.composer.clear();
             self.close_popup(&mut effects);
-            effects.extend(self.command(name, &arg));
+            effects.extend(self.command(name, &arg, raw.trim()));
             return effects;
         }
         let text = self.composer.take();
@@ -988,7 +1042,9 @@ impl App {
         effects
     }
 
-    fn command(&mut self, name: &str, arg: &str) -> Vec<Effect> {
+    /// Runs a slash command. `raw` is the command as typed: commands with an argument are recorded
+    /// in history (`/quit` and friends are not), when they apply to a session.
+    fn command(&mut self, name: &str, arg: &str, raw: &str) -> Vec<Effect> {
         let session = self.session.as_ref().map(|s| s.id.clone());
         match (name, session) {
             ("model" | "effort", _) if arg.is_empty() => {
@@ -1000,18 +1056,22 @@ impl App {
                 self.notice(Level::Info, format!("usage: /{name} <value> (now: {current})"));
                 Vec::new()
             }
-            ("model", Some(session)) => {
-                vec![Effect::SetConfig(SessionConfigParams { session, model: Some(arg.to_owned()), effort: None })]
+            // During a switch these belong to the session being opened, not the one still shown.
+            ("model" | "effort", _) if self.waiting_for_session() => {
+                let (model, effort) = if name == "model" { (Some(arg.to_owned()), None) } else { (None, Some(arg.to_owned())) };
+                self.queue(Queued::Config { raw: raw.to_owned(), model, effort });
+                Vec::new()
             }
-            ("effort", Some(session)) => {
-                vec![Effect::SetConfig(SessionConfigParams { session, model: None, effort: Some(arg.to_owned()) })]
-            }
+            ("model", Some(_)) => self.configure(raw, Some(arg.to_owned()), None),
+            ("effort", Some(_)) => self.configure(raw, None, Some(arg.to_owned())),
             ("new", _) => {
                 // A new session like the attached one: same provider, place, workspace and model.
                 let mut spec = self.config.spec.clone();
                 if let Some(s) = &self.session {
                     spec.provider.clone_from(&s.provider);
                     spec.location = s.location.clone();
+                    // As private as the attached session: an ephemeral one never begets a kept one.
+                    spec.persistence = s.persistence;
                     spec.workspace.clone_from(&s.workspace);
                     spec.model = Some(s.model.clone());
                     spec.effort.clone_from(&s.effort);

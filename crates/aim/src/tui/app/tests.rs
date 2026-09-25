@@ -49,7 +49,7 @@ fn summary(id: &str, state: SessionState) -> SessionSummary {
 fn new_app(persistence: Persistence) -> App {
     let config =
         AppConfig { spec: spec(persistence), hyperlinks: false, home: None, persist_history: persistence == Persistence::Persistent };
-    App::new(Theme::plain(), config, Vec::new(), false)
+    App::new(Theme::plain(), config, false)
 }
 
 /// An app attached to session `s1`, idle, with nothing in it.
@@ -537,11 +537,12 @@ fn saves(effects: &[Effect]) -> Vec<String> {
 #[test]
 fn rev10_ephemeral_session_prompts_never_reach_disk_history() {
     let config = AppConfig { spec: spec(Persistence::Persistent), hyperlinks: false, home: None, persist_history: true };
-    let mut app = App::new(Theme::plain(), config, vec!["old secret".into()], false);
-    app.start(Some("e1".into()));
+    let mut app = App::new(Theme::plain(), config, false);
+    let mut effects = app.start(Some("e1".into()));
     app.handle(press(KeyCode::Up));
     assert!(app.composer.is_empty(), "no disk history before the session's mode is known");
-    app.handle(Input::Attached { summary: eph_summary("e1"), transcript: Vec::new(), resync: false, attempt: app.attempt });
+    effects.extend(app.handle(Input::Attached { summary: eph_summary("e1"), transcript: Vec::new(), resync: false, attempt: app.attempt }));
+    assert!(!effects.contains(&Effect::LoadHistory), "the history file is not even read for an ephemeral session");
     app.handle(press(KeyCode::Up));
     assert!(app.composer.is_empty(), "disk history stays hidden in an ephemeral session");
     typed(&mut app, "private prompt");
@@ -550,6 +551,17 @@ fn rev10_ephemeral_session_prompts_never_reach_disk_history() {
     effects.extend(app.handle(press(KeyCode::Enter)));
     assert!(saves(&effects).is_empty(), "{effects:?}");
     assert_eq!(prompts(&effects).len(), 1);
+    // A persistent session asks for the file once, then offers it.
+    typed(&mut app, "/sessions");
+    app.handle(press(KeyCode::Enter));
+    app.handle(Input::Sessions(Ok(vec![persistent_summary("p1")])));
+    app.handle(press(KeyCode::Enter));
+    let effects =
+        app.handle(Input::Attached { summary: persistent_summary("p1"), transcript: Vec::new(), resync: false, attempt: app.attempt });
+    assert_eq!(effects.iter().filter(|e| **e == Effect::LoadHistory).count(), 1);
+    app.handle(Input::HistoryLoaded(vec!["old secret".into()]));
+    app.handle(press(KeyCode::Up));
+    assert_eq!(app.composer.text(), "old secret");
 }
 
 /// REV10 #2: returned steering keeps an unsent paste chip's content.
@@ -748,4 +760,87 @@ fn rev10_attaching_another_workspace_rebinds_completion() {
     assert!(app.attempt > old);
     let effects = app.handle(Input::Attached { summary: remote, transcript: Vec::new(), resync: false, attempt: app.attempt });
     assert!(effects.contains(&Effect::Rebind { workspace: "/srv".into(), local: false }), "{effects:?}");
+}
+
+// ---- REV12 regressions (each written to fail on the code it verified) ----
+
+/// REV12: `/new` from an attached ephemeral session opens an ephemeral session.
+#[test]
+fn rev12_new_from_an_ephemeral_session_stays_ephemeral() {
+    let mut app = new_app(Persistence::Persistent);
+    app.start(Some("e1".into()));
+    app.handle(Input::Attached { summary: eph_summary("e1"), transcript: Vec::new(), resync: false, attempt: app.attempt });
+    typed(&mut app, "/new");
+    let effects = app.handle(press(KeyCode::Enter));
+    let spec = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Create { spec, .. } => Some(spec.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(spec.persistence, Persistence::Ephemeral, "the new session is as private as the attached one");
+    app.handle(Input::Created { attempt: app.attempt, result: Ok(eph_summary("e2")) });
+    let effects = app.handle(Input::Attached { summary: eph_summary("e2"), transcript: Vec::new(), resync: false, attempt: app.attempt });
+    assert!(saves(&effects).is_empty());
+    typed(&mut app, "hi");
+    assert!(saves(&app.handle(press(KeyCode::Enter))).is_empty());
+}
+
+fn config_to(effects: &[Effect], session: &str) -> Vec<SessionConfigParams> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SetConfig(params) if params.session == session => Some(params.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// REV12: `/model` and `/effort` typed during a switch apply to the session being opened.
+#[test]
+fn rev12_config_commands_during_a_switch_go_to_the_new_session() {
+    for (command, model, effort) in [("/model x", Some("x"), None), ("/effort high", None, Some("high"))] {
+        let mut app = attached();
+        picker_to(&mut app, "s2");
+        typed(&mut app, command);
+        let effects = app.handle(press(KeyCode::Enter));
+        assert!(config_to(&effects, "s1").is_empty(), "{command} did not go to the old session: {effects:?}");
+        let effects = app.handle(Input::Attached {
+            summary: summary("s2", SessionState::Idle),
+            transcript: Vec::new(),
+            resync: false,
+            attempt: app.attempt,
+        });
+        let to_b = config_to(&effects, "s2");
+        assert_eq!(to_b.len(), 1, "{command}: {effects:?}");
+        assert_eq!((to_b[0].model.as_deref(), to_b[0].effort.as_deref()), (model, effort));
+    }
+}
+
+/// REV12 (residual of REV10 #12): a finished call stays visible behind many running ones.
+#[test]
+fn rev12_a_finished_call_shows_behind_many_running_ones() {
+    let mut app = running();
+    for n in 0..12 {
+        update(
+            &mut app,
+            SessionUpdate::ItemAdded {
+                item: Item::ToolCall { call_id: format!("c{n}"), name: format!("slow{n}"), arguments: "{}".into(), native: None },
+            },
+        );
+    }
+    update(
+        &mut app,
+        SessionUpdate::ItemAdded {
+            item: Item::ToolCall { call_id: "fin".into(), name: "quick".into(), arguments: "{}".into(), native: None },
+        },
+    );
+    update(
+        &mut app,
+        SessionUpdate::ItemAdded { item: Item::ToolResult { call_id: "fin".into(), result: ToolResult::text("quick result") } },
+    );
+    let block = view::block(&app, 60, 30);
+    let text: Vec<String> = block.rows.iter().map(ToString::to_string).collect();
+    assert!(text.iter().any(|r| r.contains("quick result")), "{text:#?}");
 }
