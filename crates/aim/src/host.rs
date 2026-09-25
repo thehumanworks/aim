@@ -303,10 +303,8 @@ pub fn native_backends_with(
             } else {
                 None
             };
-            // The kernel's code-mode exposure is decided once, here: it selects the tools below and
-            // whether the instructions carry the code-mode section (ADR 0076).
-            let code_permitted = agent.as_ref().is_none_or(|(_, policy)| policy.permits("run_code"));
-            let code = code_exposure(services.code.as_ref(), code_permitted);
+            // One exposure decision selects the code tools below and the prompt's code-mode section (ADR 0076).
+            let code = code_exposure(services.code.as_ref(), agent.as_ref().is_none_or(|(_, policy)| policy.permits("run_code")));
             let budget = resources.skill_budget.unwrap_or_else(|| resources::instructions::skill_budget(window));
             let prefix = context::instructions(&catalog, agent.as_ref().map(|(agent, _)| agent), budget, code.is_some());
             for diagnostic in &prefix.diagnostics {
