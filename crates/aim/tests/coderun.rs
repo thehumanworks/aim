@@ -482,14 +482,19 @@ async fn a_full_queue_is_refused_at_once() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn run_code_behind_a_long_cell_is_told_busy_instead_of_waiting_silently() {
-    let (_, host) = host(CodeMode::RunCode);
+    let (scripted, host) = host(CodeMode::RunCode);
     let blocker = {
         let host = host.clone();
         tokio::spawn(async move {
-            host.call("run_code".into(), json!({"code":"await new Promise(r => setTimeout(r, 30000))"}), IdempotencyKey::new("b")).await
+            host.call(
+                "run_code".into(),
+                json!({"code":"await tools.side_effect({}); await new Promise(r => setTimeout(r, 30000))"}),
+                IdempotencyKey::new("b"),
+            )
+            .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    eventually("the long cell to run", || scripted.count("side_effect") == 1).await;
     let started = Instant::now();
     let busy = host.call("run_code".into(), json!({"code":"text(1)"}), IdempotencyKey::new("c")).await.unwrap_err();
     let waited = started.elapsed();
@@ -506,12 +511,12 @@ async fn run_code_behind_a_long_cell_is_told_busy_instead_of_waiting_silently() 
 #[tokio::test(flavor = "multi_thread")]
 async fn program_workers_are_capped_per_session() {
     let temporary = tempfile::tempdir().expect("temporary program root");
-    let (_, code) = host(CodeMode::RunCode);
+    let (scripted, code) = host(CodeMode::RunCode);
     let host = ProgramToolHost::new(code, Arc::new(ProgramStore::new(temporary.path().join("programs"))));
-    let source = "export default async function main(args) { await new Promise(r => setTimeout(r, 30000)); return args.delta; }";
+    let source = "export default async function main(args) { await tools.side_effect({}); await new Promise(r => setTimeout(r, 30000)); return args.delta; }";
     host.call(
         "save_program".into(),
-        json!({"scope":"user","slug":"slow","manifest":manifest(&[]),"source":source}),
+        json!({"scope":"user","slug":"slow","manifest":manifest(&["side_effect"]),"source":source}),
         IdempotencyKey::new("save"),
     )
     .await
@@ -524,7 +529,7 @@ async fn program_workers_are_capped_per_session() {
             })
         })
         .collect();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    eventually("both programs to run", || scripted.count("side_effect") == 2).await;
     let started = Instant::now();
     let busy = host
         .call("run_program".into(), json!({"scope":"user","slug":"slow","params":{"delta":3}}), IdempotencyKey::new("third"))
@@ -676,7 +681,9 @@ async fn a_session_ends_its_turn_while_a_cell_runs_and_closes_it_with_the_sessio
 
     let scripted = Arc::new(Scripted::default());
     let workspace_closed = Arc::new(AtomicBool::new(false));
-    let code = "// @exec: {\"yield_time_ms\": 300}\nfor (;;) { await tools.side_effect({}); await new Promise(r => setTimeout(r, 50)); }";
+    // The first nested call happens before `notify` returns control, so inside the turn however
+    // slowly the worker starts; the loop then outlives the turn.
+    let code = "// @exec: {\"yield_time_ms\": 20000}\nawait tools.side_effect({}); notify('first'); for (;;) { await tools.side_effect({}); await new Promise(r => setTimeout(r, 50)); }";
     let exec = Item::ToolCall { call_id: "call-exec".into(), name: "exec".into(), arguments: code.into(), native: None };
     let answer = Item::Assistant { id: None, parts: vec![Part::Text { text: "started".into() }], native: None };
     let provider = Arc::new(ScriptedModel {
