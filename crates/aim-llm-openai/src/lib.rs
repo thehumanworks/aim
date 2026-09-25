@@ -1,131 +1,213 @@
-//! OpenAI-compatible provider using named, deserializable endpoint profiles.
+//! OpenAI-compatible model provider configured by named, deserializable endpoint profiles
+//! (docs/adr/0011): `OpenRouter`, Vercel AI Gateway, or any compatible endpoint.
 //!
-//! Chat Completions is supported. Profiles selecting Responses return a typed unavailable error
-//! until that wire protocol is implemented.
+//! Chat Completions is implemented. A profile selecting the Responses wire is rejected when the
+//! provider is constructed (`InvalidRequest`: a configuration error, never retried).
+//!
+//! - **Affinity and caching**: `Request.session_id` is sent in the profile's `session_header`
+//!   (`OpenRouter` `x-session-id`, AI Gateway `x-session-affinity`); prompt-cache settings come
+//!   from `quirks.extra_body` and `quirks.cache_key_field`. `Request.turn_id` and `Request.tier`
+//!   are ignored: neither gateway has per-turn affinity state or service tiers on this wire.
+//! - **Timeouts**: 10 s to connect, then `quirks.idle_timeout_secs` (default 300 s) without any
+//!   response byte — headers, data or keepalive comments — fails the call as `Transport`. There is
+//!   no whole-request timeout, so long streams are never cut.
+//! - **Errors** keep the provider's detail (message, code, type, upstream error), scrubbed of
+//!   the API key and truncated; 401 bodies are dropped because servers echo key prefixes.
 
-mod chat;
+mod catalog;
+mod decode;
+mod errors;
 mod profile;
+mod request;
+mod sse;
 
 pub use profile::{MaxOutputTokensField, Profile, Quirks, ReasoningParam, Wire};
 
-use aim_llm::{BoxFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use aim_llm::{BoxFuture, EventStream, LlmError, LlmErrorKind, ModelInfo, ModelProvider, Request, StreamEvent};
 use async_stream::stream;
 use futures_util::StreamExt as _;
-use reqwest::{Client, StatusCode, header};
+use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Client, RequestBuilder, Response};
 use serde_json::Value;
+
+use crate::decode::ChatDecoder;
+use crate::sse::Sse;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 
 /// An OpenAI-compatible provider configured by a profile.
 pub struct OpenAiProvider {
     profile: Profile,
     client: Client,
+    headers: HeaderMap,
+    session_header: Option<HeaderName>,
+    /// Image-input support per model id, from the static catalog or the last fetched one.
+    vision: Mutex<BTreeMap<String, bool>>,
+}
+
+fn invalid(message: impl Into<String>) -> LlmError {
+    LlmError::new(LlmErrorKind::InvalidRequest, message)
+}
+
+fn protocol(message: &'static str) -> LlmError {
+    LlmError::new(LlmErrorKind::Protocol, message)
+}
+
+/// A transport failure; the `reqwest::Error` itself is dropped (it may carry the URL).
+fn transport(error: &reqwest::Error) -> LlmError {
+    let message = if error.is_timeout() {
+        "provider connection timed out"
+    } else if error.is_connect() {
+        "could not connect to the provider"
+    } else {
+        "provider transport failure"
+    };
+    LlmError::new(LlmErrorKind::Transport, message)
+}
+
+/// Reads at most `cap` bytes of a body; the flag says whether it was cut.
+async fn read_capped(response: Response, cap: usize) -> Result<(Vec<u8>, bool), LlmError> {
+    let mut body = Vec::new();
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|error| transport(&error))?;
+        let room = cap.saturating_sub(body.len());
+        body.extend_from_slice(chunk.get(..room.min(chunk.len())).unwrap_or_default());
+        if chunk.len() > room {
+            return Ok((body, true));
+        }
+    }
+    Ok((body, false))
+}
+
+async fn failure(response: Response, key: &str) -> LlmError {
+    let status = response.status().as_u16();
+    let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+    let body = read_capped(response, MAX_ERROR_BODY_BYTES).await.map(|(body, _)| body).unwrap_or_default();
+    errors::http_error(status, retry_after.as_ref(), &body, &[key])
+}
+
+/// Decodes SSE payloads until `[DONE]`; anything after the sentinel is ignored.
+fn decode_frames(decoder: &mut ChatDecoder, frames: Vec<String>, done: &mut bool) -> Result<Vec<StreamEvent>, LlmError> {
+    let mut events = Vec::new();
+    for frame in frames {
+        if *done {
+            break;
+        }
+        if frame.trim() == "[DONE]" {
+            *done = true;
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&frame).map_err(|_| protocol("invalid SSE JSON"))?;
+        events.extend(decoder.chunk(&value)?);
+    }
+    Ok(events)
 }
 
 impl OpenAiProvider {
-    /// Construct a provider with a reusable HTTP client.
+    /// Validates the profile and builds a reusable HTTP client.
+    ///
+    /// # Errors
+    /// `InvalidRequest` for a profile this provider cannot serve (Responses wire, invalid or
+    /// `Authorization` headers); `Transport` if the TLS client cannot be built.
+    pub fn new(profile: Profile) -> Result<Self, LlmError> {
+        if profile.wire == Wire::Responses {
+            return Err(invalid("the Responses wire is not implemented for OpenAI-compatible profiles; set wire = \"chat\""));
+        }
+        let mut headers = HeaderMap::new();
+        for (name, value) in &profile.headers {
+            let header_name =
+                HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid(format!("profile header name {name:?} is invalid")))?;
+            if header_name == header::AUTHORIZATION {
+                return Err(invalid("profile headers must not set Authorization: the key is read from api_key_env"));
+            }
+            let mut header_value =
+                HeaderValue::from_str(value).map_err(|_| invalid(format!("profile header {name} has an invalid value")))?;
+            header_value.set_sensitive(true);
+            headers.insert(header_name, header_value);
+        }
+        let session_header = profile
+            .quirks
+            .session_header
+            .as_deref()
+            .map(|name| HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid(format!("session_header {name:?} is invalid"))))
+            .transpose()?;
+        let idle = Duration::from_secs(profile.quirks.idle_timeout_secs.unwrap_or(profile::DEFAULT_IDLE_TIMEOUT_SECS));
+        let client = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(idle)
+            .build()
+            .map_err(|_| LlmError::new(LlmErrorKind::Transport, "could not build the HTTP client"))?;
+        let vision = profile.models.iter().flatten().map(|model| (model.id.clone(), model.images)).collect();
+        Ok(Self { profile, client, headers, session_header, vision: Mutex::new(vision) })
+    }
+
+    /// The profile this provider serves.
     #[must_use]
-    pub fn new(profile: Profile) -> Self {
-        Self { profile, client: Client::new() }
+    pub const fn profile(&self) -> &Profile {
+        &self.profile
     }
 
     /// The effective output cap after applying the profile minimum.
     #[must_use]
     pub fn effective_max_output_tokens(&self, requested: Option<u32>) -> Option<u32> {
-        requested.map(|value| value.max(self.profile.quirks.min_output_tokens.unwrap_or(0)))
+        self.profile.quirks.effective_max_output_tokens(requested)
+    }
+
+    /// The exact Chat Completions body [`ModelProvider::stream`] sends for `request`.
+    ///
+    /// # Errors
+    /// `InvalidRequest` when the request asks for something the profile cannot express.
+    pub fn request_body(&self, request: &Request) -> Result<Value, LlmError> {
+        request::request_body(&self.profile, request, self.accepts_images(&request.model))
+    }
+
+    /// Tool-result images are sent as image parts unless the profile or the model's catalog
+    /// entry says the model cannot take them (unknown models are assumed capable).
+    fn accepts_images(&self, model: &str) -> bool {
+        self.profile.quirks.tool_result_images && self.vision.lock().ok().and_then(|known| known.get(model).copied()).unwrap_or(true)
+    }
+
+    fn remember(&self, models: &[ModelInfo]) {
+        if let Ok(mut known) = self.vision.lock() {
+            known.extend(models.iter().map(|model| (model.id.clone(), model.images)));
+        }
     }
 
     fn key(&self) -> Result<String, LlmError> {
         std::env::var(&self.profile.api_key_env)
             .ok()
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| LlmError::new(LlmErrorKind::Auth, "profile API key environment variable is unset"))
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| LlmError::new(LlmErrorKind::Auth, format!("environment variable {} is unset", self.profile.api_key_env)))
     }
 
     fn endpoint(&self, route: &str) -> String {
-        format!("{}/{}", self.profile.base_url.trim_end_matches('/'), route)
+        format!("{}/{route}", self.profile.base_url.trim_end_matches('/'))
     }
 
-    fn headers(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        for (name, value) in &self.profile.headers {
-            request = request.header(name, value);
-        }
-        request
+    fn authorized(&self, builder: RequestBuilder, key: &str) -> RequestBuilder {
+        builder.headers(self.headers.clone()).bearer_auth(key)
     }
-}
 
-fn transport(_error: reqwest::Error) -> LlmError {
-    LlmError::new(LlmErrorKind::Transport, "provider transport failure")
-}
-
-fn http_error(status: StatusCode, retry_after: Option<&header::HeaderValue>, body: &str) -> LlmError {
-    let lower = body.to_ascii_lowercase();
-    let kind = match status.as_u16() {
-        401..=403 => LlmErrorKind::Auth,
-        429 => LlmErrorKind::RateLimited,
-        400 if lower.contains("context") && (lower.contains("length") || lower.contains("window") || lower.contains("token")) => {
-            LlmErrorKind::ContextOverflow
+    async fn fetch_catalog(&self) -> Result<Vec<ModelInfo>, LlmError> {
+        let key = self.key()?;
+        let response = self.authorized(self.client.get(self.endpoint("models")), &key).send().await.map_err(|error| transport(&error))?;
+        if !response.status().is_success() {
+            return Err(failure(response, &key).await);
         }
-        500..=599 => LlmErrorKind::Unavailable,
-        _ => LlmErrorKind::InvalidRequest,
-    };
-    let message = if status.as_u16() == 402 { "provider payment required" } else { "provider rejected request" };
-    let retry_after_ms = retry_after.and_then(|v| v.to_str().ok()).and_then(|value| {
-        value.parse::<u64>().ok().map(|seconds| seconds.saturating_mul(1000)).or_else(|| {
-            httpdate::parse_http_date(value)
-                .ok()
-                .and_then(|date| date.duration_since(std::time::SystemTime::now()).ok())
-                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        })
-    });
-    LlmError { kind, message: message.into(), status: Some(status.as_u16()), retry_after_ms }
-}
-
-fn parse_catalog(data: &Value, profile: &Profile) -> Result<Vec<ModelInfo>, LlmError> {
-    let entries = data
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| LlmError::new(LlmErrorKind::Protocol, "model catalog lacks data array"))?;
-    Ok(entries
-        .iter()
-        .filter_map(|entry| {
-            let id = entry.get("id")?.as_str()?.to_owned();
-            let params = entry.get("supported_parameters").and_then(Value::as_array);
-            let has = |needle: &str| params.is_some_and(|p| p.iter().any(|v| v.as_str() == Some(needle)));
-            let reported_efforts = entry
-                .get("reasoning_options")
-                .and_then(Value::as_array)
-                .and_then(|options| options.iter().find(|option| option.get("type").and_then(Value::as_str) == Some("effort")))
-                .and_then(|option| option.get("values"))
-                .and_then(Value::as_array)
-                .map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>());
-            let efforts = match profile.quirks.reasoning_param {
-                ReasoningParam::OpenRouter if has("reasoning") || has("reasoning_effort") => {
-                    vec!["minimal", "low", "medium", "high", "xhigh"].into_iter().map(str::to_owned).collect()
-                }
-                ReasoningParam::OpenAi => reported_efforts.unwrap_or_else(|| {
-                    if has("reasoning_effort") {
-                        vec!["low", "medium", "high"].into_iter().map(str::to_owned).collect()
-                    } else {
-                        Vec::new()
-                    }
-                }),
-                ReasoningParam::None | ReasoningParam::OpenRouter => Vec::new(),
-            };
-            let modalities =
-                entry.pointer("/architecture/input_modalities").or_else(|| entry.pointer("/modalities/input")).and_then(Value::as_array);
-            Some(ModelInfo {
-                display_name: entry.get("name").and_then(Value::as_str).unwrap_or(&id).into(),
-                id,
-                context_window: entry.get("context_length").or_else(|| entry.get("context_window")).and_then(Value::as_u64),
-                efforts,
-                default_effort: None,
-                tiers: Vec::new(),
-                tools: has("tools"),
-                images: modalities.is_some_and(|m| m.iter().any(|v| v.as_str() == Some("image"))),
-                hidden: false,
-                native: Some(entry.clone()),
-            })
-        })
-        .collect())
+        let (body, cut) = read_capped(response, MAX_CATALOG_BYTES).await?;
+        if cut {
+            return Err(protocol("model catalog exceeds 16 MiB"));
+        }
+        let data = serde_json::from_slice::<Value>(&body).map_err(|_| protocol("model catalog is not JSON"))?;
+        catalog::parse_catalog(&data, &self.profile)
+    }
 }
 
 impl ModelProvider for OpenAiProvider {
@@ -135,64 +217,63 @@ impl ModelProvider for OpenAiProvider {
 
     fn catalog(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, LlmError>> {
         Box::pin(async move {
-            if let Some(models) = &self.profile.models {
-                return Ok(models.clone());
-            }
-            let key = self.key()?;
-            let response = self.headers(self.client.get(self.endpoint("models")).bearer_auth(key)).send().await.map_err(transport)?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
-                let body = response.text().await.unwrap_or_default();
-                return Err(http_error(status, retry_after.as_ref(), &body));
-            }
-            let data = response.json::<Value>().await.map_err(transport)?;
-            parse_catalog(&data, &self.profile)
+            let models = match &self.profile.models {
+                Some(models) => models.clone(),
+                None => self.fetch_catalog().await?,
+            };
+            self.remember(&models);
+            Ok(models)
         })
     }
 
     fn stream(&self, request: Request) -> BoxFuture<'_, Result<EventStream, LlmError>> {
         Box::pin(async move {
-            if self.profile.wire == Wire::Responses {
-                return Err(LlmError::new(LlmErrorKind::Unavailable, "Responses wire is not implemented for OpenAI-compatible profiles"));
-            }
-            let body = chat::request_body(&self.profile, &request)?;
+            let body = self.request_body(&request)?;
             let key = self.key()?;
-            let response = self
-                .headers(self.client.post(self.endpoint("chat/completions")).bearer_auth(key).json(&body))
-                .send()
-                .await
-                .map_err(transport)?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
-                let body = response.text().await.unwrap_or_default();
-                return Err(http_error(status, retry_after.as_ref(), &body));
+            let mut builder = self.authorized(self.client.post(self.endpoint("chat/completions")), &key).json(&body);
+            if let (Some(name), Some(session)) = (&self.session_header, &request.session_id) {
+                let value = HeaderValue::from_str(session).map_err(|_| invalid("the session id is not a valid header value"))?;
+                builder = builder.header(name.clone(), value);
             }
+            let response = builder.send().await.map_err(|error| transport(&error))?;
+            if !response.status().is_success() {
+                return Err(failure(response, &key).await);
+            }
+            let mut decoder = ChatDecoder::new(&self.profile, request::freeform_names(&request.tools));
             let mut bytes = response.bytes_stream();
-            let profile = self.profile.clone();
             let events = stream! {
-                let mut sse = chat::Sse::default();
-                let mut decoder = chat::ChatDecoder::new(&profile);
+                let mut sse = Sse::default();
                 let mut done = false;
-                while let Some(next) = bytes.next().await {
-                    let chunk = match next { Ok(chunk) => chunk, Err(error) => { yield Err(transport(error)); return; } };
-                    let frames = match sse.push(&chunk) { Ok(frames) => frames, Err(error) => { yield Err(error); return; } };
-                    for frame in frames {
-                        if frame == "[DONE]" { done = true; break; }
-                        let Ok(value) = serde_json::from_str::<Value>(&frame) else {
-                            yield Err(LlmError::new(LlmErrorKind::Protocol, "invalid SSE JSON"));
+                loop {
+                    let (frames, eof) = match bytes.next().await {
+                        Some(Ok(chunk)) => (sse.push(&chunk), false),
+                        Some(Err(error)) => {
+                            yield Err(transport(&error));
                             return;
-                        };
-                        match decoder.chunk(&value) {
-                            Ok(events) => { for event in events { yield Ok(event); } }
-                            Err(error) => { yield Err(error); return; }
+                        }
+                        None => (sse.finish(), true),
+                    };
+                    match frames.and_then(|frames| decode_frames(&mut decoder, frames, &mut done)) {
+                        Ok(events) => {
+                            for event in events {
+                                yield Ok(event);
+                            }
+                        }
+                        Err(error) => {
+                            yield Err(error);
+                            return;
                         }
                     }
-                    if done { break; }
+                    if done || eof {
+                        break;
+                    }
                 }
-                match decoder.finish() {
-                    Ok(events) => { for event in events { yield Ok(event); } }
+                match decoder.finish(done) {
+                    Ok(events) => {
+                        for event in events {
+                            yield Ok(event);
+                        }
+                    }
                     Err(error) => yield Err(error),
                 }
             };
@@ -202,64 +283,4 @@ impl ModelProvider for OpenAiProvider {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn profile_toml_and_error_mapping() -> Result<(), Box<dyn std::error::Error>> {
-        let profile: Profile = toml::from_str(
-            r#"
-id = "custom"
-base_url = "https://example.invalid/v1"
-api_key_env = "CUSTOM_API_KEY"
-wire = "chat"
-[quirks]
-min_output_tokens = 16
-max_output_tokens_field = "max_completion_tokens"
-supports_parallel_tool_calls = true
-supports_stream_usage = true
-reasoning_param = "open_ai"
-cost_in_usage = false
-"#,
-        )?;
-        assert_eq!(profile.id, "custom");
-        assert_eq!(OpenAiProvider::new(profile).effective_max_output_tokens(Some(1)), Some(16));
-        for (status, body, expected) in [
-            (401, "", LlmErrorKind::Auth),
-            (402, "", LlmErrorKind::Auth),
-            (429, "", LlmErrorKind::RateLimited),
-            (400, "context length exceeded", LlmErrorKind::ContextOverflow),
-            (400, "bad tools", LlmErrorKind::InvalidRequest),
-            (503, "", LlmErrorKind::Unavailable),
-        ] {
-            let status = StatusCode::from_u16(status)?;
-            let error = http_error(status, Some(&header::HeaderValue::from_static("2")), body);
-            assert_eq!(error.kind, expected);
-            assert_eq!(error.retry_after_ms, Some(2000));
-        }
-        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        let date = header::HeaderValue::from_str(&httpdate::fmt_http_date(future))?;
-        assert!(http_error(StatusCode::TOO_MANY_REQUESTS, Some(&date), "").retry_after_ms.is_some_and(|delay| delay > 0));
-        Ok(())
-    }
-
-    #[test]
-    fn catalog_unknowns_are_conservative() -> Result<(), Box<dyn std::error::Error>> {
-        let models = parse_catalog(&serde_json::json!({"data":[{"id":"one"}]}), &Profile::ai_gateway())?;
-        assert_eq!(models.len(), 1);
-        assert!(models.iter().all(|model| !model.tools && !model.images && model.context_window.is_none() && model.efforts.is_empty()));
-        let models = parse_catalog(
-            &serde_json::json!({"data":[{
-                "id":"two","context_window":128_000,"supported_parameters":["tools","reasoning"],
-                "modalities":{"input":["text","image"]},
-                "reasoning_options":[{"type":"effort","values":["none","low","medium","high"]}]
-            }]}),
-            &Profile::ai_gateway(),
-        )?;
-        assert!(models.iter().all(|model| model.tools));
-        assert!(models.iter().all(|model| model.images));
-        assert_eq!(models.first().and_then(|model| model.context_window), Some(128_000));
-        assert!(models.iter().all(|model| model.efforts == ["none", "low", "medium", "high"]));
-        Ok(())
-    }
-}
+mod tests;

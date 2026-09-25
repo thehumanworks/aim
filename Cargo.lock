@@ -46,6 +46,7 @@ dependencies = [
  "aim-llm",
  "aim-proto",
  "async-stream",
+ "base64",
  "futures-util",
  "httpdate",
  "reqwest",
