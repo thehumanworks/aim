@@ -693,7 +693,12 @@ async fn without_media_services_only_workspace_tools_are_offered() {
     let memory = Arc::new(MemoryStore::default());
     let search = vec![
         Ok(StreamEvent::ItemDone {
-            item: Item::ToolCall { call_id: "s".into(), name: "web_search".into(), arguments: json!({"query": "q"}).to_string(), native: None },
+            item: Item::ToolCall {
+                call_id: "s".into(),
+                name: "web_search".into(),
+                arguments: json!({"query": "q"}).to_string(),
+                native: None,
+            },
         }),
         completed(StopReason::ToolUse),
     ];
