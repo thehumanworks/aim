@@ -22,6 +22,8 @@ pub struct Tui {
     pub workspace: PathBuf,
     pub started: Instant,
     pub output_bytes: Arc<Mutex<usize>>,
+    /// Frames painted (synchronized-output begins seen).
+    pub frames: Arc<Mutex<usize>>,
 }
 
 /// How to start it.
@@ -120,10 +122,12 @@ impl Tui {
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(pty.master.take_writer().unwrap()));
         let mut reader = pty.master.try_clone_reader().unwrap();
         let output_bytes = Arc::new(Mutex::new(0_usize));
+        let frames = Arc::new(Mutex::new(0_usize));
         {
             let parser = Arc::clone(&parser);
             let writer = Arc::clone(&writer);
             let output_bytes = Arc::clone(&output_bytes);
+            let frames = Arc::clone(&frames);
             std::thread::spawn(move || {
                 let mut buf = vec![0_u8; 65536];
                 loop {
@@ -133,6 +137,7 @@ impl Tui {
                     };
                     let data = buf.get(..n).unwrap_or_default();
                     *output_bytes.lock().unwrap() += n;
+                    *frames.lock().unwrap() += data.windows(8).filter(|w| *w == b"\x1b[?2026h").count();
                     let answer = {
                         let mut p = parser.lock().unwrap();
                         p.process(data);
@@ -145,7 +150,7 @@ impl Tui {
                 }
             });
         }
-        Self { parser, writer, master: pty.master, child, dir, workspace, started, output_bytes }
+        Self { parser, writer, master: pty.master, child, dir, workspace, started, output_bytes, frames }
     }
 
     pub fn send(&self, bytes: &str) {
@@ -181,6 +186,29 @@ impl Tui {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Polls every 200 µs until `pred` holds; returns the elapsed time (None after `timeout`).
+    pub fn time_until(&self, timeout: Duration, pred: impl Fn(&str) -> bool) -> Option<Duration> {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if pred(&self.screen()) {
+                return Some(start.elapsed());
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        None
+    }
+
+    /// Time from spawn until `pred` first holds (polled every 200 µs).
+    pub fn since_spawn_until(&self, timeout: Duration, pred: impl Fn(&str) -> bool) -> Option<Duration> {
+        while self.started.elapsed() < timeout {
+            if pred(&self.screen()) {
+                return Some(self.started.elapsed());
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        None
     }
 
     pub fn wait_for(&self, needle: &str) {
