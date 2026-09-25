@@ -278,7 +278,7 @@ async fn remote_project_resources() {
     // Two round trips (listings with the fixed reads, then the listed files) plus one for Claude's
     // namespaced commands.
     assert_eq!(log.iter().filter(|l| l.starts_with("fs.read_many")).count(), 2, "{log:?}");
-    let prefix = aim::context::instructions(&catalog, None, 4096).text;
+    let prefix = aim::context::instructions(&catalog, None, 4096, false).text;
     assert!(prefix.contains("## AGENTS.md (remote, ssh:example)"), "{prefix}");
     assert!(prefix.contains(".agents/skills/haiku/SKILL.md; remote, ssh:example"), "{prefix}");
 }
@@ -368,7 +368,7 @@ async fn instruction_budget_is_shared_and_cuts_are_marked() {
     ]);
     let config = ResourceConfig { bounds: Bounds { max_file_bytes: 64 * 1024, ..Bounds::default() }, ..ResourceConfig::default() };
     let catalog = resources::discover(&config, Some(&files), "local", "").await;
-    let prefix = aim::context::instructions(&catalog, None, 4096);
+    let prefix = aim::context::instructions(&catalog, None, 4096, false);
     assert!(prefix.text.contains(&format!(
         "[… truncated: {} of {} bytes shown; read AGENTS.md for the rest]",
         instructions::MAX_PROJECT_INSTRUCTIONS,
@@ -393,7 +393,7 @@ async fn skill_catalog_fits_its_budget() {
     let catalog = resources::discover(&ResourceConfig::default(), Some(&files), "local", "").await;
     assert_eq!(catalog.skills.len(), 120);
     for budget in [instructions::DEFAULT_SKILL_BUDGET, instructions::skill_budget(Some(200_000))] {
-        let prefix = aim::context::instructions(&catalog, None, budget);
+        let prefix = aim::context::instructions(&catalog, None, budget, false);
         let listing: usize =
             prefix.text.lines().filter(|l| l.starts_with("- skill-") || l.starts_with("- …and")).map(|l| l.len() + 1).sum();
         assert!(listing <= budget, "{listing} > {budget}");
@@ -1112,7 +1112,7 @@ async fn live_prefix(aimx: &Path, repo: &Path, agent: Option<&str>) -> String {
     let catalog = resources::discover(&ResourceConfig::default(), Some(&files), "local", "").await;
     harness.shutdown().await;
     let agent = agent.and_then(|name| catalog.agent(name));
-    aim::context::instructions(&catalog, agent, instructions::DEFAULT_SKILL_BUDGET).text
+    aim::context::instructions(&catalog, agent, instructions::DEFAULT_SKILL_BUDGET, false).text
 }
 
 /// REV12: code mode's program tools obey the agent's allowlist. An agent allowed `Read` and
@@ -1181,7 +1181,8 @@ impl ToolHost for CodeModeWorkspace {
 /// ADR 0076: each code mode's tools in a native session. `off` (no `CodeConfig`) offers the
 /// workspace alone, `on` hides the compact set, `only` offers the code tools alone; an agent whose
 /// ceiling lacks `run_code` keeps its direct tools even under `only`, and one allowing `run_code`
-/// but not the program tools gets `run_code` alone.
+/// but not the program tools gets `run_code` alone. The instructions carry the "# Code mode"
+/// section exactly when `run_code` is offered.
 #[tokio::test]
 async fn code_modes_compose_their_tool_lists_and_never_widen_a_ceiling() {
     let programs = tempfile::tempdir().unwrap();
@@ -1209,7 +1210,14 @@ async fn code_modes_compose_their_tool_lists_and_never_widen_a_ceiling() {
         let (_, mut updates) = f.host.attach(id.clone()).await.unwrap();
         f.host.prompt(id, vec![Part::Text { text: "go".into() }]).await.unwrap();
         until_idle(&mut updates).await;
-        let offered: Vec<String> = f.provider.seen.lock().unwrap()[0].tools.iter().map(|t| t.name.clone()).collect();
+        let (offered, instructions): (Vec<String>, String) = {
+            let seen = f.provider.seen.lock().unwrap();
+            (seen[0].tools.iter().map(|t| t.name.clone()).collect(), seen[0].instructions.clone())
+        };
         assert_eq!(offered, expected, "mode {mode:?}, agent tools {agent_tools:?}");
+        // The code-mode section goes exactly to sessions offered the code tool.
+        let code = offered.iter().any(|name| name == "run_code");
+        assert_eq!(instructions.contains("# Code mode"), code, "mode {mode:?}, agent tools {agent_tools:?}");
+        assert!(instructions.starts_with(aim::context::SYSTEM_PROMPT.trim_end()), "the system prompt comes first");
     }
 }

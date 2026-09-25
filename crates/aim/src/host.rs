@@ -303,8 +303,12 @@ pub fn native_backends_with(
             } else {
                 None
             };
+            // The kernel's code-mode exposure is decided once, here: it selects the tools below and
+            // whether the instructions carry the code-mode section (ADR 0076).
+            let code_permitted = agent.as_ref().is_none_or(|(_, policy)| policy.permits("run_code"));
+            let code = code_exposure(services.code.as_ref(), code_permitted);
             let budget = resources.skill_budget.unwrap_or_else(|| resources::instructions::skill_budget(window));
-            let prefix = context::instructions(&catalog, agent.as_ref().map(|(agent, _)| agent), budget);
+            let prefix = context::instructions(&catalog, agent.as_ref().map(|(agent, _)| agent), budget, code.is_some());
             for diagnostic in &prefix.diagnostics {
                 tracing::info!(path = %diagnostic.path, "instructions: {}", diagnostic.message);
             }
@@ -328,12 +332,11 @@ pub fn native_backends_with(
             let mut tools_spec = spec.clone();
             tools_spec.workspace = root.clone();
             tools = with_extra_tools(tools, &services.tools, &tools_spec).await;
-            let code_permitted = agent.as_ref().is_none_or(|(_, policy)| policy.permits("run_code"));
             let (mut tools, record) = match &agent {
                 Some((agent, policy)) => (narrowed(tools, agent, policy), Some(policy.record(&agent.meta.name))),
                 None => (tools, None),
             };
-            if let Some((code, exposure)) = code_exposure(services.code.as_ref(), code_permitted) {
+            if let Some((code, exposure)) = code {
                 let cells;
                 (tools, cells) = with_code_mode(tools, code, exposure.direct, agent.as_ref(), model_info, &session_id, project);
                 shutdown = cells_first(cells, shutdown);

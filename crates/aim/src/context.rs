@@ -23,6 +23,11 @@ use crate::resources::{Catalog, Files as _, HarnessFiles};
 /// aim's built-in system prompt.
 pub const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
+/// The system prompt's "# Code mode" section (ADR 0076), sent only to sessions that are offered a
+/// code tool (`run_code`, or codex's `exec`): a session without one would pay for advice it
+/// cannot follow.
+pub const CODE_MODE_PROMPT: &str = include_str!("../prompts/code_mode.md");
+
 /// Longest wait for the provider's catalog when sizing the skill catalog.
 pub const WINDOW_LOOKUP: Duration = Duration::from_secs(2);
 
@@ -47,12 +52,15 @@ pub async fn project_instructions(peer: &Peer, workspace: &WorkspaceId) -> Optio
     })
 }
 
-/// The full instructions: aim's system prompt, then the catalog's prefix (project instructions,
-/// rules index, skills within `skill_budget` bytes, memory) and `agent`'s instructions.
+/// The full instructions: aim's system prompt (with its "# Code mode" section when `code` says
+/// the session is offered a code tool), then the catalog's prefix (project instructions, rules
+/// index, skills within `skill_budget` bytes, memory) and `agent`'s instructions.
 #[must_use]
-pub fn instructions(catalog: &Catalog, agent: Option<&AgentDef>, skill_budget: usize) -> Prefix {
+pub fn instructions(catalog: &Catalog, agent: Option<&AgentDef>, skill_budget: usize, code: bool) -> Prefix {
     let prefix = instructions::render(catalog, agent, skill_budget);
-    Prefix { text: format!("{}{}", SYSTEM_PROMPT.trim_end(), prefix.text).trim_end().to_owned() + "\n", diagnostics: prefix.diagnostics }
+    let system =
+        if code { format!("{}\n\n{}", SYSTEM_PROMPT.trim_end(), CODE_MODE_PROMPT.trim_end()) } else { SYSTEM_PROMPT.trim_end().to_owned() };
+    Prefix { text: format!("{system}{}", prefix.text).trim_end().to_owned() + "\n", diagnostics: prefix.diagnostics }
 }
 
 /// `model`'s context window in tokens, from `provider`'s catalog, if it answers within
@@ -67,4 +75,24 @@ pub async fn context_window(provider: &dyn ModelProvider, model: &str) -> Option
 pub fn environment(root: &str, location: &str, os: &str, date: &str) -> String {
     let remote = if location == "local" { String::new() } else { format!("\nThe workspace is remote ({location}); tools act there.") };
     format!("<environment>\nworkspace: {root}\nos: {os}\ndate: {date}{remote}\n</environment>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CODE_MODE_PROMPT, SYSTEM_PROMPT, instructions};
+    use crate::resources::Catalog;
+
+    /// ADR 0076: the code-mode section follows the system prompt exactly when a code tool is
+    /// offered, so a code-mode session's prefix is what it was when the section lived in
+    /// `system.md`, and a session without code mode does not pay for it.
+    #[test]
+    fn the_code_mode_section_goes_only_to_sessions_with_a_code_tool() {
+        let catalog = Catalog::default();
+        let off = instructions(&catalog, None, 4096, false).text;
+        let on = instructions(&catalog, None, 4096, true).text;
+        assert!(!off.contains("# Code mode") && !off.contains("run_code"), "{off}");
+        assert_eq!(off, format!("{}\n", SYSTEM_PROMPT.trim_end()));
+        assert_eq!(on, format!("{}\n\n{}\n", SYSTEM_PROMPT.trim_end(), CODE_MODE_PROMPT.trim_end()));
+        assert!(CODE_MODE_PROMPT.starts_with("# Code mode\n"));
+    }
 }

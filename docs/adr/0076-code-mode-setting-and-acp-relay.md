@@ -116,8 +116,12 @@ The `run_code` description, and codex's `exec`, now carry:
 
 A nested result's `.text` joins its text parts, and its string form is the same text. This is
 defined non-enumerable in the worker's bootstrap, so a result's JSON and `content` are unchanged
-and codex's `exec`/`wait` contract is kept. `system.md` gains a two-line "# Code mode" section:
-use a script for multi-step and fan-out work, and a direct tool for a single simple action.
+and codex's `exec`/`wait` contract is kept. The system prompt gains a two-line "# Code mode"
+section: use a script for multi-step and fan-out work, and a direct tool for a single simple
+action. It lives in `prompts/code_mode.md` and follows `system.md` only in sessions that are
+offered a code tool: the host decides the kernel's exposure once and passes it to both the tool
+composition and `context::instructions`. The `acp:claude` authority prompt never mentions code
+mode; Claude learns it from the relay's `run_code` description.
 
 **Scripts that fail must say why.** The first live run (below) showed that a model's natural
 scripts failed silently:
@@ -343,9 +347,15 @@ repair"). The mock now scripts a `run_code` cell for `only`, so every mode has a
 - **Code mode is opt-in.** With the default `off`, native sessions and `aim mcp` offer no
   `run_code` (before this ADR both always did, where the worker was found), and a strict
   `acp:claude` session uses `aimx mcp`, as before this ADR. `AIM_CODE_MODE=on` or `only` selects
-  the code tool and the relay. A default `off` session still sends the system prompt's two-line
-  "# Code mode" section (241 bytes) and does not get ADR 0056's shorter `Read`/`Bash`/`LS`
-  descriptions, which only code-mode sessions apply: both are follow-ups.
+  the code tool and the relay. A default `off` session no longer sends the "# Code mode" section
+  (−241 bytes per request; W1 8,353 → 8,112 bytes).
+- **Follow-ups the wire gate keeps visible** (`bench/README.md`, "Wire gate repair"):
+  - `off` sessions do not get ADR 0056's shorter `Read`/`Bash`/`LS` descriptions, which only
+    code-mode sessions apply (+427 bytes against `on`).
+  - ADR 0064's `ui_*` tools (+773 bytes) reach headless `aim run` sessions, where no client can
+    show a surface.
+  - In `only`, a cell's nested `Bash` result bypasses ADR 0056's model view: the scripted W2
+    shows 30,147 characters against 11,191 through a direct `Bash`.
 - **Allowlist warnings.** An allowlisted agent in `only` warns that its allowed direct tools are
   not offered (`AllowedTools::unknown`). This is cosmetic.
 - **The relay's model is fixed.** It always uses portable `run_code`; there is no catalog there.
