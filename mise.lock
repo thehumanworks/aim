@@ -2,6 +2,41 @@
 
 lockfile_version = 2
 
+[[tools."cargo:wasm-bindgen-cli"]]
+version = "0.2.128"
+backend = "cargo:wasm-bindgen-cli"
+specifiers = ["0.2.128"]
+
+[[tools."github:trunk-rs/trunk"]]
+version = "0.21.14"
+backend = "github:trunk-rs/trunk"
+specifiers = ["0.21.14"]
+
+[tools."github:trunk-rs/trunk"."platforms.linux-x64"]
+checksum = "sha256:f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b"
+url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890635"
+
+[tools."github:trunk-rs/trunk"."platforms.linux-x64-musl"]
+checksum = "sha256:a67f4054b249fe9acc5fabc25de1aebf19783aca3ad6ff64bf34d7da44d0ea20"
+url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890638"
+
+[tools."github:trunk-rs/trunk"."platforms.macos-arm64"]
+checksum = "sha256:764e299dd50d89442a4e96a236349f57961984b701e74d3dbdb39cd1c9f5101e"
+url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890616"
+
+[tools."github:trunk-rs/trunk"."platforms.macos-x64"]
+checksum = "sha256:f1ba0e3bbe24e0ae219c6d22c33e24e2825c1608dd27c2556e323495110f1a95"
+url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890623"
+
+[tools."github:trunk-rs/trunk"."platforms.windows-x64"]
+checksum = "sha256:cd6ac15b9daff0365e5695036791ef2ce3c63f61c014f5a8c532363266e4569c"
+url = "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/trunk-rs/trunk/releases/assets/252890632"
+
 [[tools."github:verus-lang/verus"]]
 version = "0.2026.09.20.aef82ed"
 backend = "github:verus-lang/verus"
@@ -65,6 +100,11 @@ checksum = "sha256:e337687f30f5ece3bc250951e7e88e6a7eb9a1501e90cfa52bb1e93f8f7ea
 url = "https://github.com/verus-lang/verusfmt/releases/download/v0.7.3/verusfmt-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/verus-lang/verusfmt/releases/assets/553871384"
 
+[[tools.lightpanda]]
+version = "0.4.1"
+backend = "vfox:lightpanda"
+specifiers = ["0.4.1"]
+
 [[tools.node]]
 version = "26.8.1"
 backend = "core:node"
@@ -94,6 +134,11 @@ url = "https://nodejs.org/dist/v26.8.1/node-v26.8.1-win-x64.zip"
 version = "0.81.2"
 backend = "npm:@agentclientprotocol/claude-agent-acp"
 specifiers = ["0.81.2"]
+
+[[tools.python]]
+version = "3.14.7"
+backend = "core:python"
+specifiers = ["3.14.7"]
 
 [[tools.rust]]
 version = "1.98.1"

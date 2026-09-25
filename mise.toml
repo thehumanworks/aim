@@ -11,7 +11,17 @@ rust = { version = "1.98.1", components = "rustfmt,clippy", targets = "wasm32-un
 # capability probe at every bump. Node runs it (`#!/usr/bin/env node`). These must stay under
 # `[tools]` — below a `[tools."…"]` table they would silently become that tool's options.
 node = "26.8.1"
+python = "3.14.7"
+lightpanda = "0.4.1"
 "npm:@agentclientprotocol/claude-agent-acp" = "0.81.2"
+
+# Browser bundle for ADR 0023. `trunk` alone resolves to an unrelated npm package in mise.
+[tools."github:trunk-rs/trunk"]
+version = "0.21.14"
+filter_bins = ["trunk"]
+
+[tools."cargo:wasm-bindgen-cli"]
+version = "0.2.128"
 
 # Verus tags look like `release/0.2026.09.20.aef82ed`; `version_prefix` strips `release/`.
 # The archive also carries z3/rust_verify/…; only the two entry points go on PATH.
@@ -57,6 +67,10 @@ run = ["cargo fmt --all", "verusfmt crates/aim-kernel/src/*.rs"]
 [tasks.smoke]
 description = "Live smoke tests against real services (needs credentials; required before merging integrations)"
 run = "cargo test --workspace --locked -- --ignored live_"
+
+[tasks."web:build"]
+description = "Build the browser bundle separately from the native quality gate (WASM link dominates routine checks)"
+run = "cd crates/aim-web && NO_COLOR=true trunk build --release --locked --offline && python externalize_bootstrap.py"
 
 [tasks."locked:update"]
 description = "Re-record LOCKED spec digests after a maintainer-approved decision change (with its ADR)"
