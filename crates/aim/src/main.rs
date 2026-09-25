@@ -29,6 +29,22 @@ struct Args {
 }
 
 #[derive(Subcommand)]
+enum LoginTarget {
+    /// ChatGPT (the codex provider): browser sign-in, or `--device` for a code to enter elsewhere.
+    Codex {
+        /// Use the device-code flow (for machines without a browser).
+        #[arg(long)]
+        device: bool,
+    },
+    /// Claude Code (acp:claude), through its own terminal login.
+    Claude {
+        /// Login method id (default: the adapter's first terminal method).
+        #[arg(long)]
+        method: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Run one turn headlessly in a workspace.
     Run {
@@ -61,6 +77,11 @@ enum Command {
         max_requests: u32,
         /// The prompt (read from stdin when omitted or `-`).
         prompt: Vec<String>,
+    },
+    /// Sign in to a provider.
+    Login {
+        #[command(subcommand)]
+        target: LoginTarget,
     },
     /// List recent sessions.
     Sessions {
@@ -113,6 +134,14 @@ async fn main_async(args: Args) -> Result<i32, String> {
             }
             let options = RunOptions { provider: p, model, effort, cwd, ssh, aimx, ephemeral, json, max_requests, prompt };
             cli::run(options, provider).await
+        }
+        Command::Login { target } => {
+            let mut say = |line: &str| eprintln!("{line}");
+            match target {
+                LoginTarget::Codex { device } => aim::login::codex(device, &mut say).await?,
+                LoginTarget::Claude { method } => aim::login::claude(method.as_deref(), &mut say).await?,
+            }
+            Ok(0)
         }
         Command::Sessions { limit } => {
             let store = SqliteStore::open(&cli::aim_home().join("aim.db")).map_err(|e| e.to_string())?;

@@ -8,3 +8,5 @@ allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-print-in-tests = true
 allow-dbg-in-tests = false
+# Product names that are not code (keeps help text readable); ".." keeps clippy's defaults.
+doc-valid-idents = ["ChatGPT", "OpenRouter", ".."]
