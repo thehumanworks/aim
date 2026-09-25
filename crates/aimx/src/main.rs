@@ -10,8 +10,10 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::process::Stdio;
 use std::time::Duration;
 
+use aim_rpc::{NoHandler, Peer, PeerConfig};
 use aimx::server::{Server, ServerConfig, default_protected, local_principal};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -26,6 +28,8 @@ struct Cli {
 enum Cmd {
     /// Serve aim-harness/1.
     Serve(ServeArgs),
+    /// Expose workspace tools as an MCP server.
+    Mcp(McpArgs),
     /// Copy stdin/stdout to the resident server, starting it when needed.
     Proxy(ProxyArgs),
     /// Answer one `SSH_ASKPASS` prompt through aim's private callback socket.
@@ -91,6 +95,34 @@ struct ProxyArgs {
     idle_secs: u64,
 }
 
+#[derive(Args)]
+struct McpArgs {
+    /// Serve MCP over stdin/stdout.
+    #[arg(long, required = true)]
+    stdio: bool,
+    /// Root directory on the workspace host (default: home for local workspaces).
+    #[arg(long)]
+    root: Option<PathBuf>,
+    /// SSH destination; runs every tool on that host.
+    #[arg(long)]
+    ssh: Option<String>,
+    /// SSH configuration file.
+    #[arg(long)]
+    ssh_config: Option<PathBuf>,
+    /// Bootstrap resident aimx when possible, or use agentless SSH.
+    #[arg(long, default_value = "auto")]
+    bootstrap: BootstrapMode,
+    /// Caller-verified artifact for remote installation.
+    #[arg(long, requires = "sha256")]
+    artifact: Option<PathBuf>,
+    /// Expected SHA-256 of `--artifact`.
+    #[arg(long, requires = "artifact")]
+    sha256: Option<String>,
+    /// Grant read access only to a local workspace.
+    #[arg(long)]
+    read_only: bool,
+}
+
 fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_env("AIMX_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(filter).init();
@@ -152,6 +184,63 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     Ok(())
 }
 
+async fn mcp(args: McpArgs) -> Result<(), String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_owned())?;
+    if args.ssh.is_some() && args.root.is_none() {
+        return Err("SSH MCP mode requires --root on the remote host".to_owned());
+    }
+    let root = args.root.unwrap_or_else(|| PathBuf::from(&home));
+    let root_text = root.to_str().ok_or("workspace root is not UTF-8")?;
+    let (peer, server, child) = if let Some(destination) = args.ssh {
+        if args.read_only {
+            return Err("--read-only is currently local-only".to_owned());
+        }
+        let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+        let mut command = tokio::process::Command::new(exe);
+        command.args(["serve", "--stdio", "--ssh", &destination, "--root", root_text]);
+        command.arg("--bootstrap").arg(if matches!(args.bootstrap, BootstrapMode::Auto) { "auto" } else { "never" });
+        if let Some(config) = args.ssh_config {
+            command.arg("--ssh-config").arg(config);
+        }
+        if let Some(artifact) = args.artifact {
+            command.arg("--artifact").arg(artifact);
+        }
+        if let Some(sha256) = args.sha256 {
+            command.arg("--sha256").arg(sha256);
+        }
+        command.env_clear();
+        for key in
+            ["PATH", "HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "DISPLAY", "TERM", "XDG_RUNTIME_DIR"]
+        {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).kill_on_drop(true);
+        let mut child = command.spawn().map_err(|err| format!("starting SSH harness: {err}"))?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            return Err("SSH harness has no stdio pipes".to_owned());
+        };
+        (Peer::spawn(stdout, stdin, NoHandler, PeerConfig::default()), None, Some(child))
+    } else {
+        let principal = local_principal(&[&root], args.read_only).map_err(|err| format!("invalid --root: {err}"))?;
+        let server = Server::new(ServerConfig::new(principal, default_protected(&home)));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let _server_peer = server.connect(server_read, server_write);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        (Peer::spawn(client_read, client_write, NoHandler, PeerConfig::default()), Some(server), None)
+    };
+    let adapter = aimx::mcp::Mcp::connect(peer.clone(), root_text).await.map_err(|err| format!("MCP harness: {err}"))?;
+    let result = adapter.serve(tokio::io::stdin(), tokio::io::stdout()).await.map_err(|err| err.to_string());
+    peer.close();
+    if let Some(server) = server {
+        server.shutdown().await;
+    }
+    drop(child);
+    result
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -163,6 +252,16 @@ async fn main() -> ExitCode {
         Cmd::Serve(args) => {
             init_logging();
             match serve(args).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    tracing::error!("{err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Mcp(args) => {
+            init_logging();
+            match mcp(args).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
                     tracing::error!("{err}");

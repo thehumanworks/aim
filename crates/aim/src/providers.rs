@@ -6,7 +6,8 @@
 //! - `codex` — the `ChatGPT` subscription (ADR 0010). Credentials: aim's own login
 //!   (`~/.aim/auth/codex.json`), else the Codex CLI's file, read-only and never refreshed. One
 //!   provider (one auth manager) serves the whole process, so a refresh never races itself.
-//! - `acp:claude` is an agent backend, not a model provider: sessions run it through
+//! - `acp:claude` uses witnessed strict aim tools; `acp:claude-native` explicitly uses Claude's
+//!   local built-ins. Both are agent backends, not model providers: sessions run them through
 //!   [`crate::acp::with_acp`].
 
 use std::path::PathBuf;
@@ -39,7 +40,7 @@ pub fn codex() -> Result<Arc<CodexProvider>, String> {
 pub const GATEWAY_DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5";
 
 /// Provider ids this build knows.
-pub const KNOWN: &[&str] = &["openrouter", "ai-gateway", "codex", "acp:claude"];
+pub const KNOWN: &[&str] = &["openrouter", "ai-gateway", "codex", "acp:claude", "acp:claude-native"];
 
 /// Builds provider `id` and resolves the model (`model`, else the provider's default).
 ///
@@ -54,7 +55,7 @@ pub fn build(id: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, S
         "openrouter" => gateway(Profile::openrouter()),
         "ai-gateway" => gateway(Profile::ai_gateway()),
         "codex" => Ok((codex()? as Arc<dyn ModelProvider>, model.unwrap_or(CODEX_DEFAULT_MODEL).to_owned())),
-        "acp:claude" => Err(format!("`{id}` is an agent (Claude Code), not a model provider: run it as a session")),
+        "acp:claude" | "acp:claude-native" => Err(format!("`{id}` is an agent (Claude Code), not a model provider: run it as a session")),
         other => Err(format!("unknown provider `{other}` (known: {})", KNOWN.join(", "))),
     }
 }
@@ -64,5 +65,5 @@ pub fn build(id: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, S
 #[must_use]
 pub fn backends(aimx: PathBuf, max_requests: u32) -> crate::host::BackendFactory {
     let providers: crate::host::ProviderFactory = Arc::new(build);
-    crate::acp::with_acp(crate::host::native_backends(providers, crate::host::aimx_workspaces(aimx), max_requests))
+    crate::acp::with_acp_at(crate::host::native_backends(providers, crate::host::aimx_workspaces(aimx.clone()), max_requests), aimx)
 }

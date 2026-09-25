@@ -31,11 +31,11 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tempfile = "3"
 uuid = { version = "1.26", features = ["v4"] }
 
 [dev-dependencies]
 async-stream = "0.3"
-tempfile = "3"
 
 [lints]
 workspace = true

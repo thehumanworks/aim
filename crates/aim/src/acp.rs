@@ -2,11 +2,9 @@
 //!
 //! An `acp:claude` session runs its turns in Claude Code through `claude-agent-acp`.
 //!
-//! **Tool authority.** This slice uses native tool authority: Claude Code's built-in tools act on
-//! the local workspace. aim sees them only as ACP updates, which it renders and records but does
-//! not admit, hook or shadow. So:
-//! - SSH sessions are refused until aim serves its harness tools to the agent over MCP (strict aim
-//!   authority);
+//! **Tool authority.** `acp:claude` uses strict aim MCP tools, witnessed before each adapter
+//! connection starts a session. `acp:claude-native` explicitly retains Claude's local built-ins.
+//! Both modes still:
 //! - ephemeral sessions are refused until the private-mode witness is wired in;
 //! - resuming a stored session is refused, because the model's context lives in Claude Code and
 //!   `session/load` is not wired yet.
@@ -20,22 +18,31 @@
 //! **Steering.** ACP has no mid-turn steering. Steering typed during a turn goes out as a
 //! follow-up prompt when the agent stops, and the same aim turn continues.
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aim_acp::{AcpAgentConfig, AcpClient, AcpEvent, AcpSession, ConfigKey, ConfigOption, ContentPart, SessionOptions, TurnEnd, Update};
+use aim_acp::{
+    AcpAgentConfig, AcpClient, AcpEvent, AcpSession, ConfigKey, ConfigOption, ContentPart, McpServerSpec, SessionOptions, TurnEnd, Update,
+};
 use aim_proto::conversation::{Item, Part, StopReason};
-use aim_proto::daemon::{Location, Persistence, SessionUpdate};
+use aim_proto::daemon::{Location, Persistence, SessionSpec, SessionUpdate};
 use aim_proto::error::{ErrorCode, ProtoError};
+use aim_proto::harness::{FsRead, FsReadParams, FsRemove, FsRemoveParams};
+use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::ToolResult;
 use futures_util::StreamExt as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{AgentError, AgentEvent, Backend, BackendFuture};
+use crate::context;
+use crate::harness::HarnessClient;
 use crate::host::{BackendFactory, BackendRequest, BoxFuture, Built};
+use crate::remote::RemoteHarness;
 
 /// Provider ids of ACP backends start with this.
 pub const ACP_PREFIX: &str = "acp:";
@@ -142,6 +149,7 @@ fn emit(events: &UnboundedSender<AgentEvent>, update: SessionUpdate) {
 pub struct AcpBackend {
     client: AcpClient,
     session: AcpSession,
+    scratch: Option<tempfile::TempDir>,
 }
 
 impl AcpBackend {
@@ -158,7 +166,82 @@ impl AcpBackend {
         if let Some(effort) = effort {
             session.set_config(&ConfigKey::Effort, effort).await.map_err(|e| e.to_string())?;
         }
-        Ok(Self { client, session })
+        Ok(Self { client, session, scratch: None })
+    }
+
+    async fn start_strict(agent: AcpAgentConfig, spec: &SessionSpec, aimx: &Path) -> Result<(Self, String, String), String> {
+        let (root, location, scratch, project, remote) = match &spec.location {
+            Location::Local => {
+                let root = std::fs::canonicalize(&spec.workspace).map_err(|err| format!("{}: {err}", spec.workspace))?;
+                let root = root.to_string_lossy().into_owned();
+                let harness = HarnessClient::spawn_stdio(&aimx.to_string_lossy(), &root).await.map_err(|err| err.to_string())?;
+                let project = context::project_instructions(harness.peer(), &harness.workspace().id).await;
+                harness.shutdown().await;
+                (root, "local".to_owned(), None, project, None)
+            }
+            Location::Ssh { destination } => {
+                let remote = RemoteHarness::connect(aimx, destination, &spec.workspace).await.map_err(|err| err.to_string())?;
+                let root = remote.client.workspace().root.clone();
+                let project = context::project_instructions(remote.client.peer(), &remote.client.workspace().id).await;
+                let scratch = tempfile::tempdir().map_err(|err| format!("creating local ACP scratch directory: {err}"))?;
+                (root, format!("ssh:{destination}"), Some(scratch), project, Some(remote))
+            }
+        };
+        let cwd = scratch.as_ref().map_or_else(|| PathBuf::from(&root), |dir| dir.path().to_path_buf());
+        let relay = aimx_relay(aimx, &root, &spec.location);
+        let client = AcpClient::spawn(agent.with_cwd(cwd.clone())).await.map_err(|err| err.to_string())?;
+        let mut options = SessionOptions::strict_aim(&cwd, relay.clone()).map_err(|err| err.to_string())?;
+        options.system_prompt_append = Some(authority_prompt(&root, &location, project.as_ref()));
+        let mut session = match remote {
+            None => {
+                let mut challenge = tempfile::NamedTempFile::new_in(&root).map_err(|err| format!("creating aim read challenge: {err}"))?;
+                let nonce = uuid::Uuid::new_v4().to_string();
+                challenge.write_all(nonce.as_bytes()).map_err(|err| format!("writing aim read challenge: {err}"))?;
+                challenge.flush().map_err(|err| format!("flushing aim read challenge: {err}"))?;
+                let witness = client.verify_local_aim_read_authority(relay, challenge.path(), &nonce).await.map_err(authority_error)?;
+                client.new_aim_session(options, &witness).await.map_err(authority_error)?
+            }
+            Some(remote) => {
+                let file_name = format!(".aim-authority-{}.txt", uuid::Uuid::new_v4());
+                let remote_path = Path::new(&root).join(&file_name).to_string_lossy().into_owned();
+                let local_path = cwd.join(&file_name);
+                std::fs::write(&local_path, b"local sentinel").map_err(|err| format!("creating local authority sentinel: {err}"))?;
+                let nonce = uuid::Uuid::new_v4().to_string();
+                let workspace = remote.client.workspace().id.clone();
+                let witness = client
+                    .verify_ssh_aim_authority(relay, &remote_path, &local_path, &nonce, || async {
+                        let read = remote
+                            .client
+                            .peer()
+                            .call::<FsRead>(FsReadParams { workspace: workspace.clone(), path: remote_path.clone(), range: None })
+                            .await
+                            .map_err(|_| aim_acp::AcpError::InvalidState("SSH challenge file was not readable through aimx".into()))?;
+                        Ok(read.content.into_bytes() == nonce.as_bytes())
+                    })
+                    .await;
+                let cleanup = remote
+                    .client
+                    .peer()
+                    .call::<FsRemove>(FsRemoveParams {
+                        workspace,
+                        path: remote_path,
+                        recursive: false,
+                        idempotency_key: IdempotencyKey::new(uuid::Uuid::new_v4().to_string()),
+                    })
+                    .await;
+                remote.shutdown().await;
+                let witness = witness.map_err(authority_error)?;
+                cleanup.map_err(|err| format!("removing SSH authority challenge: {err}"))?;
+                client.new_ssh_session(options, &witness).await.map_err(authority_error)?
+            }
+        };
+        if let Some(model) = spec.model.as_deref() {
+            session.set_config(&ConfigKey::Model, model).await.map_err(|err| err.to_string())?;
+        }
+        if let Some(effort) = spec.effort.as_deref() {
+            session.set_config(&ConfigKey::Effort, effort).await.map_err(|err| err.to_string())?;
+        }
+        Ok((Self { client, session, scratch }, root, location))
     }
 
     /// The model and effort in force.
@@ -280,12 +363,13 @@ impl Backend for AcpBackend {
     }
 
     fn shutdown(self: Box<Self>) -> BackendFuture<'static, ()> {
-        let Self { client, session } = *self;
+        let Self { client, session, scratch } = *self;
         Box::pin(async move {
             if let Err(error) = session.close().await {
                 tracing::debug!(%error, "closing the ACP session failed");
             }
             client.shutdown(SHUTDOWN_GRACE).await;
+            drop(scratch);
         })
     }
 }
@@ -294,31 +378,65 @@ fn unavailable(message: &str) -> ProtoError {
     ProtoError::new(ErrorCode::Unavailable, message)
 }
 
+fn authority_error(error: aim_acp::AcpError) -> String {
+    match error {
+        aim_acp::AcpError::InvalidState(_) => "strict aim tool authority could not be verified; session was not started".to_owned(),
+        other => other.to_string(),
+    }
+}
+
 /// The ACP agent a provider id names (`acp:claude`).
 #[must_use]
 pub fn agent_for(provider: &str) -> Option<AcpAgentConfig> {
     match provider.strip_prefix(ACP_PREFIX)? {
-        "claude" => Some(AcpAgentConfig::claude()),
+        "claude" | "claude-native" => Some(AcpAgentConfig::claude()),
         _ => None,
     }
+}
+
+fn aimx_relay(aimx: &Path, root: &str, location: &Location) -> McpServerSpec {
+    let mut args = vec!["mcp".to_owned(), "--stdio".to_owned(), "--root".to_owned(), root.to_owned()];
+    if let Location::Ssh { destination } = location {
+        args.extend(["--ssh".to_owned(), destination.clone()]);
+        if let Some(config) = std::env::var_os("AIM_SSH_CONFIG") {
+            args.extend(["--ssh-config".to_owned(), config.to_string_lossy().into_owned()]);
+        }
+    }
+    McpServerSpec::Stdio { name: aim_acp::AIM_MCP_SERVER.to_owned(), command: aimx.to_path_buf(), args, env: BTreeMap::default() }
+}
+
+fn authority_prompt(root: &str, location: &str, project: Option<&(String, String)>) -> String {
+    let mut prompt = if location == "local" {
+        format!("Your workspace is {root}. File and shell operations use the aim MCP tools for this workspace.")
+    } else {
+        format!(
+            "Your workspace is remote ({location}) at {root}. File and shell operations use the aim MCP tools on that remote host. Your local ACP cwd is only a scratch directory."
+        )
+    };
+    if let Some((name, text)) = project {
+        let _ = write!(prompt, "\n\n# Project instructions ({name}, from the {location} workspace)\n\n{text}");
+    }
+    prompt
 }
 
 /// Builds ACP sessions for `acp:*` providers and hands everything else to `native`.
 #[must_use]
 pub fn with_acp(native: BackendFactory) -> BackendFactory {
+    with_acp_at(native, crate::cli::find_aimx(None))
+}
+
+/// Builds ACP sessions using `aimx` for strict tool authority.
+#[must_use]
+pub fn with_acp_at(native: BackendFactory, aimx: PathBuf) -> BackendFactory {
     Arc::new(move |request: BackendRequest| {
         if !request.spec.provider.starts_with(ACP_PREFIX) {
             return native(request);
         }
+        let aimx = aimx.clone();
         let fut: BoxFuture<Result<Built, ProtoError>> = Box::pin(async move {
             let BackendRequest { spec, transcript, .. } = request;
             let agent = agent_for(&spec.provider)
                 .ok_or_else(|| ProtoError::new(ErrorCode::InvalidParams, format!("unknown ACP agent `{}`", spec.provider)))?;
-            if !matches!(spec.location, Location::Local) {
-                return Err(unavailable(
-                    "acp:claude runs Claude Code's own tools on this machine; SSH sessions need aim's tools served to it over MCP (not yet)",
-                ));
-            }
             if matches!(spec.persistence, Persistence::Ephemeral) {
                 return Err(unavailable("ephemeral Claude Code sessions need the private-mode check (not yet)"));
             }
@@ -327,22 +445,37 @@ pub fn with_acp(native: BackendFactory) -> BackendFactory {
                     "this session's context lives in Claude Code, and resuming it (session/load) is not wired yet; start a new session",
                 ));
             }
-            let root = tokio::fs::canonicalize(&spec.workspace)
-                .await
-                .map_err(|e| ProtoError::new(ErrorCode::InvalidParams, format!("{}: {e}", spec.workspace)))?;
-            let backend = AcpBackend::start(agent, root.clone(), spec.model.as_deref(), spec.effort.as_deref())
-                .await
-                .map_err(|e| unavailable(&format!("{}: {e}", spec.provider)))?;
+            let (backend, root, location) = if spec.provider == "acp:claude-native" {
+                if !matches!(spec.location, Location::Local) {
+                    return Err(unavailable("Claude Code native tools cannot act on an SSH workspace"));
+                }
+                let root = tokio::fs::canonicalize(&spec.workspace)
+                    .await
+                    .map_err(|e| ProtoError::new(ErrorCode::InvalidParams, format!("{}: {e}", spec.workspace)))?;
+                let backend = AcpBackend::start(agent, root.clone(), spec.model.as_deref(), spec.effort.as_deref())
+                    .await
+                    .map_err(|e| unavailable(&format!("{}: {e}", spec.provider)))?;
+                (backend, root.to_string_lossy().into_owned(), "local:native-tools".to_owned())
+            } else {
+                AcpBackend::start_strict(agent, &spec, &aimx).await.map_err(|e| unavailable(&format!("{}: {e}", spec.provider)))?
+            };
             let (model, _) = backend.config();
             let shutdown: Box<dyn FnOnce() -> BoxFuture<()> + Send> = Box::new(|| Box::pin(async {}));
-            Ok(Built {
-                backend: Box::new(backend),
-                model,
-                root: root.to_string_lossy().into_owned(),
-                location: "local".to_owned(),
-                shutdown,
-            })
+            Ok(Built { backend: Box::new(backend), model, root, location, shutdown })
         });
         fut
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authority_prompt;
+
+    #[test]
+    fn remote_authority_prompt_labels_project_instructions() {
+        let prompt = authority_prompt("/remote/work", "ssh:example", Some(&("AGENTS.md".into(), "Use the project rules.".into())));
+        assert!(prompt.contains("workspace is remote (ssh:example) at /remote/work"));
+        assert!(prompt.contains("AGENTS.md, from the ssh:example workspace"));
+        assert!(prompt.contains("Use the project rules."));
+    }
 }
