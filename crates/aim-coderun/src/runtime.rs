@@ -24,6 +24,7 @@ use rquickjs::{AsyncContext, AsyncRuntime, Promise, Value as JsValue};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::budget::{Charge, EventKind, MAX_EVENTS, MAX_STORE_BYTES, OutputBudget};
 use crate::protocol::{CallTool, CellOutput, Execute, ExecuteResult, Output, ToolCall};
 
 const BOOTSTRAP: &str = r"
@@ -31,7 +32,29 @@ const __aimToolSpecs = JSON.parse(__aimToolsJson);
 const __aimToolNames = new Set(__aimToolSpecs.map(t => t.name));
 const ALL_TOOLS = Object.freeze(__aimToolSpecs.map(t => Object.freeze({name:t.name,description:t.description})));
 const __aimStore = Object.assign(Object.create(null), JSON.parse(__aimStoreJson));
-function store(key, value) { __aimStore[String(key)] = value; }
+const __aimStoreSizes = Object.create(null);
+let __aimStoreSize = 0;
+for (const key of Object.keys(__aimStore)) {
+  __aimStoreSizes[key] = key.length + (JSON.stringify(__aimStore[key]) ?? '').length;
+  __aimStoreSize += __aimStoreSizes[key];
+}
+function store(key, value) {
+  const name = String(key);
+  const encoded = JSON.stringify(value);
+  const size = encoded === undefined ? 0 : name.length + encoded.length;
+  const next = __aimStoreSize - (__aimStoreSizes[name] ?? 0) + size;
+  if (next > __aimStoreLimit) {
+    throw new Error(`store is limited to ${__aimStoreLimit} bytes of JSON (this would make ${next}); store(key, undefined) removes a key`);
+  }
+  __aimStoreSize = next;
+  if (encoded === undefined) {
+    delete __aimStore[name];
+    delete __aimStoreSizes[name];
+  } else {
+    __aimStore[name] = JSON.parse(encoded);
+    __aimStoreSizes[name] = size;
+  }
+}
 function load(key) { return __aimStore[String(key)]; }
 function __aimFormat(value) {
   if (typeof value === 'string') return value;
@@ -104,12 +127,10 @@ impl CodeRuntime for QuickJsRuntime {
     }
 }
 
-#[derive(Default)]
 struct Emitted {
     output: String,
-    bytes: usize,
     yielded: bool,
-    exceeded: bool,
+    budget: OutputBudget,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -222,8 +243,14 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
     runtime.set_max_stack_size(512 * 1024).await;
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline))).await;
     let context = AsyncContext::full(&runtime).await.map_err(js_error)?;
-    let emitted = Arc::new(Mutex::new(Emitted::default()));
-    let (event_tx, mut event_rx) = mpsc::channel::<CellOutput>(128);
+    let emitted = Arc::new(Mutex::new(Emitted {
+        output: String::new(),
+        yielded: false,
+        budget: OutputBudget::new(request.output_limit_bytes, MAX_EVENTS),
+    }));
+    // Unbounded, but the budget admits at most MAX_EVENTS events and output_limit_bytes bytes, so
+    // a burst of helper calls never fails the cell with a full queue.
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<CellOutput>();
     let event_peer = parent.clone();
     let forwarder = tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
@@ -239,7 +266,6 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
     let allowed: HashSet<String> = request.tools.iter().map(|spec| spec.name.clone()).collect();
     let cell_id = request.cell_id.clone();
     let session_id = request.session_id.clone();
-    let max_bytes = request.output_limit_bytes;
     let next_call = Arc::new(AtomicU64::new(0));
     let execution = tokio::time::timeout(
         Duration::from_millis(request.timeout_ms),
@@ -248,6 +274,7 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
             globals.set("__aimToolsJson", specs_json).map_err(js_error)?;
             globals.set("__aimStoreJson", store_json).map_err(js_error)?;
             globals.set("__aimProgramArgsJson", program_args_json).map_err(js_error)?;
+            globals.set("__aimStoreLimit", MAX_STORE_BYTES).map_err(js_error)?;
             let output_state = Arc::clone(&emitted);
             let output_tx = event_tx.clone();
             let output_cell = cell_id.clone();
@@ -255,23 +282,26 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
                 .set(
                     "__aimEmit",
                     Func::from(move |text: String, immediate: bool, yielded: bool| -> rquickjs::Result<()> {
+                        let kind = match (immediate, yielded) {
+                            (_, true) => EventKind::Yield,
+                            (true, false) => EventKind::Notify,
+                            (false, false) => EventKind::Text,
+                        };
                         let mut state = locked(&output_state);
-                        let next = state.bytes.saturating_add(text.len());
-                        if next > max_bytes {
-                            state.exceeded = true;
-                            return Err(rquickjs::Error::new_from_js_message("output", "limit", "cell output limit exceeded"));
+                        state.yielded |= yielded;
+                        // Output over the budget is dropped and counted; it never throws, so a
+                        // cell is never failed after its side effects because it printed too much.
+                        if state.budget.charge(kind, text.len()) != Charge::Keep {
+                            return Ok(());
                         }
-                        state.bytes = next;
-                        if yielded {
-                            state.yielded = true;
-                        } else if !immediate {
+                        if kind == EventKind::Text {
                             state.output.push_str(&text);
                             state.output.push('\n');
                         }
                         drop(state);
-                        output_tx
-                            .try_send(CellOutput { cell_id: output_cell.clone(), text, immediate, yielded })
-                            .map_err(|_| rquickjs::Error::new_from_js_message("output", "queue", "output queue full"))
+                        // Only a finished forwarder closes the channel; the cell is ending then.
+                        drop(output_tx.send(CellOutput { cell_id: output_cell.clone(), text, immediate, yielded }));
+                        Ok(())
                     }),
                 )
                 .map_err(js_error)?;
@@ -348,24 +378,29 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
     drop(event_tx);
     drop(forwarder.await);
     let mut state = locked(&emitted);
-    if state.exceeded {
-        return Err(ProtoError::new(ErrorCode::LimitExceeded, "cell output limit exceeded"));
-    }
     let (returned, stored) = match execution {
         Err(_) if Instant::now() >= deadline => return Err(ProtoError::new(ErrorCode::Timeout, "cell deadline exceeded")),
         other => other?,
     };
+    let mut from_return = false;
     if state.output.is_empty()
         && let Some(value) = returned
     {
-        if value.len() > max_bytes {
-            return Err(ProtoError::new(ErrorCode::LimitExceeded, "cell output limit exceeded"));
-        }
-        state.output = value;
+        // A returned value is output too: what does not fit is dropped and counted.
+        let kept = state.budget.fit(value.len());
+        value.get(..value.floor_char_boundary(kept)).unwrap_or_default().clone_into(&mut state.output);
+        from_return = true;
     }
     let store: HashMap<String, Value> = serde_json::from_str(&stored)
         .map_err(|err| ProtoError::new(ErrorCode::InvalidParams, format!("store contains non-JSON data: {err}")))?;
-    Ok(ExecuteResult { output: state.output.clone(), yielded: state.yielded, store })
+    Ok(ExecuteResult {
+        output: std::mem::take(&mut state.output),
+        returned: from_return,
+        yielded: state.yielded,
+        store,
+        dropped_bytes: state.budget.dropped_bytes(),
+        dropped_events: state.budget.dropped_events(),
+    })
 }
 
 fn js_error(err: rquickjs::Error) -> ProtoError {
