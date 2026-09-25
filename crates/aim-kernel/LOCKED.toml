@@ -4,9 +4,24 @@
 # then `mise run locked:update`.
 
 [[locked]]
+decision = "job::accepted"
+adr = "0048"
+sha256 = "9bcd5c8e6fbaa5292d3a2bd5e22be1585bdd14495ece39bdaffcad505ccdc0d7"
+
+[[locked]]
 decision = "negotiate::agreed"
 adr = "0005"
 sha256 = "7b09700a52ae6b8b126a036d515d00a5a38012025a731040b46dff167774e425"
+
+[[locked]]
+decision = "job::attempt_live"
+adr = "0048"
+sha256 = "7e4b1b2b01200080dbfb81132454d9d6ab65cf43c9c8ea601adf620fa68dc988"
+
+[[locked]]
+decision = "job::claim_is_current"
+adr = "0048"
+sha256 = "8b711f3800839822d4d028de4aba977c49ab777134dc483608168ed93c2a5cc8"
 
 [[locked]]
 decision = "path::confined"
@@ -22,6 +37,16 @@ sha256 = "7ea77f5ce46dc0ba5713501029c62ac29f497d4697cc9ff0ca4617aebc543cb0"
 decision = "policy::effective_ok"
 adr = "0027"
 sha256 = "61f9bd7b83a55b6ec478c9161287b38aede21202d9d6c4cb059b422e1acf78df"
+
+[[locked]]
+decision = "job::fresh"
+adr = "0048"
+sha256 = "b021d3b3d086ce15a9b5066f476869d5cce10bcd613e8157ef4e6800fa4bb020"
+
+[[locked]]
+decision = "job::holds_capacity"
+adr = "0048"
+sha256 = "29c9a0314cb488bdd4e464b2696b7466dbe7c8adca93c9cd4b522264375dcb31"
 
 [[locked]]
 decision = "policy::intersection_ok"

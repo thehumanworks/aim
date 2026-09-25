@@ -161,7 +161,7 @@ pub struct JobView {
     pub evidence_present: bool,
 }
 
-/// Valid persisted state.
+/// LOCKED(ADR-0048): valid persisted state.
 pub open spec fn wf(v: JobView) -> bool {
     &&& v.generation <= v.max_retries
     &&& (v.state == JobState::Posted ==> v.claim is None && v.cleanup == CleanupState::Confirmed
@@ -178,7 +178,7 @@ pub open spec fn wf(v: JobView) -> bool {
     &&& (v.review != ReviewState::Pending ==> v.cleanup == CleanupState::Confirmed)
 }
 
-/// Fresh posted state.
+/// LOCKED(ADR-0048): fresh posted state.
 pub open spec fn fresh(max_retries: u32) -> JobView {
     JobView {
         state: JobState::Posted,
@@ -191,13 +191,13 @@ pub open spec fn fresh(max_retries: u32) -> JobView {
     }
 }
 
-/// Current, unexpired attempt identity.
+/// LOCKED(ADR-0048): current, unexpired attempt identity.
 pub open spec fn claim_is_current(v: JobView, generation: u32, claim_id: u64, now: u64) -> bool {
     v.generation == generation as nat && v.claim is Some && v.claim->0.claim_id == claim_id && now
         < v.claim->0.lease_until
 }
 
-/// A current claim may write only while execution is still live.
+/// LOCKED(ADR-0048): a current claim may write only while execution is still live.
 pub open spec fn attempt_live(v: JobView, generation: u32, claim_id: u64, now: u64) -> bool {
     (v.state == JobState::Claimed || v.state == JobState::Running) && claim_is_current(
         v,
@@ -207,13 +207,13 @@ pub open spec fn attempt_live(v: JobView, generation: u32, claim_id: u64, now: u
     )
 }
 
-/// Whether this job reserves a worker slot, including uncertain cleanup.
+/// LOCKED(ADR-0048): whether this job reserves a worker slot, including uncertain cleanup.
 pub open spec fn holds_capacity(v: JobView, worker: WorkerId) -> bool {
     v.claim is Some && v.claim->0.worker == worker && (v.cleanup == CleanupState::Active
         || v.cleanup == CleanupState::Pending)
 }
 
-/// Accepted evidence available to dependent jobs.
+/// LOCKED(ADR-0048): accepted evidence available to dependent jobs.
 pub open spec fn accepted(v: JobView) -> bool {
     v.state == JobState::Succeeded && v.review == ReviewState::Accepted && v.evidence_present
 }
