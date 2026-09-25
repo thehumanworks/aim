@@ -112,8 +112,9 @@ pub(crate) fn http_error(status: u16, retry_after: Option<&HeaderValue>, body: &
     LlmError { kind, message, status: Some(status), retry_after_ms: retry_after_ms(retry_after) }
 }
 
-/// Maps an `error` object received inside the SSE stream.
-pub(crate) fn stream_error(error: &Value) -> LlmError {
+/// Maps an `error` object received inside the SSE stream; `secrets` are scrubbed from its detail
+/// exactly as for HTTP errors.
+pub(crate) fn stream_error(error: &Value, secrets: &[&str]) -> LlmError {
     let text = detail(error);
     let code = error.get("code");
     let status = code.and_then(Value::as_u64).and_then(|c| u16::try_from(c).ok());
@@ -131,7 +132,7 @@ pub(crate) fn stream_error(error: &Value) -> LlmError {
             LlmErrorKind::Unavailable
         }
     };
-    LlmError { kind, message: format!("provider stream error: {}", sanitize(&text, &[])), status, retry_after_ms: None }
+    LlmError { kind, message: format!("provider stream error: {}", sanitize(&text, secrets)), status, retry_after_ms: None }
 }
 
 #[cfg(test)]
@@ -224,11 +225,22 @@ mod tests {
 
     #[test]
     fn in_stream_errors_keep_their_class() {
-        assert_eq!(stream_error(&json!({"code":429,"message":"slow down"})).kind, LlmErrorKind::RateLimited);
-        assert_eq!(stream_error(&json!({"code":"rate_limit_exceeded","message":"x"})).kind, LlmErrorKind::RateLimited);
-        assert_eq!(stream_error(&json!({"code":400,"message":"bad"})).kind, LlmErrorKind::InvalidRequest);
-        assert_eq!(stream_error(&json!({"code":"context_length_exceeded","message":"x"})).kind, LlmErrorKind::ContextOverflow);
-        assert_eq!(stream_error(&json!({"code":"server_error","message":"x"})).kind, LlmErrorKind::Unavailable);
-        assert!(stream_error(&json!({"code":502,"message":"upstream died"})).message.contains("upstream died"));
+        assert_eq!(stream_error(&json!({"code":429,"message":"slow down"}), &[]).kind, LlmErrorKind::RateLimited);
+        assert_eq!(stream_error(&json!({"code":"rate_limit_exceeded","message":"x"}), &[]).kind, LlmErrorKind::RateLimited);
+        assert_eq!(stream_error(&json!({"code":400,"message":"bad"}), &[]).kind, LlmErrorKind::InvalidRequest);
+        assert_eq!(stream_error(&json!({"code":"context_length_exceeded","message":"x"}), &[]).kind, LlmErrorKind::ContextOverflow);
+        assert_eq!(stream_error(&json!({"code":"server_error","message":"x"}), &[]).kind, LlmErrorKind::Unavailable);
+        assert!(stream_error(&json!({"code":502,"message":"upstream died"}), &[]).message.contains("upstream died"));
+    }
+
+    /// REV4-B Major 1: in-stream detail (message and upstream `metadata.raw`) is scrubbed and bounded.
+    #[test]
+    fn in_stream_detail_is_scrubbed_and_bounded() {
+        let error = json!({"code": 400, "message": format!("bad key sk-secret-value-123 {}", "x".repeat(2000)),
+                           "metadata": {"raw": "upstream saw sk-secret-value-123", "provider_name": "Up"}});
+        let mapped = stream_error(&error, &["sk-secret-value-123"]);
+        assert!(!mapped.message.contains("sk-secret-value-123"), "{}", mapped.message);
+        assert!(mapped.message.starts_with("provider stream error: bad key ***"));
+        assert!(mapped.message.chars().count() < 600);
     }
 }

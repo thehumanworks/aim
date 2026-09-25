@@ -356,9 +356,23 @@ plan fits the budget; compaction strictly shrinks; token arithmetic cannot overf
   rate-limit headers (`x-codex-primary-*`, `-secondary-*`, credits) surfaced in the status line;
   `x-codex-turn-state` echoed for affinity; `usage.attribution` recorded for token-efficiency work.
   Contract: [codex-backend](research/codex-backend.md) + [live probes](research/live-probes.md).
-- **OpenAI-compatible** — named profiles `{base_url, key_env, wire: chat | responses, quirks}`,
-  presets for OpenRouter and Vercel AI Gateway. Quirks are data (e.g. AI Gateway's
-  `min_output_tokens = 16`), not code branches.
+- **OpenAI-compatible** (`aim-llm-openai`, [ADR 0011](adr/0011-openai-compatible-profiles.md)) —
+  named profiles `{id, base_url, api_key_env, wire: chat | responses, quirks, headers, models}`,
+  presets for OpenRouter and Vercel AI Gateway. Only `chat` is implemented. Quirks are data, not
+  code branches:
+  - Output caps: `min_output_tokens` (AI Gateway 16) and `max_output_tokens_field`.
+  - Billed cost: `cost_pointer` into the streamed usage (`/cost` on OpenRouter, `/gateway_cost` on
+    AI Gateway, which includes surcharges); the raw usage object is kept in `Usage.native`.
+  - Caching and affinity: `extra_body` (OpenRouter `cache_control`, AI Gateway
+    `providerOptions.gateway.caching = "auto"`), `session_header` for `Request.session_id`
+    (`x-session-id` / `x-session-affinity`), `cache_key_field` for `Request.cache_key`.
+  - Wire capabilities: `supports_parallel_tool_calls`, `supports_stream_usage` (usage is then
+    required: a turn without it is a `Protocol` error, never zero usage), `reasoning_param`,
+    `replay_reasoning_details`, `tool_result_images` (only to models whose catalog entry accepts
+    images; an unseen model is looked up once), `idle_timeout_secs`.
+  - `headers` holds extra request headers: literal non-secret values, or `{ env = "NAME" }` for
+    secrets, read per request and never serialized. `models` is a static catalog for endpoints
+    without discovery.
 
 ### 6.6 Auth
 

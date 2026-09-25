@@ -67,7 +67,9 @@ pub struct Quirks {
     pub max_output_tokens_field: MaxOutputTokensField,
     /// Whether the endpoint accepts `parallel_tool_calls`.
     pub supports_parallel_tool_calls: bool,
-    /// Whether the endpoint accepts `stream_options.include_usage`.
+    /// Whether usage is requested with `stream_options.include_usage` — and then required: a
+    /// response without a usage chunk is a `Protocol` error, never a turn with zero usage. `false`
+    /// opts out for endpoints that cannot report usage; their turns report zero usage.
     pub supports_stream_usage: bool,
     /// Reasoning parameter shape.
     pub reasoning_param: ReasoningParam,
@@ -79,7 +81,9 @@ pub struct Quirks {
     /// response when talking to this profile again.
     pub replay_reasoning_details: bool,
     /// Whether the endpoint accepts `image_url` content parts; tool-result images are then sent
-    /// in a user message after the tool results, otherwise replaced by a text placeholder.
+    /// in a user message after the tool results to models whose catalog entry accepts images
+    /// (an unseen model is looked up in the catalog first). Otherwise, and for models the
+    /// catalog does not list, they are replaced by a text placeholder.
     pub tool_result_images: bool,
     /// Fields merged into the top level of every request body, e.g. prompt-cache settings.
     pub extra_body: Option<Map<String, Value>>,
@@ -100,8 +104,61 @@ impl Quirks {
     }
 }
 
+/// Where an extra request header's value comes from.
+///
+/// A plain string is a literal, **non-secret** value that is stored and serialized with the
+/// profile (`"x-title" = "aim"`). A secret is referenced by environment variable
+/// (`"helicone-auth" = { env = "HELICONE_AUTH" }`): the variable is read for every request, its
+/// value is sent as a sensitive header and scrubbed from errors, and only its name is ever
+/// serialized. `Debug` prints variable names, never values.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HeaderSource {
+    /// A literal, non-secret value.
+    Literal(String),
+    /// A value read from an environment variable at request time.
+    Env(EnvRef),
+}
+
+/// A reference to an environment variable by name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvRef {
+    /// Name of the environment variable.
+    pub env: String,
+}
+
+impl HeaderSource {
+    /// A value read from the environment variable `name` at request time.
+    #[must_use]
+    pub fn env(name: impl Into<String>) -> Self {
+        Self::Env(EnvRef { env: name.into() })
+    }
+}
+
+impl From<&str> for HeaderSource {
+    fn from(value: &str) -> Self {
+        Self::Literal(value.to_owned())
+    }
+}
+
+impl From<String> for HeaderSource {
+    fn from(value: String) -> Self {
+        Self::Literal(value)
+    }
+}
+
+impl fmt::Debug for HeaderSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Literal(_) => f.write_str("Literal(***)"),
+            Self::Env(reference) => reference.fmt(f),
+        }
+    }
+}
+
 /// A named OpenAI-compatible endpoint. `api_key_env` names an environment variable, never its value.
-/// `Debug` prints header names only.
+/// `Debug` prints header names and variable names only.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -116,9 +173,10 @@ pub struct Profile {
     /// Endpoint behavior.
     #[serde(default)]
     pub quirks: Quirks,
-    /// Additional request headers (non-secret values; `Authorization` is rejected).
+    /// Additional request headers: literal non-secret values or environment references for
+    /// secrets (see [`HeaderSource`]). `Authorization` is rejected: the key comes from `api_key_env`.
     #[serde(default)]
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, HeaderSource>,
     /// Static catalog override for endpoints without discovery.
     #[serde(default)]
     pub models: Option<Vec<ModelInfo>>,
@@ -132,7 +190,7 @@ impl fmt::Debug for Profile {
             .field("api_key_env", &self.api_key_env)
             .field("wire", &self.wire)
             .field("quirks", &self.quirks)
-            .field("headers", &self.headers.keys().map(|name| (name.as_str(), "***")).collect::<BTreeMap<_, _>>())
+            .field("headers", &self.headers)
             .field("models", &self.models.as_ref().map(Vec::len))
             .finish()
     }
