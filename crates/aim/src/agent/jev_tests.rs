@@ -9,6 +9,7 @@ use aim_proto::conversation::{Item, Part, StopReason, Usage};
 use aim_proto::error::ProtoError;
 use aim_proto::ids::IdempotencyKey;
 use aim_proto::tool::{ToolResult, ToolSpec};
+use futures_util::StreamExt as _;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +20,8 @@ use crate::jev::{Advice, Bundle, Decider, DecisionFuture};
 struct Provider {
     replies: Mutex<VecDeque<Vec<StreamEvent>>>,
     requests: Mutex<Vec<Request>>,
+    /// Delay before a reply's last event (the stream's tail after its tool call).
+    tail: Duration,
 }
 
 impl Provider {
@@ -30,6 +33,7 @@ impl Provider {
         Arc::new(Self {
             replies: Mutex::new([vec![tool, done(StopReason::ToolUse)], vec![done(StopReason::EndTurn)]].into()),
             requests: Mutex::new(Vec::new()),
+            tail: Duration::ZERO,
         })
     }
 }
@@ -60,8 +64,17 @@ impl ModelProvider for Provider {
         if let Ok(mut requests) = self.requests.lock() {
             requests.push(request);
         }
-        let reply = self.replies.lock().ok().and_then(|mut replies| replies.pop_front()).unwrap_or_default();
-        Box::pin(async move { Ok(Box::pin(futures_util::stream::iter(reply.into_iter().map(Ok))) as EventStream) })
+        let mut reply = self.replies.lock().ok().and_then(|mut replies| replies.pop_front()).unwrap_or_default();
+        let tail = self.tail;
+        let last = reply.pop();
+        Box::pin(async move {
+            let head = futures_util::stream::iter(reply.into_iter().map(Ok));
+            let end = futures_util::stream::iter(last).then(move |event| async move {
+                tokio::time::sleep(tail).await;
+                Ok(event)
+            });
+            Ok(Box::pin(head.chain(end)) as EventStream)
+        })
     }
 }
 
@@ -113,7 +126,20 @@ impl Decider for ScriptedDecider {
 }
 
 async fn run(tool_ms: u64, decision_ms: u64, fail: bool, enabled: bool) -> (Vec<Request>, Vec<AgentEvent>, usize, Duration) {
-    let provider = Provider::new();
+    run_with_tail(0, tool_ms, decision_ms, fail, enabled).await
+}
+
+async fn run_with_tail(
+    tail_ms: u64,
+    tool_ms: u64,
+    decision_ms: u64,
+    fail: bool,
+    enabled: bool,
+) -> (Vec<Request>, Vec<AgentEvent>, usize, Duration) {
+    let mut provider = Provider::new();
+    if let Some(p) = Arc::get_mut(&mut provider) {
+        p.tail = Duration::from_millis(tail_ms);
+    }
     let calls = Arc::new(AtomicUsize::new(0));
     let mut agent = Agent::new(
         Arc::clone(&provider) as Arc<dyn ModelProvider>,
@@ -154,6 +180,15 @@ async fn decision_overlaps_tool_and_applies_to_next_request() {
     assert_eq!(requests.first().and_then(|r| r.effort.as_deref()), None);
     assert_eq!(requests.get(1).and_then(|r| r.effort.as_deref()), Some("medium"));
     assert!(events.iter().any(|e| matches!(e, AgentEvent::Decision { decision } if decision.current == 0 && decision.output == 1)));
+}
+
+/// REV9 M2: the advice starts at the first complete tool call, not when the stream ends, so a fast
+/// tool followed by a long stream tail still gets its advice applied.
+#[tokio::test]
+async fn advice_starts_at_the_first_tool_call_not_at_the_end_of_the_stream() {
+    let (requests, _events, calls, _elapsed) = run_with_tail(300, 10, 30, false, true).await;
+    assert_eq!(calls, 1, "the advice was requested during the stream");
+    assert_eq!(requests.get(1).and_then(|r| r.effort.as_deref()), Some("medium"), "and applied to the next request");
 }
 
 #[tokio::test]

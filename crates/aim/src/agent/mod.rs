@@ -113,6 +113,18 @@ struct Response {
     running: Running,
     /// Text or reasoning of this response was shown: it cannot be retried transparently.
     streamed: bool,
+    /// Effort advice, requested as soon as the first tool call is complete so it overlaps the
+    /// tools (REV9 M2); aborted if the response is abandoned.
+    decision: Option<PendingDecision>,
+}
+
+/// An advice request in flight; dropping it aborts the request.
+struct PendingDecision(tokio::task::JoinHandle<Option<CompletedDecision>>);
+
+impl Drop for PendingDecision {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Advice and the catalog entry it was computed against.
@@ -534,6 +546,9 @@ impl Agent {
                                 emit(ctx.events, AgentEvent::ToolStarted { call_id: call_id.clone(), name: name.clone(), arguments: arguments.clone() });
                                 response.running.push(self.start_call(specs, id, name, arguments));
                                 response.dispatched.push(Dispatched { id, call_id: call_id.clone(), name: name.clone() });
+                                if response.decision.is_none() {
+                                    response.decision = self.start_decision(&ctx.goal).map(PendingDecision);
+                                }
                             }
                             self.push(item, ctx.events);
                         }
@@ -630,7 +645,7 @@ impl Agent {
         self.push(Item::User { parts: input }, events);
         let mut overflow_retried = false;
         let mut turn = Turn::new();
-        let mut ctx = TurnCtx { events, cancel, inbox, steers: Vec::new() };
+        let mut ctx = TurnCtx { goal: goal.clone(), events, cancel, inbox, steers: Vec::new() };
         let mut seen: HashSet<String> = HashSet::new();
         let mut requests = 0_u32;
         loop {
@@ -706,20 +721,19 @@ impl Agent {
             }
             // The bundle runs concurrently with outstanding tools. It is sampled once after
             // results arrive; a later reply cannot alter this or any later request.
-            let decision = if response.dispatched.is_empty() { None } else { self.start_decision(&goal) };
+            let decision = response.decision.take();
             match self.await_results(&mut turn, &mut response, &mut ctx).await {
                 Some(Ended::Cancelled) => return Ok(self.cancelled(&mut turn, &mut response, &mut ctx)),
                 Some(Ended::Failed(err)) => return self.fail(&mut turn, &mut response, &mut ctx, err),
                 None | Some(Ended::Completed(_)) => {}
             }
-            if let Some(decision) = decision {
-                if matches!(turn.phase(), Phase::Ready) && decision.is_finished() {
-                    if let Ok(Some(completed)) = decision.await {
-                        self.apply_decision(completed.advice, &completed.ladder, completed.default_effort.as_deref(), events);
-                    }
-                } else {
-                    decision.abort();
-                }
+            // A request that has not finished by now is dropped, which aborts it.
+            if let Some(mut decision) = decision
+                && matches!(turn.phase(), Phase::Ready)
+                && decision.0.is_finished()
+                && let Ok(Some(completed)) = (&mut decision.0).await
+            {
+                self.apply_decision(completed.advice, &completed.ladder, completed.default_effort.as_deref(), events);
             }
             match turn.phase() {
                 Phase::Cancelling => {
@@ -917,6 +931,8 @@ impl Agent {
 
 /// Per-turn plumbing shared by the phases.
 struct TurnCtx<'a, 'b> {
+    /// The turn's goal (the user's prompt), for advice digests.
+    goal: String,
     events: &'a UnboundedSender<AgentEvent>,
     cancel: &'a CancellationToken,
     inbox: Option<&'b mut UnboundedReceiver<Vec<Part>>>,
