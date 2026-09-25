@@ -22,10 +22,10 @@ client still builds.
 | ID | Task | Status | Now | Next | Branch / worktree |
 |---|---|---|---|---|---|
 | T0 | Base: merge FIX16 (`agent/claude/fix16-coderun`) and W26 (`agent/perf/tokens`) as-is (maintainer decision) | done | Merged (`eda6444`, `36f1bd8`); conflicts resolved in event.rs, session.rs, agent/mod.rs, agent/tools.rs, host.rs; clippy, xtask and 963/963 tests green | — | integration branch |
-| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | review | Merged (`84bbbc4`); kernel `switch`; live completion checked on codex, openrouter, acp:claude; follow-ups running (effort case-fold, `auto` only where supported, stale model on reattach); codex REV-T1 running | Merge follow-ups and review fixes | `agent/claude/tui-options` · `../aim-wt/tui-options` |
+| T1 | `/provider`, `/model`, `/effort` suggestions and completion; model list follows the selected provider (one `SessionOptions` update, ADR 0074) | review | Merged incl. follow-ups and REV-T1 fixes (`b975ac7`, merge `d3a31a0`); kernel 323 verified on branch; codex re-check running | Close on re-check verdict | `agent/claude/tui-options` · `../aim-wt/tui-options` |
 | T2 | `/clear` clears the chat and starts fresh | review | Merged with T1 (transcript, inline rows, row cache, screen + scrollback best effort, new session) | With T1 | with T1 |
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
-| T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | review | Merged (`58f857e`); kernel `code_mode`; relay live over local and SSH; codex REV-T4a running | Merge review fixes | `agent/claude/code-mode` · `../aim-wt/code-mode` |
+| T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | review | Merged (`58f857e`); codex REV-T4a: MERGE AFTER FIXES (B1 unbounded error text, B2 relay outlives a disconnected client, N1 invalid AIM_CODE_MODE silent); worker fixing | Merge the fix commits | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | in progress | Worker running (budget: OpenRouter ≤ $3, codex ≤ 12, acp:claude ≤ 16 runs) | Merge; decision into ADR 0076 | `agent/claude/code-mode-bench` · `../aim-wt/code-mode-bench` |
 | T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | review | Merged incl. REV-T5 fixes (`c4a1b35`, merge `1deaa65`); kernel conflict rule proved; live re-run green; codex re-check running | Close on re-check verdict | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
@@ -114,3 +114,12 @@ client still builds.
   over SSH. Merged tree (T1+T3+T4a+T5): clippy clean, xtask ok, Verus 353 verified, 0 errors.
 - 2026-09-25 — Codex REV-T4a started; T4b launched (wire gate repair + pre-registered code-mode
   benchmark + default decision).
+- 2026-09-25 — Codex REV-T4a (auth.json hash unchanged): MERGE AFTER FIXES. No ceiling-widening path
+  found; kernel matches ADR 0076 (254 verified on branch). B1: script error messages bypass the
+  cell output budget (runtime.rs:239, cells.rs:100). B2: on client EOF the relay waits for
+  pending calls (server.rs:79, proxy.rs:118), so aimx/ssh children can outlive the client by up
+  to 630 s. N1: an invalid AIM_CODE_MODE silently selects the default; `aim run` shows no
+  warning. Sent back to the T4a worker.
+- 2026-09-25 — T1 follow-ups + REV-T1 fixes merged (`d3a31a0`): case-folded choices, `auto_effort`,
+  generation-fenced option publishing, pinned candidate order, live summary model. Merged tree:
+  clippy clean; aim lib 286/286, host 30/30, acp_bridge 5/5. Codex re-check of T1 started.
