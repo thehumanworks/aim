@@ -77,3 +77,4 @@ Rules (enforced by `mise run check`):
 | [0064](0064-ui-surfaces-envelope-events-and-agent-tools.md) | Carry agent UI surfaces as validated, logged A2UI-shaped messages. |
 | [0065](0065-locked-digests-resolve-names-by-module.md) | LOCKED digests resolve kernel names by module. |
 | [0066](0066-code-cell-lifecycle-provenance-and-limits.md) | Bind code cells to the turn that observes them, record their nested calls, and bound their output. |
+| [0076](0076-code-mode-setting-and-acp-relay.md) | Select code mode with `AIM_CODE_MODE`, decide its exposure in the kernel, and serve it to Claude through aim's relay. |
