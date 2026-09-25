@@ -37,10 +37,10 @@ client still builds.
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` (worktree removed) |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | done | Merged incl. REV-T4a and REV-T4a-b fixes (`e569a5e`) | Residual in ADR 0076: aimx needs a SIGTERM handler (orphan shells if it ignores close) | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | done | Merged (`2df7b76`): exact graders (codex REV-T4b3: MERGE), cohort 2 rule verdict `off`, shipped default On per maintainer, wire gate green | — | `agent/claude/code-mode-bench` (worktree removed) |
-| T4c | Per-session code mode: client-side `AIM_CODE_MODE` / `--code-mode` carried in the session spec, kept on resume and `/new`, shown in the status line; ACP relay follows it | review | Merged (`d04bcf1`, merge `b7eaf87`); kernel 364 verified on branch; live: `code:on` with a daemon started without the variable; codex REV-T4c running | Close on verdict; remove worktree | `agent/claude/code-mode` · `../aim-wt/code-mode` |
+| T4c | Per-session code mode: client-side `AIM_CODE_MODE` / `--code-mode` carried in the session spec, kept on resume and `/new`, shown in the status line; ACP relay follows it | done | Merged incl. REV-T4c fix (`848473c`); codex REV-T4c2: MERGE | — | `agent/claude/code-mode` (worktree removed) |
 | T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | done | Merged incl. REV-T5 fixes (`c4a1b35`); codex re-check: MERGE | Follow-up (not in this batch): adapter resets mode/effort on model switch | `agent/claude/acp-models` (worktree removed) |
-| T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
-| T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
+| T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T4c, T5) | done | Kernel modules `switch`, `model_match`, `cells`, `code_mode`; final head: 364 verified, 0 errors (DRAFT, not LOCKED) | Maintainer: lock when accepted | — |
+| T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | done | Final head `33b7502`: `mise run check` green (1,044 passed, 0 failed), wire gate passed, `mise run verify` 364 verified | PR open against `main` | integration branch |
 
 ## Log
 
@@ -203,3 +203,7 @@ client still builds.
   an outside `find … -name target -exec rm -rf` deleted its target/ mid-run (not a batch worker).
   DEFAULT_MODE confirmed On after the merge. Release binaries rebuilt in the lead checkout
   (`cargo build --release`, daemon not stopped). Codex REV-T4c started.
+- 2026-09-25 — Codex REV-T4c2: MERGE. Worktree `code-mode` removed. Final gate on `33b7502`
+  (nothing else of this batch running): `mise run check` green — 1,044 tests passed, 0 failed,
+  107 ignored (live); wire gate passed; `mise run verify`: 364 verified, 0 errors. Batch closed;
+  PR opened against `main`.
