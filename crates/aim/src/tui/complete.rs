@@ -38,6 +38,8 @@ pub const INDEX_TTL: Duration = Duration::from_secs(10);
 pub const FRONT_MATTER_BYTES: u64 = 8 * 1024;
 /// Most skills read from one directory.
 pub const MAX_SKILLS: usize = 256;
+/// Paths ranked between two yields: a cancelled request stops within one chunk.
+pub const RANK_CHUNK: usize = 512;
 
 /// What is being completed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,12 +205,14 @@ impl Source for NoFiles {
     }
 }
 
-type Build<T> = Shared<BoxFuture<Option<Arc<T>>>>;
+/// A build in flight or done: when it finished, and what it made.
+type Build<T> = Shared<BoxFuture<Option<(Instant, Arc<T>)>>>;
 
-/// A value built by one blocking task and shared while fresh: concurrent or cancelled requests
-/// never start a second build (the work runs to completion once, whoever still waits for it).
+/// A value built by one blocking task and shared: a build in progress is always reused, and a
+/// finished one stays fresh for a TTL counted from when it *finished*. Concurrent, cancelled or
+/// late requests never start a second build (the work runs once, whoever still waits for it).
 pub struct SingleFlight<T> {
-    state: Mutex<Option<(Instant, Build<T>)>>,
+    state: Mutex<Option<Build<T>>>,
     builds: AtomicUsize,
 }
 
@@ -218,20 +222,28 @@ impl<T: Send + Sync + 'static> SingleFlight<T> {
         Self { state: Mutex::new(None), builds: AtomicUsize::new(0) }
     }
 
-    /// The value built less than `ttl` ago, or a new build of it.
-    pub fn get(&self, ttl: Duration, build: impl FnOnce() -> T + Send + 'static) -> Build<T> {
+    /// The value in progress or finished less than `ttl` ago, or a new build of it.
+    pub fn get(&self, ttl: Duration, build: impl FnOnce() -> T + Send + 'static) -> BoxFuture<Option<Arc<T>>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((at, shared)) = state.as_ref()
-            && at.elapsed() < ttl
-        {
-            return shared.clone();
-        }
-        self.builds.fetch_add(1, Ordering::Relaxed);
-        let task = tokio::task::spawn_blocking(move || Arc::new(build()));
-        let future: BoxFuture<Option<Arc<T>>> = Box::pin(async move { task.await.ok() });
-        let shared = future.shared();
-        *state = Some((Instant::now(), shared.clone()));
-        shared
+        let reusable = state.as_ref().filter(|shared| match shared.peek() {
+            None => true,
+            Some(Some((done, _))) => done.elapsed() < ttl,
+            Some(None) => false,
+        });
+        let shared = if let Some(shared) = reusable {
+            shared.clone()
+        } else {
+            self.builds.fetch_add(1, Ordering::Relaxed);
+            let task = tokio::task::spawn_blocking(move || {
+                let value = Arc::new(build());
+                (Instant::now(), value)
+            });
+            let future: BoxFuture<Option<(Instant, Arc<T>)>> = Box::pin(async move { task.await.ok() });
+            let shared = future.shared();
+            *state = Some(shared.clone());
+            shared
+        };
+        Box::pin(async move { shared.await.map(|(_, value)| value) })
     }
 
     /// How many builds have started.
@@ -372,18 +384,26 @@ type Index = Vec<String>;
 pub struct LocalFiles {
     root: PathBuf,
     index: Arc<SingleFlight<Index>>,
+    /// Paths ranked so far (all requests).
+    scored: Arc<AtomicUsize>,
 }
 
 impl LocalFiles {
     /// Files under `root`.
     pub fn new(root: PathBuf) -> Self {
-        Self { root, index: Arc::new(SingleFlight::new()) }
+        Self { root, index: Arc::new(SingleFlight::new()), scored: Arc::new(AtomicUsize::new(0)) }
     }
 
     /// How many index builds have started.
     #[cfg(test)]
     pub fn builds(&self) -> usize {
         self.index.builds()
+    }
+
+    /// How many paths have been ranked.
+    #[cfg(test)]
+    pub fn scored(&self) -> usize {
+        self.scored.load(Ordering::Relaxed)
     }
 }
 
@@ -406,14 +426,39 @@ fn walk(root: &Path) -> Vec<String> {
     out
 }
 
-fn file_candidates(index: &[String], query: &str) -> Vec<Candidate> {
-    let chosen: Vec<String> = if query.is_empty() {
-        let mut shallow: Vec<&String> = index.iter().filter(|p| p.trim_end_matches('/').matches('/').count() == 0).collect();
-        shallow.sort_by_key(|p| (!p.ends_with('/'), p.to_ascii_lowercase()));
-        shallow.into_iter().take(MAX_CANDIDATES).cloned().collect()
-    } else {
-        rank(query, index.to_vec(), true).into_iter().take(MAX_CANDIDATES).map(|(p, _)| p).collect()
-    };
+/// The top-level entries, directories first (an empty `@` query).
+fn shallow(index: &[String]) -> Vec<String> {
+    let mut shallow: Vec<&String> = index.iter().filter(|p| p.trim_end_matches('/').matches('/').count() == 0).collect();
+    shallow.sort_by_key(|p| (!p.ends_with('/'), p.to_ascii_lowercase()));
+    shallow.into_iter().take(MAX_CANDIDATES).cloned().collect()
+}
+
+/// The best paths for `query`, ranked over references in chunks that yield between them: the
+/// work lives in the request's future, so a cancelled request stops ranking within one chunk and
+/// no copy of the index is made.
+async fn ranked(index: &[String], query: &str, scored: &AtomicUsize) -> Vec<String> {
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut hits: Vec<(u32, usize)> = Vec::new();
+    for (n, chunk) in index.chunks(RANK_CHUNK).enumerate() {
+        if n > 0 {
+            tokio::task::yield_now().await;
+        }
+        let mut config = Config::DEFAULT;
+        config.set_match_paths();
+        let mut matcher = Matcher::new(config);
+        let mut buf = Vec::new();
+        for (offset, path) in chunk.iter().enumerate() {
+            if let Some(score) = pattern.score(nucleo_matcher::Utf32Str::new(path, &mut buf), &mut matcher) {
+                hits.push((score, n * RANK_CHUNK + offset));
+            }
+        }
+        scored.fetch_add(chunk.len(), Ordering::Relaxed);
+    }
+    hits.sort_by_key(|(score, at)| (core::cmp::Reverse(*score), *at));
+    hits.into_iter().take(MAX_CANDIDATES).filter_map(|(_, at)| index.get(at).cloned()).collect()
+}
+
+fn file_candidates(chosen: Vec<String>) -> Vec<Candidate> {
     chosen
         .into_iter()
         .map(|path| {
@@ -433,9 +478,11 @@ impl Source for LocalFiles {
         let root = self.root.clone();
         let index = self.index.get(INDEX_TTL, move || walk(&root));
         let query = request.context.query.clone();
+        let scored = Arc::clone(&self.scored);
         Box::pin(async move {
             let Some(index) = index.await else { return Vec::new() };
-            tokio::task::spawn_blocking(move || file_candidates(&index, &query)).await.unwrap_or_default()
+            let chosen = if query.is_empty() { shallow(&index) } else { ranked(&index, &query, &scored).await };
+            file_candidates(chosen)
         })
     }
 }
@@ -567,9 +614,9 @@ mod tests {
     #[test]
     fn empty_file_queries_list_the_top_level_directories_first() {
         let index = vec!["b.txt".to_owned(), "src/".to_owned(), "src/main.rs".to_owned(), "a/".to_owned()];
-        let labels: Vec<String> = file_candidates(&index, "").into_iter().map(|c| c.label).collect();
+        let labels: Vec<String> = file_candidates(shallow(&index)).into_iter().map(|c| c.label).collect();
         assert_eq!(labels, ["a/", "src/", "b.txt"]);
-        let ranked = file_candidates(&index, "main");
+        let ranked = file_candidates(futures_util::FutureExt::now_or_never(ranked(&index, "main", &AtomicUsize::new(0))).unwrap());
         assert_eq!(ranked.first().map(|c| c.insert.as_str()), Some("@src/main.rs "));
     }
 
@@ -665,6 +712,50 @@ mod tests {
         let skill_request = Request { context: Context { trigger: Trigger::Skill, ..request("x").context }, ..request("x") };
         futures_util::future::join_all((0..16).map(|_| skills.complete(&skill_request))).await;
         assert_eq!(skills.builds(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// REV12 (residual of REV10 #10): a build that outlives the TTL is still the one shared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rev12_a_build_longer_than_the_ttl_is_not_duplicated() {
+        let flight: SingleFlight<u32> = SingleFlight::new();
+        let ttl = Duration::from_millis(50);
+        let first = flight.get(ttl, || {
+            std::thread::sleep(Duration::from_millis(250));
+            1
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let second = flight.get(ttl, || 2);
+        assert_eq!(flight.builds(), 1, "the running build is reused past the TTL");
+        assert_eq!(second.await.map(|v| *v), Some(1));
+        assert_eq!(first.await.map(|v| *v), Some(1));
+    }
+
+    /// REV12 (residual of REV10 #10): a cancelled `@` request stops ranking.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rev12_a_cancelled_request_stops_ranking() {
+        let dir = std::env::temp_dir().join(format!("aim-rank-{}", uuid::Uuid::new_v4().simple()));
+        for d in 0..60 {
+            let sub = dir.join(format!("d{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..100 {
+                std::fs::write(sub.join(format!("f{f}.rs")), "").unwrap();
+            }
+        }
+        let files = LocalFiles::new(dir.clone());
+        let request = |q: &str| Request {
+            generation: 1,
+            context: Context { trigger: Trigger::File, query: q.into(), start: 0, end: 0 },
+            hints: Vec::new(),
+        };
+        assert!(!files.complete(&request("f1")).await.is_empty());
+        let total = files.scored();
+        let mut cancelled = files.complete(&request("f2"));
+        let _pending = futures_util::poll!(&mut cancelled);
+        drop(cancelled);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let ranked = files.scored() - total;
+        assert!(ranked < total, "the cancelled request stopped ranking ({ranked} of {total})");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
