@@ -12,6 +12,7 @@
 //! - [`acp`] — Claude Code (and other ACP agents) as a session backend.
 //! - [`login`] — `aim login codex | claude`.
 //! - [`daemon`] — the local daemon server, client and auto-spawn.
+//! - [`tui`] — the terminal UI: inline chat on a [`host::SessionClient`].
 pub mod acp;
 pub mod agent;
 pub mod cli;
@@ -27,3 +28,4 @@ pub mod remote;
 pub mod resources;
 pub mod session;
 pub mod store;
+pub mod tui;
