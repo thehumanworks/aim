@@ -159,21 +159,24 @@ impl AcpSession {
         self.prompt(&parts).await
     }
 
-    /// Sets a configuration option to one of its advertised values and confirms the agent
-    /// applied it. Returns the options as the agent now reports them.
+    /// Sets a configuration option to the advertised value `value` resolves to (exactly, by
+    /// case, or for the model by family: docs/adr/0075) and confirms the agent applied it.
+    /// Returns the options as the agent now reports them.
     ///
     /// # Errors
     ///
     /// [`AcpError::ConfigUnavailable`], [`AcpError::ConfigValueRejected`],
-    /// [`AcpError::ConfigNotApplied`], or a request error.
+    /// [`AcpError::ConfigValueAmbiguous`], [`AcpError::ConfigNotApplied`], or a request error.
     pub async fn set_config(&mut self, key: &ConfigKey, value: &str) -> Result<&[ConfigOption], AcpError> {
-        let (id, mut params) = config_options::set_params(&self.config_options, key, value)?;
+        // `value` may be an alias (`opus`); the agent must then report the advertised value it
+        // resolved to (docs/adr/0075).
+        let (id, resolved, mut params) = config_options::set_params(&self.config_options, key, value)?;
         if let Some(object) = params.as_object_mut() {
             object.insert("sessionId".into(), Value::String(self.id.clone()));
         }
         let result = self.shared.request("session/set_config_option", params, Some(self.shared.request_timeout)).await?;
         let options = parse_config_options(result.get("configOptions"));
-        config_options::confirm(&options, &id, value)?;
+        config_options::confirm(&options, &id, &resolved)?;
         self.config_options = options;
         Ok(&self.config_options)
     }

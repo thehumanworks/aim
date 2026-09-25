@@ -45,7 +45,7 @@ pub use client::{
     SessionCapabilities, initialize_params,
 };
 pub use config::{AcpAgentConfig, CLAUDE_AGENT_ACP};
-pub use config_options::{ConfigKey, ConfigKind, ConfigOption, ConfigValue, parse_config_options};
+pub use config_options::{ConfigKey, ConfigKind, ConfigOption, ConfigValue, parse_config_options, resolve_config_value};
 pub use conformance::{AimAuthorityEvidence, PrivateModeEvidence, VerifiedAimAuthority, VerifiedPrivateMode, VerifiedSshAuthority};
 pub use error::{AUTH_REQUIRED_CODE, AcpError};
 pub use events::{

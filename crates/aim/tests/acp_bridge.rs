@@ -325,6 +325,58 @@ async fn live_acp_claude_session_through_the_host() {
     let _cleanup = std::fs::remove_dir_all(&dir);
 }
 
+/// `acp:claude` with `-m opus`: claude-agent-acp offers Opus only as `opus[1m]`, so the host
+/// session starts on the resolved value, and an unknown model is refused with the offered values
+/// (ADR 0075). Run with `mise exec -- cargo test -p aim --test acp_bridge -- --ignored live_acp_claude_session_with_model_alias`.
+#[tokio::test]
+#[ignore = "live: runs Claude Code through claude-agent-acp"]
+async fn live_acp_claude_session_with_model_alias() {
+    let dir = std::env::temp_dir().join(format!("aim-live-acp-model-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let native: BackendFactory =
+        Arc::new(|_request: BackendRequest| Box::pin(async { Err(ProtoError::new(ErrorCode::Internal, "native")) }));
+    let host = SessionHost::new(HostConfig {
+        store: Arc::new(MemoryStore::default()),
+        backends: with_acp_at(native, aimx_binary()),
+        update_capacity: 1024,
+    });
+    let spec = |model: &str| SessionSpec {
+        workspace: dir.to_string_lossy().into_owned(),
+        location: Location::Local,
+        provider: "acp:claude".into(),
+        model: Some(model.into()),
+        effort: None,
+        agent: None,
+        persistence: Persistence::Persistent,
+    };
+    let refused = host.create(spec("gpt-6")).await.unwrap_err();
+    eprintln!("live acp model: gpt-6 refused: {}", refused.message);
+    assert!(refused.message.contains("model `gpt-6` is not offered") && refused.message.contains("`opus[1m]`"), "{}", refused.message);
+
+    let started = std::time::Instant::now();
+    let summary = host.create(spec("opus")).await.unwrap();
+    let id = summary.meta.id.clone();
+    let (_, mut updates) = host.attach(id.clone()).await.unwrap();
+    host.prompt(id.clone(), vec![Part::Text { text: "Reply with the word ok.".into() }]).await.unwrap();
+    let mut got = Vec::new();
+    loop {
+        let update = tokio::time::timeout(Duration::from_secs(180), updates.next()).await.unwrap().unwrap();
+        let idle = matches!(update, SessionUpdate::StateChanged { state: SessionState::Idle });
+        got.push(update);
+        if idle {
+            break;
+        }
+    }
+    let text: String =
+        got.iter().filter_map(|u| if let SessionUpdate::TextDelta { delta } = u { Some(delta.as_str()) } else { None }).collect();
+    eprintln!("live acp model: -m opus runs on {} ({:?}), reply {text:?}", summary.meta.model, started.elapsed());
+    assert!(summary.meta.model.contains("opus"), "{}", summary.meta.model);
+    assert!(text.to_lowercase().contains("ok"), "{text:?}");
+    assert!(got.iter().any(|u| matches!(u, SessionUpdate::TurnEnded { stop: StopReason::EndTurn })));
+    host.close(id).await.unwrap();
+    let _cleanup = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 #[ignore = "live: runs Claude Code through aim MCP and a private user-space sshd"]
 async fn live_acp_claude_ssh_remote_changed_local_untouched() {
