@@ -469,7 +469,7 @@ async fn live_openrouter_cache_ten_steps() -> Result<(), LlmError> {
     request.cache_key = Some("aim:w26:cache-probe".into());
     request.session_id = Some("aim-w26-cache-probe".into());
     request.max_output_tokens = Some(32);
-    let mut totals = (0_u64, 0_u64);
+    let mut totals = (0_u64, 0_u64, 0_u64);
     for step in 1..=10 {
         if step > 1 {
             request.items.push(Item::Assistant { id: None, parts: vec![Part::Text { text: "OK".into() }], native: None });
@@ -483,8 +483,15 @@ async fn live_openrouter_cache_ten_steps() -> Result<(), LlmError> {
             .ok_or_else(|| LlmError::new(LlmErrorKind::Protocol, "live cache probe has no completion usage"))?;
         totals.0 = totals.0.saturating_add(usage.input_tokens);
         totals.1 = totals.1.saturating_add(usage.cached_input_tokens);
-        eprintln!("cache step={step} input={} cached={}", usage.input_tokens, usage.cached_input_tokens);
+        totals.2 = totals.2.saturating_add(usage.cost_micro_usd.unwrap_or(0));
+        eprintln!(
+            "cache step={step} input={} cached={} cost_micro_usd={:?}",
+            usage.input_tokens, usage.cached_input_tokens, usage.cost_micro_usd
+        );
+        if totals.2 > 100_000 {
+            return Err(LlmError::new(LlmErrorKind::InvalidRequest, "live cache probe exceeded its $0.10 spend guard"));
+        }
     }
-    eprintln!("cache ten steps input={} cached={}", totals.0, totals.1);
+    eprintln!("cache ten steps input={} cached={} cost_micro_usd={}", totals.0, totals.1, totals.2);
     Ok(())
 }

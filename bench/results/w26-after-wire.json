@@ -1,14 +1,14 @@
 {
   "binary_sha256": {
-    "aim": "6fe08b6feb93e4544099e4f7979e8528415056694dadbb755516f561ee5111ff",
-    "aim_coderun": "217dc043a4269398e25fb427a89e72f31976afd5ac67381a14a79ca2e82a50f2",
-    "aimx": "1a4874ea3c523853346df68276289c9f5edf7a2d463dd4c20b7839db184f856c",
+    "aim": "93ec116bfdb87f9c39613c065b1cd2a4d7eb803c119d9c400fce46a991f3f19e",
+    "aim_coderun": "a135d442bc9ec286787eef88c08ebf5613fc5faea6169755a1e207eb6890564b",
+    "aimx": "39438e78ab4600041aa8baa568f5ff909c2321f50940a16e801f059790e6c6b6",
     "codex": "8b93eddd656ee85e07785fed7b0c6f445491abfba80d52e278d0afd1fe680a4e",
     "pi": "0fcda879f854b95368a4c217782a78808f7fea61cf60cc1e6fbec4f5b5d700f9",
     "python": "ab15cbe78b02b5fc939765827e0b1c2dc3668def22c6952f06a369bfbde01163"
   },
   "budget_used_including_transport_reserve_usd": 0.0,
-  "finished_unix": 1790320026.272182,
+  "finished_unix": 1790321029.099688,
   "hardware": {
     "machine": "arm64",
     "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
@@ -26,7 +26,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 5844,
       "first_request_instructions_chars": 1440,
-      "first_request_ms": 1765.41,
+      "first_request_ms": 32.75,
       "first_request_tokens_estimate": 1461,
       "first_request_tool_schema_bytes": [
         {
@@ -72,17 +72,17 @@
       ],
       "first_request_tools": 10,
       "first_request_tools_json_bytes": 4035,
-      "first_token_ms": 63.238,
+      "first_token_ms": 45.446,
       "harness": "aim_openrouter",
-      "harness_peak_rss_mb": 26.0,
-      "helpers_peak_rss_mb": 16.19,
+      "harness_peak_rss_mb": 26.48,
+      "helpers_peak_rss_mb": 15.99,
       "http_exchanges": 2,
       "ite": 1466.0,
       "max_tool_output_chars": 0,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 43.42,
+      "peak_rss_mb": 43.4,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -130,7 +130,7 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 1834.65
+      "wall_ms": 81.05
     },
     {
       "append_only_steps": 0,
@@ -142,7 +142,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 38432,
       "first_request_instructions_chars": 26825,
-      "first_request_ms": 478.21,
+      "first_request_ms": 177.89,
       "first_request_tokens_estimate": 9608,
       "first_request_tool_schema_bytes": [
         {
@@ -184,9 +184,9 @@
       ],
       "first_request_tools": 9,
       "first_request_tools_json_bytes": 9102,
-      "first_token_ms": 76.219,
+      "first_token_ms": 43.494,
       "harness": "codex",
-      "harness_peak_rss_mb": 105.99,
+      "harness_peak_rss_mb": 105.3,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 1,
       "ite": 9613.0,
@@ -194,7 +194,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 135.36,
+      "peak_rss_mb": 135.14,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -241,7 +241,7 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 794.92
+      "wall_ms": 448.43
     },
     {
       "append_only_steps": 0,
@@ -253,7 +253,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 6099,
       "first_request_instructions_chars": 2582,
-      "first_request_ms": 332.28,
+      "first_request_ms": 250.62,
       "first_request_tokens_estimate": 1525,
       "first_request_tool_schema_bytes": [
         {
@@ -275,9 +275,9 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 3101,
-      "first_token_ms": 53.723,
+      "first_token_ms": 42.365,
       "harness": "pi",
-      "harness_peak_rss_mb": 146.54,
+      "harness_peak_rss_mb": 146.85,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 1,
       "ite": 1530.0,
@@ -285,7 +285,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 146.65,
+      "peak_rss_mb": 147.03,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -293,529 +293,6 @@
       "read_argument_keys": {},
       "read_failure_classes": {},
       "repetition": -1,
-      "request_json_bytes": [
-        6099
-      ],
-      "request_lcp_bytes": [],
-      "request_response_sizes": [
-        [
-          2378,
-          1732
-        ]
-      ],
-      "request_usage": [
-        {
-          "cache_write_tokens": 0,
-          "cached_tokens": 0,
-          "input_tokens": 1525,
-          "output_tokens": 1,
-          "reasoning_tokens": 0
-        }
-      ],
-      "requests": 1,
-      "response_statuses": [
-        200
-      ],
-      "stable_head_ratio_median": null,
-      "stable_head_ratios": [],
-      "timed_out": false,
-      "tool_calls_by_name": {},
-      "tool_output_recovery_hint": false,
-      "tool_result_pattern_counts": {},
-      "transport_errors": 0,
-      "turn_failure_class": null,
-      "usage": {
-        "cache_write_tokens": 0,
-        "cached_tokens": 0,
-        "cost_usd": null,
-        "input_tokens": 1525,
-        "output_tokens": 1,
-        "reasoning_tokens": 0
-      },
-      "wall_ms": 395.71
-    }
-  ],
-  "recorded_spend_usd": 0.0,
-  "runs": [
-    {
-      "append_only_steps": 0,
-      "auxiliary_requests": 1,
-      "case": "W1",
-      "client_disconnects_with_usage": 0,
-      "effort": "low",
-      "exit_code": 0,
-      "failed_tools_by_name": {},
-      "first_request_bytes": 5844,
-      "first_request_instructions_chars": 1440,
-      "first_request_ms": 29.88,
-      "first_request_tokens_estimate": 1461,
-      "first_request_tool_schema_bytes": [
-        {
-          "bytes": 499,
-          "name": "Read"
-        },
-        {
-          "bytes": 376,
-          "name": "Write"
-        },
-        {
-          "bytes": 595,
-          "name": "Edit"
-        },
-        {
-          "bytes": 223,
-          "name": "LS"
-        },
-        {
-          "bytes": 470,
-          "name": "Bash"
-        },
-        {
-          "bytes": 294,
-          "name": "BashOutput"
-        },
-        {
-          "bytes": 630,
-          "name": "run_code"
-        },
-        {
-          "bytes": 425,
-          "name": "save_program"
-        },
-        {
-          "bytes": 318,
-          "name": "run_program"
-        },
-        {
-          "bytes": 194,
-          "name": "list_programs"
-        }
-      ],
-      "first_request_tools": 10,
-      "first_request_tools_json_bytes": 4035,
-      "first_token_ms": 55.216,
-      "harness": "aim_openrouter",
-      "harness_peak_rss_mb": 26.02,
-      "helpers_peak_rss_mb": 16.12,
-      "http_exchanges": 2,
-      "ite": 1466.0,
-      "max_tool_output_chars": 0,
-      "missing_success_cost": false,
-      "model": "gpt-5.5",
-      "passed": true,
-      "peak_rss_mb": 43.35,
-      "provider_cost_complete": true,
-      "provider_usage_complete": true,
-      "proxy_error_types": [],
-      "proxy_spend_cap_hit": false,
-      "read_argument_keys": {},
-      "read_failure_classes": {},
-      "repetition": 0,
-      "request_json_bytes": [
-        5844
-      ],
-      "request_lcp_bytes": [],
-      "request_response_sizes": [
-        [
-          5844,
-          515
-        ]
-      ],
-      "request_usage": [
-        {
-          "cache_write_tokens": 0,
-          "cached_tokens": 0,
-          "cost_usd": 0.0,
-          "input_tokens": 1461,
-          "output_tokens": 1,
-          "reasoning_tokens": 0
-        }
-      ],
-      "requests": 1,
-      "response_statuses": [
-        200
-      ],
-      "stable_head_ratio_median": null,
-      "stable_head_ratios": [],
-      "timed_out": false,
-      "tool_calls_by_name": {},
-      "tool_output_recovery_hint": false,
-      "tool_result_pattern_counts": {},
-      "transport_errors": 0,
-      "turn_failure_class": null,
-      "usage": {
-        "cache_write_tokens": 0,
-        "cached_tokens": 0,
-        "cost_usd": 0.0,
-        "input_tokens": 1461,
-        "output_tokens": 1,
-        "reasoning_tokens": 0
-      },
-      "wall_ms": 88.48
-    },
-    {
-      "append_only_steps": 0,
-      "auxiliary_requests": 0,
-      "case": "W1",
-      "client_disconnects_with_usage": 0,
-      "effort": "low",
-      "exit_code": 0,
-      "failed_tools_by_name": {},
-      "first_request_bytes": 38432,
-      "first_request_instructions_chars": 26825,
-      "first_request_ms": 527.34,
-      "first_request_tokens_estimate": 9608,
-      "first_request_tool_schema_bytes": [
-        {
-          "bytes": 1564,
-          "name": "exec_command"
-        },
-        {
-          "bytes": 784,
-          "name": "write_stdin"
-        },
-        {
-          "bytes": 1355,
-          "name": "request_user_input"
-        },
-        {
-          "bytes": 846,
-          "name": "apply_patch"
-        },
-        {
-          "bytes": 526,
-          "name": "view_image"
-        },
-        {
-          "bytes": 281,
-          "name": "get_goal"
-        },
-        {
-          "bytes": 760,
-          "name": "create_goal"
-        },
-        {
-          "bytes": 2172,
-          "name": "update_goal"
-        },
-        {
-          "bytes": 804,
-          "name": ""
-        }
-      ],
-      "first_request_tools": 9,
-      "first_request_tools_json_bytes": 9102,
-      "first_token_ms": 95.056,
-      "harness": "codex",
-      "harness_peak_rss_mb": 104.87,
-      "helpers_peak_rss_mb": null,
-      "http_exchanges": 1,
-      "ite": 9613.0,
-      "max_tool_output_chars": 0,
-      "missing_success_cost": true,
-      "model": "gpt-5.5",
-      "passed": true,
-      "peak_rss_mb": 119.44,
-      "provider_cost_complete": false,
-      "provider_usage_complete": true,
-      "proxy_error_types": [],
-      "proxy_spend_cap_hit": false,
-      "read_argument_keys": {},
-      "read_failure_classes": {},
-      "repetition": 0,
-      "request_json_bytes": [
-        38432
-      ],
-      "request_lcp_bytes": [],
-      "request_response_sizes": [
-        [
-          38432,
-          1732
-        ]
-      ],
-      "request_usage": [
-        {
-          "cache_write_tokens": 0,
-          "cached_tokens": 0,
-          "input_tokens": 9608,
-          "output_tokens": 1,
-          "reasoning_tokens": 0
-        }
-      ],
-      "requests": 1,
-      "response_statuses": [
-        200
-      ],
-      "stable_head_ratio_median": null,
-      "stable_head_ratios": [],
-      "timed_out": false,
-      "tool_calls_by_name": {},
-      "tool_output_recovery_hint": false,
-      "tool_result_pattern_counts": {},
-      "transport_errors": 0,
-      "turn_failure_class": null,
-      "usage": {
-        "cache_write_tokens": 0,
-        "cached_tokens": 0,
-        "cost_usd": null,
-        "input_tokens": 9608,
-        "output_tokens": 1,
-        "reasoning_tokens": 0
-      },
-      "wall_ms": 899.86
-    },
-    {
-      "append_only_steps": 0,
-      "auxiliary_requests": 0,
-      "case": "W1",
-      "client_disconnects_with_usage": 0,
-      "effort": "low",
-      "exit_code": 0,
-      "failed_tools_by_name": {},
-      "first_request_bytes": 6099,
-      "first_request_instructions_chars": 2582,
-      "first_request_ms": 761.74,
-      "first_request_tokens_estimate": 1525,
-      "first_request_tool_schema_bytes": [
-        {
-          "bytes": 787,
-          "name": "read"
-        },
-        {
-          "bytes": 611,
-          "name": "bash"
-        },
-        {
-          "bytes": 1238,
-          "name": "edit"
-        },
-        {
-          "bytes": 460,
-          "name": "write"
-        }
-      ],
-      "first_request_tools": 4,
-      "first_request_tools_json_bytes": 3101,
-      "first_token_ms": 110.689,
-      "harness": "pi",
-      "harness_peak_rss_mb": 145.6,
-      "helpers_peak_rss_mb": null,
-      "http_exchanges": 1,
-      "ite": 1530.0,
-      "max_tool_output_chars": 0,
-      "missing_success_cost": true,
-      "model": "gpt-5.5",
-      "passed": true,
-      "peak_rss_mb": 146.24,
-      "provider_cost_complete": false,
-      "provider_usage_complete": true,
-      "proxy_error_types": [],
-      "proxy_spend_cap_hit": false,
-      "read_argument_keys": {},
-      "read_failure_classes": {},
-      "repetition": 0,
-      "request_json_bytes": [
-        6099
-      ],
-      "request_lcp_bytes": [],
-      "request_response_sizes": [
-        [
-          2378,
-          1732
-        ]
-      ],
-      "request_usage": [
-        {
-          "cache_write_tokens": 0,
-          "cached_tokens": 0,
-          "input_tokens": 1525,
-          "output_tokens": 1,
-          "reasoning_tokens": 0
-        }
-      ],
-      "requests": 1,
-      "response_statuses": [
-        200
-      ],
-      "stable_head_ratio_median": null,
-      "stable_head_ratios": [],
-      "timed_out": false,
-      "tool_calls_by_name": {},
-      "tool_output_recovery_hint": false,
-      "tool_result_pattern_counts": {},
-      "transport_errors": 0,
-      "turn_failure_class": null,
-      "usage": {
-        "cache_write_tokens": 0,
-        "cached_tokens": 0,
-        "cost_usd": null,
-        "input_tokens": 1525,
-        "output_tokens": 1,
-        "reasoning_tokens": 0
-      },
-      "wall_ms": 884.56
-    },
-    {
-      "append_only_steps": 0,
-      "auxiliary_requests": 0,
-      "case": "W1",
-      "client_disconnects_with_usage": 0,
-      "effort": "low",
-      "exit_code": 0,
-      "failed_tools_by_name": {},
-      "first_request_bytes": 38432,
-      "first_request_instructions_chars": 26825,
-      "first_request_ms": 386.49,
-      "first_request_tokens_estimate": 9608,
-      "first_request_tool_schema_bytes": [
-        {
-          "bytes": 1564,
-          "name": "exec_command"
-        },
-        {
-          "bytes": 784,
-          "name": "write_stdin"
-        },
-        {
-          "bytes": 1355,
-          "name": "request_user_input"
-        },
-        {
-          "bytes": 846,
-          "name": "apply_patch"
-        },
-        {
-          "bytes": 526,
-          "name": "view_image"
-        },
-        {
-          "bytes": 281,
-          "name": "get_goal"
-        },
-        {
-          "bytes": 760,
-          "name": "create_goal"
-        },
-        {
-          "bytes": 2172,
-          "name": "update_goal"
-        },
-        {
-          "bytes": 804,
-          "name": ""
-        }
-      ],
-      "first_request_tools": 9,
-      "first_request_tools_json_bytes": 9102,
-      "first_token_ms": 48.638,
-      "harness": "codex",
-      "harness_peak_rss_mb": 105.1,
-      "helpers_peak_rss_mb": null,
-      "http_exchanges": 1,
-      "ite": 9613.0,
-      "max_tool_output_chars": 0,
-      "missing_success_cost": true,
-      "model": "gpt-5.5",
-      "passed": true,
-      "peak_rss_mb": 135.12,
-      "provider_cost_complete": false,
-      "provider_usage_complete": true,
-      "proxy_error_types": [],
-      "proxy_spend_cap_hit": false,
-      "read_argument_keys": {},
-      "read_failure_classes": {},
-      "repetition": 1,
-      "request_json_bytes": [
-        38432
-      ],
-      "request_lcp_bytes": [],
-      "request_response_sizes": [
-        [
-          38432,
-          1732
-        ]
-      ],
-      "request_usage": [
-        {
-          "cache_write_tokens": 0,
-          "cached_tokens": 0,
-          "input_tokens": 9608,
-          "output_tokens": 1,
-          "reasoning_tokens": 0
-        }
-      ],
-      "requests": 1,
-      "response_statuses": [
-        200
-      ],
-      "stable_head_ratio_median": null,
-      "stable_head_ratios": [],
-      "timed_out": false,
-      "tool_calls_by_name": {},
-      "tool_output_recovery_hint": false,
-      "tool_result_pattern_counts": {},
-      "transport_errors": 0,
-      "turn_failure_class": null,
-      "usage": {
-        "cache_write_tokens": 0,
-        "cached_tokens": 0,
-        "cost_usd": null,
-        "input_tokens": 9608,
-        "output_tokens": 1,
-        "reasoning_tokens": 0
-      },
-      "wall_ms": 613.74
-    },
-    {
-      "append_only_steps": 0,
-      "auxiliary_requests": 0,
-      "case": "W1",
-      "client_disconnects_with_usage": 0,
-      "effort": "low",
-      "exit_code": 0,
-      "failed_tools_by_name": {},
-      "first_request_bytes": 6099,
-      "first_request_instructions_chars": 2582,
-      "first_request_ms": 251.76,
-      "first_request_tokens_estimate": 1525,
-      "first_request_tool_schema_bytes": [
-        {
-          "bytes": 787,
-          "name": "read"
-        },
-        {
-          "bytes": 611,
-          "name": "bash"
-        },
-        {
-          "bytes": 1238,
-          "name": "edit"
-        },
-        {
-          "bytes": 460,
-          "name": "write"
-        }
-      ],
-      "first_request_tools": 4,
-      "first_request_tools_json_bytes": 3101,
-      "first_token_ms": 44.811,
-      "harness": "pi",
-      "harness_peak_rss_mb": 146.15,
-      "helpers_peak_rss_mb": null,
-      "http_exchanges": 1,
-      "ite": 1530.0,
-      "max_tool_output_chars": 0,
-      "missing_success_cost": true,
-      "model": "gpt-5.5",
-      "passed": true,
-      "peak_rss_mb": 146.42,
-      "provider_cost_complete": false,
-      "provider_usage_complete": true,
-      "proxy_error_types": [],
-      "proxy_spend_cap_hit": false,
-      "read_argument_keys": {},
-      "read_failure_classes": {},
-      "repetition": 1,
       "request_json_bytes": [
         6099
       ],
@@ -855,8 +332,11 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 303.35
-    },
+      "wall_ms": 299.53
+    }
+  ],
+  "recorded_spend_usd": 0.0,
+  "runs": [
     {
       "append_only_steps": 0,
       "auxiliary_requests": 1,
@@ -867,7 +347,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 5844,
       "first_request_instructions_chars": 1440,
-      "first_request_ms": 23.03,
+      "first_request_ms": 29.51,
       "first_request_tokens_estimate": 1461,
       "first_request_tool_schema_bytes": [
         {
@@ -913,17 +393,537 @@
       ],
       "first_request_tools": 10,
       "first_request_tools_json_bytes": 4035,
-      "first_token_ms": 43.388,
+      "first_token_ms": 43.549,
       "harness": "aim_openrouter",
-      "harness_peak_rss_mb": 26.0,
-      "helpers_peak_rss_mb": 16.29,
+      "harness_peak_rss_mb": 26.44,
+      "helpers_peak_rss_mb": 16.17,
       "http_exchanges": 2,
       "ite": 1466.0,
       "max_tool_output_chars": 0,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 43.52,
+      "peak_rss_mb": 43.53,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
+      "repetition": 0,
+      "request_json_bytes": [
+        5844
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          5844,
+          515
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0,
+          "input_tokens": 1461,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "stable_head_ratio_median": null,
+      "stable_head_ratios": [],
+      "timed_out": false,
+      "tool_calls_by_name": {},
+      "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 1461,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 75.96
+    },
+    {
+      "append_only_steps": 0,
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 38432,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 172.95,
+      "first_request_tokens_estimate": 9608,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 1564,
+          "name": "exec_command"
+        },
+        {
+          "bytes": 784,
+          "name": "write_stdin"
+        },
+        {
+          "bytes": 1355,
+          "name": "request_user_input"
+        },
+        {
+          "bytes": 846,
+          "name": "apply_patch"
+        },
+        {
+          "bytes": 526,
+          "name": "view_image"
+        },
+        {
+          "bytes": 281,
+          "name": "get_goal"
+        },
+        {
+          "bytes": 760,
+          "name": "create_goal"
+        },
+        {
+          "bytes": 2172,
+          "name": "update_goal"
+        },
+        {
+          "bytes": 804,
+          "name": ""
+        }
+      ],
+      "first_request_tools": 9,
+      "first_request_tools_json_bytes": 9102,
+      "first_token_ms": 47.233,
+      "harness": "codex",
+      "harness_peak_rss_mb": 104.78,
+      "helpers_peak_rss_mb": null,
+      "http_exchanges": 1,
+      "ite": 9613.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 134.63,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
+      "repetition": 0,
+      "request_json_bytes": [
+        38432
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          38432,
+          1732
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 9608,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "stable_head_ratio_median": null,
+      "stable_head_ratios": [],
+      "timed_out": false,
+      "tool_calls_by_name": {},
+      "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 9608,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 417.51
+    },
+    {
+      "append_only_steps": 0,
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 6099,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 259.81,
+      "first_request_tokens_estimate": 1525,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 787,
+          "name": "read"
+        },
+        {
+          "bytes": 611,
+          "name": "bash"
+        },
+        {
+          "bytes": 1238,
+          "name": "edit"
+        },
+        {
+          "bytes": 460,
+          "name": "write"
+        }
+      ],
+      "first_request_tools": 4,
+      "first_request_tools_json_bytes": 3101,
+      "first_token_ms": 44.118,
+      "harness": "pi",
+      "harness_peak_rss_mb": 146.87,
+      "helpers_peak_rss_mb": null,
+      "http_exchanges": 1,
+      "ite": 1530.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 147.06,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
+      "repetition": 0,
+      "request_json_bytes": [
+        6099
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          2375,
+          1732
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1525,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "stable_head_ratio_median": null,
+      "stable_head_ratios": [],
+      "timed_out": false,
+      "tool_calls_by_name": {},
+      "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 1525,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 310.43
+    },
+    {
+      "append_only_steps": 0,
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 38432,
+      "first_request_instructions_chars": 26825,
+      "first_request_ms": 177.87,
+      "first_request_tokens_estimate": 9608,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 1564,
+          "name": "exec_command"
+        },
+        {
+          "bytes": 784,
+          "name": "write_stdin"
+        },
+        {
+          "bytes": 1355,
+          "name": "request_user_input"
+        },
+        {
+          "bytes": 846,
+          "name": "apply_patch"
+        },
+        {
+          "bytes": 526,
+          "name": "view_image"
+        },
+        {
+          "bytes": 281,
+          "name": "get_goal"
+        },
+        {
+          "bytes": 760,
+          "name": "create_goal"
+        },
+        {
+          "bytes": 2172,
+          "name": "update_goal"
+        },
+        {
+          "bytes": 804,
+          "name": ""
+        }
+      ],
+      "first_request_tools": 9,
+      "first_request_tools_json_bytes": 9102,
+      "first_token_ms": 41.929,
+      "harness": "codex",
+      "harness_peak_rss_mb": 104.46,
+      "helpers_peak_rss_mb": null,
+      "http_exchanges": 1,
+      "ite": 9613.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 134.4,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
+      "repetition": 1,
+      "request_json_bytes": [
+        38432
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          38432,
+          1732
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 9608,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "stable_head_ratio_median": null,
+      "stable_head_ratios": [],
+      "timed_out": false,
+      "tool_calls_by_name": {},
+      "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 9608,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 401.55
+    },
+    {
+      "append_only_steps": 0,
+      "auxiliary_requests": 0,
+      "case": "W1",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 6099,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 258.49,
+      "first_request_tokens_estimate": 1525,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 787,
+          "name": "read"
+        },
+        {
+          "bytes": 611,
+          "name": "bash"
+        },
+        {
+          "bytes": 1238,
+          "name": "edit"
+        },
+        {
+          "bytes": 460,
+          "name": "write"
+        }
+      ],
+      "first_request_tools": 4,
+      "first_request_tools_json_bytes": 3101,
+      "first_token_ms": 43.208,
+      "harness": "pi",
+      "harness_peak_rss_mb": 146.82,
+      "helpers_peak_rss_mb": null,
+      "http_exchanges": 1,
+      "ite": 1530.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 146.98,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
+      "repetition": 1,
+      "request_json_bytes": [
+        6099
+      ],
+      "request_lcp_bytes": [],
+      "request_response_sizes": [
+        [
+          2379,
+          1732
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1525,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 1,
+      "response_statuses": [
+        200
+      ],
+      "stable_head_ratio_median": null,
+      "stable_head_ratios": [],
+      "timed_out": false,
+      "tool_calls_by_name": {},
+      "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 1525,
+        "output_tokens": 1,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 308.26
+    },
+    {
+      "append_only_steps": 0,
+      "auxiliary_requests": 1,
+      "case": "W1",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 5844,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 30.81,
+      "first_request_tokens_estimate": 1461,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 499,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 223,
+          "name": "LS"
+        },
+        {
+          "bytes": 470,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 630,
+          "name": "run_code"
+        },
+        {
+          "bytes": 425,
+          "name": "save_program"
+        },
+        {
+          "bytes": 318,
+          "name": "run_program"
+        },
+        {
+          "bytes": 194,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 10,
+      "first_request_tools_json_bytes": 4035,
+      "first_token_ms": 45.452,
+      "harness": "aim_openrouter",
+      "harness_peak_rss_mb": 26.36,
+      "helpers_peak_rss_mb": 16.25,
+      "http_exchanges": 2,
+      "ite": 1466.0,
+      "max_tool_output_chars": 0,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 43.61,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -971,7 +971,7 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 69.47
+      "wall_ms": 79.42
     },
     {
       "append_only_steps": 1,
@@ -983,7 +983,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 38458,
       "first_request_instructions_chars": 26825,
-      "first_request_ms": 160.03,
+      "first_request_ms": 164.88,
       "first_request_tokens_estimate": 9615,
       "first_request_tool_schema_bytes": [
         {
@@ -1025,9 +1025,9 @@
       ],
       "first_request_tools": 9,
       "first_request_tools_json_bytes": 9102,
-      "first_token_ms": 44.057,
+      "first_token_ms": 45.171,
       "harness": "codex",
-      "harness_peak_rss_mb": 129.63,
+      "harness_peak_rss_mb": 136.74,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 2,
       "ite": 31240.0,
@@ -1035,7 +1035,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 159.3,
+      "peak_rss_mb": 166.53,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1099,7 +1099,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 518.34
+      "wall_ms": 524.04
     },
     {
       "append_only_steps": 1,
@@ -1111,7 +1111,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 6125,
       "first_request_instructions_chars": 2582,
-      "first_request_ms": 251.87,
+      "first_request_ms": 259.84,
       "first_request_tokens_estimate": 1532,
       "first_request_tool_schema_bytes": [
         {
@@ -1133,9 +1133,9 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 3101,
-      "first_token_ms": 41.882,
+      "first_token_ms": 46.121,
       "harness": "pi",
-      "harness_peak_rss_mb": 156.17,
+      "harness_peak_rss_mb": 156.91,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 2,
       "ite": 6642.0,
@@ -1143,7 +1143,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 157.4,
+      "peak_rss_mb": 158.22,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1151,250 +1151,6 @@
       "read_argument_keys": {},
       "read_failure_classes": {},
       "repetition": 0,
-      "request_json_bytes": [
-        6125,
-        20397
-      ],
-      "request_lcp_bytes": [
-        2792
-      ],
-      "request_response_sizes": [
-        [
-          2388,
-          1532
-        ],
-        [
-          4615,
-          1732
-        ]
-      ],
-      "request_usage": [
-        {
-          "cache_write_tokens": 0,
-          "cached_tokens": 0,
-          "input_tokens": 1532,
-          "output_tokens": 1,
-          "reasoning_tokens": 0
-        },
-        {
-          "cache_write_tokens": 0,
-          "cached_tokens": 0,
-          "input_tokens": 5100,
-          "output_tokens": 1,
-          "reasoning_tokens": 0
-        }
-      ],
-      "requests": 2,
-      "response_statuses": [
-        200,
-        200
-      ],
-      "stable_head_ratio_median": 1.0,
-      "stable_head_ratios": [
-        1.0
-      ],
-      "timed_out": false,
-      "tool_calls_by_name": {},
-      "tool_output_recovery_hint": true,
-      "tool_result_pattern_counts": {},
-      "transport_errors": 0,
-      "turn_failure_class": null,
-      "usage": {
-        "cache_write_tokens": 0,
-        "cached_tokens": 0,
-        "cost_usd": null,
-        "input_tokens": 6632,
-        "output_tokens": 2,
-        "reasoning_tokens": 0
-      },
-      "wall_ms": 369.4
-    },
-    {
-      "append_only_steps": 1,
-      "auxiliary_requests": 1,
-      "case": "W2",
-      "client_disconnects_with_usage": 0,
-      "effort": "low",
-      "exit_code": 0,
-      "failed_tools_by_name": {},
-      "first_request_bytes": 5870,
-      "first_request_instructions_chars": 1440,
-      "first_request_ms": 21.21,
-      "first_request_tokens_estimate": 1468,
-      "first_request_tool_schema_bytes": [
-        {
-          "bytes": 499,
-          "name": "Read"
-        },
-        {
-          "bytes": 376,
-          "name": "Write"
-        },
-        {
-          "bytes": 595,
-          "name": "Edit"
-        },
-        {
-          "bytes": 223,
-          "name": "LS"
-        },
-        {
-          "bytes": 470,
-          "name": "Bash"
-        },
-        {
-          "bytes": 294,
-          "name": "BashOutput"
-        },
-        {
-          "bytes": 630,
-          "name": "run_code"
-        },
-        {
-          "bytes": 425,
-          "name": "save_program"
-        },
-        {
-          "bytes": 318,
-          "name": "run_program"
-        },
-        {
-          "bytes": 194,
-          "name": "list_programs"
-        }
-      ],
-      "first_request_tools": 10,
-      "first_request_tools_json_bytes": 4035,
-      "first_token_ms": 37.878,
-      "harness": "aim_openrouter",
-      "harness_peak_rss_mb": 26.43,
-      "helpers_peak_rss_mb": 17.74,
-      "http_exchanges": 3,
-      "ite": 6353.0,
-      "max_tool_output_chars": 11191,
-      "missing_success_cost": false,
-      "model": "gpt-5.5",
-      "passed": true,
-      "peak_rss_mb": 45.45,
-      "provider_cost_complete": true,
-      "provider_usage_complete": true,
-      "proxy_error_types": [],
-      "proxy_spend_cap_hit": false,
-      "read_argument_keys": {},
-      "read_failure_classes": {},
-      "repetition": 0,
-      "request_json_bytes": [
-        5870,
-        19500
-      ],
-      "request_lcp_bytes": [
-        5868
-      ],
-      "request_response_sizes": [
-        [
-          5870,
-          637
-        ],
-        [
-          19500,
-          515
-        ]
-      ],
-      "request_usage": [
-        {
-          "cache_write_tokens": 0,
-          "cached_tokens": 0,
-          "cost_usd": 0.0,
-          "input_tokens": 1468,
-          "output_tokens": 1,
-          "reasoning_tokens": 0
-        },
-        {
-          "cache_write_tokens": 0,
-          "cached_tokens": 0,
-          "cost_usd": 0.0,
-          "input_tokens": 4875,
-          "output_tokens": 1,
-          "reasoning_tokens": 0
-        }
-      ],
-      "requests": 2,
-      "response_statuses": [
-        200,
-        200
-      ],
-      "stable_head_ratio_median": 1.0,
-      "stable_head_ratios": [
-        1.0
-      ],
-      "timed_out": false,
-      "tool_calls_by_name": {
-        "Bash": 1
-      },
-      "tool_output_recovery_hint": true,
-      "tool_result_pattern_counts": {},
-      "transport_errors": 0,
-      "turn_failure_class": null,
-      "usage": {
-        "cache_write_tokens": 0,
-        "cached_tokens": 0,
-        "cost_usd": 0.0,
-        "input_tokens": 6343,
-        "output_tokens": 2,
-        "reasoning_tokens": 0
-      },
-      "wall_ms": 124.9
-    },
-    {
-      "append_only_steps": 1,
-      "auxiliary_requests": 0,
-      "case": "W2",
-      "client_disconnects_with_usage": 0,
-      "effort": "low",
-      "exit_code": 0,
-      "failed_tools_by_name": {},
-      "first_request_bytes": 6125,
-      "first_request_instructions_chars": 2582,
-      "first_request_ms": 255.24,
-      "first_request_tokens_estimate": 1532,
-      "first_request_tool_schema_bytes": [
-        {
-          "bytes": 787,
-          "name": "read"
-        },
-        {
-          "bytes": 611,
-          "name": "bash"
-        },
-        {
-          "bytes": 1238,
-          "name": "edit"
-        },
-        {
-          "bytes": 460,
-          "name": "write"
-        }
-      ],
-      "first_request_tools": 4,
-      "first_request_tools_json_bytes": 3101,
-      "first_token_ms": 39.835,
-      "harness": "pi",
-      "harness_peak_rss_mb": 157.12,
-      "helpers_peak_rss_mb": null,
-      "http_exchanges": 2,
-      "ite": 6642.0,
-      "max_tool_output_chars": 12088,
-      "missing_success_cost": true,
-      "model": "gpt-5.5",
-      "passed": true,
-      "peak_rss_mb": 158.37,
-      "provider_cost_complete": false,
-      "provider_usage_complete": true,
-      "proxy_error_types": [],
-      "proxy_spend_cap_hit": false,
-      "read_argument_keys": {},
-      "read_failure_classes": {},
-      "repetition": 1,
       "request_json_bytes": [
         6125,
         20397
@@ -1408,7 +1164,7 @@
           1532
         ],
         [
-          4614,
+          4618,
           1732
         ]
       ],
@@ -1451,7 +1207,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 369.12
+      "wall_ms": 388.73
     },
     {
       "append_only_steps": 1,
@@ -1463,7 +1219,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 5870,
       "first_request_instructions_chars": 1440,
-      "first_request_ms": 22.02,
+      "first_request_ms": 36.87,
       "first_request_tokens_estimate": 1468,
       "first_request_tool_schema_bytes": [
         {
@@ -1509,17 +1265,261 @@
       ],
       "first_request_tools": 10,
       "first_request_tools_json_bytes": 4035,
-      "first_token_ms": 43.327,
+      "first_token_ms": 50.923,
       "harness": "aim_openrouter",
-      "harness_peak_rss_mb": 26.39,
-      "helpers_peak_rss_mb": 17.83,
+      "harness_peak_rss_mb": 26.9,
+      "helpers_peak_rss_mb": 18.04,
       "http_exchanges": 3,
       "ite": 6353.0,
       "max_tool_output_chars": 11191,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 45.4,
+      "peak_rss_mb": 46.14,
+      "provider_cost_complete": true,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
+      "repetition": 0,
+      "request_json_bytes": [
+        5870,
+        19500
+      ],
+      "request_lcp_bytes": [
+        5868
+      ],
+      "request_response_sizes": [
+        [
+          5870,
+          637
+        ],
+        [
+          19500,
+          515
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0,
+          "input_tokens": 1468,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "cost_usd": 0.0,
+          "input_tokens": 4875,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "stable_head_ratio_median": 1.0,
+      "stable_head_ratios": [
+        1.0
+      ],
+      "timed_out": false,
+      "tool_calls_by_name": {
+        "Bash": 1
+      },
+      "tool_output_recovery_hint": true,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": 0.0,
+        "input_tokens": 6343,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 175.96
+    },
+    {
+      "append_only_steps": 1,
+      "auxiliary_requests": 0,
+      "case": "W2",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 6125,
+      "first_request_instructions_chars": 2582,
+      "first_request_ms": 466.52,
+      "first_request_tokens_estimate": 1532,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 787,
+          "name": "read"
+        },
+        {
+          "bytes": 611,
+          "name": "bash"
+        },
+        {
+          "bytes": 1238,
+          "name": "edit"
+        },
+        {
+          "bytes": 460,
+          "name": "write"
+        }
+      ],
+      "first_request_tools": 4,
+      "first_request_tools_json_bytes": 3101,
+      "first_token_ms": 63.062,
+      "harness": "pi",
+      "harness_peak_rss_mb": 155.11,
+      "helpers_peak_rss_mb": null,
+      "http_exchanges": 2,
+      "ite": 6642.0,
+      "max_tool_output_chars": 12088,
+      "missing_success_cost": true,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 156.52,
+      "provider_cost_complete": false,
+      "provider_usage_complete": true,
+      "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
+      "repetition": 1,
+      "request_json_bytes": [
+        6125,
+        20397
+      ],
+      "request_lcp_bytes": [
+        2792
+      ],
+      "request_response_sizes": [
+        [
+          2388,
+          1532
+        ],
+        [
+          4616,
+          1732
+        ]
+      ],
+      "request_usage": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 1532,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        },
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0,
+          "input_tokens": 5100,
+          "output_tokens": 1,
+          "reasoning_tokens": 0
+        }
+      ],
+      "requests": 2,
+      "response_statuses": [
+        200,
+        200
+      ],
+      "stable_head_ratio_median": 1.0,
+      "stable_head_ratios": [
+        1.0
+      ],
+      "timed_out": false,
+      "tool_calls_by_name": {},
+      "tool_output_recovery_hint": true,
+      "tool_result_pattern_counts": {},
+      "transport_errors": 0,
+      "turn_failure_class": null,
+      "usage": {
+        "cache_write_tokens": 0,
+        "cached_tokens": 0,
+        "cost_usd": null,
+        "input_tokens": 6632,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "wall_ms": 728.3
+    },
+    {
+      "append_only_steps": 1,
+      "auxiliary_requests": 1,
+      "case": "W2",
+      "client_disconnects_with_usage": 0,
+      "effort": "low",
+      "exit_code": 0,
+      "failed_tools_by_name": {},
+      "first_request_bytes": 5870,
+      "first_request_instructions_chars": 1440,
+      "first_request_ms": 81.42,
+      "first_request_tokens_estimate": 1468,
+      "first_request_tool_schema_bytes": [
+        {
+          "bytes": 499,
+          "name": "Read"
+        },
+        {
+          "bytes": 376,
+          "name": "Write"
+        },
+        {
+          "bytes": 595,
+          "name": "Edit"
+        },
+        {
+          "bytes": 223,
+          "name": "LS"
+        },
+        {
+          "bytes": 470,
+          "name": "Bash"
+        },
+        {
+          "bytes": 294,
+          "name": "BashOutput"
+        },
+        {
+          "bytes": 630,
+          "name": "run_code"
+        },
+        {
+          "bytes": 425,
+          "name": "save_program"
+        },
+        {
+          "bytes": 318,
+          "name": "run_program"
+        },
+        {
+          "bytes": 194,
+          "name": "list_programs"
+        }
+      ],
+      "first_request_tools": 10,
+      "first_request_tools_json_bytes": 4035,
+      "first_token_ms": 121.08,
+      "harness": "aim_openrouter",
+      "harness_peak_rss_mb": 26.9,
+      "helpers_peak_rss_mb": 18.1,
+      "http_exchanges": 3,
+      "ite": 6353.0,
+      "max_tool_output_chars": 11191,
+      "missing_success_cost": false,
+      "model": "gpt-5.5",
+      "passed": true,
+      "peak_rss_mb": 46.3,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1587,7 +1587,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 132.06
+      "wall_ms": 391.66
     },
     {
       "append_only_steps": 1,
@@ -1599,7 +1599,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 38458,
       "first_request_instructions_chars": 26825,
-      "first_request_ms": 143.9,
+      "first_request_ms": 516.88,
       "first_request_tokens_estimate": 9615,
       "first_request_tool_schema_bytes": [
         {
@@ -1641,9 +1641,9 @@
       ],
       "first_request_tools": 9,
       "first_request_tools_json_bytes": 9102,
-      "first_token_ms": 39.122,
+      "first_token_ms": 83.562,
       "harness": "codex",
-      "harness_peak_rss_mb": 129.34,
+      "harness_peak_rss_mb": 137.0,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 2,
       "ite": 31240.0,
@@ -1651,7 +1651,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 159.02,
+      "peak_rss_mb": 167.07,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1715,7 +1715,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 460.98
+      "wall_ms": 981.47
     },
     {
       "append_only_steps": 1,
@@ -1727,7 +1727,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 6116,
       "first_request_instructions_chars": 2582,
-      "first_request_ms": 240.19,
+      "first_request_ms": 268.01,
       "first_request_tokens_estimate": 1529,
       "first_request_tool_schema_bytes": [
         {
@@ -1749,9 +1749,9 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 3101,
-      "first_token_ms": 37.327,
+      "first_token_ms": 43.527,
       "harness": "pi",
-      "harness_peak_rss_mb": 155.14,
+      "harness_peak_rss_mb": 151.52,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 2,
       "ite": 14135.0,
@@ -1759,7 +1759,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 155.98,
+      "peak_rss_mb": 152.65,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1780,7 +1780,7 @@
           1528
         ],
         [
-          4706,
+          4708,
           1734
         ]
       ],
@@ -1823,7 +1823,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 338.24
+      "wall_ms": 386.4
     },
     {
       "append_only_steps": 1,
@@ -1835,7 +1835,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 5861,
       "first_request_instructions_chars": 1440,
-      "first_request_ms": 20.84,
+      "first_request_ms": 29.42,
       "first_request_tokens_estimate": 1466,
       "first_request_tool_schema_bytes": [
         {
@@ -1881,17 +1881,17 @@
       ],
       "first_request_tools": 10,
       "first_request_tools_json_bytes": 4035,
-      "first_token_ms": 38.154,
+      "first_token_ms": 43.768,
       "harness": "aim_openrouter",
-      "harness_peak_rss_mb": 26.46,
-      "helpers_peak_rss_mb": 17.35,
+      "harness_peak_rss_mb": 26.64,
+      "helpers_peak_rss_mb": 17.37,
       "http_exchanges": 3,
       "ite": 5924.0,
       "max_tool_output_chars": 11191,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 45.04,
+      "peak_rss_mb": 45.27,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -1959,7 +1959,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 118.08
+      "wall_ms": 130.98
     },
     {
       "append_only_steps": 1,
@@ -1971,7 +1971,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 38448,
       "first_request_instructions_chars": 26825,
-      "first_request_ms": 173.33,
+      "first_request_ms": 169.65,
       "first_request_tokens_estimate": 9612,
       "first_request_tool_schema_bytes": [
         {
@@ -2013,9 +2013,9 @@
       ],
       "first_request_tools": 9,
       "first_request_tools_json_bytes": 9102,
-      "first_token_ms": 42.992,
+      "first_token_ms": 42.734,
       "harness": "codex",
-      "harness_peak_rss_mb": 116.87,
+      "harness_peak_rss_mb": 115.67,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 2,
       "ite": 29821.0,
@@ -2023,7 +2023,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 146.83,
+      "peak_rss_mb": 145.52,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -2087,7 +2087,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 467.44
+      "wall_ms": 473.88
     },
     {
       "append_only_steps": 1,
@@ -2099,7 +2099,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 5861,
       "first_request_instructions_chars": 1440,
-      "first_request_ms": 21.26,
+      "first_request_ms": 30.5,
       "first_request_tokens_estimate": 1466,
       "first_request_tool_schema_bytes": [
         {
@@ -2145,17 +2145,17 @@
       ],
       "first_request_tools": 10,
       "first_request_tools_json_bytes": 4035,
-      "first_token_ms": 38.679,
+      "first_token_ms": 44.631,
       "harness": "aim_openrouter",
-      "harness_peak_rss_mb": 26.71,
-      "helpers_peak_rss_mb": 17.38,
+      "harness_peak_rss_mb": 26.89,
+      "helpers_peak_rss_mb": 17.58,
       "http_exchanges": 3,
       "ite": 5924.0,
       "max_tool_output_chars": 11191,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 45.17,
+      "peak_rss_mb": 45.55,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -2223,7 +2223,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 119.22
+      "wall_ms": 133.22
     },
     {
       "append_only_steps": 1,
@@ -2235,7 +2235,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 38448,
       "first_request_instructions_chars": 26825,
-      "first_request_ms": 159.16,
+      "first_request_ms": 163.29,
       "first_request_tokens_estimate": 9612,
       "first_request_tool_schema_bytes": [
         {
@@ -2277,9 +2277,9 @@
       ],
       "first_request_tools": 9,
       "first_request_tools_json_bytes": 9102,
-      "first_token_ms": 41.879,
+      "first_token_ms": 43.763,
       "harness": "codex",
-      "harness_peak_rss_mb": 115.08,
+      "harness_peak_rss_mb": 116.98,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 2,
       "ite": 29821.0,
@@ -2287,7 +2287,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 144.82,
+      "peak_rss_mb": 146.77,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -2351,7 +2351,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 474.62
+      "wall_ms": 498.88
     },
     {
       "append_only_steps": 1,
@@ -2363,7 +2363,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 6116,
       "first_request_instructions_chars": 2582,
-      "first_request_ms": 258.54,
+      "first_request_ms": 257.84,
       "first_request_tokens_estimate": 1529,
       "first_request_tool_schema_bytes": [
         {
@@ -2385,9 +2385,9 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 3101,
-      "first_token_ms": 37.917,
+      "first_token_ms": 43.435,
       "harness": "pi",
-      "harness_peak_rss_mb": 154.03,
+      "harness_peak_rss_mb": 154.17,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 2,
       "ite": 14135.0,
@@ -2395,7 +2395,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 154.45,
+      "peak_rss_mb": 155.32,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -2459,7 +2459,7 @@
         "output_tokens": 2,
         "reasoning_tokens": 0
       },
-      "wall_ms": 360.37
+      "wall_ms": 379.3
     },
     {
       "append_only_steps": 20,
@@ -2471,7 +2471,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 5884,
       "first_request_instructions_chars": 1440,
-      "first_request_ms": 21.04,
+      "first_request_ms": 30.97,
       "first_request_tokens_estimate": 1471,
       "first_request_tool_schema_bytes": [
         {
@@ -2517,17 +2517,17 @@
       ],
       "first_request_tools": 10,
       "first_request_tools_json_bytes": 4035,
-      "first_token_ms": 38.037,
+      "first_token_ms": 43.87,
       "harness": "aim_openrouter",
-      "harness_peak_rss_mb": 26.61,
-      "helpers_peak_rss_mb": 16.99,
+      "harness_peak_rss_mb": 27.07,
+      "helpers_peak_rss_mb": 17.32,
       "http_exchanges": 22,
       "ite": 42219.0,
       "max_tool_output_chars": 220,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 44.94,
+      "peak_rss_mb": 45.53,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -2899,7 +2899,7 @@
         "output_tokens": 21,
         "reasoning_tokens": 0
       },
-      "wall_ms": 966.74
+      "wall_ms": 1212.24
     },
     {
       "append_only_steps": 20,
@@ -2911,7 +2911,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 38472,
       "first_request_instructions_chars": 26825,
-      "first_request_ms": 145.58,
+      "first_request_ms": 164.84,
       "first_request_tokens_estimate": 9618,
       "first_request_tool_schema_bytes": [
         {
@@ -2953,9 +2953,9 @@
       ],
       "first_request_tools": 9,
       "first_request_tools_json_bytes": 9102,
-      "first_token_ms": 37.085,
+      "first_token_ms": 42.489,
       "harness": "codex",
-      "harness_peak_rss_mb": 114.85,
+      "harness_peak_rss_mb": 115.46,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 21,
       "ite": 218766.0,
@@ -2963,7 +2963,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 155.76,
+      "peak_rss_mb": 154.8,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -3312,7 +3312,7 @@
         "output_tokens": 21,
         "reasoning_tokens": 0
       },
-      "wall_ms": 2057.03
+      "wall_ms": 2222.76
     },
     {
       "append_only_steps": 20,
@@ -3324,7 +3324,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 6139,
       "first_request_instructions_chars": 2582,
-      "first_request_ms": 232.74,
+      "first_request_ms": 259.69,
       "first_request_tokens_estimate": 1535,
       "first_request_tool_schema_bytes": [
         {
@@ -3346,9 +3346,9 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 3101,
-      "first_token_ms": 37.106,
+      "first_token_ms": 43.966,
       "harness": "pi",
-      "harness_peak_rss_mb": 156.09,
+      "harness_peak_rss_mb": 155.83,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 21,
       "ite": 42146.0,
@@ -3356,7 +3356,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 157.37,
+      "peak_rss_mb": 157.17,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -3411,7 +3411,7 @@
       ],
       "request_response_sizes": [
         [
-          2396,
+          2397,
           1500
         ],
         [
@@ -3419,63 +3419,63 @@
           1500
         ],
         [
-          2486,
+          2489,
           1500
         ],
         [
-          2498,
+          2500,
           1500
         ],
         [
-          2509,
+          2508,
           1500
         ],
         [
-          2517,
+          2518,
           1500
         ],
         [
-          2524,
+          2526,
           1500
         ],
         [
-          2536,
+          2535,
           1500
         ],
         [
-          2544,
+          2545,
           1500
         ],
         [
-          2552,
+          2553,
           1510
         ],
         [
-          2563,
+          2564,
           1510
         ],
         [
-          2571,
+          2573,
           1510
         ],
         [
-          2582,
+          2583,
           1510
         ],
         [
-          2588,
+          2589,
           1510
         ],
         [
-          2594,
+          2595,
           1510
         ],
         [
-          2602,
+          2603,
           1510
         ],
         [
-          2611,
+          2612,
           1510
         ],
         [
@@ -3483,15 +3483,15 @@
           1510
         ],
         [
-          2626,
+          2625,
           1510
         ],
         [
-          2633,
+          2635,
           1510
         ],
         [
-          2644,
+          2646,
           1741
         ]
       ],
@@ -3705,7 +3705,7 @@
         "output_tokens": 21,
         "reasoning_tokens": 0
       },
-      "wall_ms": 1169.24
+      "wall_ms": 1483.36
     },
     {
       "append_only_steps": 20,
@@ -3717,7 +3717,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 38472,
       "first_request_instructions_chars": 26825,
-      "first_request_ms": 142.08,
+      "first_request_ms": 513.48,
       "first_request_tokens_estimate": 9618,
       "first_request_tool_schema_bytes": [
         {
@@ -3759,9 +3759,9 @@
       ],
       "first_request_tools": 9,
       "first_request_tools_json_bytes": 9102,
-      "first_token_ms": 37.601,
+      "first_token_ms": 56.279,
       "harness": "codex",
-      "harness_peak_rss_mb": 113.33,
+      "harness_peak_rss_mb": 114.82,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 21,
       "ite": 218766.0,
@@ -3769,7 +3769,7 @@
       "missing_success_cost": true,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 153.78,
+      "peak_rss_mb": 160.42,
       "provider_cost_complete": false,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -4118,7 +4118,7 @@
         "output_tokens": 21,
         "reasoning_tokens": 0
       },
-      "wall_ms": 1904.55
+      "wall_ms": 3054.17
     },
     {
       "append_only_steps": 20,
@@ -4130,7 +4130,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 6139,
       "first_request_instructions_chars": 2582,
-      "first_request_ms": 240.03,
+      "first_request_ms": 267.13,
       "first_request_tokens_estimate": 1535,
       "first_request_tool_schema_bytes": [
         {
@@ -4152,9 +4152,9 @@
       ],
       "first_request_tools": 4,
       "first_request_tools_json_bytes": 3101,
-      "first_token_ms": 41.575,
+      "first_token_ms": 47.202,
       "harness": "pi",
-      "harness_peak_rss_mb": 154.99,
+      "harness_peak_rss_mb": 154.93,
       "helpers_peak_rss_mb": null,
       "http_exchanges": 21,
       "ite": 42146.0,
@@ -4217,87 +4217,87 @@
       ],
       "request_response_sizes": [
         [
-          2403,
+          2398,
           1500
         ],
         [
-          2479,
+          2475,
           1500
         ],
         [
-          2494,
+          2489,
           1500
         ],
         [
-          2504,
+          2500,
           1500
         ],
         [
-          2515,
+          2511,
           1500
         ],
         [
-          2524,
+          2519,
           1500
         ],
         [
-          2531,
+          2527,
           1500
         ],
         [
-          2542,
+          2536,
           1500
         ],
         [
-          2550,
+          2546,
           1500
         ],
         [
-          2559,
+          2554,
           1510
         ],
         [
-          2569,
+          2565,
           1510
         ],
         [
-          2578,
+          2575,
           1510
         ],
         [
-          2587,
+          2584,
           1510
         ],
         [
-          2594,
+          2591,
           1510
         ],
         [
-          2601,
+          2597,
           1510
         ],
         [
-          2606,
+          2603,
           1510
         ],
         [
-          2614,
+          2612,
           1510
         ],
         [
-          2624,
+          2622,
           1510
         ],
         [
-          2629,
+          2628,
           1510
         ],
         [
-          2637,
+          2635,
           1510
         ],
         [
-          2647,
+          2645,
           1741
         ]
       ],
@@ -4511,7 +4511,7 @@
         "output_tokens": 21,
         "reasoning_tokens": 0
       },
-      "wall_ms": 1182.09
+      "wall_ms": 1785.89
     },
     {
       "append_only_steps": 20,
@@ -4523,7 +4523,7 @@
       "failed_tools_by_name": {},
       "first_request_bytes": 5884,
       "first_request_instructions_chars": 1440,
-      "first_request_ms": 21.93,
+      "first_request_ms": 47.57,
       "first_request_tokens_estimate": 1471,
       "first_request_tool_schema_bytes": [
         {
@@ -4569,17 +4569,17 @@
       ],
       "first_request_tools": 10,
       "first_request_tools_json_bytes": 4035,
-      "first_token_ms": 36.888,
+      "first_token_ms": 63.614,
       "harness": "aim_openrouter",
-      "harness_peak_rss_mb": 26.64,
-      "helpers_peak_rss_mb": 16.94,
+      "harness_peak_rss_mb": 27.16,
+      "helpers_peak_rss_mb": 17.22,
       "http_exchanges": 22,
       "ite": 42219.0,
       "max_tool_output_chars": 220,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 44.89,
+      "peak_rss_mb": 45.61,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
@@ -4951,17 +4951,17 @@
         "output_tokens": 21,
         "reasoning_tokens": 0
       },
-      "wall_ms": 998.53
+      "wall_ms": 1455.6
     }
   ],
-  "source_sha": "263efb6bf03db41f50d9205aa120ff13934a7d29",
+  "source_sha": "286274a4982320e9d2ed3df5d4f5220aab2074fd",
   "spend_cap_usd": null,
-  "started_unix": 1790320006.94487,
+  "started_unix": 1790321005.627285,
   "summary": [
     {
       "harness": "aim_openrouter",
       "ite_per_passed": 13990.5,
-      "p50_wall_ms": 122.06,
+      "p50_wall_ms": 154.59,
       "pass_rate": 1.0,
       "pass_rate_ci95": [
         0.676,
@@ -4974,7 +4974,7 @@
     {
       "harness": "codex",
       "ite_per_passed": 72360.0,
-      "p50_wall_ms": 566.04,
+      "p50_wall_ms": 511.46,
       "pass_rate": 1.0,
       "pass_rate_ci95": [
         0.676,
@@ -4987,7 +4987,7 @@
     {
       "harness": "pi",
       "ite_per_passed": 16113.25,
-      "p50_wall_ms": 369.26,
+      "p50_wall_ms": 387.56,
       "pass_rate": 1.0,
       "pass_rate_ci95": [
         0.676,

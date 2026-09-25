@@ -1,29 +1,32 @@
 {
   "binary_sha256": {
-    "aim": "c64f6e24d4ea39fc801555a203fdd9070a50015571850bde4d3a6c2e2e994ec9",
-    "aim_coderun": "217dc043a4269398e25fb427a89e72f31976afd5ac67381a14a79ca2e82a50f2",
-    "aimx": "1a4874ea3c523853346df68276289c9f5edf7a2d463dd4c20b7839db184f856c",
+    "aim": "93ec116bfdb87f9c39613c065b1cd2a4d7eb803c119d9c400fce46a991f3f19e",
+    "aim_coderun": "a135d442bc9ec286787eef88c08ebf5613fc5faea6169755a1e207eb6890564b",
+    "aimx": "39438e78ab4600041aa8baa568f5ff909c2321f50940a16e801f059790e6c6b6",
     "codex": "8b93eddd656ee85e07785fed7b0c6f445491abfba80d52e278d0afd1fe680a4e",
     "pi": "0fcda879f854b95368a4c217782a78808f7fea61cf60cc1e6fbec4f5b5d700f9",
     "python": "ab15cbe78b02b5fc939765827e0b1c2dc3668def22c6952f06a369bfbde01163"
   },
   "budget_used_including_transport_reserve_usd": 0.0,
-  "finished_unix": 1790316914.645901,
+  "finished_unix": 1790321036.3561459,
   "hardware": {
     "machine": "arm64",
     "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
     "python": "3.14.7"
   },
-  "manifest_sha256": "0869f86272eef6928bf8db172647e790c3e810eccdd89a3c494f680a1e7035d3",
+  "manifest_sha256": "03b5927e9d084c7d8ba43fd6838b5ba4f4cafabe686235dcef69fc1e545f3529",
   "prewarm": [
     {
+      "append_only_steps": 0,
       "auxiliary_requests": 1,
       "case": "W1",
+      "client_disconnects_with_usage": 0,
       "effort": "low",
       "exit_code": 0,
+      "failed_tools_by_name": {},
       "first_request_bytes": 7200,
       "first_request_instructions_chars": 1440,
-      "first_request_ms": 20.06,
+      "first_request_ms": 53.14,
       "first_request_tokens_estimate": 1800,
       "first_request_tool_schema_bytes": [
         {
@@ -73,18 +76,23 @@
       ],
       "first_request_tools": 11,
       "first_request_tools_json_bytes": 5391,
-      "first_token_ms": 0.416,
+      "first_token_ms": 63.067,
       "harness": "aim_openrouter",
+      "harness_peak_rss_mb": 26.26,
+      "helpers_peak_rss_mb": 16.09,
       "http_exchanges": 2,
       "ite": 1805.0,
       "max_tool_output_chars": 0,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 26.07,
+      "peak_rss_mb": 43.38,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
       "repetition": -1,
       "request_json_bytes": [
         7200
@@ -110,9 +118,14 @@
       "response_statuses": [
         200
       ],
+      "stable_head_ratio_median": null,
+      "stable_head_ratios": [],
       "timed_out": false,
+      "tool_calls_by_name": {},
       "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
       "transport_errors": 0,
+      "turn_failure_class": null,
       "usage": {
         "cache_write_tokens": 0,
         "cached_tokens": 0,
@@ -121,19 +134,22 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 23.02
+      "wall_ms": 120.06
     }
   ],
   "recorded_spend_usd": 0.0,
   "runs": [
     {
+      "append_only_steps": 0,
       "auxiliary_requests": 1,
       "case": "W1",
+      "client_disconnects_with_usage": 0,
       "effort": "low",
       "exit_code": 0,
+      "failed_tools_by_name": {},
       "first_request_bytes": 7200,
       "first_request_instructions_chars": 1440,
-      "first_request_ms": 19.92,
+      "first_request_ms": 48.38,
       "first_request_tokens_estimate": 1800,
       "first_request_tool_schema_bytes": [
         {
@@ -183,18 +199,23 @@
       ],
       "first_request_tools": 11,
       "first_request_tools_json_bytes": 5391,
-      "first_token_ms": 0.672,
+      "first_token_ms": 60.937,
       "harness": "aim_openrouter",
+      "harness_peak_rss_mb": 26.28,
+      "helpers_peak_rss_mb": 16.15,
       "http_exchanges": 2,
       "ite": 1805.0,
       "max_tool_output_chars": 0,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 26.18,
+      "peak_rss_mb": 43.53,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
       "repetition": 0,
       "request_json_bytes": [
         7200
@@ -220,9 +241,14 @@
       "response_statuses": [
         200
       ],
+      "stable_head_ratio_median": null,
+      "stable_head_ratios": [],
       "timed_out": false,
+      "tool_calls_by_name": {},
       "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
       "transport_errors": 0,
+      "turn_failure_class": null,
       "usage": {
         "cache_write_tokens": 0,
         "cached_tokens": 0,
@@ -231,16 +257,19 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 23.08
+      "wall_ms": 113.96
     },
     {
+      "append_only_steps": 0,
       "auxiliary_requests": 1,
       "case": "W1",
+      "client_disconnects_with_usage": 0,
       "effort": "low",
       "exit_code": 0,
+      "failed_tools_by_name": {},
       "first_request_bytes": 7200,
       "first_request_instructions_chars": 1440,
-      "first_request_ms": 19.38,
+      "first_request_ms": 41.24,
       "first_request_tokens_estimate": 1800,
       "first_request_tool_schema_bytes": [
         {
@@ -290,18 +319,23 @@
       ],
       "first_request_tools": 11,
       "first_request_tools_json_bytes": 5391,
-      "first_token_ms": 0.555,
+      "first_token_ms": 65.054,
       "harness": "aim_openrouter",
+      "harness_peak_rss_mb": 26.18,
+      "helpers_peak_rss_mb": 16.09,
       "http_exchanges": 2,
       "ite": 1805.0,
       "max_tool_output_chars": 0,
       "missing_success_cost": false,
       "model": "gpt-5.5",
       "passed": true,
-      "peak_rss_mb": 26.17,
+      "peak_rss_mb": 43.38,
       "provider_cost_complete": true,
       "provider_usage_complete": true,
       "proxy_error_types": [],
+      "proxy_spend_cap_hit": false,
+      "read_argument_keys": {},
+      "read_failure_classes": {},
       "repetition": 1,
       "request_json_bytes": [
         7200
@@ -327,9 +361,14 @@
       "response_statuses": [
         200
       ],
+      "stable_head_ratio_median": null,
+      "stable_head_ratios": [],
       "timed_out": false,
+      "tool_calls_by_name": {},
       "tool_output_recovery_hint": false,
+      "tool_result_pattern_counts": {},
       "transport_errors": 0,
+      "turn_failure_class": null,
       "usage": {
         "cache_write_tokens": 0,
         "cached_tokens": 0,
@@ -338,17 +377,17 @@
         "output_tokens": 1,
         "reasoning_tokens": 0
       },
-      "wall_ms": 22.4
+      "wall_ms": 111.08
     }
   ],
-  "source_sha": "263efb6bf03db41f50d9205aa120ff13934a7d29",
+  "source_sha": "286274a4982320e9d2ed3df5d4f5220aab2074fd",
   "spend_cap_usd": null,
-  "started_unix": 1790316914.282419,
+  "started_unix": 1790321035.5480409,
   "summary": [
     {
       "harness": "aim_openrouter",
       "ite_per_passed": 1805.0,
-      "p50_wall_ms": 22.74,
+      "p50_wall_ms": 112.52,
       "pass_rate": 1.0,
       "pass_rate_ci95": [
         0.342,
