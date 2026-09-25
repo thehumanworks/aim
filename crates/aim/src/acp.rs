@@ -441,7 +441,8 @@ impl Backend for AcpBackend {
                     // last answer, so `config()` reports what the agent last said. Idle updates
                     // carry nothing a turn needs (the bridge ignores them).
                     drop(self.session.take_idle_events());
-                    return Err(format!("{} `{value}`: {error}", key.label()));
+                    // Never repeat the request: it may be a mistyped secret (ADR 0075).
+                    return Err(format!("{}: {error}", key.label()));
                 }
             }
             // Switching models can change other options (e.g. the mode): report what the agent
@@ -630,7 +631,7 @@ mod tests {
         // Both values are valid for model `a`, so the check passes; the model step then changes
         // the effort options and the effort step fails (REV8-3).
         let refused = backend.set_config(Some("b".into()), Some("high".into())).await.unwrap_err();
-        assert!(refused.contains("high"), "{refused}");
+        assert!(refused.starts_with("effort: the requested effort is not offered"), "{refused}");
         let now = backend.set_config(None, None).await.unwrap();
         assert_eq!((now.model.as_str(), now.effort.as_deref()), ("b", Some("low")), "what the agent really has in force");
         // `auto` is not an effort this agent offers.

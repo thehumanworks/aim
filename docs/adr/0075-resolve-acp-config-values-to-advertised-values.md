@@ -56,8 +56,8 @@ first:
 
 1. **Exact** — the same bytes.
 2. **Folded** — the same value or display name after lowercasing, trimming, collapsing
-   whitespace, and spelling a `-<n>m` suffix as `[<n>m]` (`Opus`, `OPUS[1M]`, `opus-1m`,
-   `Opus 5.5`).
+   whitespace, and writing the variant spellings the agent's profile declares one way (`Opus`,
+   `OPUS[1M]`, `Opus 5.5`; for `acp:claude` also `opus-1m`).
 3. **Family** — the request contains the value's family word and names the same variant (or
    neither names one).
 4. **Family, any variant** — the request contains the family word and names no variant; the value
@@ -68,17 +68,35 @@ matches only values of that generation, and a value with no known generation doe
 The first tier with any match decides. One match resolves; two or more are `Ambiguous` and aim
 picks none; none at all is `Unknown`.
 
-How far resolution goes is per option: the `model` option (category `model`, else id `model`)
-uses all four tiers; the effort (category `thought_level`, else id `effort`) uses tiers 1–2; every
-other option (`mode`, `fast`, custom ids) matches exactly only, so the display name of a
-permission mode is never an alias. Booleans keep `true`/`on`/`false`/`off`.
+Before tiers 3–4 the family must be clear. Two advertised values *conflict* when the request's
+words name both of their (different) families (`opus sonnet`), or when the request names no
+generation and both match it at a family tier with different generations (`opus` while Opus 4.5
+and Opus 5.5 are offered). A conflict ends resolution as `Conflict`, reported like an ambiguity
+with the two values; naming the generation or a variant that only one of them has settles it.
+Exact and folded matches are tried before, so `claude-opus-4-5` or `opus[1m]` still resolve.
+
+How far resolution goes is per option, and whether an option is the model or the effort is
+decided by the same lookup that finds it for a key (`config_options::find`: category first, else
+the conventional id): the option found for the model uses all four tiers; the one found for the
+effort uses tiers 1–2; every other option (`mode`, `fast`, custom ids) matches exactly only, so
+the display name of a permission mode is never an alias. Booleans keep `true`/`on`/`false`/`off`.
+
+Variant spellings are capability data of the agent's profile, not a rule for every ACP agent:
+`AcpAgentConfig::model_variants` lists them (`VariantSyntax::Bracketed { unit }` for
+`name[<n><unit>]`, `VariantSyntax::Dashed { unit }` for `name-<n><unit>`), and the `claude`
+profile declares both with unit `m`, the adapter's two context-hint spellings
+(`session-model.js:3-4`). The session attaches its profile's list to every option list it holds
+(`ConfigOption::model_variants`, never on the wire), so aim's pre-check and the session resolve by
+the same rule. A profile that declares none gets no variant keys: model values then match exactly,
+ignoring case, or by family and generation, and no suffix is read as a variant.
 
 The shell (`aim-acp` `config_options`) derives the keys from the agent's own data, with no model,
 family or vendor word built in:
 
 - ids: one table per resolution maps each normalized string to a sequential `u64`; equal strings
   share an id, distinct strings never do. The kernel compares ids only.
-- variant: a trailing `[<n>m]` or `-<n>m`, the adapter's two context-hint spellings.
+- variant: a trailing suffix in one of the profile's declared spellings (for `acp:claude`,
+  `[<n>m]` or `-<n>m`); none when the profile declares none.
 - generation: the first number of one to three digits, with an optional `.`/`-` minor, taken from
   the value (variant removed) and else from the display name, encoded as `major * 1000 + minor`
   (`claude-opus-5-5` and "Opus 5.5" are 5005; a zero minor is dropped; dates are not versions).
@@ -94,9 +112,11 @@ the same resolver (`aim_acp::resolve_config_value`); its separate lookup is gone
 
 Errors list what the agent offers as `` `value` (Name) `` pairs, at creation and mid-session:
 `ConfigValueRejected` (its `allowed` is now `Vec<ConfigValue>`) and the new
-`ConfigValueAmbiguous`, which also names two of the tied values. Advertised model and effort
-values are capability data, not secrets; they still pass through `redact` before they are stored
-in an error.
+`ConfigValueAmbiguous` (ties and conflicts), which also names two of the values. Advertised model
+and effort values are capability data, not secrets; they still pass through `redact` before they
+are stored in an error. The request itself is never repeated in a message ("the requested model is
+not offered; the agent offers …"): it could be a mistyped secret, and pattern redaction cannot
+recognize every secret. `AcpBackend::set_config` prefixes only the option's label.
 
 ## Consequences
 
@@ -105,11 +125,14 @@ in an error.
 - A request that names another generation (`claude-opus-4-5` while only Opus 5.5 is offered) is
   refused with the list rather than silently upgraded. When the adapter's list changes, the
   aliases follow it with no code change.
-- When a family comes both with and without a variant, a request without one prefers the value
-  without one (tier 3 before 4), like the adapter's own substring tier, which requires equal
-  context hints (`session-model.js:117`). If such a list also held two generations of the family,
-  `opus` would pick the variant-less one, whatever its generation; a request naming the
-  generation or the variant is then needed to get the other.
+- When a family comes both with and without a variant in one generation, a request without one
+  prefers the value without one (tier 3 before 4), like the adapter's own substring tier, which
+  requires equal context hints (`session-model.js:117`). Across generations there is no
+  preference: `opus` with Opus 4.5 and Opus 5.5 offered is refused with both named, since aim
+  cannot know which is newer or preferred. A value with no readable generation counts as a
+  generation of its own there.
+- Another ACP agent gets the family and generation tiers but no variant folding until its
+  profile declares its spellings; `-1m` is then just part of the value.
 - The key derivation is a heuristic on the agent's strings. Its failure mode is a refusal
   (`Unknown`) or `Ambiguous`, both of which list the values; the kernel guarantees that a wrong
   silent pick needs a wrong key, never a tie.
@@ -122,15 +145,21 @@ in an error.
   `resolve` ensures its result equals `resolve_spec`, so resolution is a function of its keys;
   `theorem_resolved_is_the_unique_best` (the index is in bounds, matches at its tier, within the
   depth, is the only match there, and nothing matches at a better tier);
-  `theorem_ambiguity_is_a_tie_at_the_best_tier`; `theorem_unknown_means_no_match`;
+  `theorem_ambiguity_is_a_tie_at_the_best_tier`; `theorem_conflict_is_real`;
+  `theorem_unqualified_family_never_picks_a_generation` (a request naming no generation never
+  resolves at a family tier while two values it matches there differ in generation);
+  `theorem_two_families_never_resolve` (a request whose words name two advertised families never
+  resolves at a family tier); `theorem_unknown_means_no_match`;
   `theorem_unique_best_is_resolved` (the answer depends only on which values match at which tier,
   not on list order); `theorem_exact_wins`; `theorem_generation_is_respected`;
   `theorem_variant_is_respected`.
 - Shell tests, `crates/aim-acp/src/config_options.rs`: every alias above against the recorded
   fixture list; `gpt-6`, `no-such-model`, `claude`, `claude-opus-4-5`, `sonnet[1m]` refused with
-  all five `value (Name)` pairs; a constructed tie; effort case folding; property tests (every
-  advertised value resolves to itself in any case and list order, Opus aliases in any case and
-  order, generations never crossed, folding idempotent).
+  all five `value (Name)` pairs and without repeating the request; a constructed tie; `opus`
+  across two generations and `opus sonnet` refused with the two values; an option found as the
+  model by its id resolving like the model; variants folded only when the profile declares them;
+  effort case folding; property tests (every advertised value resolves to itself in any case and
+  list order, Opus aliases in any case and order, generations never crossed, folding idempotent).
 - Wire and backend tests: `crates/aim-acp/tests/wire.rs`
   `a_model_alias_is_sent_as_the_advertised_value_and_confirmed_by_it` (aim sends `opus[1m]` for
   `opus` and confirms the agent's canonical current value); `crates/aim/src/acp.rs`

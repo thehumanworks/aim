@@ -7,6 +7,7 @@ use aim_kernel::model_match::{self, Candidate, Request, Tier, Unresolved};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::VariantSyntax;
 use crate::error::AcpError;
 use crate::redact::redact;
 use crate::wire;
@@ -102,6 +103,12 @@ pub struct ConfigOption {
     pub category: Option<String>,
     /// Kind and value.
     pub kind: ConfigKind,
+    /// How the agent spells variants of model values: its profile's
+    /// [`crate::AcpAgentConfig::model_variants`], attached by the session to every option list it
+    /// holds, so each caller resolving against them applies the same rule (docs/adr/0075). Never
+    /// read from or written to the wire.
+    #[serde(skip)]
+    pub model_variants: Vec<VariantSyntax>,
 }
 
 macro_rules! opaque_config_debug {
@@ -177,7 +184,17 @@ fn parse_option(raw: &Value) -> Option<ConfigOption> {
         description: wire::string(raw, "description"),
         category: wire::string(raw, "category"),
         kind,
+        model_variants: Vec::new(),
     })
+}
+
+/// `options` with the variant spellings of the agent's profile attached (docs/adr/0075).
+#[must_use]
+pub fn with_model_variants(mut options: Vec<ConfigOption>, variants: &[VariantSyntax]) -> Vec<ConfigOption> {
+    for option in &mut options {
+        option.model_variants = variants.to_vec();
+    }
+    options
 }
 
 /// Finds the option `key` refers to.
@@ -195,10 +212,12 @@ pub fn find<'a>(options: &'a [ConfigOption], key: &ConfigKey) -> Option<&'a Conf
 /// request resolves to; for a boolean, `true` or `false`.
 ///
 /// A select value resolves by the first tier that matches, best first: the exact value; the
-/// value or display name ignoring case (and `-1m` spelled `[1m]`); for the model only, the one
-/// value of the family, generation and variant the request names (`opus`, `claude-opus-5-5` →
-/// `opus[1m]` when that is the only Opus 5.5 offered). The decision is `aim_kernel::model_match`;
-/// this shell only normalizes strings into the keys it compares.
+/// value or display name ignoring case (with the variant spellings the agent's profile declares,
+/// such as `-1m` for `[1m]`, folded together); for the model only, the one value of the family,
+/// generation and variant the request names (`opus`, `claude-opus-5-5` → `opus[1m]` when that is
+/// the only Opus offered). A request naming two families, or a family in two generations without
+/// naming one, is ambiguous. The decision is `aim_kernel::model_match`; this shell only
+/// normalizes strings into the keys it compares.
 ///
 /// # Errors
 ///
@@ -208,7 +227,7 @@ pub fn find<'a>(options: &'a [ConfigOption], key: &ConfigKey) -> Option<&'a Conf
 pub fn resolve_config_value(options: &[ConfigOption], key: &ConfigKey, value: &str) -> Result<(String, String), AcpError> {
     let option = find(options, key).ok_or_else(|| AcpError::ConfigUnavailable { key: key.label().to_owned() })?;
     let resolved = match &option.kind {
-        ConfigKind::Select { values, .. } => resolve_select(option, values, value)?.value.clone(),
+        ConfigKind::Select { values, .. } => resolve_select(depth(options, option), option, values, value)?.value.clone(),
         ConfigKind::Boolean { .. } => match value {
             "true" | "on" => "true".to_owned(),
             "false" | "off" => "false".to_owned(),
@@ -260,28 +279,39 @@ fn redacted(value: &ConfigValue) -> ConfigValue {
     ConfigValue { value: redact(&value.value), name: redact(&value.name), description: None, group: None }
 }
 
-/// How far from the exact bytes a request may resolve for `option` (docs/adr/0075): the model
-/// down to its family, the effort ignoring case, anything else (mode, fast, custom ids) exactly.
-fn depth(option: &ConfigOption) -> Tier {
-    match option.category.as_deref().unwrap_or(option.id.as_str()) {
-        "model" => Tier::FamilyAnyVariant,
-        "thought_level" | "effort" => Tier::Folded,
-        _ => Tier::Exact,
+/// How far from the exact bytes a request may resolve for `option`, one of `options`
+/// (docs/adr/0075). It asks [`find`], so an option is treated as the model or the effort exactly
+/// when a lookup for that key finds it: the model down to its family, the effort ignoring case,
+/// anything else (mode, fast, custom ids) exactly.
+fn depth(options: &[ConfigOption], option: &ConfigOption) -> Tier {
+    let serves = |key: &ConfigKey| find(options, key).is_some_and(|found| core::ptr::eq(found, option));
+    if serves(&ConfigKey::Model) {
+        Tier::FamilyAnyVariant
+    } else if serves(&ConfigKey::Effort) {
+        Tier::Folded
+    } else {
+        Tier::Exact
     }
 }
 
-fn resolve_select<'a>(option: &ConfigOption, values: &'a [ConfigValue], requested: &str) -> Result<&'a ConfigValue, AcpError> {
-    let deepest = depth(option);
+fn resolve_select<'a>(
+    deepest: Tier,
+    option: &ConfigOption,
+    values: &'a [ConfigValue],
+    requested: &str,
+) -> Result<&'a ConfigValue, AcpError> {
+    // Variant spellings are the profile's, and only for the model.
+    let variants: &[VariantSyntax] = if deepest == Tier::FamilyAnyVariant { &option.model_variants } else { &[] };
     let mut ids = Ids::default();
-    let (request, words) = request_keys(&mut ids, requested);
-    let candidates: Vec<Candidate> = values.iter().map(|value| candidate_keys(&mut ids, value, deepest)).collect();
+    let (request, words) = request_keys(&mut ids, requested, variants);
+    let candidates: Vec<Candidate> = values.iter().map(|value| candidate_keys(&mut ids, value, deepest, variants)).collect();
+    let pair = |first: usize, second: usize| -> Vec<&ConfigValue> { [first, second].iter().filter_map(|&i| values.get(i)).collect() };
     match model_match::resolve(request, &words, &candidates, deepest) {
         // The kernel proves the index in bounds (`theorem_resolved_is_the_unique_best`).
         Ok(resolved) => values.get(resolved.index).ok_or_else(|| rejected(option, requested, &[])),
         Err(Unresolved::Unknown) => Err(rejected(option, requested, &[])),
-        Err(Unresolved::Ambiguous { first, second, .. }) => {
-            let tie: Vec<&ConfigValue> = [first, second].iter().filter_map(|&i| values.get(i)).collect();
-            Err(rejected(option, requested, &tie))
+        Err(Unresolved::Ambiguous { first, second, .. } | Unresolved::Conflict { first, second }) => {
+            Err(rejected(option, requested, &pair(first, second)))
         }
     }
 }
@@ -299,13 +329,13 @@ impl Ids {
 }
 
 /// The request's keys and the ids of its words.
-fn request_keys(ids: &mut Ids, requested: &str) -> (Request, Vec<u64>) {
+fn request_keys(ids: &mut Ids, requested: &str, variants: &[VariantSyntax]) -> (Request, Vec<u64>) {
     let lower = fold_text(requested);
-    let (base, variant) = split_variant(&lower);
+    let (base, variant) = split_variant(&lower, variants);
     let words = words(base).iter().map(|word| ids.id(word)).collect();
     let request = Request {
         value: ids.id(requested),
-        folded: ids.id(&fold_value(requested)),
+        folded: ids.id(&fold_value(requested, variants)),
         generation: generation(base),
         variant: variant.map(|v| ids.id(v)),
     };
@@ -314,14 +344,14 @@ fn request_keys(ids: &mut Ids, requested: &str) -> (Request, Vec<u64>) {
 
 /// An advertised value's keys. Only the model has a family: other options match exactly or by
 /// case.
-fn candidate_keys(ids: &mut Ids, value: &ConfigValue, deepest: Tier) -> Candidate {
+fn candidate_keys(ids: &mut Ids, value: &ConfigValue, deepest: Tier, variants: &[VariantSyntax]) -> Candidate {
     let lower = fold_text(&value.value);
-    let (base, variant) = split_variant(&lower);
+    let (base, variant) = split_variant(&lower, variants);
     let name = fold_text(&value.name);
     let family = if deepest == Tier::FamilyAnyVariant { family(base, &value.name) } else { None };
     Candidate {
         value: ids.id(&value.value),
-        folded: ids.id(&fold_value(&value.value)),
+        folded: ids.id(&fold_value(&value.value, variants)),
         name: (!name.is_empty()).then(|| ids.id(&name)),
         family: family.map(|word| ids.id(&word)),
         generation: generation(base).or_else(|| generation(&name)),
@@ -334,29 +364,33 @@ fn fold_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
-/// A value folded for comparison: [`fold_text`], with a `-1m` context suffix spelled `[1m]`.
-fn fold_value(value: &str) -> String {
+/// A value folded for comparison: [`fold_text`], with a declared variant spelling written one
+/// way (`opus-1m` → `opus[1m]` when the profile declares both).
+fn fold_value(value: &str, variants: &[VariantSyntax]) -> String {
     let lower = fold_text(value);
-    match split_variant(&lower) {
+    match split_variant(&lower, variants) {
         (base, Some(variant)) => format!("{base}[{variant}]"),
         (base, None) => base.to_owned(),
     }
 }
 
-/// Splits a trailing context-size variant off a lowercased value, in either spelling the adapter
-/// accepts (claude-agent-acp `session-model.js`, `MODEL_CONTEXT_HINT_PATTERN` and
-/// `CONTEXT_HINT_SUFFIX_PATTERN`): `opus[1m]` and `opus-1m` are (`opus`, `1m`).
-fn split_variant(lower: &str) -> (&str, Option<&str>) {
-    let is_size = |hint: &str| hint.strip_suffix('m').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-    if let Some((base, hint)) = lower.strip_suffix(']').and_then(|s| s.rsplit_once('['))
-        && is_size(hint)
-    {
-        return (base, Some(hint));
-    }
-    if let Some((base, hint)) = lower.rsplit_once('-')
-        && is_size(hint)
-    {
-        return (base, Some(hint));
+/// Splits a trailing variant off a lowercased value, in the first of the profile's declared
+/// spellings that fits (for claude-agent-acp, `opus[1m]` and `opus-1m` are both (`opus`, `1m`)).
+/// With no declared spelling nothing is a variant.
+fn split_variant<'a>(lower: &'a str, variants: &[VariantSyntax]) -> (&'a str, Option<&'a str>) {
+    let size = |hint: &str, unit: char| {
+        hint.strip_suffix(unit.to_ascii_lowercase()).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    for syntax in variants {
+        let (split, unit) = match *syntax {
+            VariantSyntax::Bracketed { unit } => (lower.strip_suffix(']').and_then(|s| s.rsplit_once('[')), unit),
+            VariantSyntax::Dashed { unit } => (lower.rsplit_once('-'), unit),
+        };
+        if let Some((base, hint)) = split
+            && size(hint, unit)
+        {
+            return (base, Some(hint));
+        }
     }
     (lower, None)
 }
@@ -475,12 +509,23 @@ mod tests {
     }
 
     /// The options claude-agent-acp 0.81.2 advertised in a live session
-    /// (`tests/fixtures/permission_turn.jsonl`, line 6).
+    /// (`tests/fixtures/permission_turn.jsonl`, line 6), as a `claude` session holds them.
     fn claude_options() -> Vec<ConfigOption> {
+        claude(recorded_options())
+    }
+
+    fn recorded_options() -> Vec<ConfigOption> {
         let line = include_str!("../tests/fixtures/permission_turn.jsonl").lines().nth(5).unwrap();
         let frame: Value = serde_json::from_str(line).unwrap();
         parse_config_options(frame["msg"]["result"].get("configOptions"))
     }
+
+    /// `options` with the `claude` profile's variant spellings attached, as its session does.
+    fn claude(options: Vec<ConfigOption>) -> Vec<ConfigOption> {
+        with_model_variants(options, &crate::AcpAgentConfig::claude().model_variants)
+    }
+
+    const CLAUDE_VARIANTS: [VariantSyntax; 2] = [VariantSyntax::Bracketed { unit: 'm' }, VariantSyntax::Dashed { unit: 'm' }];
 
     fn model(options: &[ConfigOption], requested: &str) -> Result<String, AcpError> {
         resolve_config_value(options, &ConfigKey::Model, requested).map(|(id, value)| {
@@ -528,6 +573,7 @@ mod tests {
     #[test]
     fn unknown_models_are_rejected_with_what_the_agent_offers() {
         let options = claude_options();
+        let offered = find(&options, &ConfigKey::Model).unwrap().allowed();
         // Another vendor, a made-up id, a vendor word that is no family, the wrong generation,
         // and a variant the family does not come in.
         for requested in ["gpt-6", "no-such-model", "claude", "claude-opus-4-5", "sonnet-4-5", "opus-2m", "sonnet[1m]", ""] {
@@ -544,33 +590,102 @@ mod tests {
             ] {
                 assert!(message.contains(pair), "{message}");
             }
-            assert!(message.starts_with(&format!("model `{requested}` is not offered")), "{message}");
+            assert!(message.starts_with("the requested model is not offered; the agent offers `default`"), "{message}");
+            // The request itself is never repeated: it could be a mistyped secret.
+            if !requested.is_empty() && !offered.iter().any(|v| v.contains(requested)) {
+                assert!(!message.contains(requested), "{message}");
+            }
         }
     }
 
     #[test]
     fn a_tie_is_ambiguous_and_names_both() {
-        let options = parse_config_options(Some(&json!([
+        let options = claude(parse_config_options(Some(&json!([
             {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "default",
              "options": [{"value": "default", "name": "Default", "description": "Opus (1M context)"},
                          {"value": "opus[1m]", "name": "Opus 5.5"},
                          {"value": "claude-opus-5-5[1m]", "name": "Opus 5.5 (1M context)"},
                          {"value": "claude-opus-4-5", "name": "Opus 4.5"},
                          {"value": "sonnet", "name": "Sonnet 5"}]}
-        ])));
+        ]))));
         let error = model(&options, "claude-opus-5-5").unwrap_err();
         let AcpError::ConfigValueAmbiguous { matches, allowed, .. } = &error else { panic!("{error}") };
         assert_eq!(matches.iter().map(|m| m.value.as_str()).collect::<Vec<_>>(), ["opus[1m]", "claude-opus-5-5[1m]"]);
         assert_eq!(allowed.len(), 5);
-        assert!(error.to_string().contains("is ambiguous: it matches `opus[1m]` (Opus 5.5), `claude-opus-5-5[1m]`"), "{error}");
+        assert!(
+            error.to_string().starts_with("the requested model is ambiguous: it matches `opus[1m]` (Opus 5.5), `claude-opus-5-5[1m]`"),
+            "{error}"
+        );
         // A request that names the generation of only one of them is not a tie; neither is the
         // exact value.
         assert_eq!(model(&options, "claude-opus-4-5").as_deref(), Ok("claude-opus-4-5"));
         assert_eq!(model(&options, "opus-4-5").as_deref(), Ok("claude-opus-4-5"));
         assert_eq!(model(&options, "opus[1m]").as_deref(), Ok("opus[1m]"));
-        // Without a variant, a value without one is preferred (the adapter's own includes tier
-        // also wants equal context hints).
-        assert_eq!(model(&options, "opus").as_deref(), Ok("claude-opus-4-5"));
+        // `opus` names no generation while Opus comes in 5.5 and 4.5: no silent pick of either
+        // (`theorem_unqualified_family_never_picks_a_generation`).
+        let error = model(&options, "opus").unwrap_err();
+        let AcpError::ConfigValueAmbiguous { matches, .. } = &error else { panic!("{error}") };
+        assert_eq!(matches.iter().map(|m| m.value.as_str()).collect::<Vec<_>>(), ["opus[1m]", "claude-opus-4-5"]);
+        // Naming the variant narrows it to one generation.
+        assert_eq!(model(&options, "opus-1m").as_deref(), Ok("opus[1m]"));
+    }
+
+    /// A request that names two advertised families picks neither
+    /// (`theorem_two_families_never_resolve`).
+    #[test]
+    fn two_families_are_ambiguous() {
+        let options = claude_options();
+        for requested in ["opus sonnet", "sonnet-opus", "Haiku or Fable"] {
+            let error = model(&options, requested).unwrap_err();
+            assert!(matches!(&error, AcpError::ConfigValueAmbiguous { matches, .. } if matches.len() == 2), "{requested}: {error}");
+        }
+        let error = model(&options, "opus sonnet").unwrap_err();
+        assert!(error.to_string().contains("it matches `opus[1m]` (Opus 5.5), `sonnet` (Sonnet 5)"), "{error}");
+    }
+
+    /// Whether an option is the model or the effort is decided by the same lookup that finds it,
+    /// so an option found as the model by its id resolves like the model.
+    #[test]
+    fn an_option_found_as_the_model_resolves_like_the_model() {
+        let options = claude(parse_config_options(Some(&json!([
+            {"id": "model", "name": "Model", "category": "custom_model", "type": "select", "currentValue": "a",
+             "options": [{"value": "opus[1m]", "name": "Opus 5.5"}, {"value": "sonnet", "name": "Sonnet 5"}]},
+            {"id": "effort", "name": "Effort", "category": "custom_effort", "type": "select", "currentValue": "low",
+             "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}
+        ]))));
+        assert_eq!(find(&options, &ConfigKey::Model).map(|o| o.id.as_str()), Some("model"));
+        assert_eq!(model(&options, "opus").as_deref(), Ok("opus[1m]"));
+        assert_eq!(resolve_config_value(&options, &ConfigKey::Id("model".into()), "Sonnet").map(|(_, v)| v).as_deref(), Ok("sonnet"));
+        assert_eq!(resolve_config_value(&options, &ConfigKey::Effort, "High").map(|(_, v)| v).as_deref(), Ok("high"));
+        // An option with the model's category wins the lookup, and only it resolves like the model.
+        let mut both = options.clone();
+        both.extend(claude(parse_config_options(Some(&json!([
+            {"id": "llm", "name": "LLM", "category": "model", "type": "select", "currentValue": "x",
+             "options": [{"value": "x-large", "name": "X Large"}]}
+        ])))));
+        assert_eq!(resolve_config_value(&both, &ConfigKey::Model, "x large"), Ok(("llm".to_owned(), "x-large".to_owned())));
+        assert!(resolve_config_value(&both, &ConfigKey::Id("model".into()), "opus").is_err(), "no longer the model: exact only");
+    }
+
+    /// Variant spellings are the profile's: without a declaration nothing is read as a variant.
+    #[test]
+    fn variants_are_folded_only_when_the_profile_declares_them() {
+        let list = json!([
+            {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "claude-opus-5-5",
+             "options": [{"value": "claude-opus-5-5", "name": "Opus 5.5"}, {"value": "claude-opus-5-5[1m]", "name": "Opus 5.5 (1M context)"}]}
+        ]);
+        let declared = claude(parse_config_options(Some(&list)));
+        let undeclared = parse_config_options(Some(&list));
+        assert!(undeclared[0].model_variants.is_empty());
+        // Declared: `-1m` is the `[1m]` variant, and a request without one prefers a value
+        // without one.
+        assert_eq!(model(&declared, "claude-opus-5-5-1m").as_deref(), Ok("claude-opus-5-5[1m]"));
+        assert_eq!(model(&declared, "opus").as_deref(), Ok("claude-opus-5-5"));
+        // Undeclared: no suffix means anything, so both are plain Opus 5.5 and neither is picked.
+        assert!(matches!(model(&undeclared, "claude-opus-5-5-1m"), Err(AcpError::ConfigValueAmbiguous { .. })));
+        assert!(matches!(model(&undeclared, "opus"), Err(AcpError::ConfigValueAmbiguous { .. })));
+        // Exact and case-insensitive values still resolve.
+        assert_eq!(model(&undeclared, "Claude-Opus-5-5[1M]").as_deref(), Ok("claude-opus-5-5[1m]"));
     }
 
     #[test]
@@ -590,11 +705,16 @@ mod tests {
 
     #[test]
     fn normalization_examples() {
-        assert_eq!(split_variant("opus[1m]"), ("opus", Some("1m")));
-        assert_eq!(split_variant("opus-1m"), ("opus", Some("1m")));
-        assert_eq!(split_variant("claude-opus-5-5"), ("claude-opus-5-5", None));
-        assert_eq!(split_variant("opus[m]"), ("opus[m]", None));
-        assert_eq!(fold_value(" Claude-Opus-5-5-1M "), "claude-opus-5-5[1m]");
+        let claude = &CLAUDE_VARIANTS;
+        assert_eq!(split_variant("opus[1m]", claude), ("opus", Some("1m")));
+        assert_eq!(split_variant("opus-1m", claude), ("opus", Some("1m")));
+        assert_eq!(split_variant("claude-opus-5-5", claude), ("claude-opus-5-5", None));
+        assert_eq!(split_variant("opus[m]", claude), ("opus[m]", None));
+        assert_eq!(split_variant("opus[2k]", claude), ("opus[2k]", None), "only the declared unit");
+        assert_eq!(split_variant("opus[1m]", &[]), ("opus[1m]", None));
+        assert_eq!(split_variant("opus-1m", &[VariantSyntax::Bracketed { unit: 'm' }]), ("opus-1m", None));
+        assert_eq!(fold_value(" Claude-Opus-5-5-1M ", claude), "claude-opus-5-5[1m]");
+        assert_eq!(fold_value(" Claude-Opus-5-5-1M ", &[]), "claude-opus-5-5-1m");
         assert_eq!(words("claude-opus-5-5"), ["claude", "opus"]);
         assert_eq!(words("Default (recommended)"), ["default", "recommended"]);
         assert_eq!(family("claude-fable-5-1", "Fable 5.1").as_deref(), Some("fable"));
@@ -660,10 +780,11 @@ mod tests {
         /// Folding is idempotent and ignores letter case; both context spellings fold alike.
         #[test]
         fn folding_is_stable(base in "[a-zA-Z][a-zA-Z0-9.-]{0,12}", size in 1u32..999) {
-            let folded = fold_value(&base);
-            prop_assert_eq!(fold_value(&folded), folded.clone());
-            prop_assert_eq!(fold_value(&base.to_uppercase()), folded);
-            prop_assert_eq!(fold_value(&format!("{base}[{size}m]")), fold_value(&format!("{base}-{size}M")));
+            let claude = &CLAUDE_VARIANTS;
+            let folded = fold_value(&base, claude);
+            prop_assert_eq!(fold_value(&folded, claude), folded.clone());
+            prop_assert_eq!(fold_value(&base.to_uppercase(), claude), folded);
+            prop_assert_eq!(fold_value(&format!("{base}[{size}m]"), claude), fold_value(&format!("{base}-{size}M"), claude));
         }
     }
 }
