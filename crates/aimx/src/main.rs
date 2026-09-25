@@ -10,9 +10,10 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use aimx::server::{Server, ServerConfig, default_protected, local_principal};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "aimx", about = "aim's execution layer", version)]
@@ -25,24 +26,69 @@ struct Cli {
 enum Cmd {
     /// Serve aim-harness/1.
     Serve(ServeArgs),
+    /// Copy stdin/stdout to the resident server, starting it when needed.
+    Proxy(ProxyArgs),
+    /// Answer one `SSH_ASKPASS` prompt through aim's private callback socket.
+    Askpass { prompt: String },
     /// Print the version and the protocol generations spoken.
     Version,
 }
 
 #[derive(Args)]
+#[expect(clippy::struct_excessive_bools, reason = "independent command-line switches are represented as booleans by clap")]
 struct ServeArgs {
     /// Listen on this unix socket.
-    #[arg(long, value_name = "PATH", conflicts_with = "stdio", required_unless_present = "stdio")]
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["stdio", "resident", "resident_child"], required_unless_present_any = ["stdio", "resident", "resident_child"])]
     unix: Option<PathBuf>,
     /// Serve one connection on stdin/stdout.
     #[arg(long)]
     stdio: bool,
+    /// Start a detached server for one root and return when it answers.
+    #[arg(long, conflicts_with_all = ["stdio", "resident_child"])]
+    resident: bool,
+    /// Run the detached server process (internal).
+    #[arg(long, hide = true, conflicts_with = "stdio")]
+    resident_child: bool,
+    /// Route a stdio harness connection over SSH.
+    #[arg(long, requires = "stdio")]
+    ssh: Option<String>,
+    /// Force agentless operation, or bootstrap the resident binary.
+    #[arg(long, default_value = "auto")]
+    bootstrap: BootstrapMode,
+    /// Caller-verified artifact to install on the SSH host.
+    #[arg(long, requires = "sha256")]
+    artifact: Option<PathBuf>,
+    /// Expected SHA-256 of `--artifact`.
+    #[arg(long, requires = "artifact")]
+    sha256: Option<String>,
+    /// SSH configuration file (also useful for isolated tests).
+    #[arg(long)]
+    ssh_config: Option<PathBuf>,
+    /// Resident idle shutdown delay.
+    #[arg(long, default_value_t = 600)]
+    idle_secs: u64,
     /// A directory clients may open workspaces under (repeatable; default: the home directory).
     #[arg(long = "root", value_name = "DIR")]
     roots: Vec<PathBuf>,
     /// Grant read access only: no writes, no processes, no mutating tools.
     #[arg(long)]
     read_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BootstrapMode {
+    Auto,
+    Never,
+}
+
+#[derive(Args)]
+struct ProxyArgs {
+    /// Workspace root served by the resident.
+    #[arg(long)]
+    root: PathBuf,
+    /// Resident idle shutdown delay.
+    #[arg(long, default_value_t = 600)]
+    idle_secs: u64,
 }
 
 fn init_logging() {
@@ -57,6 +103,31 @@ fn version() {
 }
 
 async fn serve(args: ServeArgs) -> Result<(), String> {
+    if args.resident || args.resident_child {
+        let [root] = args.roots.as_slice() else {
+            return Err("resident mode requires exactly one --root".to_owned());
+        };
+        let idle = Duration::from_secs(args.idle_secs);
+        if args.resident_child {
+            return aimx::ssh::resident::serve_child(root, idle).await.map_err(|err| err.to_string());
+        }
+        return aimx::ssh::resident::ensure(root, idle).await.map(|_| ()).map_err(|err| err.to_string());
+    }
+    if let Some(destination) = &args.ssh {
+        let [root] = args.roots.as_slice() else {
+            return Err("SSH mode requires exactly one --root".to_owned());
+        };
+        return aimx::ssh::forward::serve_ssh(aimx::ssh::forward::ForwardOptions {
+            destination: destination.clone(),
+            root: root.clone(),
+            bootstrap: matches!(args.bootstrap, BootstrapMode::Auto),
+            artifact: args.artifact.clone(),
+            sha256: args.sha256.clone(),
+            ssh_config: args.ssh_config.clone(),
+            idle: Duration::from_secs(args.idle_secs),
+        })
+        .await;
+    }
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_owned())?;
     let roots = if args.roots.is_empty() { vec![PathBuf::from(&home)] } else { args.roots };
     let principal = local_principal(&roots, args.read_only).map_err(|err| format!("invalid --root: {err}"))?;
@@ -97,6 +168,30 @@ async fn main() -> ExitCode {
                     tracing::error!("{err}");
                     ExitCode::FAILURE
                 }
+            }
+        }
+        Cmd::Proxy(args) => {
+            init_logging();
+            match aimx::ssh::resident::proxy(&args.root, Duration::from_secs(args.idle_secs)).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    tracing::error!("{err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Askpass { prompt } => {
+            use std::io::Write as _;
+            match aimx::ssh::conn::askpass_client(&prompt).await {
+                Ok(Some(answer)) => {
+                    let mut out = std::io::stdout().lock();
+                    if out.write_all(answer.as_bytes()).and_then(|()| out.write_all(b"\n")).is_ok() {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Ok(None) | Err(_) => ExitCode::FAILURE,
             }
         }
     }

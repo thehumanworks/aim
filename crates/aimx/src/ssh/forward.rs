@@ -1,0 +1,163 @@
+//! Local aimx stdio entry for resident SSH and agentless fallback.
+
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead as _, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::PathBuf;
+use std::process::{Command as SyncCommand, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+
+use aim_proto::HARNESS_GENERATIONS;
+
+use super::agentless::AgentlessWorkspace;
+use super::bootstrap::{self, Artifact};
+use super::conn::{Connection, Prompter, SshOptions};
+use super::quote;
+use crate::authz::{Principal, ProtectedPaths};
+use crate::server::{Server, ServerConfig};
+use crate::workspace::Workspace;
+
+/// Options of `aimx serve --stdio --ssh`.
+#[derive(Clone, Debug)]
+pub struct ForwardOptions {
+    /// Destination resolved by OpenSSH.
+    pub destination: String,
+    /// Workspace path on that host.
+    pub root: PathBuf,
+    /// Whether to install and use a resident binary.
+    pub bootstrap: bool,
+    /// Optional caller-verified binary.
+    pub artifact: Option<PathBuf>,
+    /// Expected digest of `artifact`.
+    pub sha256: Option<String>,
+    /// Optional OpenSSH configuration file.
+    pub ssh_config: Option<PathBuf>,
+    /// Remote resident idle shutdown delay.
+    pub idle: Duration,
+}
+
+struct TtyPrompter;
+
+impl Prompter for TtyPrompter {
+    fn prompt(&self, text: &str, echo: bool) -> Option<String> {
+        let mut tty = OpenOptions::new().read(true).write(true).open("/dev/tty").ok()?;
+        write!(tty, "{text} ").ok()?;
+        tty.flush().ok()?;
+        let mut guard = if echo { None } else { Some(EchoGuard::disable(&tty)?) };
+        let mut line = String::new();
+        let read = std::io::BufReader::new(tty.try_clone().ok()?).read_line(&mut line).ok()?;
+        if let Some(guard) = guard.take() {
+            drop(guard);
+        }
+        if read == 0 {
+            return None;
+        }
+        Some(line.trim_end_matches(['\n', '\r']).to_owned())
+    }
+}
+
+struct EchoGuard {
+    tty: File,
+}
+
+impl EchoGuard {
+    fn disable(tty: &File) -> Option<Self> {
+        let clone = tty.try_clone().ok()?;
+        if !SyncCommand::new("stty").arg("-echo").stdin(Stdio::from(clone)).status().ok()?.success() {
+            return None;
+        }
+        Some(Self { tty: tty.try_clone().ok()? })
+    }
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        if let Ok(tty) = self.tty.try_clone() {
+            drop(SyncCommand::new("stty").arg("echo").stdin(Stdio::from(tty)).status());
+        }
+    }
+}
+
+struct AskpassScript {
+    path: PathBuf,
+}
+
+impl AskpassScript {
+    fn create() -> Result<Self, String> {
+        let home = std::env::var_os("HOME").ok_or("HOME is unset")?;
+        let dir = PathBuf::from(home).join(".aim/ssh");
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|err| err.to_string())?;
+        let path = dir.join(format!("askpass-{}.sh", std::process::id()));
+        let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+        std::fs::write(&path, format!("#!/bin/sh\nexec {} askpass \"$@\"\n", quote(&exe.to_string_lossy())))
+            .map_err(|err| err.to_string())?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(|err| err.to_string())?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for AskpassScript {
+    fn drop(&mut self) {
+        drop(std::fs::remove_file(&self.path));
+    }
+}
+
+/// Connect by SSH, prefer the verified resident, and serve agentlessly when it is unavailable.
+///
+/// # Errors
+/// Returns an error when SSH itself or both serving modes fail.
+pub async fn serve_ssh(options: ForwardOptions) -> Result<(), String> {
+    let connection = connect_ssh(&options).await?;
+    if options.bootstrap {
+        match remote_binary(&connection, &options).await {
+            Ok(binary) => return super::reconnect::relay(&options, connection, binary).await,
+            Err(err) => tracing::warn!(%err, "remote bootstrap unavailable; using agentless SSH"),
+        }
+    }
+    serve_agentless(connection, &options).await
+}
+
+pub(super) async fn connect_ssh(options: &ForwardOptions) -> Result<Connection, String> {
+    let askpass = AskpassScript::create()?;
+    let mut ssh = SshOptions::new(&options.destination);
+    ssh.askpass_program = Some(askpass.path.clone());
+    ssh.config_file = options.ssh_config.clone();
+    let connection = Connection::connect(ssh, Some(Arc::new(TtyPrompter))).await.map_err(|err| err.to_string())?;
+    drop(askpass);
+    Ok(connection)
+}
+
+pub(super) async fn remote_binary(connection: &Connection, options: &ForwardOptions) -> Result<String, String> {
+    let probe = bootstrap::probe(connection).await.map_err(|err| format!("probe: {err:?}"))?;
+    let target = probe.target.ok_or("unsupported SSH host")?;
+    let path = options.artifact.clone().map_or_else(std::env::current_exe, Ok).map_err(|err| err.to_string())?;
+    let sha256 = if let Some(hash) = &options.sha256 {
+        hash.clone()
+    } else {
+        bootstrap::local_sha256(&path).map_err(|err| format!("hash: {err:?}"))?
+    };
+    let artifact = Artifact {
+        path,
+        sha256,
+        target: target.to_owned(),
+        generation: HARNESS_GENERATIONS.1,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    let binary = bootstrap::install(connection, &artifact, false).await.map_err(|err| format!("install: {err:?}"))?;
+    connection.run(&format!("{} version >/dev/null", quote(&binary)), &[]).await.map_err(|err| err.to_string())?;
+    Ok(binary)
+}
+
+async fn serve_agentless(connection: Connection, options: &ForwardOptions) -> Result<(), String> {
+    let root = options.root.to_str().ok_or("remote root is not UTF-8")?;
+    let workspace = AgentlessWorkspace::open(connection.clone(), root).await.map_err(|err| err.to_string())?;
+    let platform = bootstrap::probe(&connection).await.map_err(|err| format!("probe: {err:?}"))?;
+    let root = workspace.root().to_owned();
+    let principal = Principal { id: format!("ssh:{}", options.destination), roots: vec![root], read_only: false };
+    let protected = ProtectedPaths::defaults(&platform.home, None);
+    let server = Server::new_agentless(ServerConfig::new(principal, protected), Arc::new(workspace));
+    server.serve_stdio().await;
+    Ok(())
+}

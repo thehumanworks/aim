@@ -253,6 +253,28 @@ impl Connection {
 
 fn base_command(options: &SshOptions) -> Command {
     let mut command = Command::new(&options.program);
+    // OpenSSH may forward selected environment variables through user `SendEnv` rules. Keep
+    // provider credentials and unrelated process state out of every SSH child by construction.
+    command.env_clear();
+    for name in [
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "SSH_AUTH_SOCK",
+        "KRB5CCNAME",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "DISPLAY",
+        "XAUTHORITY",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     if let Some(config) = &options.config_file {
         command.arg("-F").arg(config);
     }
@@ -359,7 +381,9 @@ mod tests {
         let relay = AskpassRelay::start(dir.path(), Arc::new(TestPrompter)).expect("relay");
         assert_eq!(askpass_client_at(&relay.socket, "Password:").await.expect("client"), Some("test-answer".to_owned()));
         let askpass = dir.path().join("askpass");
-        std::fs::write(&askpass, "#!/bin/sh\nprintf '%s' \"$1\" | nc -U \"$AIM_SSH_ASKPASS_SOCKET\"\n").expect("askpass script");
+        let binary = crate::ssh::live_tests::aimx_binary();
+        std::fs::write(&askpass, format!("#!/bin/sh\nexec {} askpass \"$@\"\n", crate::ssh::quote(&binary.to_string_lossy())))
+            .expect("askpass script");
         std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         let fake_ssh = dir.path().join("fake-ssh");
         std::fs::write(&fake_ssh, "#!/bin/sh\nexec \"$SSH_ASKPASS\" 'Password:'\n").expect("fake ssh script");
@@ -372,6 +396,6 @@ mod tests {
             .await
             .expect("fake ssh");
         assert!(output.status.success());
-        assert_eq!(output.stdout, b"test-answer");
+        assert_eq!(output.stdout, b"test-answer\n");
     }
 }

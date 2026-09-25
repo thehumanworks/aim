@@ -3,6 +3,9 @@
 pub mod agentless;
 pub mod bootstrap;
 pub mod conn;
+pub mod forward;
+mod reconnect;
+pub mod resident;
 
 /// Seam for a future resident `aimx serve` proxy over a multiplexed SSH channel.
 pub struct RemoteHarness;
