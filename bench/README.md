@@ -97,3 +97,18 @@ The code-mode-off W1 diagnostic uses
 `results/w26-codex-cache.json` records numeric provider usage from the ignored
 `live_codex_cache_ten_steps` smoke test. Live `request_usage` contains only numeric
 provider usage per request; no request body or credential is retained.
+`results/w26-openrouter-cache.json` pairs ten serial live OpenRouter calls on the task-start
+main source and the W26 branch with the same stable instruction/session prefix. It records
+provider input, cached and cost usage per request. OpenRouter's profile uses `cache_control`
+and `x-session-id`; it does not send `prompt_cache_key` because that field is not configured
+for this endpoint. The main-source probe test was injected into a temporary source archive,
+then removed after measurement.
+The final rebased OpenRouter pair uses one repetition of all six tasks; the earlier two-repetition
+candidate and focused diagnostics consumed part of W26's cumulative $1 cap. The final Codex
+subscription artifact covers four tasks after an earlier six-task candidate, the ten-step cache
+probe, and the media-search smoke used the 12-run cap. `results/w26-codex-catalog-timing.json`
+records a read-only live catalog GET and ETag revalidation without a generation request;
+`results/w26-codex-startup-mock.json` separates warmed local startup from that network GET.
+`results/w26-spend-ledger.json` totals every W26 paid invocation, including superseded
+diagnostics and the two unpriced transport reserves. The one direct Sonnet 5 smoke has a
+conservative price bound from its numeric token usage and the published model rates.
