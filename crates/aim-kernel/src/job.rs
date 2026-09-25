@@ -169,11 +169,13 @@ pub open spec fn wf(v: JobView) -> bool {
     &&& ((v.state == JobState::Claimed || v.state == JobState::Running) ==> v.claim is Some
         && v.cleanup == CleanupState::Active && v.review == ReviewState::Pending
         && !v.evidence_present)
-    &&& (v.state == JobState::Succeeded ==> v.claim is Some && v.cleanup == CleanupState::Confirmed)
+    &&& (v.state == JobState::Succeeded ==> v.claim is Some && v.cleanup != CleanupState::Active)
     &&& ((v.state == JobState::Failed || v.state == JobState::Cancelled) ==> v.review
-        == ReviewState::Pending && (v.claim is Some || v.cleanup == CleanupState::Confirmed))
+        == ReviewState::Pending && v.cleanup != CleanupState::Active && (v.claim is Some
+        || v.cleanup == CleanupState::Confirmed))
     &&& (v.review == ReviewState::Accepted ==> v.state == JobState::Succeeded && v.evidence_present)
     &&& (v.review == ReviewState::Rejected ==> v.state == JobState::Succeeded)
+    &&& (v.review != ReviewState::Pending ==> v.cleanup == CleanupState::Confirmed)
 }
 
 /// Fresh posted state.
@@ -193,6 +195,16 @@ pub open spec fn fresh(max_retries: u32) -> JobView {
 pub open spec fn claim_is_current(v: JobView, generation: u32, claim_id: u64, now: u64) -> bool {
     v.generation == generation as nat && v.claim is Some && v.claim->0.claim_id == claim_id && now
         < v.claim->0.lease_until
+}
+
+/// A current claim may write only while execution is still live.
+pub open spec fn attempt_live(v: JobView, generation: u32, claim_id: u64, now: u64) -> bool {
+    (v.state == JobState::Claimed || v.state == JobState::Running) && claim_is_current(
+        v,
+        generation,
+        claim_id,
+        now,
+    )
 }
 
 /// Whether this job reserves a worker slot, including uncertain cleanup.
@@ -230,14 +242,14 @@ pub open spec fn next(pre: JobView, ev: Event, now: u64) -> Option<JobView> {
         },
         Event::Heartbeat { generation, claim_id, lease_until } => if (pre.state == JobState::Claimed
             || pre.state == JobState::Running) && claim_is_current(pre, generation, claim_id, now)
-            && lease_until > pre.claim->0.lease_until {
+            && lease_until >= pre.claim->0.lease_until {
             Some(JobView { claim: Some(Claim { lease_until, ..pre.claim->0 }), ..pre })
         } else {
             None
         },
         Event::Complete { generation, claim_id } => if pre.state == JobState::Running
             && claim_is_current(pre, generation, claim_id, now) {
-            Some(JobView { state: JobState::Succeeded, cleanup: CleanupState::Confirmed, ..pre })
+            Some(JobView { state: JobState::Succeeded, cleanup: CleanupState::Pending, ..pre })
         } else {
             None
         },
@@ -265,7 +277,8 @@ pub open spec fn next(pre: JobView, ev: Event, now: u64) -> Option<JobView> {
             None
         },
         Event::ConfirmCleanup => if (pre.state == JobState::Failed || pre.state
-            == JobState::Cancelled) && pre.cleanup == CleanupState::Pending {
+            == JobState::Cancelled || pre.state == JobState::Succeeded) && pre.cleanup
+            == CleanupState::Pending {
             Some(JobView { cleanup: CleanupState::Confirmed, ..pre })
         } else {
             None
@@ -303,8 +316,8 @@ pub open spec fn next(pre: JobView, ev: Event, now: u64) -> Option<JobView> {
             None
         },
         Event::Review { accepted: decision, evidence_present } => if pre.state
-            == JobState::Succeeded && pre.review == ReviewState::Pending && (!decision
-            || evidence_present) {
+            == JobState::Succeeded && pre.cleanup == CleanupState::Confirmed && pre.review
+            == ReviewState::Pending && (!decision || evidence_present) {
             Some(
                 JobView {
                     review: if decision {
@@ -407,6 +420,120 @@ pub proof fn lemma_pending_cleanup_fences_retry(pre: JobView, now: u64)
     ensures
         next(pre, Event::Retry, now) is None,
 {
+}
+
+/// Every accepted step preserves the bounded generation, and only Retry advances it.
+pub proof fn lemma_generation_monotone(pre: JobView, ev: Event, now: u64)
+    requires
+        wf(pre),
+        next(pre, ev, now) is Some,
+    ensures
+        pre.generation <= next(pre, ev, now)->0.generation,
+        next(pre, ev, now)->0.generation <= pre.max_retries,
+        ev is Retry || next(pre, ev, now)->0.generation == pre.generation,
+{
+}
+
+/// A non-posted job can return to Posted only through a budgeted retry.
+pub proof fn lemma_posted_only_via_retry(pre: JobView, ev: Event, now: u64)
+    requires
+        wf(pre),
+        pre.state != JobState::Posted,
+        next(pre, ev, now) is Some,
+        next(pre, ev, now)->0.state == JobState::Posted,
+    ensures
+        ev is Retry,
+        next(pre, ev, now)->0.generation == pre.generation + 1,
+{
+}
+
+/// An accepted result is absorbing; a dependent can rely on its acceptance.
+pub proof fn lemma_acceptance_absorbing(pre: JobView, ev: Event, now: u64)
+    requires
+        wf(pre),
+        accepted(pre),
+        next(pre, ev, now) is Some,
+    ensures
+        accepted(next(pre, ev, now)->0),
+{
+}
+
+/// Only a Claim transition can turn an unheld worker slot into a held one.
+pub proof fn lemma_only_claim_acquires(pre: JobView, ev: Event, now: u64, worker: WorkerId)
+    requires
+        wf(pre),
+        next(pre, ev, now) is Some,
+        !holds_capacity(pre, worker),
+        holds_capacity(next(pre, ev, now)->0, worker),
+    ensures
+        ev is Claim,
+{
+}
+
+/// Count successful Claim transitions in a prefix of a valid lifecycle trace.
+pub open spec fn claim_count(events: Seq<Event>, n: nat) -> nat
+    recommends
+        n <= events.len(),
+    decreases n,
+{
+    if n == 0 {
+        0
+    } else {
+        claim_count(events, (n - 1) as nat) + if events[n - 1] is Claim {
+            1nat
+        } else {
+            0nat
+        }
+    }
+}
+
+/// Every state is the accepted successor of the previous state, beginning fresh.
+pub open spec fn valid_trace(states: Seq<JobView>, events: Seq<Event>, times: Seq<u64>) -> bool {
+    states.len() == events.len() + 1 && times.len() == events.len() && states[0].state
+        == JobState::Posted && states[0].generation == 0 && wf(states[0]) && (forall|i: int|
+        0 <= i < events.len() ==> wf(states[i]) && next(states[i], events[i], times[i]) == Some(
+            states[i + 1],
+        )) && wf(states[events.len() as int])
+}
+
+proof fn lemma_trace_prefix(states: Seq<JobView>, events: Seq<Event>, times: Seq<u64>, n: nat)
+    requires
+        valid_trace(states, events, times),
+        n <= events.len(),
+    ensures
+        claim_count(events, n) <= states[n as int].generation + if states[n as int].state
+            == JobState::Posted {
+            0nat
+        } else {
+            1nat
+        },
+    decreases n,
+{
+    if n > 0 {
+        lemma_trace_prefix(states, events, times, (n - 1) as nat);
+        let pre = states[(n - 1) as int];
+        let ev = events[(n - 1) as int];
+        let now = times[(n - 1) as int];
+        let post = states[n as int];
+        lemma_generation_monotone(pre, ev, now);
+        if pre.state != JobState::Posted && post.state == JobState::Posted {
+            lemma_posted_only_via_retry(pre, ev, now);
+        }
+        if ev is Claim {
+            assert(pre.state == JobState::Posted);
+            assert(post.state != JobState::Posted);
+        }
+    }
+}
+
+/// A valid run claims at most once per generation and cannot outlive its retry budget.
+pub proof fn theorem_bounded_lifecycle(states: Seq<JobView>, events: Seq<Event>, times: Seq<u64>)
+    requires
+        valid_trace(states, events, times),
+    ensures
+        claim_count(events, events.len()) <= states[events.len() as int].max_retries + 1,
+{
+    lemma_trace_prefix(states, events, times, events.len());
 }
 
 fn is_posted(s: JobState) -> (b: bool)
@@ -616,15 +743,15 @@ impl Job {
                 }
             },
             JobState::Succeeded => {
-                if claim.is_none() || !is_cleanup_confirmed(cleanup) || (is_review_accepted(review)
+                if claim.is_none() || is_cleanup_active(cleanup) || (!is_review_pending(review)
+                    && !is_cleanup_confirmed(cleanup)) || (is_review_accepted(review)
                     && !evidence_present) {
                     return Err(LifecycleError::InvalidSnapshot);
                 }
             },
             JobState::Failed | JobState::Cancelled => {
-                if !is_review_pending(review) || (claim.is_none() && !is_cleanup_confirmed(
-                    cleanup,
-                )) {
+                if !is_review_pending(review) || (claim.is_none() && !is_cleanup_confirmed(cleanup))
+                    || is_cleanup_active(cleanup) {
                     return Err(LifecycleError::InvalidSnapshot);
                 }
             },
@@ -729,9 +856,29 @@ impl Job {
     #[must_use]
     pub fn authorizes_attempt(&self, generation: u32, claim_id: u64, now: u64) -> (b: bool)
         ensures
-            b == claim_is_current(self@, generation, claim_id, now),
+            b == attempt_live(self@, generation, claim_id, now),
     {
-        self.check_claim(generation, claim_id, now)
+        (is_claimed(self.state) || is_running(self.state)) && self.check_claim(
+            generation,
+            claim_id,
+            now,
+        )
+    }
+
+    /// Apply a non-claim event; claims require [`crate::board::claim_admitted`].
+    ///
+    /// # Errors
+    /// Refuses Claim here and any invalid lifecycle transition.
+    pub fn transition(&mut self, ev: Event, now: u64) -> (r: Result<(), LifecycleError>)
+        ensures
+            ev is Claim ==> r is Err,
+            r is Ok ==> next(old(self)@, ev, now) == Some(final(self)@),
+            r is Err ==> final(self)@ == old(self)@,
+    {
+        match ev {
+            Event::Claim { .. } => Err(LifecycleError::WrongState),
+            _ => self.apply(ev, now),
+        }
     }
 
     /// Apply an event, preserving the snapshot on rejection.
@@ -744,7 +891,7 @@ impl Job {
         clippy::nonminimal_bool,
         reason = "one independently proved return path per lifecycle event"
     )]
-    pub fn apply(&mut self, ev: Event, now: u64) -> (r: Result<(), LifecycleError>)
+    pub(crate) fn apply(&mut self, ev: Event, now: u64) -> (r: Result<(), LifecycleError>)
         ensures
             r is Ok ==> next(old(self)@, ev, now) == Some(final(self)@),
             r is Err ==> final(self)@ == old(self)@,
@@ -787,7 +934,7 @@ impl Job {
                     return Err(LifecycleError::StaleClaim);
                 }
                 if let Some(c) = self.claim {
-                    if lease_until <= c.lease_until {
+                    if lease_until < c.lease_until {
                         return Err(LifecycleError::InvalidLease);
                     }
                     self.claim = Some(Claim { lease_until, ..c });
@@ -802,7 +949,7 @@ impl Job {
                     return Err(LifecycleError::StaleClaim);
                 }
                 self.state = JobState::Succeeded;
-                self.cleanup = CleanupState::Confirmed;
+                self.cleanup = CleanupState::Pending;
                 return Ok(());
             },
             Event::Fail { generation, claim_id, cleanup_confirmed } => {
@@ -839,9 +986,9 @@ impl Job {
                 return Ok(());
             },
             Event::ConfirmCleanup => {
-                if (!is_failed(self.state) && !is_cancelled(self.state)) || !is_cleanup_pending(
-                    self.cleanup,
-                ) {
+                if (!is_failed(self.state) && !is_cancelled(self.state) && !is_succeeded(
+                    self.state,
+                )) || !is_cleanup_pending(self.cleanup) {
                     return Err(LifecycleError::WrongState);
                 }
                 self.cleanup = CleanupState::Confirmed;
@@ -879,7 +1026,8 @@ impl Job {
                 return Ok(());
             },
             Event::Review { accepted, evidence_present } => {
-                if !is_succeeded(self.state) || !is_review_pending(self.review) {
+                if !is_succeeded(self.state) || !is_cleanup_confirmed(self.cleanup)
+                    || !is_review_pending(self.review) {
                     return Err(LifecycleError::WrongState);
                 }
                 if accepted && !evidence_present {

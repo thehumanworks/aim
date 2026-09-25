@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use aim_kernel::negotiate::{Generations, negotiate};
 use aim_proto::board::{
-    BoardAssign, BoardCancel, BoardClaim, BoardComplete, BoardEvent, BoardEventNotification, BoardEventParams, BoardFail, BoardHeartbeat,
-    BoardList, BoardMessage, BoardPoll, BoardPost, BoardRetry, BoardReview, BoardShow, BoardWatch, PollParams,
+    BoardAssign, BoardCancel, BoardClaim, BoardComplete, BoardConfirmCleanup, BoardEvent, BoardEventNotification, BoardEventParams,
+    BoardExpire, BoardFail, BoardHeartbeat, BoardList, BoardMessage, BoardPoll, BoardPost, BoardRegisterWorker, BoardRetry, BoardReview,
+    BoardShow, BoardWatch, PollParams,
 };
 use aim_proto::content::Base64Bytes;
 use aim_proto::daemon::{
@@ -82,6 +83,23 @@ struct Connection {
     board: Arc<BoardService>,
     board_forwarders: Mutex<HashMap<String, CancellationToken>>,
     dedup: Arc<Dedup>,
+    worker: Mutex<Option<String>>,
+}
+
+fn owner_connection(state: &Connection) -> Result<(), ProtoError> {
+    if lock(&state.worker).is_some() {
+        return Err(error(ErrorCode::Denied, "worker connection cannot make owner decisions"));
+    }
+    Ok(())
+}
+
+fn bind_worker(state: &Connection, worker: &str) -> Result<(), ProtoError> {
+    let mut bound = lock(&state.worker);
+    if bound.as_deref().is_some_and(|name| name != worker) {
+        return Err(error(ErrorCode::Denied, "connection is bound to another worker"));
+    }
+    *bound = Some(worker.to_owned());
+    Ok(())
 }
 
 /// Removes a prepared attachment when its request is cancelled or no reply is queued.
@@ -214,36 +232,39 @@ async fn forward_board_events(
     cancel: CancellationToken,
     mut events: tokio::sync::broadcast::Receiver<BoardEvent>,
 ) {
+    let mut reconcile = tokio::time::interval(Duration::from_secs(5));
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let event = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
             () = peer.closed() => return,
             event = events.recv() => event,
+            _ = reconcile.tick() => {
+                // A notification is only a wakeup; the outbox is the source of order.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(0))
+            },
         };
         match event {
-            Ok(event) if event.run_id == run_id && event.seq > cursor => {
+            Ok(event) if event.run_id != run_id => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+        }
+        loop {
+            let Ok(snapshot) = board.poll(PollParams { run_id: run_id.clone(), after_seq: cursor, limit: 256, after_job: None }).await
+            else {
+                return;
+            };
+            let count = snapshot.events.len();
+            for event in snapshot.events {
                 cursor = event.seq;
                 if peer.notify::<BoardEventNotification>(BoardEventParams { event }).await.is_err() {
                     return;
                 }
             }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                // Push is a hint. Reconcile from the outbox after a bounded channel gap.
-                let Ok(snapshot) = board.poll(PollParams { run_id: run_id.clone(), after_seq: cursor, limit: 256 }).await else {
-                    return;
-                };
-                for event in snapshot.events {
-                    if event.seq > cursor {
-                        cursor = event.seq;
-                        if peer.notify::<BoardEventNotification>(BoardEventParams { event }).await.is_err() {
-                            return;
-                        }
-                    }
-                }
+            if count < 256 {
+                break;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
 }
@@ -420,18 +441,49 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
         .method::<SessionSetConfig, _, _>(|state, _, params: SessionConfigParams| async move { state.host.set_config(params).await })
         .method::<SessionClose, _, _>(|state, _, reference| async move { state.host.close(reference.session).await })
         .method::<MediaTranscribe, _, _>(|state, _, params| async move { state.host.transcribe(params).await })
-        .method::<BoardPost, _, _>(|state, _, params| async move { state.board.post(params).await.map_err(board_error) })
+        .method::<BoardPost, _, _>(|state, _, params| async move {
+            owner_connection(&state)?;
+            state.board.post(params).await.map_err(board_error)
+        })
         .method::<BoardList, _, _>(|state, _, params| async move { state.board.list(params).await.map_err(board_error) })
         .method::<BoardShow, _, _>(|state, _, reference| async move { state.board.show(reference.job_id).await.map_err(board_error) })
-        .method::<BoardAssign, _, _>(|state, _, params| async move { state.board.assign(params).await.map_err(board_error) })
-        .method::<BoardClaim, _, _>(|state, _, params| async move { state.board.claim(params).await.map_err(board_error) })
+        .method::<BoardAssign, _, _>(|state, _, params| async move {
+            owner_connection(&state)?;
+            state.board.assign(params).await.map_err(board_error)
+        })
+        .method::<BoardRegisterWorker, _, _>(|state, _, params| async move {
+            owner_connection(&state)?;
+            state.board.register_worker(params).await.map_err(board_error)
+        })
+        .method::<BoardClaim, _, _>(|state, _, params| async move {
+            bind_worker(&state, &params.worker)?;
+            state.board.claim(params).await.map_err(board_error)
+        })
         .method::<BoardHeartbeat, _, _>(|state, _, params| async move { state.board.heartbeat(params).await.map_err(board_error) })
         .method::<BoardMessage, _, _>(|state, _, params| async move { state.board.message(params).await.map_err(board_error) })
         .method::<BoardComplete, _, _>(|state, _, params| async move { state.board.complete(params).await.map_err(board_error) })
         .method::<BoardFail, _, _>(|state, _, params| async move { state.board.fail(params).await.map_err(board_error) })
-        .method::<BoardCancel, _, _>(|state, _, params| async move { state.board.cancel(params).await.map_err(board_error) })
-        .method::<BoardRetry, _, _>(|state, _, params| async move { state.board.retry(params).await.map_err(board_error) })
-        .method::<BoardReview, _, _>(|state, _, params| async move { state.board.review(params).await.map_err(board_error) })
+        .method::<BoardConfirmCleanup, _, _>(|state, _, params| async move {
+            let job_id = params.job_id.clone();
+            state.board.record_cleanup(params.job_id, params.attempt_id, params.claim_token, params.receipt).await.map_err(board_error)?;
+            state.board.show(job_id).await.map_err(board_error)
+        })
+        .method::<BoardExpire, _, _>(|state, _, params| async move {
+            owner_connection(&state)?;
+            state.board.expire(params.job_id, params.expected_version).await.map_err(board_error)
+        })
+        .method::<BoardCancel, _, _>(|state, _, params| async move {
+            owner_connection(&state)?;
+            state.board.cancel(params).await.map_err(board_error)
+        })
+        .method::<BoardRetry, _, _>(|state, _, params| async move {
+            owner_connection(&state)?;
+            state.board.retry(params).await.map_err(board_error)
+        })
+        .method::<BoardReview, _, _>(|state, _, params| async move {
+            owner_connection(&state)?;
+            state.board.review(params).await.map_err(board_error)
+        })
         .method::<BoardPoll, _, _>(|state, _, params| async move { state.board.poll(params).await.map_err(board_error) })
         .method::<BoardWatch, _, _>(|state, ctx, params| async move {
             let events = state.board.subscribe();
@@ -540,6 +592,7 @@ fn serve_connection(
         board,
         board_forwarders: Mutex::new(HashMap::new()),
         dedup,
+        worker: Mutex::new(None),
     });
     let (read, write) = stream.into_split();
     Ok(Peer::spawn(read, write, routes(connection), PeerConfig { max_message_bytes: MAX_DAEMON_MESSAGE_BYTES, ..PeerConfig::default() }))

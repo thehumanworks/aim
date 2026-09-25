@@ -7,7 +7,35 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::content::Base64Bytes;
+use crate::daemon::Location;
 use crate::{method, notification};
+
+/// What to do with an isolated worktree after an attempt fails.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCleanup {
+    /// Preserve the branch and worktree for inspection; stop its processes.
+    #[default]
+    Keep,
+    /// Remove the worktree after stopping its processes; retain the branch.
+    Remove,
+}
+
+/// Execution and integration instructions for an editing job.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WorkPolicy {
+    /// Where the repository lives; remote roots use the same path on the SSH host.
+    #[serde(default)]
+    pub location: Location,
+    /// Branch into which an accepted contribution may be integrated.
+    pub target_branch: String,
+    /// Optional check command to run on the attempt and after integration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_command: Option<String>,
+    /// Treatment of the isolated worktree when execution fails.
+    #[serde(default)]
+    pub failure_cleanup: FailureCleanup,
+}
 
 /// A job's immutable posted contract.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
@@ -26,6 +54,9 @@ pub struct JobSpec {
     /// Workspace selected by the lead, when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Optional worker and integration policy. Absent jobs remain board-only contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<WorkPolicy>,
 }
 
 /// Execution state; review acceptance is recorded separately.
@@ -186,6 +217,9 @@ pub struct ListParams {
     /// Maximum rows; the service applies a cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Continue after this job ID in stable newest-first order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_job: Option<String>,
 }
 
 /// A bounded list of authoritative job snapshots.
@@ -193,6 +227,10 @@ pub struct ListParams {
 pub struct ListResult {
     /// Jobs in stable order.
     pub jobs: Vec<JobSnapshot>,
+    /// Pass to `after_job` to read the next page.
+    pub next_job: Option<String>,
+    /// More jobs remain after this page.
+    pub truncated: bool,
 }
 method!(
     /// `board.list` — read the current board.
@@ -225,6 +263,19 @@ method!(
     BoardAssign = "board.assign" (AssignParams) -> JobSnapshot
 );
 
+/// Owner registration of one stable worker capacity.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RegisterWorkerParams {
+    /// Worker identity.
+    pub worker: String,
+    /// Maximum simultaneous held attempts.
+    pub capacity: u32,
+}
+method!(
+    /// `board.register_worker` — register an immutable capacity before claims.
+    BoardRegisterWorker = "board.register_worker" (RegisterWorkerParams) -> ()
+);
+
 /// Claim a dependency-ready job with a declared worker capacity.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ClaimParams {
@@ -232,8 +283,14 @@ pub struct ClaimParams {
     pub job_id: String,
     /// Worker identity.
     pub worker: String,
-    /// Maximum active and cleanup-pending claims for this worker.
+    /// Declared concurrency; the server also applies the worker's registered ceiling.
     pub capacity: u32,
+    /// Client-chosen attempt ID, persisted with its private token before the request.
+    pub attempt_id: String,
+    /// SHA-256 of the client-held claim token, in lowercase hexadecimal.
+    pub token_sha256: String,
+    /// Stable retry key; same key and hash return the same attempt.
+    pub idempotency_key: String,
     /// Observed current time, Unix milliseconds.
     pub now_ms: u64,
     /// Requested lease length in milliseconds (the service caps it).
@@ -243,15 +300,13 @@ pub struct ClaimParams {
     pub expected_version: Option<u64>,
 }
 
-/// One-time claim receipt. Store `claim_token` privately; snapshots and events never repeat it.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Claim receipt; the client retains its own secret, which never crosses this result.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ClaimResult {
     /// Committed job.
     pub job: JobSnapshot,
     /// Fenced attempt.
     pub attempt: AttemptSummary,
-    /// One-time bearer secret for this attempt.
-    pub claim_token: String,
 }
 method!(
     /// `board.claim` — atomically reserve a fenced attempt.
@@ -343,14 +398,57 @@ pub struct FailParams {
     pub claim_token: String,
     /// Safe diagnostic class (no credentials or raw model output).
     pub reason: String,
-    /// Whether external effects have been reconciled and stopped.
-    pub cleanup_confirmed: bool,
     /// Observed current time, Unix milliseconds.
     pub now_ms: u64,
 }
 method!(
     /// `board.fail` — record an attempt failure and cleanup status.
     BoardFail = "board.fail" (FailParams) -> JobSnapshot
+);
+
+/// Runner-observed process cleanup, bound to the holder's claim token.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct CleanupReceipt {
+    /// Closed worker session, if one was started.
+    pub session_id: Option<String>,
+    /// Attempt worktree on the workspace host.
+    pub worktree: String,
+    /// The session was closed, or no session was created.
+    pub session_stopped: bool,
+    /// Harness-owned commands and transport were stopped.
+    pub harness_stopped: bool,
+    /// `kept` for inspection or `removed` after shutdown.
+    pub disposition: String,
+}
+
+/// Confirm an attempt's stopped external effects with its fenced secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConfirmCleanupParams {
+    /// Job containing the attempt.
+    pub job_id: String,
+    /// Current attempt.
+    pub attempt_id: String,
+    /// Holder's private token.
+    pub claim_token: String,
+    /// Runner-produced evidence of stopped effects.
+    pub receipt: CleanupReceipt,
+}
+method!(
+    /// `board.confirm_cleanup` — clear a capacity hold only with a holder receipt.
+    BoardConfirmCleanup = "board.confirm_cleanup" (ConfirmCleanupParams) -> JobSnapshot
+);
+
+/// Record an expired lease without clearing its uncertain cleanup hold.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExpireParams {
+    /// Job with the expired current attempt.
+    pub job_id: String,
+    /// Observed job version.
+    pub expected_version: u64,
+}
+method!(
+    /// `board.expire` — persist Failed/Pending after lease expiry.
+    BoardExpire = "board.expire" (ExpireParams) -> JobSnapshot
 );
 
 /// Cancel a job at an observed version.
@@ -375,8 +473,6 @@ pub struct RetryParams {
     pub job_id: String,
     /// Job version observed by the caller.
     pub expected_version: u64,
-    /// Caller asserts external cleanup was confirmed.
-    pub cleanup_confirmed: bool,
     /// Observed current time, Unix milliseconds.
     pub now_ms: u64,
 }
@@ -420,7 +516,7 @@ macro_rules! redacted_claim_debug {
         )+
     };
 }
-redacted_claim_debug!(ClaimResult, HeartbeatParams, MessageParams, CompleteParams, FailParams);
+redacted_claim_debug!(HeartbeatParams, MessageParams, CompleteParams, FailParams, ConfirmCleanupParams);
 
 /// Reconciliation read for a run after a durable event sequence.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
@@ -431,6 +527,9 @@ pub struct PollParams {
     pub after_seq: u64,
     /// Maximum number of events.
     pub limit: u32,
+    /// Continue the current job snapshot after this job ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_job: Option<String>,
 }
 
 /// Authoritative snapshots and ordered committed events.
@@ -442,6 +541,10 @@ pub struct PollResult {
     pub events: Vec<BoardEvent>,
     /// Highest event sequence returned (or the incoming cursor if none).
     pub next_seq: u64,
+    /// Pass to `after_job` to read the next snapshot page.
+    pub next_job: Option<String>,
+    /// More job snapshots remain after this page.
+    pub truncated: bool,
 }
 method!(
     /// `board.poll` — reconcile after a notification or reconnect.

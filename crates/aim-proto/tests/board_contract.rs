@@ -17,11 +17,14 @@ fn every_board_method_has_unique_name_and_both_schemas() {
         schema::<board::BoardList>(),
         schema::<board::BoardShow>(),
         schema::<board::BoardAssign>(),
+        schema::<board::BoardRegisterWorker>(),
         schema::<board::BoardClaim>(),
         schema::<board::BoardHeartbeat>(),
         schema::<board::BoardMessage>(),
         schema::<board::BoardComplete>(),
         schema::<board::BoardFail>(),
+        schema::<board::BoardConfirmCleanup>(),
+        schema::<board::BoardExpire>(),
         schema::<board::BoardCancel>(),
         schema::<board::BoardRetry>(),
         schema::<board::BoardReview>(),
@@ -50,6 +53,7 @@ fn post_contract_and_event_round_trip() {
         depends_on: vec!["job-a".into()],
         max_retries: 2,
         workspace: None,
+        work: None,
     };
     let wire = serde_json::to_value(&spec).unwrap();
     assert_eq!(

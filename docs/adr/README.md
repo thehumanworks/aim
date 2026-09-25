@@ -59,4 +59,7 @@ Rules (enforced by `mise run check`):
 | [0036](0036-log-failure-closes-and-config-replies.md) | A session stops at its first log-write failure; config changes answer their requester. |
 | [0037](0037-bounded-rpc-notification-backlog.md) | Bound ordered RPC notifications without blocking control frames. |
 | [0038](0038-session-authority-effort-source-and-config-outcomes.md) | Record a session's agent and effort source; report every config outcome. |
+| [0040](0040-daemon-recovery-and-paged-attachments.md) | Recover daemon attachments and page large session histories. |
+| [0041](0041-indexed-session-summaries.md) | Index durable session summaries. |
 | [0042](0042-bound-media-services-and-private-opt-in.md) | Bound media output and require private-session opt-in. |
+| [0048](0048-board-workers-and-integration.md) | Run fenced board attempts in isolated worktrees and integrate accepted evidence serially. |

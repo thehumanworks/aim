@@ -9,10 +9,11 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use aim_proto::board::{
-    AssignParams, BoardAssign, BoardCancel, BoardClaim, BoardComplete, BoardEvent, BoardEventParams, BoardFail, BoardHeartbeat, BoardList,
-    BoardMessage, BoardPoll, BoardPost, BoardRetry, BoardReview, BoardShow, BoardWatch, CancelParams, ClaimParams, ClaimResult,
-    CompleteParams, FailParams, HeartbeatParams, JobRef, JobSnapshot, ListParams, ListResult, MessageParams, MessageResult, PollParams,
-    PollResult, PostParams, PostResult, RetryParams, ReviewParams, WatchParams,
+    AssignParams, BoardAssign, BoardCancel, BoardClaim, BoardComplete, BoardConfirmCleanup, BoardEvent, BoardEventParams, BoardExpire,
+    BoardFail, BoardHeartbeat, BoardList, BoardMessage, BoardPoll, BoardPost, BoardRegisterWorker, BoardRetry, BoardReview, BoardShow,
+    BoardWatch, CancelParams, ClaimParams, ClaimResult, CompleteParams, ConfirmCleanupParams, ExpireParams, FailParams, HeartbeatParams,
+    JobRef, JobSnapshot, ListParams, ListResult, MessageParams, MessageResult, PollParams, PollResult, PostParams, PostResult,
+    RegisterWorkerParams, RetryParams, ReviewParams, WatchParams,
 };
 use aim_proto::conversation::{Item, Part};
 use aim_proto::daemon::{
@@ -277,6 +278,14 @@ impl DaemonClient {
         self.peer.call::<BoardAssign>(params).await
     }
 
+    /// Registers a fixed worker capacity before claims.
+    ///
+    /// # Errors
+    /// Returns a registration or transport error.
+    pub async fn board_register_worker(&self, params: RegisterWorkerParams) -> Result<(), ProtoError> {
+        self.peer.call::<BoardRegisterWorker>(params).await
+    }
+
     /// Claims a dependency-ready job; the token in the receipt must be stored privately.
     ///
     /// # Errors
@@ -315,6 +324,22 @@ impl DaemonClient {
     /// Returns the daemon or transport error.
     pub async fn board_fail(&self, params: FailParams) -> Result<JobSnapshot, ProtoError> {
         self.peer.call::<BoardFail>(params).await
+    }
+
+    /// Records stopped effects for the current attempt.
+    ///
+    /// # Errors
+    /// Returns a rejected claim or transport error.
+    pub async fn board_confirm_cleanup(&self, params: ConfirmCleanupParams) -> Result<JobSnapshot, ProtoError> {
+        self.peer.call::<BoardConfirmCleanup>(params).await
+    }
+
+    /// Persists an expired attempt while retaining its cleanup hold.
+    ///
+    /// # Errors
+    /// Returns a version, state, or transport error.
+    pub async fn board_expire(&self, params: ExpireParams) -> Result<JobSnapshot, ProtoError> {
+        self.peer.call::<BoardExpire>(params).await
     }
 
     /// Cancels a job at an observed version.

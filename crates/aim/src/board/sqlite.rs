@@ -8,12 +8,13 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use aim_proto::board::BoardEvent;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 
 use super::Error;
 
-type Task = Box<dyn FnOnce(&mut Connection) + Send>;
+type Task = Box<dyn FnOnce(&mut Connection, &broadcast::Sender<BoardEvent>) + Send>;
 
 /// One board actor with one SQLite connection, sharing the session store's WAL file.
 #[derive(Clone)]
@@ -31,15 +32,51 @@ fn backend(err: impl core::fmt::Display) -> Error {
     Error::Storage(err.to_string())
 }
 
+fn committed_events(conn: &Connection, after: i64) -> Result<Vec<BoardEvent>, Error> {
+    let mut statement = conn
+        .prepare("SELECT seq,event_id,run_id,job_id,job_version,kind,created_ms FROM board_outbox WHERE seq>?1 ORDER BY seq")
+        .map_err(backend)?;
+    let rows = statement
+        .query_map([after], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(backend)?;
+    rows.map(|row| {
+        let (seq, id, run_id, job_id, version, kind, ts_ms) = row.map_err(backend)?;
+        Ok(BoardEvent {
+            id,
+            run_id,
+            job_id: job_id.unwrap_or_default(),
+            seq: u64::try_from(seq).map_err(backend)?,
+            version: u64::try_from(version.unwrap_or_default()).map_err(backend)?,
+            kind,
+            ts_ms: u64::try_from(ts_ms).map_err(backend)?,
+        })
+    })
+    .collect()
+}
+
 const SCHEMA: &str = "
     PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = NORMAL;
+    PRAGMA synchronous = FULL;
     PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS board_runs (
         id TEXT PRIMARY KEY,
         owner_session TEXT NOT NULL,
         workspace TEXT NOT NULL,
         created_ms INTEGER NOT NULL
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS board_workers (
+        worker TEXT PRIMARY KEY,
+        capacity INTEGER NOT NULL CHECK(capacity BETWEEN 1 AND 64)
     ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS board_jobs (
         id TEXT PRIMARY KEY,
@@ -74,6 +111,7 @@ const SCHEMA: &str = "
         assignee TEXT NOT NULL,
         claim_id INTEGER NOT NULL CHECK(claim_id > 0),
         token_hash BLOB NOT NULL CHECK(length(token_hash) = 32),
+        claim_key TEXT NOT NULL DEFAULT '',
         lease_until_ms INTEGER NOT NULL,
         heartbeat_seq INTEGER NOT NULL DEFAULT 0 CHECK(heartbeat_seq >= 0),
         state TEXT NOT NULL,
@@ -139,6 +177,26 @@ const SCHEMA: &str = "
         attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0)
     );
     CREATE INDEX IF NOT EXISTS board_outbox_by_run ON board_outbox(run_id, seq);
+    CREATE TABLE IF NOT EXISTS board_integrations (
+        job_id TEXT PRIMARY KEY REFERENCES board_jobs(id),
+        attempt_id TEXT NOT NULL REFERENCES board_attempts(id),
+        source_branch TEXT NOT NULL,
+        target_branch TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('queued','integrating','integrated','conflict','failed')),
+        target_head TEXT,
+        source_commit TEXT,
+        conflicts_json TEXT NOT NULL DEFAULT '[]',
+        artifact_id TEXT,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS board_integrations_by_state ON board_integrations(state, created_ms);
+    CREATE TABLE IF NOT EXISTS board_cleanup_receipts (
+        attempt_id TEXT PRIMARY KEY REFERENCES board_attempts(id),
+        job_id TEXT NOT NULL REFERENCES board_jobs(id),
+        receipt_json TEXT NOT NULL,
+        created_ms INTEGER NOT NULL
+    ) WITHOUT ROWID;
 ";
 
 #[cfg(unix)]
@@ -194,11 +252,28 @@ fn private_files(path: &Path) -> Result<(), Error> {
 }
 
 impl Ledger {
+    #[cfg(test)]
     pub(super) fn open(path: &Path) -> Result<Self, Error> {
+        let (events, _) = broadcast::channel(256);
+        Self::open_with_events(path, events)
+    }
+
+    pub(super) fn open_with_events(path: &Path, events: broadcast::Sender<BoardEvent>) -> Result<Self, Error> {
         private_files(path)?;
         let conn = Connection::open(path).map_err(backend)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(backend)?;
         conn.execute_batch(SCHEMA).map_err(backend)?;
+        let mut columns = conn.prepare("PRAGMA table_info(board_attempts)").map_err(backend)?;
+        let names =
+            columns.query_map([], |row| row.get::<_, String>(1)).map_err(backend)?.collect::<Result<Vec<_>, _>>().map_err(backend)?;
+        drop(columns);
+        if !names.iter().any(|name| name == "claim_key") {
+            conn.execute_batch("ALTER TABLE board_attempts ADD COLUMN claim_key TEXT NOT NULL DEFAULT ''").map_err(backend)?;
+        }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS board_attempts_by_claim_key ON board_attempts(claim_key) WHERE claim_key != ''",
+        )
+        .map_err(backend)?;
         private_files(path)?;
         let (tx, rx) = mpsc::channel::<Task>();
         std::thread::Builder::new()
@@ -206,7 +281,7 @@ impl Ledger {
             .spawn(move || {
                 let mut conn = conn;
                 while let Ok(task) = rx.recv() {
-                    task(&mut conn);
+                    task(&mut conn, &events);
                 }
             })
             .map_err(backend)?;
@@ -219,11 +294,21 @@ impl Ledger {
     ) -> Result<T, Error> {
         let (reply, answer) = oneshot::channel();
         self.tx
-            .send(Box::new(move |conn| {
+            .send(Box::new(move |conn, events| {
                 let result = (|| {
+                    let before: i64 =
+                        conn.query_row("SELECT COALESCE(MAX(seq),0) FROM board_outbox", [], |row| row.get(0)).map_err(backend)?;
                     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(backend)?;
                     let value = work(&tx)?;
                     tx.commit().map_err(backend)?;
+                    match committed_events(conn, before) {
+                        Ok(committed) => {
+                            for event in committed {
+                                drop(events.send(event));
+                            }
+                        }
+                        Err(err) => tracing::warn!("board outbox hints unavailable after commit: {err}"),
+                    }
                     Ok(value)
                 })();
                 drop(reply.send(result));
@@ -238,6 +323,14 @@ mod tests {
 
     use super::*;
     use rusqlite::params;
+
+    #[test]
+    fn board_connection_uses_full_wal_sync() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        let mode: i64 = connection.query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, 2);
+    }
 
     #[tokio::test]
     async fn state_and_outbox_commit_or_rollback_together() {

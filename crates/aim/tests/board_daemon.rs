@@ -10,12 +10,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aim::daemon::{client::DaemonClient, server, socket_path};
 use aim::host::{BoxFuture, SessionClient, UpdateStream};
 use aim_proto::board::{
-    ArtifactInput, ClaimParams, CompleteParams, JobRef, JobSnapshot, JobSpec, ListParams, PollParams, PostParams, ReviewParams, WatchParams,
+    ArtifactInput, CancelParams, ClaimParams, CleanupReceipt, CompleteParams, ConfirmCleanupParams, JobRef, JobSnapshot, JobSpec,
+    ListParams, PollParams, PostParams, RegisterWorkerParams, ReviewParams, WatchParams,
 };
 use aim_proto::content::Base64Bytes;
 use aim_proto::conversation::Part;
 use aim_proto::daemon::{PromptOutcome, SessionAttachResult, SessionConfigParams, SessionListParams, SessionSpec, SessionSummary};
 use aim_proto::error::{ErrorCode, ProtoError};
+use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt as _;
 
@@ -75,6 +77,7 @@ fn post(title: &str, run_id: Option<String>, depends_on: Vec<String>) -> PostPar
             depends_on,
             max_retries: 1,
             workspace: None,
+            work: None,
         },
         idempotency_key: format!("post-{title}"),
     }
@@ -85,7 +88,33 @@ fn now_ms() -> u64 {
 }
 
 fn claim(job_id: String, worker: &str) -> ClaimParams {
-    ClaimParams { job_id, worker: worker.into(), capacity: 1, now_ms: now_ms(), lease_ms: 60_000, expected_version: None }
+    let token_sha256 = Sha256::digest(token(&job_id, worker));
+    let attempt_id = uuid::Uuid::new_v4().to_string();
+    ClaimParams {
+        job_id,
+        worker: worker.into(),
+        capacity: 1,
+        attempt_id: attempt_id.clone(),
+        token_sha256: format!("{token_sha256:x}"),
+        idempotency_key: attempt_id,
+        now_ms: now_ms(),
+        lease_ms: 60_000,
+        expected_version: None,
+    }
+}
+
+fn token(job_id: &str, worker: &str) -> String {
+    format!("test-token:{job_id}:{worker}")
+}
+
+fn cleanup() -> CleanupReceipt {
+    CleanupReceipt {
+        session_id: None,
+        worktree: "/tmp/test-inert-worktree".into(),
+        session_stopped: true,
+        harness_stopped: true,
+        disposition: "kept".into(),
+    }
 }
 
 async fn cli(home: &Path, args: &[&str]) -> std::process::Output {
@@ -104,8 +133,54 @@ async fn daemon_board_round_trip_and_watch_hint() {
     let b = first.board_post(post("b", Some(a.run_id.clone()), vec![a.id.clone()])).await.unwrap().job;
     let hint = tokio::time::timeout(Duration::from_secs(3), events.recv()).await.unwrap().unwrap();
     assert_eq!(hint.job_id, b.id);
-    let readback = watcher.board_poll(PollParams { run_id: a.run_id, after_seq: 0, limit: 20 }).await.unwrap();
+    let readback = watcher.board_poll(PollParams { run_id: a.run_id, after_seq: 0, limit: 20, after_job: None }).await.unwrap();
     assert!(readback.events.iter().any(|event| event.id == hint.id));
+    task.abort();
+}
+
+#[tokio::test]
+async fn daemon_binds_worker_to_connection_and_denies_owner_actions() {
+    let (dir, task) = started().await;
+    let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
+    let a = client.board_post(post("role-a", None, vec![])).await.unwrap().job;
+    let b = client.board_post(post("role-b", Some(a.run_id.clone()), vec![])).await.unwrap().job;
+    for worker in ["w", "alias"] {
+        client.board_register_worker(RegisterWorkerParams { worker: worker.into(), capacity: 1 }).await.unwrap();
+    }
+    let claimed = client.board_claim(claim(a.id.clone(), "w")).await.unwrap();
+    assert_eq!(client.board_claim(claim(b.id.clone(), "alias")).await.unwrap_err().code, ErrorCode::Denied);
+    assert_eq!(
+        client.board_cancel(CancelParams { job_id: b.id, expected_version: b.version, now_ms: now_ms() }).await.unwrap_err().code,
+        ErrorCode::Denied
+    );
+    assert_eq!(
+        client.board_register_worker(RegisterWorkerParams { worker: "new".into(), capacity: 1 }).await.unwrap_err().code,
+        ErrorCode::Denied
+    );
+    assert_eq!(claimed.attempt.worker, "w");
+    task.abort();
+}
+
+#[tokio::test]
+async fn oversized_artifact_batch_is_a_typed_error_before_frame_limit() {
+    let (dir, task) = started().await;
+    let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
+    let job = client.board_post(post("large", None, vec![])).await.unwrap().job;
+    client.board_register_worker(RegisterWorkerParams { worker: "large-worker".into(), capacity: 1 }).await.unwrap();
+    let claim = client.board_claim(claim(job.id.clone(), "large-worker")).await.unwrap();
+    let artifacts =
+        (0..25).map(|_| ArtifactInput { media_type: "application/octet-stream".into(), data: Base64Bytes(vec![0; 1_048_576]) }).collect();
+    let error = client
+        .board_complete(CompleteParams {
+            job_id: job.id.clone(),
+            attempt_id: claim.attempt.id,
+            claim_token: token(&job.id, "large-worker"),
+            artifacts,
+            now_ms: now_ms(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidParams);
     task.abort();
 }
 
@@ -137,6 +212,9 @@ async fn cli_post_list_show_uses_real_binary_and_temp_home() {
         cli(dir.path(), &["board", "complete", &job.id, attempt, "--artifact", evidence_file.to_str().unwrap(), "--json"]).await;
     assert!(completed.status.success(), "{}", String::from_utf8_lossy(&completed.stderr));
     let completed: JobSnapshot = serde_json::from_slice(&completed.stdout).unwrap();
+    let cleaned =
+        cli(dir.path(), &["board", "confirm-cleanup", &job.id, attempt, "--worktree", "/tmp/test-inert-worktree", "--json"]).await;
+    assert!(cleaned.status.success(), "{}", String::from_utf8_lossy(&cleaned.stderr));
     let evidence = completed.artifacts.first().expect("artifact summary").id.as_str();
     let reviewed = cli(
         dir.path(),
@@ -190,28 +268,40 @@ async fn live_board_two_job_dag_over_daemon() {
 
     let one = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
     let two = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
+    one.board_register_worker(RegisterWorkerParams { worker: "worker-one".into(), capacity: 1 }).await.unwrap();
+    one.board_register_worker(RegisterWorkerParams { worker: "worker-two".into(), capacity: 1 }).await.unwrap();
     assert!(two.board_claim(claim(b.id.clone(), "worker-two")).await.is_err(), "B must wait for accepted A evidence");
     let a_claim = one.board_claim(claim(a.id.clone(), "worker-one")).await.unwrap();
     let a_done = one
         .board_complete(CompleteParams {
             job_id: a.id.clone(),
             attempt_id: a_claim.attempt.id.clone(),
-            claim_token: a_claim.claim_token,
+            claim_token: token(&a.id, "worker-one"),
             artifacts: vec![ArtifactInput { media_type: "text/plain".into(), data: Base64Bytes(b"A evidence".to_vec()) }],
             now_ms: now_ms(),
         })
         .await
         .unwrap();
     assert!(two.board_claim(claim(b.id.clone(), "worker-two")).await.is_err(), "execution success is not review acceptance");
+    one.board_confirm_cleanup(ConfirmCleanupParams {
+        job_id: a.id.clone(),
+        attempt_id: a_claim.attempt.id.clone(),
+        claim_token: token(&a.id, "worker-one"),
+        receipt: cleanup(),
+    })
+    .await
+    .unwrap();
+    let a_clean = one.board_show(JobRef { job_id: a.id.clone() }).await.unwrap();
     let evidence = a_done.artifacts.first().expect("A artifact").id.clone();
-    let a_accepted = one
+    let reviewer = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
+    let a_accepted = reviewer
         .board_review(ReviewParams {
             job_id: a.id,
             attempt_id: a_claim.attempt.id,
             reviewer: "reviewer".into(),
             accepted: true,
             evidence: vec![evidence],
-            expected_version: a_done.version,
+            expected_version: a_clean.version,
             now_ms: now_ms(),
         })
         .await
@@ -224,14 +314,14 @@ async fn live_board_two_job_dag_over_daemon() {
         .board_complete(CompleteParams {
             job_id: b.id.clone(),
             attempt_id: b_claim.attempt.id,
-            claim_token: b_claim.claim_token,
+            claim_token: token(&b.id, "worker-two"),
             artifacts: vec![ArtifactInput { media_type: "text/plain".into(), data: Base64Bytes(b"B evidence".to_vec()) }],
             now_ms: now_ms(),
         })
         .await
         .unwrap();
     assert_eq!(b_done.state, aim_proto::board::JobState::Succeeded);
-    let listed = two.board_list(ListParams { run_id: Some(b.run_id), limit: Some(10) }).await.unwrap();
+    let listed = two.board_list(ListParams { run_id: Some(b.run_id), limit: Some(10), after_job: None }).await.unwrap();
     assert_eq!(listed.jobs.len(), 2);
     eprintln!("live board DAG: posted={posted:?}, A accepted={accepted:?}, B completed={:?}", began.elapsed());
     task.abort();
