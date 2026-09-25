@@ -65,5 +65,6 @@ Rules (enforced by `mise run check`):
 | [0046](0046-per-call-harness-authority.md) | Carry narrowing authority on harness calls and sessions. |
 | [0047](0047-remote-harness-websocket-and-http.md) | Carry the harness protocol over bounded WebSocket and HTTP sessions. |
 | [0048](0048-board-workers-and-integration.md) | Run fenced board attempts in isolated worktrees and integrate accepted evidence serially. |
+| [0052](0052-remote-workspace-location.md) | Persist remote harness URLs as workspace locations without credentials. |
 | [0053](0053-network-token-call-scope-ceilings.md) | Bind network bearer scopes to harness sessions. |
 | [0054](0054-reserve-image-destination-before-generation.md) | Reserve image destinations before paid generation. |
