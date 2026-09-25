@@ -40,8 +40,9 @@ struct Kernel {
     items: BTreeMap<String, Vec<Item>>,
     /// Bare name → the `module::name` keys that declare it.
     by_name: BTreeMap<String, Vec<String>>,
-    /// Module → the names it imports with `use crate::…`, and the module each comes from.
-    imports: BTreeMap<String, BTreeMap<String, String>>,
+    /// Module → the names it imports with `use crate::…`, each with its source module and the
+    /// original name it stands for (`use crate::job::Event as E` maps `E` to `job::Event`).
+    imports: BTreeMap<String, BTreeMap<String, (String, String)>>,
 }
 
 impl Kernel {
@@ -74,8 +75,8 @@ impl Kernel {
         if self.items.contains_key(&local) {
             return vec![local];
         }
-        if let Some(from) = self.imports.get(module).and_then(|imports| imports.get(name)) {
-            let key = format!("{from}::{name}");
+        if let Some((from, original)) = self.imports.get(module).and_then(|imports| imports.get(name)) {
+            let key = format!("{from}::{original}");
             if self.items.contains_key(&key) {
                 return vec![key];
             }
@@ -265,6 +266,26 @@ mod tests {
         let glob = "use crate::job::*;\n\n/// LOCKED(ADR-0048)\npub open spec fn uses(e: Event) -> bool {\n    true\n}\n";
         let files = |turn: &str| vec![file("glob", glob), file("job", JOB), file("turn", turn)];
         assert_ne!(digest(&files(TURN), "glob::uses"), digest(&files(&TURN.replace("Start", "Begin")), "glob::uses"));
+    }
+
+    #[test]
+    fn a_renamed_import_covers_the_original_item() {
+        let board = "use crate::job::{Event as E};\n\n/// LOCKED(ADR-0048)\npub open spec fn uses(e: E) -> bool {\n    true\n}\n";
+        let simple = "use crate::job::Event as E;\n\n/// LOCKED(ADR-0048)\npub open spec fn uses(e: E) -> bool {\n    true\n}\n";
+        for importer in [board, simple] {
+            let files = |job: &str| vec![file("board", importer), file("job", job), file("turn", TURN)];
+            assert_ne!(digest(&files(JOB), "board::uses"), digest(&files(&JOB.replace("Claim", "Claimed")), "board::uses"));
+        }
+    }
+
+    #[test]
+    fn type_aliases_consts_and_private_types_are_part_of_the_closure() {
+        let job = "type WorkerId = u64;\n\npub const CAP: u64 = 4;\n\nenum Hidden {\n    A,\n}\n\n/// LOCKED(ADR-0048)\npub open spec fn holds(w: WorkerId, h: Hidden) -> bool {\n    w < CAP\n}\n";
+        let base = digest(&[file("job", job)], "job::holds");
+        assert!(!base.is_empty());
+        assert_ne!(base, digest(&[file("job", &job.replace("= u64", "= u32"))], "job::holds"));
+        assert_ne!(base, digest(&[file("job", &job.replace("= 4", "= 5"))], "job::holds"));
+        assert_ne!(base, digest(&[file("job", &job.replace("    A,", "    B,"))], "job::holds"));
     }
 
     #[test]

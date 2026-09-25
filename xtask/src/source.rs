@@ -77,22 +77,36 @@ fn item_text(lines: &[&str], start: usize) -> String {
     out
 }
 
-/// Collects spec fns, structs and enums declared in `file`, in source order. A module may declare
-/// a name more than once (the same method name on different types), so names can repeat.
+/// `line` without a leading visibility (`pub`, `pub(crate)`, `pub(super)`, `pub(in …)`).
+fn without_visibility(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix("pub") else { return line };
+    let rest = if rest.starts_with('(') { rest.find(')').and_then(|end| rest.get(end + 1..)).unwrap_or(rest) } else { rest };
+    if rest.starts_with(char::is_whitespace) { rest.trim_start() } else { line }
+}
+
+/// Collects the items a decision can depend on — spec fns, and structs, enums, type aliases and
+/// consts of any visibility — declared in `file`, in source order. A module may declare a name
+/// more than once (the same method name on different types), so names can repeat.
 pub fn items(file: &SourceFile) -> Vec<(String, Item)> {
     let lines: Vec<&str> = file.text.lines().collect();
     let mut found = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
-        let (kind, name) = if trimmed.contains("spec fn ") && !trimmed.starts_with("//") {
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        let declared = without_visibility(trimmed);
+        let (kind, name) = if trimmed.contains("spec fn ") {
             (ItemKind::SpecFn, ident_after(trimmed, "fn"))
-        } else if trimmed.starts_with("pub enum ") || trimmed.starts_with("pub struct ") {
-            let keyword = if trimmed.starts_with("pub enum ") { "enum" } else { "struct" };
-            (ItemKind::Type, ident_after(trimmed, keyword))
+        } else if let Some(keyword) =
+            ["enum", "struct", "type", "const"].into_iter().find(|k| declared.strip_prefix(k).is_some_and(|r| r.starts_with(' ')))
+        {
+            (ItemKind::Type, ident_after(declared, keyword))
         } else {
             continue;
         };
-        let Some(name) = name else { continue };
+        // `const fn` is an exec function, not a constant a decision can read.
+        let Some(name) = name.filter(|name| !matches!(name.as_str(), "fn" | "unsafe" | "async" | "extern")) else { continue };
         let doc = lines
             .get(..i)
             .unwrap_or_default()
@@ -111,9 +125,9 @@ pub fn items(file: &SourceFile) -> Vec<(String, Item)> {
     found
 }
 
-/// Names that `file` imports from other kernel modules (`use crate::module::{A, B};` or
-/// `use crate::module::A;`), mapped to the module they come from.
-pub fn imports(file: &SourceFile) -> BTreeMap<String, String> {
+/// Names that `file` imports from other kernel modules (`use crate::module::{A, B as C};` or
+/// `use crate::module::A;`), mapped to the module and the original name they stand for.
+pub fn imports(file: &SourceFile) -> BTreeMap<String, (String, String)> {
     let mut map = BTreeMap::new();
     let mut rest = file.text.as_str();
     while let Some(start) = rest.find("use crate::") {
@@ -122,9 +136,14 @@ pub fn imports(file: &SourceFile) -> BTreeMap<String, String> {
         let (stmt, after) = tail.split_at(end);
         rest = after;
         let Some((module, names)) = stmt.split_once("::") else { continue };
-        for name in tokens(names) {
-            if name != "self" {
-                map.insert(name.to_owned(), module.trim().to_owned());
+        for entry in names.split([',', '{', '}']).map(str::trim).filter(|e| !e.is_empty()) {
+            let (path, alias) = match entry.split_once(" as ") {
+                Some((path, alias)) => (path.trim(), alias.trim()),
+                None => (entry, entry.rsplit("::").next().unwrap_or(entry).trim()),
+            };
+            let original = path.rsplit("::").next().unwrap_or(path).trim();
+            if original != "self" && alias != "_" {
+                map.insert(alias.to_owned(), (module.trim().to_owned(), original.to_owned()));
             }
         }
     }
@@ -161,9 +180,4 @@ pub fn paths(text: &str) -> Vec<(Option<&str>, &str)> {
 /// Whitespace-insensitive normal form used for digests (formatting never changes a decision).
 pub fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Identifier-like tokens appearing in `text`.
-pub fn tokens(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|t| !t.is_empty())
 }

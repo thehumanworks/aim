@@ -37,6 +37,12 @@ so this ADR fixes the checker.
      scanner cannot place. An unplaceable reference widens a digest and never narrows it.
 - A LOCKED spec whose name is declared more than once in its own module is refused: its key
   would be ambiguous.
+- **Items (amended after REV16, codex's review of this change):** a decision's closure covers
+  spec fns and structs, enums, type aliases and consts of **any** visibility. `const fn` is exec
+  code and is not an item. Previously `pub type WorkerId = u64` sat outside `job::holds_capacity`'s
+  digest, so retyping it changed a locked decision unnoticed. A renamed import
+  (`use crate::job::Event as E`) resolves `E` to `job::Event`. The second re-record changed only
+  the six `job::*` digests, which reference `WorkerId`.
 - The digest hashes each item's kind, `module::name` key and normalized text. Every recorded
   digest therefore changed once, with the algorithm. `LOCKED.toml` was re-recorded under this ADR.
   - The set of `(decision, ADR)` pairs is unchanged, except that `job::wf` (ADR 0048) is now
@@ -53,10 +59,12 @@ so this ADR fixes the checker.
 
 ## Verification
 
-- Unit tests in `xtask/src/locked.rs` cover four cases:
+- Unit tests in `xtask/src/locked.rs` cover these cases:
   - a same-named item in another module stays out of the digest, while the spec's own helper
     and type are in it;
   - imports and `crate::module::name` paths pick the named module;
   - a glob-imported name widens the digest;
-  - a LOCKED name declared twice in its module is refused.
+  - a LOCKED name declared twice in its module is refused;
+  - a renamed import covers the original item (grouped and simple forms);
+  - type aliases, consts and private types are part of the closure.
 - `mise run check` passes with the re-recorded manifest.
