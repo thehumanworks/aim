@@ -1,6 +1,6 @@
 //! Fenced job attempts and independent result review.
 //!
-//! DRAFT(M5a): the lead will lock this decision after reviewing the ledger contract.
+//! The attempt-scoped lifecycle is locked by ADR 0048.
 //! Lease expiry fences an attempt but does not prove its process stopped.
 #![expect(clippy::match_like_matches_macro, reason = "Verus proves these explicit pattern matches against enum predicates")]
 use vstd::prelude::*;
@@ -109,8 +109,13 @@ pub enum Event {
         /// Current generation.
         generation: u32,
     },
-    /// Confirm an old process has stopped.
-    ConfirmCleanup,
+    /// Confirm the named attempt's process has stopped, even after lease expiry.
+    ConfirmCleanup {
+        /// Current generation.
+        generation: u32,
+        /// Current or last claim identity.
+        claim_id: u64,
+    },
     /// Open a new generation within the retry budget.
     Retry,
     /// Cancel an open or active job.
@@ -218,7 +223,7 @@ pub open spec fn accepted(v: JobView) -> bool {
     v.state == JobState::Succeeded && v.review == ReviewState::Accepted && v.evidence_present
 }
 
-/// DRAFT(M5a): a complete transition or `None` when rejected.
+/// LOCKED(ADR-0048): a complete attempt-scoped transition or `None` when rejected.
 pub open spec fn next(pre: JobView, ev: Event, now: u64) -> Option<JobView> {
     match ev {
         Event::Claim { worker, claim_id, lease_until } => if pre.state == JobState::Posted && now
@@ -276,9 +281,10 @@ pub open spec fn next(pre: JobView, ev: Event, now: u64) -> Option<JobView> {
         } else {
             None
         },
-        Event::ConfirmCleanup => if (pre.state == JobState::Failed || pre.state
-            == JobState::Cancelled || pre.state == JobState::Succeeded) && pre.cleanup
-            == CleanupState::Pending {
+        Event::ConfirmCleanup { generation, claim_id } => if pre.generation == generation as nat
+            && pre.claim is Some && pre.claim->0.claim_id == claim_id && (pre.state
+            == JobState::Failed || pre.state == JobState::Cancelled || pre.state
+            == JobState::Succeeded) && pre.cleanup == CleanupState::Pending {
             Some(JobView { cleanup: CleanupState::Confirmed, ..pre })
         } else {
             None
@@ -356,6 +362,7 @@ pub proof fn lemma_completion_needs_review(pre: JobView, generation: u32, claim_
 }
 
 /// An old generation, wrong claim id, or expired lease cannot mutate an active attempt.
+/// Cleanup confirmation does not require a live lease, but it does require the exact identity.
 pub proof fn lemma_stale_attempt_fenced(pre: JobView, generation: u32, claim_id: u64, now: u64)
     requires
         wf(pre),
@@ -365,6 +372,8 @@ pub proof fn lemma_stale_attempt_fenced(pre: JobView, generation: u32, claim_id:
         next(pre, Event::Heartbeat { generation, claim_id, lease_until: u64::MAX }, now) is None,
         next(pre, Event::Complete { generation, claim_id }, now) is None,
         next(pre, Event::Fail { generation, claim_id, cleanup_confirmed: true }, now) is None,
+        (pre.generation != generation as nat || pre.claim is None || pre.claim->0.claim_id
+            != claim_id) ==> next(pre, Event::ConfirmCleanup { generation, claim_id }, now) is None,
 {
 }
 
@@ -715,6 +724,17 @@ impl Job {
         evidence_present: bool,
     ) -> (r: Result<Self, LifecycleError>)
         ensures
+            r is Ok <==> wf(
+                JobView {
+                    state,
+                    review,
+                    generation: generation as nat,
+                    max_retries: max_retries as nat,
+                    claim,
+                    cleanup,
+                    evidence_present,
+                },
+            ),
             match r {
                 Ok(job) => wf(job@) && job@.state == state && job@.review == review
                     && job@.generation == generation as nat && job@.claim == claim && job@.cleanup
@@ -872,6 +892,7 @@ impl Job {
     pub fn transition(&mut self, ev: Event, now: u64) -> (r: Result<(), LifecycleError>)
         ensures
             ev is Claim ==> r is Err,
+            r is Ok <==> (!(ev is Claim) && next(old(self)@, ev, now) is Some),
             r is Ok ==> next(old(self)@, ev, now) == Some(final(self)@),
             r is Err ==> final(self)@ == old(self)@,
     {
@@ -893,9 +914,9 @@ impl Job {
     )]
     pub(crate) fn apply(&mut self, ev: Event, now: u64) -> (r: Result<(), LifecycleError>)
         ensures
+            r is Ok <==> next(old(self)@, ev, now) is Some,
             r is Ok ==> next(old(self)@, ev, now) == Some(final(self)@),
             r is Err ==> final(self)@ == old(self)@,
-            next(old(self)@, ev, now) is None ==> r is Err,
     {
         proof {
             reveal(<Job as View>::view);
@@ -985,7 +1006,18 @@ impl Job {
                 self.cleanup = CleanupState::Pending;
                 return Ok(());
             },
-            Event::ConfirmCleanup => {
+            Event::ConfirmCleanup { generation, claim_id } => {
+                if self.generation != generation {
+                    return Err(LifecycleError::StaleClaim);
+                }
+                match self.claim {
+                    Some(c) => {
+                        if c.claim_id != claim_id {
+                            return Err(LifecycleError::StaleClaim);
+                        }
+                    },
+                    None => return Err(LifecycleError::StaleClaim),
+                }
                 if (!is_failed(self.state) && !is_cancelled(self.state) && !is_succeeded(
                     self.state,
                 )) || !is_cleanup_pending(self.cleanup) {

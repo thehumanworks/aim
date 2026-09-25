@@ -19,6 +19,11 @@ adr = "0050"
 sha256 = "12136c5d2f2ceb46380ae845ba4e207aba9dc28d22e6ea26089f8ed45a708dcc"
 
 [[locked]]
+decision = "board::may_claim"
+adr = "0048"
+sha256 = "48a67f38976153551d8fa98a974708efc893cbed33488c9c7e360a906e791d90"
+
+[[locked]]
 decision = "compaction::cut_ok"
 adr = "0025"
 sha256 = "b5fd42f60b49b4f29dd25a8d5eb39510bb4bad09b481787d5f173fe14d1f8618"
@@ -47,6 +52,11 @@ sha256 = "06697421fa8772e0bb1264ec1c7e57acf540ff5462a5e81a241ad4f44657c6a6"
 decision = "dedup::finish_phase"
 adr = "0050"
 sha256 = "d1e863368fe5a3f1a4bf79b4fd6416a4294dd3eeea27ec72089d4e6d8589a16b"
+
+[[locked]]
+decision = "dedup::minted_too_old_spec"
+adr = "0055"
+sha256 = "933e6cbbf2c5dcd45e348704eeb8f061bdddb17d5d1a6cd267f72afd8a512867"
 
 [[locked]]
 decision = "discovery::budget_wf"
@@ -92,6 +102,11 @@ sha256 = "3e117e5879f463c0db9894a40caea075c4406cd692853f0654b2828f849e5102"
 decision = "job::holds_capacity"
 adr = "0048"
 sha256 = "999f20d5f385ac2e0fab974f45a224c2c7d3b3ae36c011e95b0b351895d61669"
+
+[[locked]]
+decision = "job::next"
+adr = "0048"
+sha256 = "0a7067ab8dd49588e8b71555d9bc1cbf836607565405d21c41754f99edbcabb4"
 
 [[locked]]
 decision = "job::wf"

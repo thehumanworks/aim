@@ -1,5 +1,6 @@
 //! Typed board operations over the transactional ledger.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -154,6 +155,9 @@ fn kernel_job(tx: &Transaction<'_>, snapshot: &JobSnapshot) -> Result<KernelJob,
             }
         }
     };
+    // Review verifies every referenced immutable artifact before accepting it. The artifact
+    // table refuses updates and deletes, so a later restore needs only the review's evidence
+    // references; re-reading and hashing the bytes here makes every claim scale with history.
     let evidence_present = if snapshot.review == ReviewState::Pending {
         false
     } else {
@@ -167,17 +171,15 @@ fn kernel_job(tx: &Transaction<'_>, snapshot: &JobSnapshot) -> Result<KernelJob,
             .map_err(sql)?;
         let ids = evidence.as_deref().map(decode::<Vec<String>>).transpose()?.unwrap_or_default();
         for id in &ids {
-            let artifact: Option<(Vec<u8>, Vec<u8>)> = tx
+            let present: bool = tx
                 .query_row(
-                    "SELECT sha256,data FROM board_artifacts WHERE id=?1 AND attempt_id=?2",
+                    "SELECT EXISTS(SELECT 1 FROM board_artifacts WHERE id=?1 AND attempt_id=?2)",
                     params![id, snapshot.attempt.as_ref().map(|attempt| attempt.id.as_str())],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| row.get(0),
                 )
-                .optional()
                 .map_err(sql)?;
-            let (stored, bytes) = artifact.ok_or_else(|| Error::Storage("review references missing attempt artifact".into()))?;
-            if !same_hash(&stored, &Sha256::digest(&bytes).into()) {
-                return Err(Error::Storage("review artifact hash mismatch".into()));
+            if !present {
+                return Err(Error::Storage("review references missing attempt artifact".into()));
             }
         }
         !ids.is_empty()
@@ -356,11 +358,15 @@ pub(super) fn update_job(
     generation: u32,
     now: u64,
 ) -> Result<JobSnapshot, Error> {
-    tx.execute(
-        "UPDATE board_jobs SET state=?1, review_state=?2, generation=?3, version=version+1, updated_ms=?4 WHERE id=?5 AND version=?6",
-        params![state_name(state), review_name(review), generation, as_i64(now)?, job.id, as_i64(job.version)?],
-    )
-    .map_err(sql)?;
+    let updated = tx
+        .execute(
+            "UPDATE board_jobs SET state=?1, review_state=?2, generation=?3, version=version+1, updated_ms=?4 WHERE id=?5 AND version=?6",
+            params![state_name(state), review_name(review), generation, as_i64(now)?, job.id, as_i64(job.version)?],
+        )
+        .map_err(sql)?;
+    if updated != 1 {
+        return Err(Error::Conflict("job version changed during update".into()));
+    }
     load_job(tx, &job.id)
 }
 
@@ -447,6 +453,10 @@ fn valid_spec(spec: &JobSpec) -> Result<(), Error> {
     {
         return Err(Error::Invalid("job contract field exceeds its bound".into()));
     }
+    let mut dependencies = HashSet::with_capacity(spec.depends_on.len());
+    if spec.depends_on.iter().any(|id| !dependencies.insert(id)) {
+        return Err(Error::Invalid("duplicate dependency".into()));
+    }
     if let Some(work) = &spec.work
         && (spec.workspace.as_deref().is_none_or(|path| path.is_empty() || !path.starts_with('/'))
             || work.target_branch.is_empty()
@@ -502,11 +512,11 @@ impl Board {
                 if job.attempt.as_ref().is_none_or(|attempt| attempt.id != attempt_id) {
                     return Err(Error::StaleClaim);
                 }
-                let stored: Vec<u8> = tx
+                let (claim_id, stored): (i64, Vec<u8>) = tx
                     .query_row(
-                        "SELECT token_hash FROM board_attempts WHERE id=?1 AND job_id=?2 AND generation=?3",
+                        "SELECT claim_id,token_hash FROM board_attempts WHERE id=?1 AND job_id=?2 AND generation=?3",
                         params![attempt_id, job_id, job.generation],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .map_err(sql)?;
                 if !same_hash(&stored, &hash_token(&token)) {
@@ -521,24 +531,25 @@ impl Board {
                     if prior != encoded {
                         return Err(Error::Conflict("cleanup receipt changed on retry".into()));
                     }
-                    return Ok(None);
-                }
-                tx.execute(
-                    "INSERT INTO board_cleanup_receipts (attempt_id,job_id,receipt_json,created_ms) VALUES (?1,?2,?3,?4)",
-                    params![attempt_id, job_id, encoded, as_i64(now)?],
-                )
-                .map_err(sql)?;
-                let current = job.attempt.as_ref().ok_or(Error::StaleClaim)?;
-                let job = if !current.cleanup_confirmed && matches!(job.state, JobState::Succeeded | JobState::Failed | JobState::Cancelled)
-                {
-                    let mut kernel = kernel_job(tx, &job)?;
-                    kernel.transition(KernelEvent::ConfirmCleanup, now).map_err(kernel_error)?;
-                    tx.execute("UPDATE board_attempts SET cleanup_state='confirmed' WHERE id=?1", params![attempt_id]).map_err(sql)?;
-                    update_from_kernel(tx, &job, &kernel, now)?
                 } else {
-                    job
-                };
-                insert_event(tx, &job.run_id, &job.id, job.version, "attempt.cleanup_confirmed", now).map(Some)
+                    tx.execute(
+                        "INSERT INTO board_cleanup_receipts (attempt_id,job_id,receipt_json,created_ms) VALUES (?1,?2,?3,?4)",
+                        params![attempt_id, job_id, encoded, as_i64(now)?],
+                    )
+                    .map_err(sql)?;
+                }
+                let current = job.attempt.as_ref().ok_or(Error::StaleClaim)?;
+                if !current.cleanup_confirmed && matches!(job.state, JobState::Succeeded | JobState::Failed | JobState::Cancelled) {
+                    let mut kernel = kernel_job(tx, &job)?;
+                    kernel
+                        .transition(KernelEvent::ConfirmCleanup { generation: job.generation, claim_id: as_u64(claim_id)? }, now)
+                        .map_err(kernel_error)?;
+                    tx.execute("UPDATE board_attempts SET cleanup_state='confirmed' WHERE id=?1", params![attempt_id]).map_err(sql)?;
+                    let job = update_from_kernel(tx, &job, &kernel, now)?;
+                    insert_event(tx, &job.run_id, &job.id, job.version, "attempt.cleanup_confirmed", now).map(Some)
+                } else {
+                    Ok(None)
+                }
             })
             .await?;
 
@@ -762,12 +773,17 @@ impl Board {
                     .collect::<Result<Vec<_>,_>>().map_err(sql)?
             };
             let deps = dependency_ids.iter().map(|id| kernel_job(tx,&load_job(tx,id)?)).collect::<Result<Vec<_>,_>>()?;
-            let job_ids = {
-                let mut query = tx.prepare("SELECT id FROM board_jobs ORDER BY id").map_err(sql)?;
-                query.query_map([],|row|row.get::<_,String>(0)).map_err(sql)?
+            // The kernel counts only this worker's current Active/Pending attempts. An indexed
+            // projection selects that complete set without restoring unrelated ledger history.
+            let held_job_ids = {
+                let mut query = tx.prepare(
+                    "SELECT j.id FROM board_attempts a JOIN board_jobs j ON j.id=a.job_id AND j.generation=a.generation \
+                     WHERE a.assignee=?1 AND a.cleanup_state!='confirmed'",
+                ).map_err(sql)?;
+                query.query_map(params![params.worker],|row|row.get::<_,String>(0)).map_err(sql)?
                     .collect::<Result<Vec<_>,_>>().map_err(sql)?
             };
-            let others = job_ids.iter().map(|id| kernel_job(tx,&load_job(tx,id)?)).collect::<Result<Vec<_>,_>>()?;
+            let others = held_job_ids.iter().map(|id| kernel_job(tx,&load_job(tx,id)?)).collect::<Result<Vec<_>,_>>()?;
             let generation = current.generation;
             let claim_id = u64::from(generation).saturating_add(1);
             let mut kernel = kernel_job(tx,&current)?;
@@ -891,6 +907,11 @@ impl Board {
                 kernel.transition(KernelEvent::Start {generation:claim.generation,claim_id:claim.claim_id},now).map_err(kernel_error)?;
             }
             kernel.transition(KernelEvent::Complete {generation:claim.generation,claim_id:claim.claim_id},now).map_err(kernel_error)?;
+            let cleanup_confirmed = cleanup_recorded(tx, &params.attempt_id)?;
+            if cleanup_confirmed {
+                kernel.transition(KernelEvent::ConfirmCleanup {generation:claim.generation,claim_id:claim.claim_id},now)
+                    .map_err(kernel_error)?;
+            }
             for artifact in &params.artifacts {
                 let digest = Sha256::digest(&artifact.data.0);
                 let hex = hex_bytes(&digest);
@@ -900,7 +921,10 @@ impl Board {
                     params![id,current.id,params.attempt_id,format!("sha256:{hex}"),artifact.media_type,as_i64(u64::try_from(artifact.data.0.len()).map_err(sql)?)?,digest.as_slice(),artifact.data.0,as_i64(now)?],
                 ).map_err(sql)?;
             }
-            tx.execute("UPDATE board_attempts SET state='succeeded',cleanup_state='pending',ended_ms=?1 WHERE id=?2",params![as_i64(now)?,params.attempt_id]).map_err(sql)?;
+            tx.execute(
+                "UPDATE board_attempts SET state='succeeded',cleanup_state=?1,ended_ms=?2 WHERE id=?3",
+                params![if cleanup_confirmed { "confirmed" } else { "pending" },as_i64(now)?,params.attempt_id],
+            ).map_err(sql)?;
             let job = update_from_kernel(tx,&current,&kernel,now)?;
             let event = insert_event(tx,&job.run_id,&job.id,job.version,"job.succeeded",now)?;
             Ok((job,event))
@@ -1026,7 +1050,7 @@ impl Board {
                 || current.attempt.as_ref().is_none_or(|attempt| attempt.id != params.attempt_id) {
                 return Err(Error::Conflict("job is not reviewable at this version".into()));
             }
-            if current.attempt.as_ref().is_some_and(|attempt| attempt.worker == params.reviewer) {
+            if current.attempt.as_ref().is_some_and(|attempt| attempt.worker.trim().to_lowercase() == params.reviewer.trim().to_lowercase()) {
                 return Err(Error::Conflict("worker cannot review its own attempt".into()));
             }
             if params.accepted && params.evidence.is_empty() {

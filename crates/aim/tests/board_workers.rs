@@ -9,18 +9,24 @@ use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aim::agent::ToolHost;
 use aim::board::{Board, integration::IntegrationState};
 use aim::daemon::{client::DaemonClient, socket_path};
+use aim::harness::HarnessClient;
 use aim::host::{BoxFuture, SessionClient, UpdateStream};
+use aim::resources::{self, ResourceConfig, tools::AllowedTools};
 use aim::workers::{Integrator, Runner, RunnerOptions};
-use aim_proto::board::{FailureCleanup, JobSnapshot, JobSpec, PostParams, ReviewParams, WorkPolicy};
+use aim_proto::board::{FailureCleanup, JobSnapshot, JobSpec, JobState, PostParams, ReviewParams, WorkPolicy};
 use aim_proto::conversation::{Part, StopReason};
 use aim_proto::daemon::{
     Location, Persistence, PromptOutcome, SessionAttachResult, SessionConfigParams, SessionListParams, SessionSpec, SessionState,
     SessionSummary, SessionUpdate,
 };
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::event::SessionMeta;
+use aim_proto::event::{SessionAgent, SessionMeta};
+use aim_proto::harness::{FsList, FsListParams, FsRead, FsReadParams};
+use aim_proto::ids::IdempotencyKey;
+use serde_json::json;
 use tempfile::TempDir;
 
 /// The live test owns its daemon, including when an assertion or provider call fails.
@@ -55,6 +61,7 @@ enum Script {
     Separate,
     Conflict,
     Paused,
+    Revision,
 }
 
 struct Session {
@@ -65,6 +72,7 @@ struct Session {
 
 struct Scripted {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    prompts: Arc<Mutex<Vec<String>>>,
     script: Script,
 }
 
@@ -87,7 +95,11 @@ impl SessionClient for Scripted {
                     model: spec.model.unwrap_or_else(|| "scripted".into()),
                     title: None,
                     parent: None,
-                    agent: None,
+                    agent: spec.agent.map(|name| SessionAgent {
+                        name,
+                        allow: Some(["Edit", "Glob", "Grep", "LS", "Read", "Write"].into_iter().map(str::to_owned).collect()),
+                        deny: Vec::new(),
+                    }),
                 },
                 state: SessionState::Idle,
                 persistence: Persistence::Persistent,
@@ -120,20 +132,22 @@ impl SessionClient for Scripted {
     }
     fn prompt(&self, id: String, parts: Vec<Part>) -> BoxFuture<Result<PromptOutcome, ProtoError>> {
         let sessions = Arc::clone(&self.sessions);
+        let prompts = Arc::clone(&self.prompts);
         let script = self.script;
         Box::pin(async move {
             let text = parts.iter().find_map(|part| if let Part::Text { text } = part { Some(text.as_str()) } else { None }).unwrap_or("");
+            prompts.lock().unwrap().push(text.to_owned());
             let (workspace, updates) = {
                 let mut map = sessions.lock().unwrap();
                 let session = map.get_mut(&id).ok_or_else(unavailable)?;
                 session.summary.state = SessionState::Running;
-                session.summary.turns = 1;
+                session.summary.turns += 1;
                 (session.summary.meta.workspace.clone(), session.updates.clone())
             };
-            let is_a = text.contains("Title: A");
+            let is_a = text.contains("Title: A") || matches!(script, Script::Revision);
             if !matches!(script, Script::Paused) {
                 let name = match script {
-                    Script::Separate => {
+                    Script::Separate | Script::Revision => {
                         if is_a {
                             "a.txt"
                         } else {
@@ -143,9 +157,17 @@ impl SessionClient for Scripted {
                     Script::Conflict => "shared.txt",
                     Script::Paused => "a.txt",
                 };
-                std::fs::write(Path::new(&workspace).join(name), if is_a { "A\n" } else { "B\n" })
+                let content = if matches!(script, Script::Revision) && !text.contains("runner's check failed") {
+                    "wrong\n"
+                } else if is_a {
+                    "A\n"
+                } else {
+                    "B\n"
+                };
+                std::fs::write(Path::new(&workspace).join(name), content)
                     .map_err(|err| ProtoError::new(ErrorCode::Unavailable, err.to_string()))?;
                 let _ignored = updates.send(SessionUpdate::TurnEnded { stop: StopReason::EndTurn });
+                sessions.lock().unwrap().get_mut(&id).ok_or_else(unavailable)?.summary.state = SessionState::Idle;
             }
             Ok(PromptOutcome::Started { turn: 1 })
         })
@@ -188,7 +210,7 @@ fn setup(script: Script) -> (TempDir, PathBuf, PathBuf, Board, Arc<Scripted>) {
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-m", "base"]);
     let board = Board::open(&home.join("aim.db")).unwrap();
-    let sessions = Arc::new(Scripted { sessions: Arc::new(Mutex::new(HashMap::new())), script });
+    let sessions = Arc::new(Scripted { sessions: Arc::new(Mutex::new(HashMap::new())), prompts: Arc::new(Mutex::new(Vec::new())), script });
     (dir, repo, home, board, sessions)
 }
 
@@ -221,6 +243,7 @@ async fn post(board: &Board, repo: &Path, title: &str, depends_on: Vec<String>, 
     let check = match script {
         Script::Separate | Script::Paused => format!("test -f {}.txt", title.to_ascii_lowercase()),
         Script::Conflict => "test -f shared.txt".into(),
+        Script::Revision => "grep -qx 'A' a.txt || awk 'BEGIN { for(i=0;i<1000;i++) print \"failed line\"; exit 1 }'".into(),
     };
     board
         .post(PostParams {
@@ -282,6 +305,35 @@ async fn scripted_two_job_dag_runs_in_worktrees_then_integrates() {
     assert_eq!(integrator.integrate(b.id).await.unwrap().state, IntegrationState::Integrated);
     assert_eq!(git(&repo, &["show", "main:a.txt"]), "A");
     assert_eq!(git(&repo, &["show", "main:b.txt"]), "B");
+}
+
+#[tokio::test]
+async fn failing_runner_check_returns_bounded_feedback_for_a_file_only_revision() {
+    let (_dir, repo, home, board, sessions) = setup(Script::Revision);
+    let job = post(&board, &repo, "A", vec![], Script::Revision).await;
+    let runner = worker(&home, board.clone(), Arc::clone(&sessions));
+    let summary = runner.run_once().await.unwrap();
+    assert_eq!((summary.succeeded, summary.failed), (1, 0));
+    {
+        let prompts = sessions.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("runner's check failed"));
+        assert!(prompts[1].contains("failed line"));
+        assert!(prompts[1].chars().count() < 8_500, "failure feedback must stay bounded");
+    }
+    assert!(board.show(job.id).await.unwrap().attempt.unwrap().cleanup_confirmed);
+}
+
+#[tokio::test]
+async fn worktree_inside_aim_home_is_refused_before_claim() {
+    let (dir, repo, _home, board, sessions) = setup(Script::Separate);
+    let job = post(&board, &repo, "A", vec![], Script::Separate).await;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let runner = worker(dir.path(), board.clone(), sessions);
+    let err = runner.run_once().await.unwrap_err();
+    assert!(err.contains("overlaps AIM_HOME"), "{err}");
+    assert_eq!(board.show(job.id).await.unwrap().state, JobState::Posted);
+    assert_eq!(std::fs::read_dir(dir.path().join("run/board-workers")).unwrap().count(), 1, "only the worker lock exists");
 }
 
 #[tokio::test]
@@ -374,6 +426,7 @@ async fn a_failed_check_leaves_the_users_checkout_untouched() {
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one restart regression also checks the worker's exact read, write, and command boundary")]
 async fn runner_restart_resumes_a_live_session_from_its_private_receipt() {
     let (_dir, repo, home, board, sessions) = setup(Script::Paused);
     let job = post(&board, &repo, "A", vec![], Script::Paused).await;
@@ -393,6 +446,96 @@ async fn runner_restart_resumes_a_live_session_from_its_private_receipt() {
     let _ignored = task.await;
     drop(runner);
     tokio::time::sleep(Duration::from_millis(30)).await;
+    let attempt = board.show(job.id.clone()).await.unwrap().attempt.unwrap();
+    let agent_name = format!("board-worker-{}", attempt.id);
+    let catalog = resources::discover(&ResourceConfig::user(&home), None, "local", "").await;
+    let policy = catalog.agent(&agent_name).expect("private board worker agent").tools.clone();
+    assert_eq!(
+        policy.allow.as_ref().unwrap().iter().map(String::as_str).collect::<Vec<_>>(),
+        ["Edit", "Glob", "Grep", "LS", "Read", "Write"]
+    );
+    let workspace = sessions.sessions.lock().unwrap().values().next().unwrap().summary.meta.workspace.clone();
+    let harness = HarnessClient::spawn_stdio(aimx().to_str().unwrap(), &workspace).await.unwrap();
+    let workspace_id = harness.workspace().id.clone();
+    let receipt = home.join("run/board-workers").join(format!("{}.json", attempt.id));
+    for path in [&receipt, &receipt.canonicalize().unwrap()] {
+        let denied = harness
+            .peer()
+            .call::<FsRead>(FsReadParams {
+                workspace: workspace_id.clone(),
+                path: path.to_string_lossy().into_owned(),
+                range: None,
+                scope: None,
+                hash: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, ErrorCode::Denied, "fs.read cannot leave the attempt worktree");
+    }
+    assert_eq!(
+        harness
+            .peer()
+            .call::<FsList>(FsListParams {
+                workspace: workspace_id,
+                path: home.to_string_lossy().into_owned(),
+                limit: None,
+                page_token: None,
+                include_hidden: true,
+                scope: None,
+            })
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Denied,
+        "fs.list cannot enumerate AIM_HOME"
+    );
+    let tools = AllowedTools::new(Arc::new(harness), policy, agent_name.clone());
+    assert!(!tools.specs().iter().any(|tool| tool.name == "Bash" || tool.name == "run_code"));
+    let key = || IdempotencyKey::new(uuid::Uuid::new_v4().to_string());
+    let blocked = tools
+        .call("Bash".into(), json!({"command":"aim board review job attempt --reviewer lead --decision accepted"}), key())
+        .await
+        .unwrap_err();
+    assert_eq!(blocked.code, ErrorCode::Denied, "the model cannot open a board owner connection via Bash");
+    assert_eq!(
+        tools.call("Read".into(), json!({"file_path": receipt}), key()).await.unwrap_err().code,
+        ErrorCode::Denied,
+        "the model cannot read its own token receipt"
+    );
+    let other = home.join("run/board-workers/other.json");
+    std::fs::write(&other, b"other attempt token").unwrap();
+    assert_eq!(
+        tools.call("Read".into(), json!({"file_path": other}), key()).await.unwrap_err().code,
+        ErrorCode::Denied,
+        "the model cannot read another attempt's token"
+    );
+    let alias = Path::new(&workspace).join("receipt-link");
+    std::os::unix::fs::symlink(&receipt, &alias).unwrap();
+    assert_eq!(
+        tools.call("Read".into(), json!({"file_path": alias}), key()).await.unwrap_err().code,
+        ErrorCode::Denied,
+        "a worktree symlink cannot cross the root"
+    );
+    assert_eq!(
+        tools.call("Write".into(), json!({"file_path": home.join("control"), "content":"x"}), key()).await.unwrap_err().code,
+        ErrorCode::Denied,
+        "the model cannot write controller state"
+    );
+    assert_eq!(
+        tools
+            .call(
+                "Write".into(),
+                json!({"file_path": home.join("agents").join(format!("{agent_name}.md")), "content":"tools: [Bash]"}),
+                key()
+            )
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Denied,
+        "the model cannot modify its private agent definition"
+    );
+    std::fs::remove_file(alias).unwrap();
+    std::fs::remove_file(other).unwrap();
     let resumed = worker(&home, board.clone(), Arc::clone(&sessions));
     let task = tokio::spawn(async move { resumed.run_once().await });
     for _ in 0..100 {

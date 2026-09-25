@@ -31,6 +31,7 @@ use self::token::TokenStore;
 use crate::authz::{Principal, ProtectedPaths};
 use crate::dedup::{Begin, DedupConfig, DedupTable};
 use crate::workspace::Workspace;
+use aim_kernel::dedup::minted_too_old;
 
 /// How far in the future a timestamped idempotency key may be minted (client clock skew).
 const MAX_KEY_SKEW: Duration = Duration::from_mins(5);
@@ -134,11 +135,25 @@ pub fn local_principal(roots: &[impl AsRef<Path>], read_only: bool) -> io::Resul
     Ok(Principal { id: format!("local:{}", rustix::process::getuid().as_raw()), roots: canonical, read_only, ceiling: None })
 }
 
-/// Reads the default protected set for `home` (`~/.aim/gate`, `~/.aim/ledger`, `~/.aim/protected`).
+/// Reads the default protected set and write-protects the whole aim state directory, including
+/// worker receipts and the daemon socket. An explicit `AIM_HOME` is protected too.
 #[must_use]
 pub fn default_protected(home: &str) -> ProtectedPaths {
+    let explicit = std::env::var_os("AIM_HOME");
+    protected_aim_home(home, explicit.as_deref().map(Path::new))
+}
+
+fn protected_aim_home(home: &str, explicit: Option<&Path>) -> ProtectedPaths {
     let listing = std::fs::read_to_string(Path::new(home).join(".aim/protected")).ok();
-    ProtectedPaths::defaults(home, listing.as_deref())
+    let mut protected = ProtectedPaths::defaults(home, listing.as_deref()).with([format!("{home}/.aim")]);
+    if let Some(aim_home) = explicit {
+        let absolute =
+            if aim_home.is_absolute() { Some(aim_home.to_path_buf()) } else { std::env::current_dir().ok().map(|cwd| cwd.join(aim_home)) };
+        if let Some(absolute) = absolute {
+            protected = protected.with([absolute.to_string_lossy().into_owned()]);
+        }
+    }
+    protected
 }
 
 /// Adds the canonical spelling of every protected path (its deepest existing ancestor resolved,
@@ -265,7 +280,7 @@ impl State {
                 "the idempotency key's UUIDv7 time is in the future; check the client's clock",
             )));
         }
-        let too_old = minted.is_some_and(|minted| minted.saturating_add(ms(self.config.key_horizon)) <= now);
+        let too_old = minted_too_old(minted, now, ms(self.config.key_horizon));
         let mut work = Some(work);
         loop {
             let mut done = self.dedup_done.subscribe();
@@ -633,5 +648,24 @@ mod dedup_tests {
         assert_eq!(second, first);
         assert_eq!(runs.load(Ordering::SeqCst), 1, "a partial mutation must never run twice");
         assert!(!parent.join("target").exists());
+    }
+}
+
+#[cfg(test)]
+mod protected_home_tests {
+    use std::path::Path;
+
+    use super::protected_aim_home;
+
+    #[test]
+    fn explicit_aim_home_and_default_home_are_write_protected() {
+        let protected = protected_aim_home("/users/example", Some(Path::new("/private/aim-state")));
+        assert!(protected.guards("/users/example/.aim/agents/worker.md"));
+        assert!(protected.guards("/private/aim-state/run/board-workers/attempt.json"));
+        assert!(protected.guards("/private/aim-state/run/daemon.sock"));
+        assert!(!protected.guards("/users/example/project/source.rs"));
+        let relative = protected_aim_home("/users/example", Some(Path::new("relative-home")));
+        let current = std::env::current_dir().unwrap();
+        assert!(relative.guards(&current.join("relative-home/run/daemon.sock").to_string_lossy()));
     }
 }
