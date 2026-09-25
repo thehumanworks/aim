@@ -290,6 +290,10 @@ impl CodeToolHost {
         };
         drop(ticket);
         let mut output = result.output;
+        if output.is_empty() {
+            // A silent cell usually forgot to emit or to await (ADR 0076, from a live run).
+            output.push_str("(no output: emit results with text(value), or end the script with an expression; await its promises)\n");
+        }
         for note in [dropped_note(result.dropped_bytes, result.dropped_events), store_note].into_iter().flatten() {
             output.push_str(&note);
             output.push('\n');
@@ -477,7 +481,7 @@ impl ToolHost for CodeToolHost {
             CodeMode::RunCode => vec![spec(
                 "run_code",
                 &format!(
-                    "Run a JavaScript/TypeScript script in an isolated async cell. Prefer one script to several tool calls for multi-step work (find, read several files, summarize) and fan-out; Promise.all runs calls together: const [a, b] = await Promise.all([tools.Read({{file_path: \"a.rs\"}}), tools.Read({{file_path: \"b.rs\"}})]); text(a.text + b.text). Emit results with text(value).\n{index}"
+                    "Run a JavaScript/TypeScript script in an isolated async cell. Prefer one script to several tool calls for multi-step work (find, read several files, summarize) and fan-out; Promise.all runs calls together: const [a, b] = await Promise.all([tools.Read({{file_path: \"a.rs\"}}), tools.Read({{file_path: \"b.rs\"}})]); text(a.text + b.text). Emit results with text(value). Not Node: no require/import, fs or fetch; use tools.*.\n{index}"
                 ),
                 ToolInput::Json,
                 json!({"type":"object","properties":{"code":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":300_000}},"required":["code"]}),

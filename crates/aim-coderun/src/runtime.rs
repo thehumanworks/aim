@@ -20,7 +20,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType};
 use oxc_transformer::{TransformOptions, Transformer};
 use rquickjs::prelude::{Async, Func};
-use rquickjs::{AsyncContext, AsyncRuntime, Promise, Value as JsValue};
+use rquickjs::{AsyncContext, AsyncRuntime, CaughtError, Ctx, Promise, Value as JsValue};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -67,6 +67,9 @@ function audio(value) { __aimEmit(__aimFormat(value), false, false); }
 function generatedImage(value) { __aimEmit(__aimFormat(value), false, false); }
 function notify(value) { __aimEmit(__aimFormat(value), true, false); }
 function yield_control() { __aimEmit('', true, true); }
+globalThis.console = Object.freeze(Object.fromEntries(['log', 'info', 'warn', 'error', 'debug'].map(level =>
+  [level, (...values) => text(values.map(__aimFormat).join(' '))])));
+globalThis.global = globalThis;
 function exit() { throw new Error('__AIM_EXIT__'); }
 function describe(name) { return __aimToolSpecs.find(t => t.name === name); }
 function search(query) {
@@ -208,6 +211,61 @@ impl<'a> Visit<'a> for Finder {
     }
 }
 
+/// Makes a cell's last top-level expression statement its returned value, as a REPL does
+/// (ADR 0076): a script that ends with `summary` returns it, and one that ends with `main()` or a
+/// `.then(...)` chain is awaited instead of ending before its calls finish. Source that does not
+/// parse on its own (a top-level `return`, say) is left as it is.
+fn return_last_expression(code: &str) -> String {
+    let allocator = Allocator::default();
+    let Ok(source_type) = SourceType::from_path(Path::new("cell.ts")) else { return code.to_owned() };
+    let parsed = Parser::new(&allocator, code, source_type).parse();
+    if !parsed.diagnostics.is_empty() {
+        return code.to_owned();
+    }
+    let Some(Statement::ExpressionStatement(statement)) = parsed.program.body.last() else { return code.to_owned() };
+    let span = statement.expression.span();
+    let (Ok(start), Ok(end), Ok(after)) = (usize::try_from(span.start), usize::try_from(span.end), usize::try_from(statement.span.end))
+    else {
+        return code.to_owned();
+    };
+    match (code.get(..start), code.get(start..end), code.get(after..)) {
+        (Some(before), Some(expression), Some(rest)) => format!("{before}return ({expression});{rest}"),
+        _ => code.to_owned(),
+    }
+}
+
+/// A script's exception as the model should read it: its name and message (ADR 0076). The stack
+/// is left out: its line numbers are those of the wrapped, type-stripped source.
+fn script_error(ctx: &Ctx<'_>, err: rquickjs::Error) -> ProtoError {
+    match CaughtError::from_error(ctx, err) {
+        CaughtError::Exception(exception) => {
+            let name = exception.get::<_, String>("name").unwrap_or_else(|_| "Error".to_owned());
+            let message = exception.message().unwrap_or_default();
+            // QuickJS reports its own limits (memory, stack) as an `InternalError`.
+            let code = if name == "InternalError" && (message.contains("memory") || message.contains("stack overflow")) {
+                ErrorCode::LimitExceeded
+            } else {
+                ErrorCode::InvalidParams
+            };
+            // Models often write Node: say where files and commands are instead.
+            let hint = if ["require is not defined", "could not load module", "fetch is not defined", "process is not defined"]
+                .iter()
+                .any(|node| message.contains(node))
+            {
+                " (a cell is not Node: it has no modules, fs, fetch or process; reach files and commands through tools.*)"
+            } else {
+                ""
+            };
+            ProtoError::new(code, format!("the script threw {name}: {message}{hint}"))
+        }
+        CaughtError::Value(value) => {
+            let shown = value.as_string().and_then(|text| text.to_string().ok()).unwrap_or_else(|| format!("a {}", value.type_name()));
+            ProtoError::new(ErrorCode::InvalidParams, format!("the script threw {shown}"))
+        }
+        CaughtError::Error(err) => js_error(err),
+    }
+}
+
 fn prepare_program(source: &str) -> Result<String, ProtoError> {
     let allocator = Allocator::default();
     let source_type =
@@ -240,7 +298,7 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
     if request.timeout_ms == 0 || request.memory_limit_bytes == 0 || request.output_limit_bytes == 0 {
         return Err(ProtoError::new(ErrorCode::InvalidParams, "cell limits must be positive"));
     }
-    let code = if request.program_args.is_some() { prepare_program(&request.code)? } else { request.code.clone() };
+    let code = if request.program_args.is_some() { prepare_program(&request.code)? } else { return_last_expression(&request.code) };
     let source = strip_types(&format!(
         "(async function() {{\ntry {{\n{code}\n}} catch (e) {{ if (e?.message !== '__AIM_EXIT__') throw e; }}\n}})()"
     ))?;
@@ -365,8 +423,8 @@ async fn run_cell(request: Execute, parent: Peer) -> Result<ExecuteResult, Proto
                 )
                 .map_err(js_error)?;
             ctx.eval::<(), _>(BOOTSTRAP).map_err(js_error)?;
-            let promise: Promise<'_> = ctx.eval(source).map_err(js_error)?;
-            let outcome: JsValue<'_> = promise.into_future().await.map_err(js_error)?;
+            let promise: Promise<'_> = ctx.eval(source).map_err(|err| script_error(&ctx, err))?;
+            let outcome: JsValue<'_> = promise.into_future().await.map_err(|err| script_error(&ctx, err))?;
             let returned = if outcome.is_undefined() {
                 None
             } else if let Some(value) = outcome.as_string() {
