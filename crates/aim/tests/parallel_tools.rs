@@ -120,6 +120,7 @@ async fn two_calls_in_one_response_run_concurrently_through_aimx() {
         effort: None,
         agent: None,
         persistence: Persistence::Persistent,
+        code_mode: None,
     };
     let id = host.create(spec).await.expect("session").meta.id;
     let (_, mut updates) = host.attach(id.clone()).await.expect("attached");

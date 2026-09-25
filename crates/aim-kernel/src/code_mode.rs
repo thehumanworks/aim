@@ -169,6 +169,46 @@ pub open spec fn direct_view(direct: Direct, hidden: Seq<u64>, tools: Seq<u64>) 
     tools.filter(shown_direct(direct, hidden))
 }
 
+/// DRAFT(ADR-0076): a session's own setting (sent by its client) wins; without one, the daemon's
+/// request applies (and without that, the default).
+pub open spec fn session_request(
+    session: Option<Mode>,
+    daemon: CodeModeRequest,
+) -> CodeModeRequest {
+    match session {
+        Some(mode) => CodeModeRequest::Set(mode),
+        None => daemon,
+    }
+}
+
+/// Decides a session's code-mode exposure from its own setting and the daemon's request: total,
+/// and exactly [`code_mode_decision`] of [`session_request`]. The guards (platform, worker, the
+/// session's ceiling) apply after the precedence.
+#[must_use]
+pub fn decide_for_session(
+    session: Option<Mode>,
+    daemon: CodeModeRequest,
+    default: Mode,
+    worker: bool,
+    platform: bool,
+    permitted: bool,
+) -> (out: Exposure)
+    ensures
+        out == code_mode_decision(
+            session_request(session, daemon),
+            default,
+            worker,
+            platform,
+            permitted,
+        ),
+{
+    let requested = match session {
+        Some(mode) => CodeModeRequest::Set(mode),
+        None => daemon,
+    };
+    decide(requested, default, worker, platform, permitted)
+}
+
 /// Decides code mode's exposure: total, and exactly [`code_mode_decision`].
 #[must_use]
 pub fn decide(
@@ -326,6 +366,53 @@ proof fn lemma_direct_filter_none(s: Seq<u64>, pred: spec_fn(u64) -> bool)
     if s.len() > 0 {
         lemma_direct_filter_none(s.drop_last(), pred);
     }
+}
+
+/// A session's explicit setting always wins over the daemon's request and the default.
+pub proof fn theorem_session_setting_wins(mode: Mode, daemon: CodeModeRequest, default: Mode)
+    ensures
+        wanted_mode(session_request(Some(mode), daemon), default) == mode,
+        code_mode_decision(session_request(Some(mode), daemon), default, true, true, true).mode
+            == mode,
+{
+}
+
+/// A session without a setting gets exactly the daemon's decision.
+pub proof fn theorem_unset_session_follows_the_daemon(daemon: CodeModeRequest)
+    ensures
+        session_request(None, daemon) == daemon,
+{
+}
+
+/// A session's setting never widens anything: code tools still need the worker, a sandboxing
+/// platform and a ceiling that permits `run_code`, and a ceiling without it stays `Off`.
+pub proof fn theorem_session_setting_never_widens(
+    session: Option<Mode>,
+    daemon: CodeModeRequest,
+    default: Mode,
+    worker: bool,
+    platform: bool,
+    permitted: bool,
+)
+    ensures
+        ({
+            let out = code_mode_decision(
+                session_request(session, daemon),
+                default,
+                worker,
+                platform,
+                permitted,
+            );
+            (out.code || out.programs) ==> worker && platform && permitted
+        }),
+        !permitted ==> code_mode_decision(
+            session_request(session, daemon),
+            default,
+            worker,
+            platform,
+            false,
+        ).mode == Mode::Off,
+{
 }
 
 /// An unset request is exactly a request for the default.

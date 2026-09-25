@@ -150,6 +150,10 @@ pub struct Script {
     /// What the provider's catalog lists.
     #[serde(default)]
     pub catalog: Vec<CatalogModel>,
+    /// Offer code mode as a host with the worker would, whose own setting is `off` (ADR 0076): a
+    /// session gets it only when it asks (`--code-mode`). No cell runs: the worker path is not real.
+    #[serde(default)]
+    pub code_worker: bool,
 }
 
 struct Scripted {
@@ -328,6 +332,7 @@ async fn seed(store: &MemoryStore, spec: &SessionSpec, items: usize) -> Result<S
         title: Some("seeded".into()),
         parent: None,
         agent: None,
+        code_mode: None,
     };
     store.create(meta).await.map_err(|e| e.to_string())?;
     let events: Vec<SessionEvent> = (0..items)
@@ -378,7 +383,15 @@ pub async fn run(path: &Path, args: &TuiArgs) -> Result<i32, String> {
             workspaces(),
             args.max_requests,
             crate::resources::ResourceConfig::user(crate::cli::aim_home()),
-            NativeServices { tools: vec![crate::ui::tools_factory()], ..NativeServices::default() },
+            NativeServices {
+                tools: vec![crate::ui::tools_factory()],
+                code: script.code_worker.then(|| crate::host::CodeConfig {
+                    worker: "/nonexistent/aim-coderun".into(),
+                    user_programs: std::env::temp_dir().join("aim-script-programs"),
+                    mode: crate::coderun::mode::Mode::Off,
+                }),
+                ..NativeServices::default()
+            },
         ),
         update_capacity: 4096,
     });

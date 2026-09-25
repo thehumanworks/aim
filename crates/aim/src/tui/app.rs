@@ -12,6 +12,7 @@ use aim_proto::conversation::{Item, Part, RateLimits, StopReason};
 use aim_proto::daemon::{
     Location, Persistence, PromptOutcome, SessionConfigParams, SessionOptions, SessionSpec, SessionState, SessionSummary, SessionUpdate,
 };
+use aim_proto::event::CodeModeSetting;
 use aim_proto::ui::model::{Change, Surface, Surfaces};
 use aim_proto::ui::{Placement, UiAction, UiMessage};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -181,6 +182,8 @@ pub struct SessionView {
     /// The model changed after `options` arrived: their efforts are the old model's until the
     /// session sends new ones.
     pub stale_efforts: bool,
+    /// The code mode the host gave it (ADR 0076), when its backend has one.
+    pub code_mode: Option<CodeModeSetting>,
 }
 
 /// Where a sent prompt is, from the UI's point of view.
@@ -586,6 +589,11 @@ impl App {
         self.transcript.push(Entry::Notice { level, text: text.into() });
     }
 
+    /// Shows a warning in the transcript (e.g. an invalid `AIM_CODE_MODE` at start, ADR 0076).
+    pub fn warn(&mut self, text: impl Into<String>) {
+        self.notice(Level::Warn, text);
+    }
+
     /// Applies one input.
     pub fn handle(&mut self, input: Input) -> Vec<Effect> {
         let mut effects = self.apply(input);
@@ -803,6 +811,7 @@ impl App {
             persistence: summary.persistence,
             options,
             stale_efforts,
+            code_mode: meta.code_mode,
         });
         self.remember_config(&meta.provider, &meta.model, None);
         if (meta.workspace.clone(), local) != self.bound {

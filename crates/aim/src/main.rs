@@ -88,6 +88,9 @@ enum Command {
         /// Most model requests in the turn.
         #[arg(long, default_value_t = 64)]
         max_requests: u32,
+        /// Code mode: off, on or only (ADR 0076). Without it, `AIM_CODE_MODE` applies.
+        #[arg(long = "code-mode", value_parser = aim::coderun::mode::parse_flag)]
+        code_mode: Option<aim_proto::event::CodeModeSetting>,
         /// The prompt (read from stdin when omitted or `-`).
         prompt: Vec<String>,
     },
@@ -387,7 +390,9 @@ async fn list_sessions(limit: u32) -> Result<i32, String> {
     let store = SqliteStore::open(&cli::aim_home().join("aim.db")).map_err(|e| e.to_string())?;
     let sessions = store.list(limit).await.map_err(|e| e.to_string())?;
     for s in sessions {
-        eprintln!("{}  {}  {}/{}  {}", s.id, s.created_ms, s.provider, s.model, s.workspace);
+        // The code mode it was created with (ADR 0076); older sessions recorded none.
+        let code = s.code_mode.map(|mode| format!("  code:{}", mode.label())).unwrap_or_default();
+        eprintln!("{}  {}  {}/{}  {}{code}", s.id, s.created_ms, s.provider, s.model, s.workspace);
     }
     Ok(0)
 }
@@ -473,23 +478,27 @@ async fn mcp_command(
 #[expect(clippy::too_many_lines, reason = "the CLI command dispatcher keeps daemon status and stop adjacent")]
 async fn main_async(args: Args) -> Result<i32, String> {
     // Where code mode is chosen from this process's environment, an invalid AIM_CODE_MODE is
-    // said on stderr: the CLI has no log subscriber (ADR 0076).
-    if matches!(
-        args.command,
-        None | Some(Command::Tui(_) | Command::Run { .. } | Command::Mcp { stdio: true, .. } | Command::Daemon { .. })
-    ) && let Some(warning) = aim::coderun::mode::invalid_env_warning()
+    // said on stderr: the CLI has no log subscriber (ADR 0076). `aim run` says it with its own
+    // setting below, and the TUI in its transcript.
+    if matches!(args.command, Some(Command::Mcp { stdio: true, .. } | Command::Daemon { .. }))
+        && let Some(warning) = aim::coderun::mode::invalid_env_warning()
     {
         eprintln!("aim: {warning}");
     }
     let Some(command) = args.command else { return tui(args.tui).await };
     match command {
         Command::Tui(tui_args) => tui(tui_args).await,
-        Command::Run { provider: p, model, effort, cwd, ssh, remote, aimx, ephemeral, json, max_requests, prompt } => {
+        Command::Run { provider: p, model, effort, cwd, ssh, remote, aimx, ephemeral, json, max_requests, code_mode, prompt } => {
             let prompt = read_prompt(&prompt)?;
             if prompt.trim().is_empty() {
                 return Err("empty prompt".to_owned());
             }
-            let options = RunOptions { provider: p, model, effort, cwd, ssh, remote, aimx, ephemeral, json, max_requests, prompt };
+            let (code_mode, warning) = aim::coderun::mode::client_setting_from_env(code_mode);
+            if let Some(warning) = warning {
+                eprintln!("aim: {warning}");
+            }
+            let options =
+                RunOptions { provider: p, model, effort, cwd, ssh, remote, aimx, ephemeral, json, max_requests, prompt, code_mode };
             cli::run(options, provider).await
         }
         Command::Search { query } => search_cli(&query).await,

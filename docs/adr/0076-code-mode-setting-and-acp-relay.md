@@ -331,6 +331,85 @@ fix-a-function tasks, but 17% dearer in ITE and 32% dearer in requests on the sc
 where gpt-4.1-mini seldom scripts. `AIM_CODE_MODE=off` opts out; `only` stays an explicit choice.
 The benchmark is not re-run to fit the decision; the rule's `off` stays on record here.
 
+### 7. A session carries its own code mode (task T4c)
+
+**The problem.** The maintainer ran `export AIM_CODE_MODE=1; mise run tui` and got a session
+without code mode. Sessions run in the background daemon, and the daemon read `AIM_CODE_MODE` from
+its own environment when it started. A daemon started earlier without the variable ignored the
+client's shell, and nothing in the TUI showed which mode a session had.
+
+**Contract changes** (aim-proto, additive; old peers and logs read `None`):
+- `SessionSpec.code_mode: Option<CodeModeSetting>` is what the client asks for, one of `off`,
+  `on` or `only`.
+- `SessionMeta.code_mode: Option<CodeModeSetting>` is what the session got. This single field is
+  both stored and published:
+  - **Stored:** written when the session is created.
+  - **Published:** in a live summary, it is what the host gave the session after its guards. On
+    resume the in-memory value is replaced by what the guards give now; the stored record keeps
+    the value from creation.
+  - **`None`** for backends without code mode (and in older logs).
+
+**The client sends it.** `aim` (the TUI) and `aim run` send their setting with every new session:
+- the `--code-mode <off|on|only>` flag;
+- else the client's own `AIM_CODE_MODE`: an invalid value fails closed to `off`, with one warning
+  (on stderr for `aim run`, a transcript notice in the TUI);
+- else nothing, and the daemon decides.
+
+**Precedence is verified.** `aim_kernel::code_mode::decide_for_session` puts the session's
+setting first, then the daemon's request, then the default. The guards (platform, worker, and the
+session's ceiling) apply after that precedence.
+- `theorem_session_setting_wins`: an explicit session setting always wins.
+- `theorem_unset_session_follows_the_daemon`: without one, the daemon's request applies.
+- `theorem_session_setting_never_widens`: code tools still need the worker, a sandboxing platform
+  and a ceiling that permits `run_code`, and a ceiling without it stays `off`.
+
+**The daemon's worker serves any session.** `providers::code_mode` now returns a `CodeConfig`
+whenever the worker is found on a sandboxing platform, and `CodeConfig.mode` is the daemon's own
+request (its env, else the default). A session asking for `on` from a daemon whose own mode is
+`off` therefore gets code mode.
+
+**Sessions keep their mode.**
+- **Resume:** a resumed session asks for its recorded mode, so the tool list, and the prompt cache
+  that depends on it, stays the same. The guards apply again: a resumed session can show
+  `code:off` if the worker is gone.
+- **The stored mode is what the session got, not what it asked for.** A session that asked for
+  `on` but fell back to `off` (no worker at creation) resumes `off` even after the worker is
+  installed. Start a new session to ask again. This keeps a session's tools stable for its whole
+  life.
+- **Switches:** `/new`, `/clear` and `/provider` carry the attached session's mode, or the client's
+  setting when none is attached. `aim_kernel::switch::Shape.code_mode` carries it, and
+  `switches_keep_place_and_privacy` now says it is kept.
+
+**Shown.**
+- The TUI status line shows the effective mode as `code:on`, `code:off` or `code:only`, taken from
+  the summary, and nothing for a backend without code mode.
+- `aim sessions` appends the recorded `code:<mode>`.
+- `acp:claude`'s strict relay follows the session's effective mode: `aim code-mcp` for `on` or
+  `only`, `aimx mcp` for `off` or when the worker or aim's executable is missing.
+  `acp:claude-native` reports `off`.
+
+**Evidence** (2026-09-25, release binaries, a private scratch `AIM_HOME`; the maintainer's
+daemon was not touched):
+- **Proofs:** `mise run verify`: `verification results:: 364 verified, 0 errors` (whole kernel).
+- **Tests:**
+  - `resources.rs`: `a_session_s_code_mode_wins_is_guarded_and_is_kept_on_resume` (the setting
+    wins in both directions; no worker, or a ceiling without `run_code`, stays off; a resumed
+    session on a new host still offers `run_code`);
+  - `code_mode.rs`: `a_daemon_without_code_mode_gives_a_session_the_mode_its_client_asks_for` (a
+    real unix socket; the session says `on`, offers `run_code`, and a cell returns 42);
+  - `acp::tests::strict_sessions_point_at_the_code_mode_relay_when_code_mode_is_on` (the
+    precedence decides the relay);
+  - `tui_pty.rs`: `the_status_line_shows_the_code_mode_the_client_asked_for` (flag, environment,
+    invalid value);
+  - unit tests of the client setting, the switch and the status line.
+- **Live:** a daemon started without `AIM_CODE_MODE`, and the TUI in a pseudo-terminal with
+  `AIM_CODE_MODE=1 aim -p openrouter -m openai/gpt-4.1-mini`:
+  - **With `1`:** the status line read `idle · openai/gpt-4.1-mini · code:on`, and `aim sessions`
+    listed `code:on`. The model (asked to find and summarize TODOs, and once told to use
+    `run_code`) still chose `Bash`, and named 4/4 TODOs.
+  - **With `only`:** the status read `code:only`, the model's calls were `run_code` and
+    `list_programs`, and it named 4/4 TODOs.
+
 ## Consequences
 
 **Amends ADR 0018 and ADR 0056.**

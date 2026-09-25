@@ -107,6 +107,10 @@ pub struct SessionSpec {
     /// Kept or ephemeral.
     #[serde(default)]
     pub persistence: Persistence,
+    /// The code mode the client asks for (ADR 0076); the daemon's own `AIM_CODE_MODE`, else the
+    /// default, when absent. The host's guards still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<crate::event::CodeModeSetting>,
 }
 
 /// What a session is doing.

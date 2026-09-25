@@ -447,6 +447,7 @@ mod tests {
                 title: None,
                 parent: None,
                 agent: None,
+                code_mode: None,
             },
         )
         .unwrap();

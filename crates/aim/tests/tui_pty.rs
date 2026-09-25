@@ -474,3 +474,21 @@ fn clear_in_fullscreen_leaves_no_old_rows_on_either_screen() {
     assert!(!screen.contains("old question") && !screen.contains("An old answer."), "{screen}");
     tui.quit();
 }
+
+/// T4c (ADR 0076): the status line shows the code mode the session got from a host whose own mode
+/// is off: `--code-mode on`, then this shell's `AIM_CODE_MODE`; an invalid value is a warning in
+/// the transcript and fails closed to off.
+#[test]
+fn the_status_line_shows_the_code_mode_the_client_asked_for() {
+    let script = json!({"responses": [], "code_worker": true});
+    let tui = Tui::start(&script, &Start { cols: 120, args: &["--code-mode", "on"], ..Start::default() });
+    tui.wait_for("code:on");
+    tui.quit();
+    let tui = Tui::start(&script, &Start { cols: 120, env: &[("AIM_CODE_MODE", "1")], ..Start::default() });
+    tui.wait_for("code:on");
+    tui.quit();
+    let tui = Tui::start(&script, &Start { cols: 120, env: &[("AIM_CODE_MODE", "onn")], ..Start::default() });
+    tui.wait_for("code:off");
+    tui.wait_for("is not off, on or only");
+    tui.quit();
+}

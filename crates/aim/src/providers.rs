@@ -150,7 +150,8 @@ pub fn services() -> crate::host::NativeServices {
 /// Code mode as `AIM_CODE_MODE` asks (ADR 0076; unset means the default, `on`; an invalid value
 /// means off), when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this
 /// executable. It runs sandboxed on macOS and refuses to run on Linux until its bubblewrap profile
-/// exists (ADR 0018), so it is offered on macOS only. `None` when the mode is off or cannot run.
+/// exists (ADR 0018), so it is offered on macOS only. `None` when it cannot run; otherwise its
+/// `mode` is what this process asks for (ADR 0076), which a session's own setting overrides.
 pub(crate) fn code_mode() -> Option<crate::host::CodeConfig> {
     code_mode_as(crate::coderun::mode::requested_from_env())
 }
@@ -161,9 +162,14 @@ pub(crate) fn code_mode_as(requested: crate::coderun::mode::CodeModeRequest) -> 
         .map(PathBuf::from)
         .or_else(|| std::env::current_exe().ok().map(|exe| exe.with_file_name("aim-coderun")))
         .filter(|path| path.exists());
-    let exposure = crate::coderun::mode::decide(requested, worker.is_some(), cfg!(target_os = "macos"), true);
-    let worker = worker.filter(|_| exposure.code)?;
-    Some(crate::host::CodeConfig { worker, user_programs: crate::cli::aim_home().join("programs"), mode: exposure.mode })
+    let platform = cfg!(target_os = "macos");
+    // Logs why this process's own request cannot run, if it cannot.
+    let _process = crate::coderun::mode::decide(requested, worker.is_some(), platform, true);
+    // What this process asks for, before the guards: sessions without a setting of their own get
+    // it, and a session asking for code mode still needs the worker (ADR 0076).
+    let mode = crate::coderun::mode::decide(requested, true, true, true).mode;
+    let worker = worker.filter(|_| platform)?;
+    Some(crate::host::CodeConfig { worker, user_programs: crate::cli::aim_home().join("programs"), mode })
 }
 
 type SearchParts = (Arc<crate::search::SearchEngine>, Arc<crate::store::SqliteStore>);
@@ -370,6 +376,7 @@ mod tests {
             effort: None,
             agent: None,
             persistence,
+            code_mode: None,
         }
     }
 

@@ -86,6 +86,7 @@ impl CodeRelay {
             effort: None,
             agent: None,
             persistence: Persistence::Persistent,
+            code_mode: None,
         };
         let connected = crate::host::aimx_workspaces(self.aimx.clone())(&spec).await?;
         // A `CodeRelay` is built from a found worker on a sandboxing platform; an ACP session has

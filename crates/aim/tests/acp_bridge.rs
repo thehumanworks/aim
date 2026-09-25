@@ -224,6 +224,7 @@ async fn acp_sessions_require_authority_and_persistence_gates() {
         effort: None,
         agent: None,
         persistence: Persistence::Persistent,
+        code_mode: None,
     };
     let refuse = |spec: SessionSpec, transcript: Vec<Item>| {
         let factory = Arc::clone(&factory);
@@ -274,6 +275,7 @@ async fn live_acp_claude_session_through_the_host() {
             effort: None,
             agent: None,
             persistence: Persistence::Persistent,
+            code_mode: None,
         })
         .await
         .unwrap();
@@ -348,6 +350,7 @@ async fn live_acp_claude_session_with_model_alias() {
         effort: None,
         agent: None,
         persistence: Persistence::Persistent,
+        code_mode: None,
     };
     let refused = host.create(spec("gpt-6")).await.unwrap_err();
     eprintln!("live acp model: gpt-6 refused: {}", refused.message);

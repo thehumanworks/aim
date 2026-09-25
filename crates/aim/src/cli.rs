@@ -45,6 +45,8 @@ pub struct RunOptions {
     pub max_requests: u32,
     /// The prompt.
     pub prompt: String,
+    /// The code mode to ask for (ADR 0076): the flag, else this shell's `AIM_CODE_MODE`.
+    pub code_mode: Option<aim_proto::event::CodeModeSetting>,
 }
 
 /// Builds a provider and resolves its default model.
@@ -214,6 +216,7 @@ pub async fn run(options: RunOptions, factory: ProviderFactory) -> Result<i32, S
         effort: options.effort.clone(),
         agent: None,
         persistence,
+        code_mode: options.code_mode,
     };
     let summary = host.create(spec).await.map_err(|e| e.message)?;
     let session_id = summary.meta.id.clone();

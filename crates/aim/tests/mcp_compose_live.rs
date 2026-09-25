@@ -60,6 +60,7 @@ async fn live_openrouter_composed_mcp_echo_and_board_list() {
             effort: None,
             agent: None,
             persistence: Persistence::Persistent,
+            code_mode: None,
         })
         .await
         .expect("create native session");

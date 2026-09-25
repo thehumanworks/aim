@@ -39,6 +39,7 @@ fn summary() -> SessionSummary {
             title: None,
             parent: None,
             agent: None,
+            code_mode: None,
         },
         state: SessionState::Idle,
         persistence: Persistence::Ephemeral,
