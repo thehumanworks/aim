@@ -2,7 +2,8 @@
 //! normalization-insensitive volume (this macOS host's APFS), a spelling that differs only in case
 //! or in Unicode normalization names the same file. The backend compares filesystem identity, so
 //! no such spelling of a protected path, of one of its ancestors, or of a protected path that does
-//! not exist yet can be modified by any mutating request. On a case-sensitive volume the other spellings are other files, and the
+//! not exist yet can be modified by any mutating request; the policy file `~/.aim/protected` is
+//! itself protected. On a case-sensitive volume the other spellings are other files, and the
 //! protected bytes must still be untouched.
 
 use std::path::Path;
@@ -13,6 +14,7 @@ use aim_proto::harness::{
     FsWrite, FsWriteParams, Precondition, ToolsCall, ToolsCallParams,
 };
 use aim_proto::ids::WorkspaceId;
+use aimx::authz::ProtectedPaths;
 use aimx::server::default_protected;
 use serde_json::json;
 
@@ -168,4 +170,37 @@ async fn aliases_of_protected_paths_that_do_not_exist_yet_are_denied() {
     untouched(&env);
     assert!(!env.path("locked-dir").exists() || !ci, "the protected path's parent was not created");
     assert!(!env.path("caf\u{e9}").exists() || !ni);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_protected_path_policy_file_is_protected() {
+    let env = home().await;
+    let ci = case_insensitive(&env.root);
+    let (client, _, ws) = session(&env).await;
+    // The listed path is protected.
+    refused(write(&client, &ws, "secret", false).await, true, "a listed path");
+    // The policy file cannot be replaced, cleared, removed or moved, under any spelling.
+    refused(write(&client, &ws, ".aim/protected", false).await, true, "fs.write of the policy");
+    refused(write(&client, &ws, ".AIM/PROTECTED", false).await, ci, "fs.write of an alias of the policy");
+    let edit = FsEditParams {
+        workspace: ws.clone(),
+        path: ".aim/protected".into(),
+        edits: vec![ExactEdit { old: "~/secret\n".into(), new: String::new(), replace_all: false }],
+        precondition: Precondition::Any,
+        idempotency_key: key(),
+    };
+    refused(client.peer.call::<FsEdit>(edit).await.map(|_| ()), true, "fs.edit of the policy");
+    refused(remove(&client, &ws, ".aim/protected").await, true, "fs.remove of the policy");
+    refused(rename(&client, &ws, ".aim/protected", "moved").await, true, "fs.rename of the policy");
+    refused(rename(&client, &ws, "other.txt", ".aim/protected").await, true, "fs.rename onto the policy");
+    refused(copy(&client, &ws, "other.txt", ".Aim/Protected").await, ci, "fs.copy onto an alias of the policy");
+    refused(rename(&client, &ws, ".aim", "moved").await, true, "fs.rename of the policy's directory");
+    untouched(&env);
+
+    // A server started later still reads the original policy.
+    let protected = default_protected(env.root.to_str().unwrap());
+    let listed = std::fs::canonicalize(&env.root).unwrap().join("secret");
+    assert!(protected.paths().iter().any(|p| Path::new(p) == env.root.join("secret") || Path::new(p) == listed), "{protected:?}");
+    assert!(protected.guards(env.root.join(".aim/protected").to_str().unwrap()), "the policy file is in the default set");
+    drop(ProtectedPaths::default());
 }
