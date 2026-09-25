@@ -191,6 +191,18 @@ impl AimServices {
     }
 }
 
+/// Add code mode's saved-program tools to aim's MCP service catalog when its worker is present.
+/// The wrapped host remains the authority for every nested program call.
+#[must_use]
+pub fn with_programs(host: Arc<dyn ToolHost>, aim_home: &Path) -> Arc<dyn ToolHost> {
+    let Some(code) = crate::providers::code_mode() else { return host };
+    let runtime = crate::coderun::CodeToolHost::new(Arc::clone(&host), code.worker, "aim-mcp", crate::coderun::CodeMode::RunCode);
+    let project = std::env::current_dir().ok().map(|root| root.join(".agents/programs"));
+    let store = Arc::new(crate::programs::ProgramStore::new(aim_home.join("programs"), project));
+    let programs: Arc<dyn ToolHost> = Arc::new(crate::coderun::ProgramToolHost::new(runtime, store));
+    Arc::new(crate::agent::tools::Compose::new(host, vec![programs]))
+}
+
 impl ToolHost for AimServices {
     fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = self.search.specs();

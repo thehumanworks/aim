@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -68,6 +69,10 @@ async fn live_aim_stdio_serves_search_to_real_mcp_client() {
     .expect("MCP handshake");
     let page = client.list_tools(None).await.expect("list aim services");
     assert!(page.tools.iter().any(|tool| tool.name == "search_sessions"));
+    if PathBuf::from(env!("CARGO_BIN_EXE_aim")).with_file_name("aim-coderun").exists() {
+        assert!(page.tools.iter().any(|tool| tool.name == "list_programs"));
+        assert!(page.tools.iter().any(|tool| tool.name == "run_program"));
+    }
     let result = client
         .call_tool(
             CallToolRequestParams::new("search_sessions")

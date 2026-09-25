@@ -19,6 +19,7 @@ use aim_llm::ModelProvider;
 use aim_llm_codex::CodexProvider;
 use aim_llm_codex::media::{MediaClient, MediaConfig};
 use aim_llm_openai::{OpenAiProvider, Profile};
+use sha2::Digest as _;
 
 /// A provider endpoint override from the environment (endpoints are configuration data: a
 /// recording proxy for benchmarks, an enterprise gateway). Only `https://` URLs, or `http://` to a
@@ -109,13 +110,13 @@ pub fn services() -> crate::host::NativeServices {
     let decider = std::env::var_os("TYPESAFE_API_KEY")
         .is_some_and(|value| !value.is_empty())
         .then(|| Arc::new(crate::jev::JevDecider) as Arc<dyn crate::jev::Decider>);
-    crate::host::NativeServices { media: Some(media), decider, tools: vec![search_tools()], code: code_mode() }
+    crate::host::NativeServices { media: Some(media), decider, tools: vec![search_tools(), board_tools(), mcp_tools()], code: code_mode() }
 }
 
 /// Code mode, when the `aim-coderun` worker is available: `$AIM_CODERUN`, else next to this
 /// executable. It runs sandboxed on macOS and refuses to run on Linux until its bubblewrap profile
 /// exists (ADR 0018), so it is offered on macOS only.
-fn code_mode() -> Option<crate::host::CodeConfig> {
+pub(crate) fn code_mode() -> Option<crate::host::CodeConfig> {
     if !cfg!(target_os = "macos") {
         return None;
     }
@@ -236,10 +237,82 @@ fn search_tools() -> crate::host::ToolsFactory {
     })
 }
 
+/// Ordinary native sessions share a durable run by workspace location and root. Private and
+/// ephemeral sessions receive no board handle and never open its SQLite ledger.
+fn board_tools() -> crate::host::ToolsFactory {
+    board_tools_at(crate::cli::aim_home())
+}
+
+fn board_tools_at(aim_home: PathBuf) -> crate::host::ToolsFactory {
+    Arc::new(move |spec: &aim_proto::daemon::SessionSpec| {
+        let spec = spec.clone();
+        let aim_home = aim_home.clone();
+        Box::pin(async move {
+            if spec.persistence != aim_proto::daemon::Persistence::Persistent {
+                return None;
+            }
+            let mut digest = sha2::Sha256::new();
+            digest.update(serde_json::to_vec(&spec.location).ok()?);
+            digest.update([0]);
+            digest.update(spec.workspace.as_bytes());
+            let run_id = format!("native-{:x}", digest.finalize());
+            let path = aim_home.join("aim.db");
+            let board = tokio::task::spawn_blocking(move || crate::board::Board::open(&path)).await.ok()?.ok()?;
+            let host: Arc<dyn crate::agent::ToolHost> =
+                Arc::new(crate::board::tools::BoardTools::reviewer(board, run_id.clone(), format!("session:{run_id}")));
+            Some(host)
+        })
+    })
+}
+
+/// Discover trusted MCP config through the selected workspace harness, then start its servers
+/// in the background. The returned host advertises a private last-known catalog immediately.
+fn mcp_tools() -> crate::host::ToolsFactory {
+    Arc::new(|spec: &aim_proto::daemon::SessionSpec| {
+        let spec = spec.clone();
+        Box::pin(async move { crate::mcp::session::connect_for_session(&spec).await })
+    })
+}
+
 /// Every backend this build can host: `acp:*` agents, else the native loop with [`build`]'s
 /// providers and local workspaces served by the `aimx` binary at `aimx`.
 #[must_use]
 pub fn backends(aimx: PathBuf, max_requests: u32) -> crate::host::BackendFactory {
     let providers: crate::host::ProviderFactory = Arc::new(build);
     crate::acp::with_acp_at(crate::host::native_backends(providers, crate::host::aimx_workspaces(aimx.clone()), max_requests), aimx)
+}
+
+#[cfg(test)]
+mod tests {
+    use aim_proto::daemon::{Location, Persistence, SessionSpec};
+    use aim_proto::ids::IdempotencyKey;
+
+    use super::board_tools_at;
+
+    fn spec(persistence: Persistence) -> SessionSpec {
+        SessionSpec {
+            workspace: "/workspace".to_owned(),
+            location: Location::Local,
+            provider: "scripted".to_owned(),
+            model: None,
+            effort: None,
+            agent: None,
+            persistence,
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_board_tools_are_real_and_private_sessions_do_not_open_a_ledger() {
+        let home = tempfile::tempdir().unwrap();
+        let aim_home = home.path().join("aim");
+        let factory = board_tools_at(aim_home.clone());
+        assert!(factory(&spec(Persistence::Ephemeral)).await.is_none());
+        assert!(!aim_home.exists(), "private session must not create shared board state");
+        let board = factory(&spec(Persistence::Persistent)).await.expect("persistent board tools");
+        assert!(board.specs().iter().any(|tool| tool.name == "board_list"));
+        let listed =
+            board.call("board_list".to_owned(), serde_json::json!({}), IdempotencyKey::new("list")).await.expect("real board list");
+        assert!(!listed.is_error);
+        assert!(aim_home.join("aim.db").exists());
+    }
 }

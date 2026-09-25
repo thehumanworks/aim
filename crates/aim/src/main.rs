@@ -379,7 +379,7 @@ async fn discovered_mcp(cwd: PathBuf, ssh: Option<String>, aimx: Option<PathBuf>
         let harness =
             aim::remote::RemoteHarness::connect(&aimx, &destination, &root).await.map_err(|_| "cannot connect to SSH workspace")?;
         let files = HarnessFiles::new(harness.client.peer().clone(), harness.client.workspace().id.clone());
-        let found = mcp_config::discover(Some(&files), &user_home, &aim_home, &root).await;
+        let found = mcp_config::discover(Some(&files), &user_home, &aim_home, &harness.client.workspace().root).await;
         harness.shutdown().await;
         found
     } else {
@@ -413,7 +413,9 @@ async fn mcp_command(
         if action.is_some() || ssh.is_some() {
             return Err("--stdio cannot be combined with a subcommand or --ssh".to_owned());
         }
-        let host: Arc<dyn aim::agent::ToolHost> = Arc::new(AimServices::open(&cli::aim_home()).await?);
+        let aim_home = cli::aim_home();
+        let base: Arc<dyn aim::agent::ToolHost> = Arc::new(AimServices::open(&aim_home).await?);
+        let host = aim::mcp::services::with_programs(base, &aim_home);
         mcp_server::serve_stdio(host).await.map_err(|_| "MCP stdio transport failed".to_owned())?;
         return Ok(0);
     }

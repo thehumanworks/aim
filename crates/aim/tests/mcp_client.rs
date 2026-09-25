@@ -14,6 +14,7 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mcp_fake.cjs");
+static NODE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn definition(era: &str, env: BTreeMap<String, String>) -> ServerDefinition {
     ServerDefinition {
@@ -41,6 +42,7 @@ async fn echo_and_error(host: &McpToolHost) {
 
 #[tokio::test]
 async fn stdio_supports_modern_and_legacy_mcp() {
+    let _serial = NODE_TESTS.lock().await;
     for era in ["modern", "legacy"] {
         let host = McpToolHost::connect(vec![definition(era, BTreeMap::new())]).await.expect("fake stdio connection");
         echo_and_error(&host).await;
@@ -59,6 +61,7 @@ async fn untrusted_server_is_never_started() {
 
 #[tokio::test]
 async fn dropping_a_call_sends_mcp_cancelled() {
+    let _serial = NODE_TESTS.lock().await;
     let home = tempfile::tempdir().expect("cancellation log directory");
     let log = home.path().join("cancel.log");
     let mut env = BTreeMap::new();
@@ -86,6 +89,7 @@ async fn dropping_a_call_sends_mcp_cancelled() {
 
 #[tokio::test]
 async fn streamable_http_supports_modern_and_legacy_mcp() {
+    let _serial = NODE_TESTS.lock().await;
     for era in ["modern", "legacy"] {
         let mut child = tokio::process::Command::new("node")
             .args([FIXTURE, "http", era])
