@@ -24,6 +24,7 @@ mod composer;
 mod history;
 mod inline;
 mod markdown;
+mod runtime;
 mod schedule;
 #[cfg(feature = "test-support")]
 pub mod script;
@@ -128,6 +129,7 @@ impl TuiArgs {
             fullscreen: self.fullscreen,
             history: (!self.ephemeral).then(|| home.join("history")),
             sources: Sources::factory(Some(home.join("skills"))),
+            workspaces: crate::host::aimx_workspaces(crate::cli::find_aimx(self.aimx.as_deref())),
             close_on_exit: true,
             keep_superseded_completions: false,
             notice,

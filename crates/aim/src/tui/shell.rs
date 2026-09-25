@@ -23,7 +23,8 @@ use super::schedule::{Frame, Scheduler};
 use super::text::encode;
 use super::theme::Theme;
 use super::view::{self, RowCache};
-use crate::host::SessionClient;
+use crate::host::{SessionClient, WorkspaceFactory};
+use tokio_util::sync::CancellationToken;
 
 /// How the TUI starts.
 pub struct Options {
@@ -37,6 +38,8 @@ pub struct Options {
     pub history: Option<PathBuf>,
     /// Builds completion sources for a workspace (the launch directory, then each attached one).
     pub sources: SourceFactory,
+    /// Connects runtime slash actions to the invoking workspace's harness.
+    pub workspaces: WorkspaceFactory,
     /// Close the sessions this UI opened on exit (in-process hosts; a daemon keeps them).
     pub close_on_exit: bool,
     /// Keep superseded completion requests running (tests of the app's fence).
@@ -322,6 +325,8 @@ struct Runner {
     forwarder: Option<tokio::task::JoinHandle<()>>,
     opened: Vec<String>,
     history: Option<PathBuf>,
+    workspaces: WorkspaceFactory,
+    command_task: Option<(u64, CancellationToken, tokio::task::JoinHandle<()>)>,
 }
 
 impl Runner {
@@ -331,6 +336,7 @@ impl Runner {
         broker: Broker,
         sources: SourceFactory,
         history: Option<PathBuf>,
+        workspaces: WorkspaceFactory,
     ) -> Self {
         let (ordered, mut lane) = mpsc::unbounded_channel::<Ordered>();
         let (lane_client, lane_inputs) = (Arc::clone(&client), inputs.clone());
@@ -350,7 +356,7 @@ impl Runner {
                 }
             }
         });
-        Self { ordered, client, inputs, broker, sources, forwarder: None, opened: Vec::new(), history }
+        Self { ordered, client, inputs, broker, sources, forwarder: None, opened: Vec::new(), history, workspaces, command_task: None }
     }
 
     fn spawn(&self, work: impl Future<Output = Input> + Send + 'static) {
@@ -370,6 +376,14 @@ impl Runner {
     fn one(&mut self, effect: Effect) {
         let client = Arc::clone(&self.client);
         match effect {
+            Effect::RunCommand { id, action, spec } => self.start_command(id, action, *spec),
+            Effect::CancelCommand(id) => {
+                if let Some((running, token, _)) = &self.command_task
+                    && *running == id
+                {
+                    token.cancel();
+                }
+            }
             Effect::Create { spec, attempt } => {
                 self.spawn(async move { Input::Created { attempt, result: client.create(spec).await.map_err(|e| e.message) } });
             }
@@ -408,6 +422,33 @@ impl Runner {
             }
             // The screen's own effect: `execute` ran it before handing the rest over.
             Effect::ClearScreen | Effect::Quit => {}
+        }
+    }
+
+    fn start_command(&mut self, id: u64, action: super::runtime::Action, spec: SessionSpec) {
+        if self.command_task.as_ref().is_some_and(|(_, _, task)| !task.is_finished()) {
+            let _gone = self
+                .inputs
+                .send(Input::CommandDone { id, result: Err("previous slash command is still stopping; retry when it finishes".into()) });
+            return;
+        }
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let workspaces = Arc::clone(&self.workspaces);
+        let inputs = self.inputs.clone();
+        let task = tokio::spawn(async move {
+            let result = super::runtime::execute(action, spec, workspaces, token).await;
+            let _gone = inputs.send(Input::CommandDone { id, result });
+        });
+        self.command_task = Some((id, cancel, task));
+    }
+
+    async fn stop_commands(&mut self) {
+        if let Some((_, cancel, mut task)) = self.command_task.take() {
+            cancel.cancel();
+            // Do not abort the worker: its cancellation path closes the harness and releases
+            // processes. Cleanup normally takes at most aimx's two-second exit grace.
+            let _finished = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
         }
     }
 
@@ -484,6 +525,14 @@ impl Runner {
     }
 }
 
+impl Drop for Runner {
+    fn drop(&mut self) {
+        if let Some((_, cancel, _)) = &self.command_task {
+            cancel.cancel();
+        }
+    }
+}
+
 /// Runs the TUI until the user quits; returns the process exit code.
 ///
 /// # Errors
@@ -514,7 +563,8 @@ pub async fn run(client: Arc<dyn SessionClient>, options: Options) -> Result<i32
     if options.keep_superseded_completions {
         broker.keep_superseded();
     }
-    let mut runner = Runner::new(client, inputs, broker, Arc::clone(&options.sources), options.history.clone());
+    let mut runner =
+        Runner::new(client, inputs, broker, Arc::clone(&options.sources), options.history.clone(), Arc::clone(&options.workspaces));
     // The session starts before the keyboard query, which may wait for the terminal's answer.
     let first = app.start(options.attach.clone());
     runner.run(first);
@@ -528,6 +578,7 @@ pub async fn run(client: Arc<dyn SessionClient>, options: Options) -> Result<i32
         event_loop(&mut app, &mut screen, &mut runner, &mut scheduler, &mut events, &mut received, &mut completed, &mut clock).await;
 
     let finished = screen.finish(&mut app);
+    runner.stop_commands().await;
     let current = app.session.as_ref().map(|s| s.id.clone());
     if options.close_on_exit {
         runner.close(current.as_deref(), &mut received).await;
@@ -717,7 +768,14 @@ mod tests {
         let received = Arc::clone(&client.received);
         let (inputs, mut answers) = tokio::sync::mpsc::unbounded_channel::<Input>();
         let (completions, _completed) = tokio::sync::mpsc::unbounded_channel();
-        let mut runner = Runner::new(client, inputs, Broker::new(Sources::remote(None), completions), Sources::factory(None), None);
+        let mut runner = Runner::new(
+            client,
+            inputs,
+            Broker::new(Sources::remote(None), completions),
+            Sources::factory(None),
+            None,
+            crate::host::aimx_workspaces("aimx".into()),
+        );
         runner.run(vec![prompt(1, "first"), prompt(2, "second")]);
         for _ in 0..2 {
             tokio::time::timeout(Duration::from_secs(5), answers.recv()).await.unwrap().unwrap();

@@ -6,6 +6,8 @@
 //! `SteerDelivered`), and `SteersReturned` hands unsent text back to the composer, so typed text
 //! is never lost (the tny ADR 0013 lesson).
 
+mod runtime;
+
 use std::collections::BTreeMap;
 
 use aim_proto::conversation::{Item, Part, RateLimits, StopReason};
@@ -88,6 +90,8 @@ pub enum Input {
         /// What happened to it.
         result: Result<PromptOutcome, String>,
     },
+    /// A runtime slash command completed; its id fences cancellation and session switches.
+    CommandDone { id: u64, result: Result<super::runtime::ResultText, String> },
     /// Completions arrived.
     Completed(Completed),
     /// The session list arrived.
@@ -105,6 +109,10 @@ pub enum Input {
 /// What the app asks the shell to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
+    /// Execute a user-invoked runtime action outside any model turn.
+    RunCommand { id: u64, action: super::runtime::Action, spec: Box<SessionSpec> },
+    /// Cancel a runtime action (not the agent turn).
+    CancelCommand(u64),
     /// Create a session.
     Create {
         /// What to create.
@@ -384,6 +392,8 @@ pub struct App {
     /// Optional status-line segments, in presentation order.
     pub status_fields: Vec<super::settings::StatusField>,
     next_prompt: u64,
+    next_command: u64,
+    command_pending: Option<runtime::Pending>,
     /// Prompts and session commands submitted while no session was attached (or one was being
     /// switched to), for the session being opened, in order.
     queued: Vec<Queued>,
@@ -503,6 +513,8 @@ impl App {
             commands: BTreeMap::new(),
             status_fields: super::settings::Settings::default().status,
             next_prompt: 1,
+            next_command: 0,
+            command_pending: None,
             queued: Vec::new(),
             history_file: HistoryFile::Unread,
             attempt: 0,
@@ -528,6 +540,9 @@ impl App {
 
     /// A new attempt: any answer to an older create or attach is ignored from now on.
     fn next_attempt(&mut self) -> u64 {
+        if let Some(cancel) = self.cancel_command() {
+            self.outbox.push(cancel);
+        }
         self.attempt = self.attempt.saturating_add(1);
         self.attempt
     }
@@ -643,6 +658,7 @@ impl App {
                 self.on_prompt_done(id, result);
                 Vec::new()
             }
+            Input::CommandDone { id, result } => self.command_done(id, result),
             Input::Completed(completed) => {
                 self.on_completed(completed);
                 Vec::new()
@@ -1364,7 +1380,15 @@ impl App {
         let mut effects = Vec::new();
         if let Some((name, arg)) = commands::parse(&raw) {
             if let Some(command) = self.commands.get(name).cloned() {
-                let text = crate::resources::prompts::expand(&command.text, crate::resources::prompts::Dialect::Aim, &[], arg);
+                if let Some(action) = super::runtime::prepare(&command, arg) {
+                    return self.run_command(name, command.output, command.text, arg, action);
+                }
+                let text = crate::resources::prompts::expand(
+                    command.text.as_deref().unwrap_or_default(),
+                    crate::resources::prompts::Dialect::Aim,
+                    &[],
+                    arg,
+                );
                 if text.trim().is_empty() {
                     self.notice(Level::Error, format!("/{name} expanded to empty text; check its arguments or template"));
                     return effects;
@@ -1396,6 +1420,12 @@ impl App {
     /// Runs a slash command. `raw` is the command as typed: commands with an argument are recorded
     /// in history (`/quit` and friends are not), when they apply to a session.
     fn command(&mut self, name: &str, arg: &str, raw: &str) -> Vec<Effect> {
+        if name == "cancel"
+            && let Some(cancel) = self.cancel_command()
+        {
+            self.notice(Level::Info, "slash command cancelled");
+            return vec![cancel];
+        }
         let session = self.session.as_ref().map(|s| s.id.clone());
         match (name, session) {
             ("model" | "effort", _) if arg.is_empty() => {
@@ -1475,11 +1505,7 @@ impl App {
                 self.notice(Level::Info, "/dictate arrives in M8");
                 Vec::new()
             }
-            ("status", _) => {
-                let text = commands::status(self.session.as_ref().map(|s| s.provider.as_str()), self.limits.as_ref());
-                self.notice(Level::Info, text);
-                Vec::new()
-            }
+            ("status", _) => self.run_command("status", super::settings::Output::User, None, "", super::runtime::Action::Status),
             ("help", _) => {
                 let mut help = vec![help_text()];
                 help.extend(self.commands.iter().map(|(name, command)| format!("/{name} — {}", command.description)));
@@ -1497,7 +1523,7 @@ impl App {
 
     fn quit(&mut self) -> Vec<Effect> {
         self.quitting = true;
-        vec![Effect::Quit]
+        self.cancel_command().into_iter().chain([Effect::Quit]).collect()
     }
 
     /// The session a switch creates (ADR 0074): from the one being created while a create is in
@@ -1587,6 +1613,10 @@ impl App {
     }
 
     fn interrupt(&mut self) -> Vec<Effect> {
+        if let Some(cancel) = self.cancel_command() {
+            self.notice(Level::Info, "slash command cancelled");
+            return vec![cancel];
+        }
         if self.composer.search().is_some() {
             self.composer.search_cancel();
             return Vec::new();
@@ -1687,9 +1717,14 @@ impl App {
                 return Some(self.after_edit());
             }
             KeyCode::Enter if key.modifiers.is_empty() => {
+                let typed = self.composer.text().trim().to_owned();
                 let candidate = self.accept()?;
                 let run_now = match candidate.kind {
-                    Kind::Command => commands::find(candidate.insert.trim_start_matches('/')).is_some_and(|c| !c.takes_argument()),
+                    Kind::Command => {
+                        commands::find(candidate.insert.trim_start_matches('/')).is_some_and(|c| !c.takes_argument())
+                            || (typed == candidate.insert.trim()
+                                && self.commands.contains_key(candidate.insert.trim().trim_start_matches('/')))
+                    }
                     Kind::Argument => true,
                     Kind::File | Kind::Dir | Kind::Skill => false,
                 };

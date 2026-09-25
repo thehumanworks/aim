@@ -35,15 +35,33 @@ impl Default for Settings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomCommand {
     pub description: String,
     pub output: Output,
-    pub text: String,
+    /// A template, or an optional wrapper around a runtime result (`{{output}}`).
+    pub text: Option<String>,
+    /// Execute an argv vector through the workspace's Bash tool, with shell-safe quoting.
+    pub run: Option<Vec<String>>,
+    /// Invoke a harness tool directly, expanding only string argument values.
+    pub tool: Option<ToolAction>,
+    #[serde(default = "default_timeout")]
+    pub timeout_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+fn default_timeout() -> u64 {
+    aim_kernel::slash::DEFAULT_TIMEOUT_MS
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolAction {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Output {
     Agent,
@@ -73,12 +91,20 @@ impl Settings {
 
     fn parse(bytes: &[u8]) -> Result<Self, String> {
         let settings: Self = serde_json::from_slice(bytes).map_err(|e| format!("TUI settings: {e}"))?;
-        for name in settings.commands.keys() {
+        for (name, command) in &settings.commands {
             if name.is_empty()
                 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
                 || super::commands::find(name).is_some()
             {
                 return Err(format!("invalid or reserved slash command name: {name}"));
+            }
+            if (command.run.is_some() && command.tool.is_some())
+                || (command.run.is_none() && command.tool.is_none() && command.text.is_none())
+                || command.run.as_ref().is_some_and(|argv| argv.first().is_none_or(|program| program.trim().is_empty()))
+                || command.tool.as_ref().is_some_and(|tool| tool.name.trim().is_empty() || !tool.arguments.is_object())
+                || aim_kernel::slash::timeout(command.timeout_ms).is_none()
+            {
+                return Err(format!("/{name}: provide text, run, or tool (run and tool are exclusive), and timeout_ms in 1..=600000"));
             }
         }
         Ok(settings)
@@ -99,6 +125,35 @@ mod tests {
         std::fs::write(&path, vec![b' '; 65_537]).unwrap();
         assert!(Settings::load(&path).err().unwrap().contains("64 KiB"));
         assert!(Settings::load(home.path()).is_err());
+    }
+
+    #[test]
+    fn runtime_actions_require_a_valid_shape_and_bounded_deadline() {
+        for action in [
+            serde_json::json!({"run":[]}),
+            serde_json::json!({"run":[""]}),
+            serde_json::json!({"run":["echo"],"tool":{"name":"Read","arguments":{}}}),
+            serde_json::json!({"tool":{"name":"Read","arguments":[]}}),
+            serde_json::json!({"run":["echo"],"timeout_ms":0}),
+            serde_json::json!({"run":["echo"],"timeout_ms":600_001}),
+            serde_json::json!({}),
+        ] {
+            let mut command = action.as_object().unwrap().clone();
+            command.insert("description".into(), "test".into());
+            command.insert("output".into(), "user".into());
+            let config = serde_json::json!({"commands":{"test":command}});
+            assert!(Settings::parse(config.to_string().as_bytes()).is_err());
+        }
+        for action in [
+            serde_json::json!({"run":["git","status"],"timeout_ms":600_000}),
+            serde_json::json!({"tool":{"name":"Read","arguments":{"file_path":"$1"}},"text":"{{output}}"}),
+        ] {
+            let mut command = action.as_object().unwrap().clone();
+            command.insert("description".into(), "test".into());
+            command.insert("output".into(), "agent".into());
+            let config = serde_json::json!({"commands":{"test":command}});
+            assert!(Settings::parse(config.to_string().as_bytes()).is_ok());
+        }
     }
 
     #[test]

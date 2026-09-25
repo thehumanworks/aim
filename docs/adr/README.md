@@ -81,3 +81,4 @@ Rules (enforced by `mise run check`):
 | [0075](0075-resolve-acp-config-values-to-advertised-values.md) | Resolve requested ACP model and effort values to advertised values by verified tiers; list the values on refusal. |
 | [0076](0076-code-mode-setting-and-acp-relay.md) | Select code mode with `AIM_CODE_MODE`, decide its exposure in the kernel, and serve it to Claude through aim's relay. |
 | [0077](0077-configurable-tui-slash-commands.md) | Configure TUI commands with explicit agent or user-only output and personal status-line segments. |
+| [0078](0078-runtime-slash-actions-and-fresh-codex-usage.md) | Execute slash actions through the workspace harness and fetch fresh Codex account usage. |

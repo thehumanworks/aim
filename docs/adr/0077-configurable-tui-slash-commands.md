@@ -1,6 +1,6 @@
 # ADR 0077: Configure TUI commands with explicit output visibility
 
-- Status: Accepted
+- Status: Superseded by 0078
 - Date: 2026-09-25
 - Baseline: 0014, 0015, 0017, 0034
 - Scope: User-owned TUI command templates and presentation settings; not daemon workflows or executable project plugins.

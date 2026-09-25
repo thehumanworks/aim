@@ -11,6 +11,7 @@ mod limits;
 pub mod media;
 mod stream;
 mod turn_state;
+mod usage;
 mod wire;
 
 #[cfg(test)]
@@ -95,7 +96,7 @@ impl CodexConfig {
     }
 
     pub(crate) fn http_client_builder(&self) -> reqwest::ClientBuilder {
-        reqwest::Client::builder().connect_timeout(self.connect_timeout)
+        reqwest::Client::builder().connect_timeout(self.connect_timeout).redirect(reqwest::redirect::Policy::none())
     }
 
     fn drive_options(&self) -> DriveOptions {

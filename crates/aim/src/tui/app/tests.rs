@@ -22,7 +22,14 @@ fn custom_commands_route_output_without_reinterpreting_slashes() {
         app.config.persist_history = true;
         app.commands.insert(
             "local".into(),
-            CustomCommand { description: "local panel".into(), output: Output::User, text: "/quit $ARGUMENTS".into() },
+            CustomCommand {
+                description: "local panel".into(),
+                output: Output::User,
+                text: Some("/quit $ARGUMENTS".into()),
+                run: None,
+                tool: None,
+                timeout_ms: 30_000,
+            },
         );
         typed(&mut app, "/local private");
         let effects = app.handle(press(KeyCode::Enter));
@@ -36,7 +43,14 @@ fn custom_commands_route_output_without_reinterpreting_slashes() {
     let mut app = attached();
     app.commands.insert(
         "review".into(),
-        CustomCommand { description: "review".into(), output: Output::Agent, text: "Review $1: $ARGUMENTS".into() },
+        CustomCommand {
+            description: "review".into(),
+            output: Output::Agent,
+            text: Some("Review $1: $ARGUMENTS".into()),
+            run: None,
+            tool: None,
+            timeout_ms: 30_000,
+        },
     );
     typed(&mut app, "/review 'two words'");
     let effects = app.handle(press(KeyCode::Enter));
@@ -47,7 +61,7 @@ fn custom_commands_route_output_without_reinterpreting_slashes() {
 fn status_is_user_only_and_does_not_print_native_metadata() {
     let mut app = attached();
     app.session.as_mut().unwrap().provider = "codex".into();
-    app.limits = Some(RateLimits {
+    let limits = RateLimits {
         windows: vec![aim_proto::conversation::RateLimitWindow {
             id: "codex.primary".into(),
             used_percent: 25.0,
@@ -55,15 +69,24 @@ fn status_is_user_only_and_does_not_print_native_metadata() {
             resets_at: Some(1_790_000_000),
         }],
         native: Some(serde_json::json!({"opaque": "never-display-this"})),
-    });
+    };
     typed(&mut app, "/status");
     let effects = app.handle(press(KeyCode::Enter));
-    assert!(effects.iter().all(|e| matches!(e, Effect::CancelCompletion)));
+    let id = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::RunCommand { id, action: crate::tui::runtime::Action::Status, .. } => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!notices(&app).join("\n").contains("25% used"), "cached limits are not displayed as fresh");
+    let text = commands::status(&limits);
+    assert!(app.handle(Input::CommandDone { id, result: Ok(crate::tui::runtime::ResultText { text, limits: Some(limits) }) }).is_empty());
     let text = notices(&app).join("\n");
     assert!(text.contains("25% used"));
     assert!(text.contains("300 min"));
     assert!(text.contains("1790000000"));
-    assert!(text.contains("not a live refresh"));
+    assert!(text.contains("freshly fetched"));
     assert!(!text.contains("never-display-this"));
     assert!(app.steers.is_empty());
     assert!(app.disk_history.is_empty());
@@ -74,8 +97,17 @@ async fn custom_commands_complete_from_the_same_registry() {
     use crate::tui::complete::{CommandSource, Source as _};
     use crate::tui::settings::{CustomCommand, Output};
     let mut app = attached();
-    app.commands
-        .insert("review".into(), CustomCommand { description: "Review changes".into(), output: Output::Agent, text: "$ARGUMENTS".into() });
+    app.commands.insert(
+        "review".into(),
+        CustomCommand {
+            description: "Review changes".into(),
+            output: Output::Agent,
+            text: Some("$ARGUMENTS".into()),
+            run: None,
+            tool: None,
+            timeout_ms: 30_000,
+        },
+    );
     let effects = typed(&mut app, "/rev");
     let request = effects
         .iter()
@@ -87,6 +119,73 @@ async fn custom_commands_complete_from_the_same_registry() {
         .unwrap();
     let candidates = CommandSource.complete(request).await;
     assert!(candidates.iter().any(|c| c.insert == "/review " && c.detail == "Review changes"));
+}
+
+fn runtime_command(app: &mut App, output: &str) -> u64 {
+    let command = serde_json::from_value(serde_json::json!({
+        "description": "runtime", "output": output, "run": ["git", "status"],
+        "text": "Result: {{output}}"
+    }))
+    .unwrap();
+    app.commands.insert("runtime".into(), command);
+    typed(app, "/runtime");
+    let effects = app.handle(press(KeyCode::Enter));
+    effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::RunCommand { id, .. } => Some(*id),
+            _ => None,
+        })
+        .unwrap()
+}
+
+fn runtime_done(id: u64) -> Input {
+    Input::CommandDone { id, result: Ok(crate::tui::runtime::ResultText { text: "fresh /quit $ARGUMENTS".into(), limits: None }) }
+}
+
+#[test]
+fn runtime_output_stays_on_its_declared_channel_and_invoking_session() {
+    for state in [SessionState::Idle, SessionState::Running] {
+        for output in ["agent", "user"] {
+            let mut app = attached();
+            app.session.as_mut().unwrap().state = state;
+            let id = runtime_command(&mut app, output);
+            assert!(app.steers.is_empty(), "invocation does not start a model turn");
+            let effects = app.handle(runtime_done(id));
+            if output == "agent" {
+                assert!(effects.iter().any(|e| matches!(e, Effect::Prompt { session, parts, .. }
+                    if session == "s1" && text_of(parts) == "Result: fresh /quit $ARGUMENTS")));
+            } else {
+                assert!(effects.is_empty());
+                assert!(notices(&app).iter().any(|n| n == "Result: fresh /quit $ARGUMENTS"));
+                assert!(app.steers.is_empty());
+                assert!(app.private_history.is_empty());
+            }
+            assert!(!app.quitting);
+        }
+    }
+    let mut app = attached();
+    let id = runtime_command(&mut app, "agent");
+    typed(&mut app, "/new");
+    let effects = app.handle(press(KeyCode::Enter));
+    assert!(effects.contains(&Effect::CancelCommand(id)));
+    assert!(app.handle(runtime_done(id)).is_empty(), "late result cannot reach the next session");
+    assert!(app.queued.is_empty());
+}
+
+#[test]
+fn cancelled_and_failed_commands_never_become_prompts() {
+    let mut app = attached();
+    let id = runtime_command(&mut app, "agent");
+    assert!(app.handle(ctrl('c')).contains(&Effect::CancelCommand(id)));
+    assert!(app.handle(runtime_done(id)).is_empty());
+    let newer = runtime_command(&mut app, "agent");
+    assert!(app.handle(runtime_done(id)).is_empty(), "old completion cannot clear the new command");
+    assert!(app.command_pending.is_some());
+    assert!(app.handle(Input::CommandDone { id: newer, result: Err("tool refused".into()) }).is_empty());
+    assert!(notices(&app).iter().any(|n| n.contains("tool refused")));
+    assert!(app.steers.is_empty());
+    assert!(app.private_history.is_empty());
 }
 
 #[test]

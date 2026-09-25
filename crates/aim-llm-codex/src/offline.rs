@@ -27,6 +27,55 @@ fn provider(server: &FakeServer) -> CodexProvider {
     provider_with(server.config())
 }
 
+#[tokio::test]
+async fn account_usage_is_fresh_bounded_and_authenticated_without_model_calls() {
+    let server = FakeServer::start(|_, index| {
+        Reply::json(
+            200,
+            &json!({
+                "email": "never-display",
+                "rate_limit": {"primary_window": {"used_percent": index, "limit_window_seconds": 18_000, "reset_at": 1_790_000_000}}
+            }),
+        )
+    })
+    .await;
+    let provider = provider(&server);
+    for expected in [0.0, 1.0] {
+        let limits = provider.account_limits().await.unwrap();
+        assert!((limits.windows[0].used_percent - expected).abs() < f64::EPSILON);
+        assert!(limits.native.is_none());
+    }
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path(), "/backend-api/wham/usage");
+        assert_eq!(request.header("chatgpt-account-id"), Some("acct-fixture"));
+        assert!(request.header("authorization").is_some());
+        assert_eq!(request.header("cache-control"), Some("no-cache"));
+        assert!(request.body.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn account_usage_errors_never_echo_response_bodies_or_follow_redirects() {
+    let server = FakeServer::start(|_, index| match index {
+        0 => Reply::text(401, "private-account-data"),
+        1 => Reply::text(302, "private-account-data").header("location", "/do-not-follow"),
+        2 => Reply::text(200, "{}"),
+        3 => Reply::text(200, &"x".repeat(256 * 1024 + 1)),
+        _ => Reply::Silent,
+    })
+    .await;
+    let provider = provider_with(CodexConfig { request_timeout: Duration::from_millis(100), ..server.config() });
+    for kind in [LlmErrorKind::Auth, LlmErrorKind::Unavailable, LlmErrorKind::Protocol, LlmErrorKind::Protocol, LlmErrorKind::Transport] {
+        let error = provider.account_limits().await.unwrap_err();
+        assert_eq!(error.kind, kind);
+        assert!(!error.message.contains("private-account-data"));
+    }
+    assert_eq!(server.requests().await.len(), 5);
+}
+
 fn request(session: Option<&str>, turn: Option<&str>) -> Request {
     Request {
         model: "gpt-6-luna".into(),

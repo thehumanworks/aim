@@ -29,7 +29,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "cancel", args: "", help: "cancel the running turn" },
     Command { name: "fullscreen", args: "", help: "toggle the fullscreen layout" },
     Command { name: "dictate", args: "", help: "voice input (arrives in M8)" },
-    Command { name: "status", args: "", help: "show latest reported Codex subscription limits (user only)" },
+    Command { name: "status", args: "", help: "fetch fresh ChatGPT / Codex subscription limits (user only)" },
     Command { name: "help", args: "", help: "list commands and keys" },
     Command { name: "quit", args: "", help: "exit aim" },
 ];
@@ -47,14 +47,11 @@ pub fn parse(text: &str) -> Option<(&str, &str)> {
 }
 
 /// Formats only normalized subscription windows, never opaque provider metadata.
-pub fn status(provider: Option<&str>, limits: Option<&aim_proto::conversation::RateLimits>) -> String {
-    if provider != Some("codex") {
-        return "Codex subscription limits are available in a Codex session.".to_owned();
+pub fn status(limits: &aim_proto::conversation::RateLimits) -> String {
+    if limits.windows.is_empty() {
+        return "ChatGPT / Codex subscription — account refreshed; no usage windows reported.".to_owned();
     }
-    let Some(limits) = limits.filter(|limits| !limits.windows.is_empty()) else {
-        return "No Codex subscription limits reported yet. Run a Codex turn first.".to_owned();
-    };
-    let mut lines = vec!["ChatGPT / Codex subscription — latest reported limits (not a live refresh)".to_owned()];
+    let mut lines = vec!["ChatGPT / Codex subscription — freshly fetched account limits".to_owned()];
     for window in &limits.windows {
         let duration = window.window_minutes.map_or_else(|| "unknown".to_owned(), |m| format!("{m} min"));
         let reset = window.resets_at.map_or_else(|| "unknown".to_owned(), |t| format!("{t} (Unix seconds)"));
