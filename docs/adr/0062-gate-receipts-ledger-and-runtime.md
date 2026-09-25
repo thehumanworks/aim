@@ -1,0 +1,28 @@
+# ADR 0062: Pin gate evidence and activate only an exact trial artifact
+
+- Status: Accepted
+- Date: 2026-09-25
+- Baseline: 0020, 0022, 0060, 0061
+- Scope: The first same-UID `aim-gate` runtime, its private TOML config, ed25519 receipt JSON, JSONL hash-chain ledger, sandbox policy, and trial deployment format. No modification of the live `~/.aim/bin` installation.
+
+## Context
+
+ADR 0020 requires a trusted evaluator outside candidate authority, independent final-artifact checks, signed evidence and promotion readback. The architecture specifies the same boundary and a hash-chained externally anchored ledger (`docs/architecture.md`, §10). Candidate-controlled passing logs or evaluator edits have been observed in self-improving agent experiments (`docs/research/self-improvement.md`, TL;DR and §1). W28 makes an explicit temporary exception to ADR 0020's separate-OS-user recommendation: no system changes are authorized, so this slice runs the gate as the owner's UID but outside every Seatbelt candidate sandbox. An escaped candidate with the same UID can attack the gate home; a dedicated user remains open work.
+
+## Decision
+
+The gate keeps `config.toml`, `receipt.key`, receipts and `ledger.jsonl` under `~/.aim-gate/` with owner-only modes (0700 directory, 0600 files), checks owner UID, and opens private inputs with no final-symlink following. Its deployed artifacts are only under a configured gate-owned deploy root, defaulting to `~/.aim-gate/deploy/<sha>/`; it never writes `~/.aim/bin`. The private key is ed25519 PKCS#8. A receipt is versioned JSON with a fixed typed body and hex signature over `serde_json` serialization of that body. Verification uses the trusted key's public half, never a public key supplied by the receipt. The body binds candidate commit and Git tree, baseline commit, evaluator digest, environment digest, validator report, successful check/conditional Verus output, both test inventories, both raw benchmark artifacts, paired numeric results and pass status. The evaluator digest hashes the gate executable and predeclared protected evaluator files in order; config pins it before candidate evaluation.
+
+The ledger is newline-delimited versioned JSON. Each record has a zero-based sequence, predecessor SHA-256 (64 zero hex characters at genesis), typed event, and SHA-256 of `{"version":1,"seq":...,"prev_hash":...,"event":...}` serialized by the gate. Append obtains a stable private lock, verifies the entire old chain, writes one record, and fsyncs. A checkpoint publishes the latest record hash and sequence to private `gate/ledger`, then reads the remote ref back. The external checkpoint makes a local rewrite detectable; the on-host chain alone does not.
+
+Candidates and baselines use fresh local clones at exact commits after the proposing process exits. Candidate-controlled Git checkout filters, builds, tests, xtask, code and subprocesses execute under a deny-by-default Seatbelt profile built by `aim_gate::sandbox::Policy`; only clone/target writes and declared toolchain/cache/evaluator reads are authorized. The profile withholds `~/.aim-gate`, `~/.aim`, `~/.codex`, `~/.ssh` and `~/.config`. Cargo is offline and locked; the protected gate-side validator, not candidate xtask, decides LOCKED, dependency, test-inventory and protected-path acceptability. The protected `bench/run.py` is invoked from the pinned evaluator tree with `AIM_GATE_BENCH_SOURCE_ROOT` pointing to each clone and `AIM_GATE_BENCH_PORT` fixing one loopback port. Its manifest and proxy remain pinned. Seatbelt permits only that port during the mock benchmark. Missing port support, metrics, paired samples or predeclared threshold compliance refuses evaluation. Paid broker calls are disabled by default and never put a real provider key in candidate environment, arguments or readable files.
+
+Promotion goes only to `gate/trial`. The gate verifies receipt signature, exact candidate/tree/baseline/evaluator digests and kernel transition eligibility; performs a baseline commit compare-and-swap; pushes the trial ref and reads it back; stages an exact artifact under its deploy root; atomically swaps `current` while retaining the predecessor; runs an offline canary and reads the pointer back. Failure restores the predecessor and records a failed or rolled-back event. A runnable predecessor is required before activation. External side effects are not claimed reversible. No `main` update is made in this slice.
+
+## Consequences
+
+The gate can evaluate and stage a candidate without trusting candidate logs or installing into aim's live path. The same-UID design relies on Seatbelt and explicit protected path denial; it is weaker than a dedicated OS user against sandbox escape. Cache and toolchain roots must be declared as read-only inputs in private config. A protected evaluator update requires a new pinned digest and fresh receipts. The paired wire benchmark uses first-request timing as a startup proxy, not full application startup proof. The paid live tier remains unavailable until a broker-only network profile and spend accounting are verified.
+
+## Verification
+
+`aim-gate` fast fixture tests cover private key/receipt alteration, ledger-chain corruption, malformed SHA, threshold regressions, and pure Seatbelt profile output. The ignored `live_seatbelt_blocks_private_files_and_network` smoke checks the actual macOS profile against a temporary private file, an allowed mock port, another loopback port and an external address. Protected validator fixtures are in `aim-gate-validators`; promotion transitions are proved in `aim-kernel::gate` under ADR 0060. The end-to-end gate trial and external checkpoint readback require a separate live run; this ADR alone is not that evidence.

@@ -75,6 +75,14 @@ run = ["cargo fmt --all", "verusfmt crates/aim-kernel/src/*.rs"]
 description = "Live smoke tests against real services (needs credentials; required before merging integrations)"
 run = "cargo test --workspace --locked -- --ignored live_"
 
+[tasks."smoke:offline"]
+description = "Offline canary for a staged gate trial artifact"
+run = "CARGO_NET_OFFLINE=true CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test --workspace --locked"
+
+[tasks."gate:build"]
+description = "Build the trusted gate binary from a pinned protected source revision"
+run = "CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo build -p aim-gate --bin aim-gate --locked"
+
 [tasks."web:build"]
 description = "Build the browser bundle separately from the native quality gate (WASM link dominates routine checks)"
 run = "cd crates/aim-web && NO_COLOR=true trunk build --release --locked --offline && python externalize_bootstrap.py"
