@@ -48,3 +48,5 @@ Rules (enforced by `mise run check`):
 | [0025](0025-compaction-plan-invariants.md) | Cut transcripts without separating tool exchanges. |
 | [0026](0026-daemon-stream-lifecycle-and-stored-summaries.md) | Order daemon attachments, report stream termination, and summarize stored sessions. |
 | [0027](0027-policy-kernel.md) | Intersect authority scopes in the verified kernel. |
+| [0031](0031-session-host-and-agent-backends.md) | Host sessions as actors over pluggable agent backends. |
+| [0032](0032-compaction-events-and-model-context.md) | Record compaction as events; rebuild the model's context from the log. |
