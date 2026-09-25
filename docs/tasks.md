@@ -27,6 +27,7 @@ client still builds.
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | done | Merged incl. REV-T3 B1 fix (`bd418ae`): rendezvous tests; forced serialization fails them | Optional codex re-check of the fix | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | done | Merged incl. REV-T4a and REV-T4a-b fixes (`e569a5e`) | Residual in ADR 0076: aimx needs a SIGTERM handler (orphan shells if it ignores close) | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default; repair the wire gate | review | Merged (`ad49be0`, merge `02d987e`): wire gate passes; pre-registered benchmark chose default `off`; follow-up running (code-mode prompt section only when code tools are offered); codex REV-T4b running | Merge follow-up; close | `agent/claude/code-mode-bench` |
+| T4c | Per-session code mode: client-side `AIM_CODE_MODE` / `--code-mode` carried in the session spec, kept on resume and `/new`, shown in the status line; ACP relay follows it | in progress | T4a's worker (context kept), on `agent/claude/code-mode` | Merge; codex review | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | done | Merged incl. REV-T5 fixes (`c4a1b35`); codex re-check: MERGE | Follow-up (not in this batch): adapter resets mode/effort on model switch | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
 | T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
@@ -159,3 +160,11 @@ client still builds.
   graders + false-pass tests, re-register, rerun the primary arms (~$0.55), re-grade secondaries
   offline if their reports were kept. Sent back to the T4b worker.
 - 2026-09-25 — Full `mise run check` on `b10ad82` (all merges except T4b's grader fix): green — 1,036 tests passed, 0 failed; wire gate passed. Tree clean.
+- 2026-09-25 — Maintainer tried `export AIM_CODE_MODE=1; mise run tui` and got no code mode: the
+  running daemon (pid 5761, started 18:11) lacked the variable, and a no-op `mise run build` does
+  not restart it. Verified in-process: `AIM_CODE_MODE=1 aim run` offers run_code/save_program/
+  run_program/list_programs (and hides Glob/Grep/KillShell/session search); `off` does the reverse.
+- 2026-09-25 — Maintainer decisions: (1) make code mode per-session and client-carried with a
+  status-line indicator (T4c); (2) make code mode the DEFAULT (`on`), overriding the benchmark
+  rule's `off` — T4b's worker flips DEFAULT_MODE, re-records the wire baseline and records the
+  override in ADR 0076 next to the (rerun) numbers.
