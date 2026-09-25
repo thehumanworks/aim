@@ -16,7 +16,41 @@ use tokio::sync::oneshot;
 use super::{BoxFuture, MAX_FORK_DEPTH, SessionStore, StoreError, StoredSessionSummary, check_sequence};
 
 /// Schema version of the database itself (independent of the event schema).
-const DB_SCHEMA: i64 = 2;
+const DB_SCHEMA: i64 = 3;
+
+const SUMMARY_QUERY: &str = "SELECT s.meta, st.turns, st.last_activity_ms
+    FROM session_stats AS st JOIN sessions AS s ON s.id = st.session_id
+    ORDER BY st.last_activity_ms DESC, st.session_id ASC LIMIT ?1";
+
+const CREATE_STATS: &str = "CREATE TABLE session_stats (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+    turns INTEGER NOT NULL,
+    last_activity_ms INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX session_stats_by_activity ON session_stats(last_activity_ms DESC, session_id ASC);";
+
+// Used once when upgrading a v1 store. The recursive prefix cap matches materialize(): a
+// child's fork point limits every ancestor, while a later parent append stays invisible.
+const BACKFILL_STATS: &str = "WITH RECURSIVE lineage(root_id, ancestor_id, max_seq, depth) AS (
+    SELECT id, id, 9223372036854775807, 0 FROM sessions
+    UNION ALL
+    SELECT lineage.root_id, json_extract(s.meta, '$.parent.session'),
+           MIN(lineage.max_seq, json_extract(s.meta, '$.parent.seq')), lineage.depth + 1
+      FROM lineage JOIN sessions s ON s.id = lineage.ancestor_id
+     WHERE json_extract(s.meta, '$.parent.session') IS NOT NULL
+       AND lineage.depth + 1 < ?1
+), visible AS (
+    SELECT lineage.root_id, e.seq, e.turn, e.ts_ms,
+           ROW_NUMBER() OVER (PARTITION BY lineage.root_id ORDER BY e.seq DESC) AS recent
+      FROM lineage JOIN events e ON e.session_id = lineage.ancestor_id AND e.seq <= lineage.max_seq
+), aggregate AS (
+    SELECT root_id, MAX(turn) AS turns,
+           MAX(CASE WHEN recent = 1 THEN ts_ms END) AS last_event_ms
+      FROM visible GROUP BY root_id
+)
+INSERT INTO session_stats(session_id, turns, last_activity_ms)
+SELECT s.id, COALESCE(a.turns, 0), COALESCE(a.last_event_ms, s.created_ms)
+  FROM sessions s LEFT JOIN aggregate a ON a.root_id = s.id";
 
 type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 
@@ -76,32 +110,58 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     crate::search::index::migrate(conn)?;
     match version {
         None => {
+            conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+            conn.execute_batch(CREATE_STATS).map_err(backend)?;
+            conn.execute(BACKFILL_STATS, params![i64::try_from(MAX_FORK_DEPTH).map_err(backend)?]).map_err(backend)?;
             conn.execute("INSERT INTO db_schema (version) VALUES (?1)", params![DB_SCHEMA]).map_err(backend)?;
+            conn.execute_batch("COMMIT").map_err(backend)?;
         }
         Some(v) if v < DB_SCHEMA => {
-            crate::search::index::queue_existing(conn)?;
+            conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+            if v < 2 {
+                crate::search::index::queue_existing(conn)?;
+            }
+            conn.execute_batch(CREATE_STATS).map_err(backend)?;
+            conn.execute(BACKFILL_STATS, params![i64::try_from(MAX_FORK_DEPTH).map_err(backend)?]).map_err(backend)?;
             conn.execute("UPDATE db_schema SET version = ?1", params![DB_SCHEMA]).map_err(backend)?;
+            conn.execute_batch("COMMIT").map_err(backend)?;
         }
         Some(_) => {}
     }
     Ok(())
 }
 
-fn create(conn: &Connection, meta: &SessionMeta) -> Result<(), StoreError> {
-    if let Some(parent) = &meta.parent {
-        let (_, history) = load_with_depth(conn, &parent.session, 1)?;
+fn create(conn: &mut Connection, meta: &SessionMeta) -> Result<(), StoreError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(backend)?;
+    let (turns, last_activity_ms) = if let Some(parent) = &meta.parent {
+        let (_, history) = load_with_depth(&tx, &parent.session, 1)?;
         if parent.seq > history.last().map_or(0, |event| event.seq) {
             return Err(StoreError::Backend("fork point exceeds parent history".to_owned()));
         }
-    }
-    let json = serde_json::to_string(meta).map_err(backend)?;
-    match conn.execute("INSERT INTO sessions (id, created_ms, meta) VALUES (?1, ?2, ?3)", params![meta.id, meta.created_ms, json]) {
-        Ok(_) => Ok(()),
-        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
-            Err(StoreError::Exists(meta.id.clone()))
+        let mut turns = 0;
+        let mut last_activity_ms = meta.created_ms;
+        for event in history.iter().take_while(|event| event.seq <= parent.seq) {
+            turns = turns.max(event.turn);
+            last_activity_ms = event.ts_ms;
         }
-        Err(err) => Err(backend(err)),
+        (turns, last_activity_ms)
+    } else {
+        (0, meta.created_ms)
+    };
+    let json = serde_json::to_string(meta).map_err(backend)?;
+    match tx.execute("INSERT INTO sessions (id, created_ms, meta) VALUES (?1, ?2, ?3)", params![meta.id, meta.created_ms, json]) {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+            return Err(StoreError::Exists(meta.id.clone()));
+        }
+        Err(err) => return Err(backend(err)),
     }
+    tx.execute(
+        "INSERT INTO session_stats(session_id, turns, last_activity_ms) VALUES (?1, ?2, ?3)",
+        params![meta.id, i64::try_from(turns).map_err(backend)?, last_activity_ms],
+    )
+    .map_err(backend)?;
+    tx.commit().map_err(backend)
 }
 
 fn append(conn: &mut Connection, session: &str, events: &[SessionEvent]) -> Result<(), StoreError> {
@@ -135,6 +195,16 @@ fn append(conn: &mut Connection, session: &str, events: &[SessionEvent]) -> Resu
             params![session, max_seq],
         )
         .map_err(backend)?;
+        let max_turn = events.iter().map(|event| event.turn).max().unwrap_or(0);
+        let updated = tx
+            .execute(
+                "UPDATE session_stats SET turns = MAX(turns, ?2), last_activity_ms = ?3 WHERE session_id = ?1",
+                params![session, i64::try_from(max_turn).map_err(backend)?, last_event.ts_ms],
+            )
+            .map_err(backend)?;
+        if updated != 1 {
+            return Err(StoreError::Backend("session summary row is missing".to_owned()));
+        }
     }
     tx.commit().map_err(backend)
 }
@@ -246,39 +316,9 @@ fn list(conn: &Connection, limit: u32) -> Result<Vec<SessionMeta>, StoreError> {
 }
 
 fn summarize(conn: &Connection, limit: u32) -> Result<Vec<StoredSessionSummary>, StoreError> {
-    // Each lineage row exposes only the ancestor prefix visible to the child. Event seqs are
-    // unique across that effective log, so the greatest seq supplies its last timestamp.
-    let mut stmt = conn
-        .prepare_cached(
-            "WITH RECURSIVE lineage(root_id, ancestor_id, max_seq, depth) AS (
-                 SELECT id, id, 9223372036854775807, 0 FROM sessions
-                 UNION ALL
-                 SELECT lineage.root_id,
-                        json_extract(s.meta, '$.parent.session'),
-                        MIN(lineage.max_seq, json_extract(s.meta, '$.parent.seq')),
-                        lineage.depth + 1
-                   FROM lineage JOIN sessions s ON s.id = lineage.ancestor_id
-                  WHERE json_extract(s.meta, '$.parent.session') IS NOT NULL
-                    AND lineage.depth + 1 < ?1
-             ), visible AS (
-                 SELECT lineage.root_id, e.seq, e.turn, e.ts_ms,
-                        ROW_NUMBER() OVER (PARTITION BY lineage.root_id ORDER BY e.seq DESC) AS recent
-                   FROM lineage JOIN events e ON e.session_id = lineage.ancestor_id
-                    AND e.seq <= lineage.max_seq
-             ), aggregate AS (
-                 SELECT root_id, MAX(turn) AS turns,
-                        MAX(CASE WHEN recent = 1 THEN ts_ms END) AS last_event_ms
-                   FROM visible GROUP BY root_id
-             )
-             SELECT s.meta, COALESCE(a.turns, 0), COALESCE(a.last_event_ms, s.created_ms)
-               FROM sessions s LEFT JOIN aggregate a ON a.root_id = s.id
-              ORDER BY COALESCE(a.last_event_ms, s.created_ms) DESC, s.id ASC LIMIT ?2",
-        )
-        .map_err(backend)?;
+    let mut stmt = conn.prepare_cached(SUMMARY_QUERY).map_err(backend)?;
     let rows = stmt
-        .query_map(params![i64::try_from(MAX_FORK_DEPTH).map_err(backend)?, limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-        })
+        .query_map(params![limit], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
         .map_err(backend)?;
     rows.map(|row| {
         let (json, turns, last_activity_ms) = row.map_err(backend)?;
@@ -307,7 +347,7 @@ fn serve(mut conn: Connection, rx: &mpsc::Receiver<Command>, search_tx: &mpsc::S
     while let Ok(command) = rx.recv() {
         // A dropped reply only means the caller stopped waiting.
         match command {
-            Command::Create(meta, reply) => drop(reply.send(create(&conn, &meta))),
+            Command::Create(meta, reply) => drop(reply.send(create(&mut conn, &meta))),
             Command::Append(session, events, reply) => {
                 let changed = !events.is_empty();
                 let result = append(&mut conn, &session, &events);
@@ -396,7 +436,7 @@ mod tests {
         let mut conn = Connection::open(&path).unwrap();
         migrate(&conn).unwrap();
         create(
-            &conn,
+            &mut conn,
             &SessionMeta {
                 id: "session".to_owned(),
                 created_ms: 1,
@@ -423,5 +463,15 @@ mod tests {
             })
             .unwrap();
         assert_eq!((count, max_seq), (1, 3));
+    }
+
+    #[test]
+    fn summary_plan_reads_activity_index_without_visiting_events() {
+        let conn = Connection::open_in_memory().expect("test database opens");
+        migrate(&conn).expect("schema migration succeeds");
+        let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {SUMMARY_QUERY}")).expect("summary plan prepares");
+        let details: Vec<String> = plan.query_map([50], |row| row.get(3)).expect("summary plan runs").map(Result::unwrap).collect();
+        assert!(details.iter().any(|detail| detail.contains("session_stats_by_activity")), "{details:?}");
+        assert!(!details.iter().any(|detail| detail.contains("events") || detail.contains("TEMP B-TREE")), "{details:?}");
     }
 }

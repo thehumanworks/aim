@@ -147,7 +147,8 @@ fn input() -> Vec<Part> {
 
 async fn wait_socket(path: &Path) {
     for _ in 0..100 {
-        if path.exists() {
+        if let Ok(stream) = UnixStream::connect(path).await {
+            drop(stream);
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -189,7 +190,7 @@ async fn until_idle(stream: &mut UpdateStream) -> Vec<SessionUpdate> {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn initialize_guard_and_socket_permissions() {
     let (dir, _, _, task) = started(1, Duration::ZERO).await;
     let socket = socket_path(dir.path());
@@ -222,7 +223,7 @@ async fn initialize_guard_and_socket_permissions() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transcription_contract_checks_session_privacy_before_provider_access() {
     assert!(MAX_DAEMON_MESSAGE_BYTES > (25_usize * 1024 * 1024).div_ceil(3) * 4 + 1024);
     let (dir, host, _, task) = started(1, Duration::ZERO).await;
@@ -241,7 +242,7 @@ async fn transcription_contract_checks_session_privacy_before_provider_access() 
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attach_prompt_and_two_clients_receive_ordered_updates() {
     let (dir, _, _, task) = started(20, Duration::from_millis(1)).await;
     let a = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
@@ -259,7 +260,7 @@ async fn attach_prompt_and_two_clients_receive_ordered_updates() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reattach_on_one_connection_replaces_forwarder() {
     let (dir, _, _, task) = started(4, Duration::from_millis(1)).await;
     let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
@@ -275,7 +276,7 @@ async fn reattach_on_one_connection_replaces_forwarder() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reattach_while_streaming_preserves_finished_items_once() {
     let (dir, _, _, task) = started(200, Duration::from_millis(1)).await;
     let socket = socket_path(dir.path());
@@ -299,7 +300,7 @@ async fn reattach_while_streaming_preserves_finished_items_once() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_delivers_terminal_state_then_ends_stream() {
     let (dir, _, _, task) = started(1, Duration::ZERO).await;
     let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
@@ -315,7 +316,7 @@ async fn close_delivers_terminal_state_then_ends_stream() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_broadcast_lag_sends_detached_reason() {
     let dir = private_tempdir();
     let socket = socket_path(dir.path());
@@ -335,7 +336,7 @@ async fn host_broadcast_lag_sends_detached_reason() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_ui_stream_ends_at_its_bound_and_can_reattach() {
     let (dir, _, _, task) = started(1300, Duration::ZERO).await;
     let client = DaemonClient::connect(&socket_path(dir.path())).await.unwrap();
@@ -363,7 +364,7 @@ async fn slow_ui_stream_ends_at_its_bound_and_can_reattach() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attach_during_stream_is_gap_free_and_reconnect_sees_transcript() {
     let (dir, _, _, task) = started(200, Duration::from_millis(1)).await;
     let socket = socket_path(dir.path());
@@ -389,7 +390,7 @@ async fn attach_during_stream_is_gap_free_and_reconnect_sees_transcript() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn duplicate_key_runs_one_turn_and_second_daemon_cannot_bind() {
     let (dir, host, provider, task) = started(100, Duration::from_millis(1)).await;
     let socket = socket_path(dir.path());
@@ -400,13 +401,20 @@ async fn duplicate_key_runs_one_turn_and_second_daemon_cannot_bind() {
     let (a, b) =
         tokio::join!(client.prompt_with_key(session.clone(), input(), key.clone()), other.prompt_with_key(session.clone(), input(), key),);
     assert_eq!(a.unwrap(), b.unwrap());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while provider.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     let conflict = server::serve(dir.path(), &socket, None, host).await.unwrap_err();
     assert_eq!(conflict.code, ErrorCode::Conflict);
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn detached_stream_stops_while_session_keeps_running() {
     let (dir, _, _, task) = started(100, Duration::from_millis(2)).await;
     let socket = socket_path(dir.path());
@@ -432,7 +440,7 @@ async fn detached_stream_stops_while_session_keeps_running() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disconnect_mid_turn_ends_stream_and_late_client_recovers() {
     let (dir, _, _, task) = started(100, Duration::from_millis(2)).await;
     let socket = socket_path(dir.path());
@@ -452,7 +460,7 @@ async fn disconnect_mid_turn_ends_stream_and_late_client_recovers() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idle_exit_waits_for_connections_then_removes_socket() {
     let dir = private_tempdir();
     let (host, _) = host(1, Duration::ZERO);
@@ -471,7 +479,7 @@ async fn idle_exit_waits_for_connections_then_removes_socket() {
     assert!(!socket.exists());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropping_last_client_releases_idle_connection() {
     let dir = private_tempdir();
     let (host, _) = host(1, Duration::ZERO);
@@ -491,7 +499,7 @@ async fn dropping_last_client_releases_idle_connection() {
     assert!(!socket.exists());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_lock_is_held_through_workspace_shutdown() {
     let dir = private_tempdir();
     let socket = socket_path(dir.path());
@@ -519,7 +527,7 @@ async fn daemon_lock_is_held_through_workspace_shutdown() {
     assert!(!socket.exists());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_socket_is_recovered() {
     let dir = private_tempdir();
     std::fs::create_dir(dir.path().join("run")).unwrap();
@@ -542,7 +550,7 @@ async fn stale_socket_is_recovered() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn binary_auto_spawn_status_stop_leaves_no_socket() {
     let dir = private_tempdir();
     let binary = env!("CARGO_BIN_EXE_aim");
@@ -579,7 +587,7 @@ async fn binary_auto_spawn_status_stop_leaves_no_socket() {
     assert!(!alive, "stopped daemon process is still alive");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_auto_spawn_gets_one_process() {
     let dir = private_tempdir();
     let binary = Path::new(env!("CARGO_BIN_EXE_aim"));
@@ -594,7 +602,7 @@ async fn concurrent_auto_spawn_gets_one_process() {
     second.disconnect();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires a real codex provider and aimx credentials"]
 async fn live_daemon_codex_turn() {
     let dir = private_tempdir();

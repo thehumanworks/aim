@@ -297,6 +297,11 @@ pub trait SessionClient: Send + Sync {
     fn create(&self, spec: SessionSpec) -> BoxFuture<Result<SessionSummary, ProtoError>>;
     /// Lists sessions (live and stored), newest first.
     fn list(&self, params: SessionListParams) -> BoxFuture<Result<Vec<SessionSummary>, ProtoError>>;
+    /// Live actors for daemon idle checks and shutdown. The in-process host answers from memory
+    /// without touching the durable session index.
+    fn live_summaries(&self) -> BoxFuture<Result<Vec<SessionSummary>, ProtoError>> {
+        self.list(SessionListParams { limit: Some(u32::MAX), workspace: None })
+    }
     /// Attaches: the state and transcript so far, then every later update.
     fn attach(&self, session: String) -> BoxFuture<Result<(SessionAttachResult, UpdateStream), ProtoError>>;
     /// Sends input: starts a turn when idle, steers the running turn otherwise.
@@ -753,6 +758,11 @@ fn updates_of(rx: broadcast::Receiver<SessionUpdate>) -> UpdateStream {
 }
 
 impl SessionClient for SessionHost {
+    fn live_summaries(&self) -> BoxFuture<Result<Vec<SessionSummary>, ProtoError>> {
+        let live = lock(&self.sessions).values().map(|entry| lock(&entry.summary).clone()).collect();
+        Box::pin(async move { Ok(live) })
+    }
+
     fn transcribe(&self, params: MediaTranscribeParams) -> BoxFuture<Result<MediaTranscribeResult, ProtoError>> {
         let host = self.clone();
         Box::pin(async move {
