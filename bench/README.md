@@ -123,8 +123,9 @@ conservative price bound from its numeric token usage and the published model ra
 
 `mise run bench:wire` failed on the integration branch with 35 regressions. Every one is
 attributed below; none was hidden by a bound alone. The gate now compares against
-`results/t4b-main-baseline.json` (named by the manifest's `[wire] baseline`), recorded at
-`d211f6a` with the decided default code mode, `off`. The manifest's aim bounds changed with it, so
+`results/t4b-main-baseline.json` (named by the manifest's `[wire] baseline`), recorded with the
+decided default code mode, `off`: first at `d211f6a`, and again at `7afcf10` once the code-mode
+prompt section followed the exposure. The manifest's aim bounds changed with it, so
 this is a new cohort. `results/w26-main-baseline.json` stays as W26's evidence.
 
 **Codex CLI and pi (26 regressions): the measurement, not the peers.** Their pinned binaries hash
@@ -137,7 +138,8 @@ new baseline equal W26's byte for byte. A gated run also refuses a caller's `AIM
 `AIM_BENCH_CODE_MODE`), which would otherwise change what the arm-less aim harness measures.
 
 **aim (9 regressions): W1 grew from 5,844 bytes (W26's recorded candidate, code mode `on`) to
-8,353 (default `off`).** At the fixed `/tmp` root:
+8,353 (default `off`), then fell to 8,112 when the code-mode prompt section became conditional.**
+At the fixed `/tmp` root:
 
 | Change | Commit (ADR) | W1 bytes | Tools | Instruction chars |
 |---|---|---|---|---|
@@ -152,12 +154,14 @@ new baseline equal W26's byte for byte. A gated run also refuses a caller's `AIM
 | default `off`: `Glob` 434, `Grep` 1,081, `KillShell` 258, `search_sessions` 374, `read_session` 348 | `d211f6a` | +2,495 | +5 | |
 | default `off`: full `Read`/`Bash`/`LS` descriptions (W26 shortens them only in code mode) | `1cdfba8` (0056) | +427 | | |
 | one more tool separator | | +1 | | |
-| **new baseline** | `d211f6a` | **8,353** | **15** | **1,820** |
+| **first T4b baseline** | `d211f6a` | **8,353** | **15** | **1,820** |
+| "# Code mode" section only with a code tool (`prompts/code_mode.md`) | `7afcf10` (0076 §3) | −241 | | −241 |
+| **current baseline** | `7afcf10` | **8,112** | **15** | **1,579** |
 
 W2's model-visible Bash output is 11,191 characters (ceiling 12,088, unchanged) and aim makes one
 auxiliary request, as in W26. The manifest's `aim_expected_tools` is now 15 and
-`aim_w1_max_bytes` 8,400: 47 bytes of room, so a new tool or prompt line needs an explicit
-manifest change. The rest of the gate (no request growth against the baseline, append-only
+`aim_w1_max_bytes` 8,160: 48 bytes of room, so a new tool or prompt line needs an explicit
+manifest change. (It was 8,400 at `d211f6a`.) The rest of the gate (no request growth against the baseline, append-only
 prompts, identical repetitions) is unchanged.
 
 **Real costs this keeps visible**, measured here and left for follow-ups because they are outside
@@ -166,17 +170,17 @@ this task's files or would change what the code-mode benchmark measured:
 - The four `ui_*` tools (+773 bytes) reach headless `aim run` sessions, where no client can show
   a surface. ADR 0064 accepted them under an 800-byte budget; offering them only with a UI
   client attached would recover the bytes.
-- The "# Code mode" prompt section (+241 bytes, `b364b9c`) is sent although the default no longer
-  offers a code tool. It should follow the exposure (it is built before code mode is composed,
-  in `host.rs`).
 - `off` sessions do not get W26's shorter `Read`/`Bash`/`LS` descriptions (+427 bytes against
-  `on`). With them, `off`'s W1 would be about 7,926 bytes.
+  `on`). With them, `off`'s W1 would be about 7,685 bytes.
 - In `only`, a cell's nested `Bash` result bypasses ADR 0056's model view: the scripted W2 shows
   30,147 characters against 11,191 through a direct `Bash`.
 
-Wire-tier W1 by arm on this tree (`results/t4b-wire-arms.json`, `--harnesses aim_openrouter@off,aim_openrouter@on,aim_openrouter@only --no-gate`):
-`off` 8,353 bytes and 15 tools, `on` 7,745 and 14, `only` 4,998 and 4. W4's 21-request trajectory
-ends at 12,675 / 12,067 / 10,760 bytes.
+The fourth cost, the "# Code mode" prompt section (+241 bytes) sent to sessions without a code
+tool, is fixed at `7afcf10`: the host passes the kernel's exposure to the instructions too.
+
+Wire-tier W1 by arm at `7afcf10` (`results/t4b-wire-arms.json`, `--harnesses aim_openrouter@off,aim_openrouter@on,aim_openrouter@only --no-gate`):
+`off` 8,112 bytes and 15 tools, `on` 7,745 and 14, `only` 4,998 and 4. W4's 21-request trajectory
+ends at 12,434 / 12,067 / 10,760 bytes.
 
 ## Code-mode cohort (T4b)
 
@@ -243,6 +247,9 @@ What the runs show beyond the rule:
 - `on`'s lower existing-task ITE is its smaller prefix, not code: 7,745 bytes against `off`'s
   8,353 in W1, from ADR 0056's compact direct set and shorter `Read`/`Bash`/`LS` descriptions,
   which apply only in code-mode sessions. Giving `off` the shorter descriptions is a follow-up.
+  The benchmarked `off` arm also carried the 241-byte "# Code mode" prompt section, since removed
+  from sessions without a code tool (`7afcf10`): that only makes `off` cheaper, so the verdict
+  stands.
 - `doc_index` failed 9/9 on OpenRouter in every arm (the model takes `# Options` over the earlier
   `## Command line usage`) and passed 8/8 on codex and Claude: it separates models, not arms.
 - In `only`, a cell that prints a nested `Bash` result shows the model 30,147 characters of the
