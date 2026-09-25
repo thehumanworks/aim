@@ -50,9 +50,13 @@ fn temp_dir() -> PathBuf {
     dir
 }
 
+/// Unique per test in this process: the clock alone is not (macOS clocks tick in microseconds, and
+/// parallel tests started within one tick shared a directory).
 fn uuid_like() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    format!("{}-{nanos}", std::process::id())
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{nanos}-{n}", std::process::id())
 }
 
 /// A small workspace: a few files and a skill.

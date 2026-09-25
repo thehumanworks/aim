@@ -64,7 +64,10 @@ impl Drop for Tmux {
 }
 
 fn start(script: &serde_json::Value) -> Tmux {
-    let dir = std::env::temp_dir().join(format!("aim-tmux-{}-{}", std::process::id(), Instant::now().elapsed().as_nanos()));
+    // Tests run in parallel: each gets its own directory and tmux server.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("aim-tmux-{}-{n}", std::process::id()));
     let workspace = dir.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     tui_support::workspace(&workspace);
@@ -84,7 +87,7 @@ fn start(script: &serde_json::Value) -> Tmux {
         script = script_path.display(),
         ws = workspace.display()
     );
-    let tmux = Tmux { socket: format!("aim-tui-{}", std::process::id()), dir };
+    let tmux = Tmux { socket: format!("aim-tui-{}-{n}", std::process::id()), dir };
     let conf = conf.to_string_lossy().into_owned();
     let out = Command::new("tmux")
         .args(["-L", &tmux.socket, "-f", &conf, "new-session", "-d", "-s", "t", "-x", "80", "-y", "24", &command])
@@ -156,4 +159,36 @@ fn tmux_resize_mid_stream_keeps_scrollback_clean() {
     for residue in ["running", "ask anything", "scripted-model", "⧗", "src/main.rs", "──────"] {
         assert_eq!(count(residue), 0, "no `{residue}` left behind:\n{text}");
     }
+}
+
+/// `/clear` (ADR 0074) erases the old chat from the screen and from tmux's history (`CSI 3 J`),
+/// and the new session works.
+#[test]
+#[ignore = "needs tmux"]
+fn tmux_clear_purges_the_scrollback() {
+    assert!(has_tmux(), "tmux is not installed");
+    let answer = (1..=40).map(|i| format!("old line {i:02}")).collect::<Vec<_>>().join("\n\n");
+    let script = json!({"responses": [
+        [{"kind": "text", "text": answer, "chunks": 4, "delay_ms": 5}],
+        [{"kind": "text", "text": "A fresh answer.", "chunks": 1, "delay_ms": 0}]
+    ]});
+    let tmux = start(&script);
+    tmux.wait("idle", |s| s.contains("idle"));
+    tmux.keys("old question");
+    tmux.enter();
+    tmux.wait("the old answer", |s| s.contains("old line 40") && s.contains("idle"));
+    let before = tmux.capture();
+    assert!(before.iter().any(|r| r.contains("old line 01")), "the old answer reached scrollback:\n{}", before.join("\n"));
+    tmux.keys("/clear");
+    tmux.enter();
+    tmux.wait("a cleared screen", |s| !s.contains("old line") && s.contains("idle"));
+    tmux.keys("new question");
+    tmux.enter();
+    tmux.wait("the fresh answer", |s| s.contains("A fresh answer.") && s.contains("idle"));
+    let rows = tmux.capture();
+    let text = rows.join("\n");
+    for gone in ["before-1", "old question", "old line 01", "old line 40"] {
+        assert!(!rows.iter().any(|r| r.contains(gone)), "`{gone}` is still in the history:\n{text}");
+    }
+    assert!(rows.iter().any(|r| r.contains("› new question")), "{text}");
 }
