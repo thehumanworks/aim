@@ -27,7 +27,7 @@ client still builds.
 | T3 | Parallel tools: batching guidance in prompts, `readOnlyHint` on aimx MCP, end-to-end concurrency tests, FIX16 cell scheduler moved to the kernel with proofs | in progress | Worker running | Review its report, merge | `agent/claude/parallel-tools` · `../aim-wt/parallel-tools` |
 | T4a | `AIM_CODE_MODE` (off/on/only): verified decision, native sessions, `aim mcp`, code-mode MCP proxy in front of aimx for `acp:claude`, typed declarations + `Promise.all` in the code tool (ADR 0076) | in progress | Worker running | Review its report, merge, then T4b | `agent/claude/code-mode` · `../aim-wt/code-mode` |
 | T4b | Benchmark code mode (offline + live, pre-declared rule), then set the default | todo | Waits for T4a | — | — |
-| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | in progress | Worker running | Review its report, merge | `agent/claude/acp-models` · `../aim-wt/acp-models` |
+| T5 | ACP Claude: selecting Opus (and any model) works — verified model-id resolution (ADR 0075) | done | Merged; kernel 263 verified; live: `-m opus` → `opus[1m]`, usage `claude-opus-5-5` | Open: adapter resets mode/effort when switching model (see log) | `agent/claude/acp-models` · `../aim-wt/acp-models` |
 | T6 | Verus proofs for the decision logic (done inside T1, T3, T4a, T5) | todo | — | Check each worker's `mise run verify` | — |
 | T7 | Merge worker branches, full gate + verify, cross-model review, push, PR | todo | — | — | integration branch |
 
@@ -65,3 +65,9 @@ client still builds.
 - 2026-09-25 — FIX16's scheduler runs at most one cell per session by design (REV13a H1); in code
   mode, parallelism is `Promise.all` inside a cell. Kept; the scheduler moves to the kernel (T3).
 - 2026-09-25 — Merged base green (963 tests). Four workers launched (T1, T3, T4a, T5), Opus, one worktree each.
+- 2026-09-25 — T5 done (`4e00940`, merged). Kernel `model_match` (7 theorems), aim-acp resolver,
+  errors list `value (Name)` pairs, ADR 0075. Live: `live_set_config` and
+  `live_acp_claude_session_with_model_alias` pass; `aim run -p acp:claude -m opus` → `ok`.
+  Open (adapter behaviour, not aim): switching to `haiku` flipped `mode` to `acceptEdits` and dropped
+  the effort/fast options; back on `opus`, effort returned at `medium`. Worth a follow-up so
+  `/model` after `/effort` keeps the effort and aim re-asserts its permission mode.
