@@ -190,7 +190,7 @@ pub open spec fn fresh(max_retries: u32) -> JobView {
 }
 
 /// Current, unexpired attempt identity.
-pub open spec fn current(v: JobView, generation: u32, claim_id: u64, now: u64) -> bool {
+pub open spec fn claim_is_current(v: JobView, generation: u32, claim_id: u64, now: u64) -> bool {
     v.generation == generation as nat && v.claim is Some && v.claim->0.claim_id == claim_id && now
         < v.claim->0.lease_until
 }
@@ -222,35 +222,27 @@ pub open spec fn next(pre: JobView, ev: Event, now: u64) -> Option<JobView> {
         } else {
             None
         },
-        Event::Start { generation, claim_id } => if pre.state == JobState::Claimed && current(
-            pre,
-            generation,
-            claim_id,
-            now,
-        ) {
+        Event::Start { generation, claim_id } => if pre.state == JobState::Claimed
+            && claim_is_current(pre, generation, claim_id, now) {
             Some(JobView { state: JobState::Running, ..pre })
         } else {
             None
         },
         Event::Heartbeat { generation, claim_id, lease_until } => if (pre.state == JobState::Claimed
-            || pre.state == JobState::Running) && current(pre, generation, claim_id, now)
+            || pre.state == JobState::Running) && claim_is_current(pre, generation, claim_id, now)
             && lease_until > pre.claim->0.lease_until {
             Some(JobView { claim: Some(Claim { lease_until, ..pre.claim->0 }), ..pre })
         } else {
             None
         },
-        Event::Complete { generation, claim_id } => if pre.state == JobState::Running && current(
-            pre,
-            generation,
-            claim_id,
-            now,
-        ) {
+        Event::Complete { generation, claim_id } => if pre.state == JobState::Running
+            && claim_is_current(pre, generation, claim_id, now) {
             Some(JobView { state: JobState::Succeeded, cleanup: CleanupState::Confirmed, ..pre })
         } else {
             None
         },
         Event::Fail { generation, claim_id, cleanup_confirmed } => if pre.state == JobState::Running
-            && current(pre, generation, claim_id, now) {
+            && claim_is_current(pre, generation, claim_id, now) {
             Some(
                 JobView {
                     state: JobState::Failed,
@@ -354,7 +346,7 @@ pub proof fn lemma_completion_needs_review(pre: JobView, generation: u32, claim_
 pub proof fn lemma_stale_attempt_fenced(pre: JobView, generation: u32, claim_id: u64, now: u64)
     requires
         wf(pre),
-        !current(pre, generation, claim_id, now),
+        !claim_is_current(pre, generation, claim_id, now),
     ensures
         next(pre, Event::Start { generation, claim_id }, now) is None,
         next(pre, Event::Heartbeat { generation, claim_id, lease_until: u64::MAX }, now) is None,
@@ -737,7 +729,7 @@ impl Job {
     #[must_use]
     pub fn authorizes_attempt(&self, generation: u32, claim_id: u64, now: u64) -> (b: bool)
         ensures
-            b == current(self@, generation, claim_id, now),
+            b == claim_is_current(self@, generation, claim_id, now),
     {
         self.check_claim(generation, claim_id, now)
     }
@@ -906,7 +898,7 @@ impl Job {
 
     fn check_claim(&self, generation: u32, claim_id: u64, now: u64) -> (ok: bool)
         ensures
-            ok == current(self@, generation, claim_id, now),
+            ok == claim_is_current(self@, generation, claim_id, now),
     {
         if generation != self.generation {
             return false;
