@@ -6,9 +6,11 @@
 //! - [`session`] — recording agent events into the durable session log.
 //! - [`context`] — instructions and environment given to the model.
 //! - [`cli`] — the headless `aim run`.
+//! - [`host`] — hosting live sessions (the daemon's core; also used in process).
 pub mod agent;
 pub mod cli;
 pub mod context;
 pub mod harness;
+pub mod host;
 pub mod session;
 pub mod store;

@@ -12,6 +12,7 @@ dependencies = [
  "aim-rpc",
  "async-stream",
  "clap",
+ "futures-core",
  "futures-util",
  "rusqlite",
  "serde",

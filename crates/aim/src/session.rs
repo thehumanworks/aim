@@ -48,10 +48,32 @@ impl Recorder {
         Ok(Self { store, session, model, seq: 0, turn: 0 })
     }
 
+    /// Continues recording a stored session after `events`, its log so far.
+    #[must_use]
+    pub fn resume(store: Arc<dyn SessionStore>, meta: &SessionMeta, events: &[SessionEvent]) -> Self {
+        let seq = events.last().map_or(0, |e| e.seq);
+        let turn = events.iter().map(|e| e.turn).max().unwrap_or(0);
+        let model = events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.body {
+                EventBody::ConfigChanged { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| meta.model.clone());
+        Self { store, session: meta.id.clone(), model, seq, turn }
+    }
+
     /// The session id.
     #[must_use]
     pub fn session(&self) -> &str {
         &self.session
+    }
+
+    /// Turns started so far.
+    #[must_use]
+    pub const fn turns(&self) -> u64 {
+        self.turn
     }
 
     /// Appends one event.
@@ -87,7 +109,10 @@ impl Recorder {
             AgentEvent::RateLimits { limits } => EventBody::RateLimits { limits: limits.clone() },
             AgentEvent::TurnEnded { stop } => EventBody::TurnEnded { stop: stop.clone() },
             AgentEvent::TurnFailed { message } => EventBody::TurnFailed { message: message.clone() },
-            AgentEvent::ConfigChanged { model, effort } => EventBody::ConfigChanged { model: model.clone(), effort: effort.clone() },
+            AgentEvent::ConfigChanged { model, effort } => {
+                self.model.clone_from(model);
+                EventBody::ConfigChanged { model: model.clone(), effort: effort.clone() }
+            }
             AgentEvent::StateChanged { .. }
             | AgentEvent::TurnStarted { .. }
             | AgentEvent::RequestStarted { .. }

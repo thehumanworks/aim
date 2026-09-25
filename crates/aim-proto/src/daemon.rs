@@ -295,7 +295,8 @@ pub struct SessionConfigParams {
 }
 
 method!(
-    /// `session.set_config` — change model or effort for the next request.
+    /// `session.set_config` — change model or effort: now when idle, from the next turn when a turn
+    /// is running.
     SessionSetConfig = "session.set_config" (SessionConfigParams) -> ()
 );
 

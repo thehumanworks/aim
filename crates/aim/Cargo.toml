@@ -17,6 +17,7 @@ aim-llm = { path = "../aim-llm" }
 aim-proto = { path = "../aim-proto" }
 aim-rpc = { path = "../aim-rpc" }
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
+futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
