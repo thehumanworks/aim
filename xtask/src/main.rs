@@ -11,9 +11,7 @@
 
 mod adr;
 mod kernel;
-mod locked;
 mod osaccess;
-mod source;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -38,12 +36,12 @@ fn main() -> ExitCode {
         ["check"] => {
             let mut findings = adr::check(&root);
             findings.extend(kernel::check(&root));
-            findings.extend(locked::check(&root));
+            findings.extend(aim_gate_validators::check_locked(&root));
             findings.extend(osaccess::check(&root));
             report(&findings)
         }
-        ["locked", "--update"] => report(&locked::update(&root)),
-        ["locked"] => report(&locked::check(&root)),
+        ["locked", "--update"] => report(&aim_gate_validators::update_locked(&root)),
+        ["locked"] => report(&aim_gate_validators::check_locked(&root)),
         _ => report(&["usage: cargo xtask check | cargo xtask locked [--update]".to_owned()]),
     };
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }

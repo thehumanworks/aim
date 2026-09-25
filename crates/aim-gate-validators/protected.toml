@@ -1,0 +1,23 @@
+# Embedded in the pinned gate build. Candidates cannot supply or relax this policy.
+version = 1
+protected = [
+  "crates/aim-gate/",
+  "crates/aim-gate-validators/",
+  "xtask/",
+  "crates/aim-kernel/LOCKED.toml",
+  "crates/aim-kernel/src/policy.rs",
+  "crates/aimx/src/authz/",
+  "bench/",
+  "gate/",
+]
+sensitive = [
+  ".cargo/",
+  ".github/",
+  "scripts/",
+  "mise.toml",
+  "mise.lock",
+  "rust-toolchain.toml",
+  "rust-toolchain",
+]
+allowed_sensitive = []
+allowed_packages = []

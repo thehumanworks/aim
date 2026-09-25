@@ -170,6 +170,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aim-gate-validators"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "sha2",
+ "tempfile",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "aim-kernel"
 version = "0.0.0"
 dependencies = [
@@ -6226,7 +6236,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 name = "xtask"
 version = "0.0.0"
 dependencies = [
- "sha2",
+ "aim-gate-validators",
 ]
 
 [[package]]
