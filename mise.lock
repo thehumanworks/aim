@@ -2,10 +2,81 @@
 
 lockfile_version = 2
 
+[[tools.bun]]
+version = "1.4.2"
+backend = "core:bun"
+specifiers = ["1.4.2"]
+
+[tools.bun."platforms.linux-x64"]
+checksum = "sha256:36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913"
+url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip"
+
+[tools.bun."platforms.linux-x64-baseline"]
+checksum = "sha256:c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f"
+url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64-baseline.zip"
+
+[tools.bun."platforms.linux-x64-musl"]
+checksum = "sha256:4835eca59d6da70f4674f5642f6e459dcadab773695b2ed9922d131057989742"
+url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64-musl.zip"
+
+[tools.bun."platforms.linux-x64-musl-baseline"]
+checksum = "sha256:76e1db84e98f22f78de0a87e309bfbbf297732847f9720db36750646c85c8c18"
+url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64-musl-baseline.zip"
+
+[tools.bun."platforms.macos-arm64"]
+checksum = "sha256:90987a3a16d7db556d886ac3d551e7b6d3edf0a1cf43acaed622e8676be1d12f"
+url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-darwin-aarch64.zip"
+
+[tools.bun."platforms.macos-x64"]
+checksum = "sha256:80520d7e17526308c9185d261679ac6d27798d3803a0e9f7ff9121ab8affb012"
+url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-darwin-x64.zip"
+
+[tools.bun."platforms.macos-x64-baseline"]
+checksum = "sha256:bad5bbd6cf14d0980d115f5954c9ff904df619d5e994d2da1ffccd3f316300b0"
+url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-darwin-x64-baseline.zip"
+
+[tools.bun."platforms.windows-x64"]
+checksum = "sha256:ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405"
+url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64.zip"
+
+[tools.bun."platforms.windows-x64-baseline"]
+checksum = "sha256:78c221c2376f79731ccf4e4af0b3bb46d81fefa3296c5abee09ad8a1b21e68c6"
+url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64-baseline.zip"
+
 [[tools."cargo:wasm-bindgen-cli"]]
 version = "0.2.128"
 backend = "cargo:wasm-bindgen-cli"
 specifiers = ["0.2.128"]
+
+[[tools.codex]]
+version = "0.158.0-alpha.10"
+backend = "aqua:openai/codex"
+specifiers = ["0.158.0-alpha.10"]
+
+[tools.codex."platforms.linux-x64"]
+checksum = "sha256:4f5df791c3aedd2e1375806beeea8930bf2b966f28a400e023e519c1594db334"
+url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/openai/codex/releases/assets/586825288"
+
+[tools.codex."platforms.linux-x64-musl"]
+checksum = "sha256:4f5df791c3aedd2e1375806beeea8930bf2b966f28a400e023e519c1594db334"
+url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/openai/codex/releases/assets/586825288"
+
+[tools.codex."platforms.macos-arm64"]
+checksum = "sha256:4c4589351f0d20343ba41434c022a04b6b721102654c023dc9a4b4f4b8d2522b"
+url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/openai/codex/releases/assets/586840573"
+
+[tools.codex."platforms.macos-x64"]
+checksum = "sha256:cc2ff55dd48eed8112e161b15005899c66353e3e7f122fad6883a2e30e646396"
+url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/openai/codex/releases/assets/586830776"
+
+[tools.codex."platforms.windows-x64"]
+checksum = "sha256:42920eaa55fd39b2949f39a0a4a0cd434850709e10ef03d3525b713e6cdc0af0"
+url = "https://github.com/openai/codex/releases/download/rust-v0.158.0-alpha.10/codex-package-x86_64-pc-windows-msvc.tar.gz"
+url_api = "https://api.github.com/repos/openai/codex/releases/assets/586827636"
 
 [[tools."github:trunk-rs/trunk"]]
 version = "0.21.14"
@@ -105,6 +176,18 @@ version = "0.4.1"
 backend = "vfox:lightpanda"
 specifiers = ["0.4.1"]
 
+[tools.lightpanda."platforms.linux-x64"]
+url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-linux"
+
+[tools.lightpanda."platforms.linux-x64-musl"]
+url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-linux"
+
+[tools.lightpanda."platforms.macos-arm64"]
+url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-aarch64-macos"
+
+[tools.lightpanda."platforms.macos-x64"]
+url = "https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-macos"
+
 [[tools.node]]
 version = "26.8.1"
 backend = "core:node"
@@ -135,10 +218,65 @@ version = "0.81.2"
 backend = "npm:@agentclientprotocol/claude-agent-acp"
 specifiers = ["0.81.2"]
 
+[[tools.pi]]
+version = "0.87.1"
+backend = "aqua:earendil-works/pi"
+specifiers = ["0.87.1"]
+
+[tools.pi."platforms.linux-x64"]
+checksum = "sha256:80d78dd62d50049a006b981d994c61255bcc10e730b0c278d4ea0a755909764c"
+url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094203"
+
+[tools.pi."platforms.linux-x64-musl"]
+checksum = "sha256:80d78dd62d50049a006b981d994c61255bcc10e730b0c278d4ea0a755909764c"
+url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094203"
+
+[tools.pi."platforms.macos-arm64"]
+checksum = "sha256:4f8d288b78c9768d3a4ac6f61f06cd34394b82ac17d5b42d1e44a437add401b7"
+url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-darwin-arm64.tar.gz"
+url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094198"
+
+[tools.pi."platforms.macos-x64"]
+checksum = "sha256:01d8ee28d7114fec4f4eeedbb7561f790853040e9bfbdeebe79437ab66ea51f5"
+url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-darwin-x64.tar.gz"
+url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094201"
+
+[tools.pi."platforms.windows-x64"]
+checksum = "sha256:aab2ba67baf8ff97a52d05b62d88e9e65a840c6ea8fa1029a28d62d210d4e5fc"
+url = "https://github.com/earendil-works/pi/releases/download/v0.87.1/pi-windows-x64.zip"
+url_api = "https://api.github.com/repos/earendil-works/pi/releases/assets/582094243"
+
 [[tools.python]]
 version = "3.14.7"
 backend = "core:python"
 specifiers = ["3.14.7"]
+
+[tools.python."platforms.linux-x64"]
+checksum = "sha256:bd0d0568ccded07bbf1c87727230dc5dd0187e706a87da23c4de78388a229b78"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
+[tools.python."platforms.linux-x64-musl"]
+checksum = "sha256:8ea6ca8a46e2e0b824a29ddaf208388dea7ede6808d8ceccd02b547882c92b3a"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-unknown-linux-musl-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
+[tools.python."platforms.macos-arm64"]
+checksum = "sha256:f0fb6b233971672dd7add4efa90f8c209a63253e457ffabd0148b9f734638319"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-aarch64-apple-darwin-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
+[tools.python."platforms.macos-x64"]
+checksum = "sha256:82745f483d2bcf39ade058ec0dbd44659d583454ea9c4562b66dae7d718ae100"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-apple-darwin-install_only_stripped.tar.gz"
+provenance = "github-attestations"
+
+[tools.python."platforms.windows-x64"]
+checksum = "sha256:1493fc4185edf84bbd4305c15c5fbac2d4fcd4ddd7eb6273903669a5d3106178"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.14.7+20260924-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+provenance = "github-attestations"
 
 [[tools.rust]]
 version = "1.98.1"

@@ -1,0 +1,88 @@
+# ADR 0024 comparison contract. Changing this file makes a new benchmark cohort.
+version = 1
+hardware = "macOS arm64, report host details in each result"
+topology = "local, loopback HTTP recording proxy, fresh git worktree per run"
+permissions = "workspace read/write/exec; no hosted search; no network tool"
+aim_code_mode = "enabled, with a built and explicitly selected aim-coderun worker"
+cache_state = "fresh isolated HOME per trial; one recorded mock prewarm per harness before timed trials"
+token_estimate = "ceil(uncompressed request JSON bytes / 4); provider usage is separate"
+
+[wire]
+model = "gpt-5.5"
+effort = "low"
+repetitions = 2
+harnesses = ["aim_openrouter", "codex", "pi"]
+optional_harnesses = ["omp", "unreal"] # require pinned local artifacts supplied to run.py
+max_concurrency = 1
+prewarm_mock_runs = 1
+
+[[wire.case]]
+id = "W1"
+scenario = "reply"
+prompt = "Reply with OK."
+steps = 0
+
+[[wire.case]]
+id = "W2"
+scenario = "big_output"
+prompt = "Run the shell command and then reply OK."
+command = "seq 1 100000"
+steps = 1
+
+[[wire.case]]
+id = "W3"
+scenario = "big_file"
+prompt = "Read big.txt and then reply OK."
+command = "cat big.txt"
+steps = 1
+
+[[wire.case]]
+id = "W4"
+scenario = "steps"
+prompt = "Run the requested command twenty times, then reply OK."
+command = "true"
+steps = 20
+
+[live]
+repetitions = 2
+max_concurrency = 1
+prewarm_mock_runs = 1
+max_spend_usd = 1.50
+unpriced_transport_reserve_usd = 0.05
+max_subscription_runs = 12
+pass_noninferiority_delta_pp = 8
+openrouter_model = "openai/gpt-4.1-mini"
+codex_model = "gpt-6-sol"
+codex_effort = "low"
+harnesses = ["aim_openrouter", "codex_openrouter", "aim_codex"]
+timeout_seconds = 180
+
+[[live.task]]
+id = "even_sum"
+grader = "python3 -m unittest -q"
+prompt = "Fix sum_even in calc.py. Run the tests and keep the public function name."
+
+[[live.task]]
+id = "clamp"
+grader = "python3 -m unittest -q"
+prompt = "Implement clamp(value, low, high) in mathutil.py. Run the tests."
+
+[[live.task]]
+id = "slug"
+grader = "python3 -m unittest -q"
+prompt = "Fix slugify in strings.py so the tests pass. Run the tests."
+
+[[live.task]]
+id = "retry"
+grader = "python3 -m unittest -q"
+prompt = "Fix retry in retry.py so it makes exactly the allowed attempts. Run the tests."
+
+[[live.task]]
+id = "ledger"
+grader = "python3 -m unittest -q"
+prompt = "Fix total_cents in ledger.py. Run the tests."
+
+[[live.task]]
+id = "normalize"
+grader = "python3 -m unittest discover -q"
+prompt = "Fix unique_sorted in normalize.py. Run the tests."
