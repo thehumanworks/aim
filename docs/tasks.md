@@ -158,3 +158,4 @@ client still builds.
   wrong function names). Per the plan, grader changes after the smoke need a new cohort: fix
   graders + false-pass tests, re-register, rerun the primary arms (~$0.55), re-grade secondaries
   offline if their reports were kept. Sent back to the T4b worker.
+- 2026-09-25 — Full `mise run check` on `b10ad82` (all merges except T4b's grader fix): green — 1,036 tests passed, 0 failed; wire gate passed. Tree clean.
