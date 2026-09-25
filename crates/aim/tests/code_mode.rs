@@ -239,6 +239,23 @@ async fn closing_the_relay_s_input_ends_a_pending_call_and_its_processes() {
     assert!(!root.path().join("survived").exists());
 }
 
+/// Codex review N1: an invalid `AIM_CODE_MODE` is said where the user runs aim, once.
+#[test]
+fn an_invalid_code_mode_is_reported_on_stderr_once() {
+    let home = tempfile::tempdir().expect("home");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_aim"))
+        .args(["run", "--ephemeral", "-p", "no-such-provider", "-C"])
+        .arg(home.path())
+        .arg("hello")
+        .env("AIM_CODE_MODE", "onn")
+        .env("AIM_HOME", home.path().join("aim"))
+        .output()
+        .expect("aim runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = "aim: AIM_CODE_MODE=\"onn\" is not off, on or only (or 0, 1, false, true); code mode is off";
+    assert_eq!(stderr.matches(warning).count(), 1, "{stderr}");
+}
+
 /// A small repository with four TODO comments (and a FIXME that is not one).
 fn todo_repository() -> tempfile::TempDir {
     let root = tempfile::tempdir().expect("repository");

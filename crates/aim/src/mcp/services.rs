@@ -204,7 +204,7 @@ pub fn with_programs(host: Arc<dyn ToolHost>, aim_home: &Path) -> Arc<dyn ToolHo
 #[must_use]
 pub fn with_code_mode(host: Arc<dyn ToolHost>, aim_home: &Path, code: Option<crate::host::CodeConfig>) -> Arc<dyn ToolHost> {
     let Some(code) = code else { return host };
-    let exposure = crate::coderun::mode::decide(Some(code.mode), true, true, true);
+    let exposure = crate::coderun::mode::decide(crate::coderun::mode::CodeModeRequest::Set(code.mode), true, true, true);
     if !exposure.code {
         return host;
     }
