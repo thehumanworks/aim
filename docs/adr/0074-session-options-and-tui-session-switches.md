@@ -80,9 +80,12 @@ seen values (wrong across providers).
    already resolved (REV-T1 B1). A model change also drops the latest options at the bump, under
    the transcript lock, so an attach never reads the old model's ladder next to the new model: it
    gets none and the new ones follow on its stream; a TUI that reattaches and sees another model
-   treats the ladder it kept as stale. The live summary's model follows every announced change and a
+   treats the ladder it kept as stale. The live summary's model follows every `ConfigChanged` and a
    resumed session's summary shows the model it resumed with, so a client attaching later is told
-   the model in force.
+   the model in force. Once the change is logged, the summary update and the `ConfigChanged`
+   broadcast are one step under the transcript lock that `attach` snapshots and subscribes under:
+   an attach sees the old model and then the update, or the new model and not the update, never the
+   old model followed by the new model's options (REV-T1b B2).
    Native sessions answer from the catalog W26 fetched at start (codex) or from one bounded
    background fetch (the gateways' catalog is cached by the provider), without hidden models, with
    the current model's ladder and the default effort marked. ACP sessions answer from the agent's
@@ -131,7 +134,11 @@ seen values (wrong across providers).
   then `ConfigChanged`, then the new lookup, in the session's task) is by inspection: the stale
   lookup sends `Options` holding the options lock, and `announce` bumps under that lock before it
   sends `ConfigChanged` (lock-free, through `publish`), so an old generation's `Options` can only
-  precede its `ConfigChanged`. Reattach: `crates/aim/src/tui/app/tests.rs::a_reattach_after_a_missed_model_change_does_not_trust_the_old_ladder`. Summary model:
+  precede its `ConfigChanged`. Summary and stream in one step:
+  `crates/aim/src/host.rs::tests::a_model_change_reaches_the_summary_and_the_stream_in_one_step`
+  (holds the attach lock across the transition; fails with the old ordering) and
+  `crates/aim/tests/host.rs::attaches_racing_model_changes_never_pair_a_model_with_another_ladder`
+  (40 attaches against 40 model changes; it caught the old ordering in 3 of 5 runs). Reattach: `crates/aim/src/tui/app/tests.rs::a_reattach_after_a_missed_model_change_does_not_trust_the_old_ladder`. Summary model:
   `crates/aim/tests/host.rs::attach_reports_the_model_in_force_after_a_change_and_a_resume`; what
   `auto` does: `options_say_what_auto_does_in_an_advised_session`.
 - Contract: `crates/aim-proto/tests/contract.rs::adr_0074_session_options_are_additive`.
