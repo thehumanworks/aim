@@ -74,3 +74,4 @@ Rules (enforced by `mise run check`):
 | [0055](0055-board-attempt-identity-and-worker-boundary.md) | Bind cleanup to an attempt and narrow worker authority. |
 | [0063](0063-compose-native-mcp-and-board-tools.md) | Compose trusted MCP and durable board tools, with a private last-known MCP catalog. |
 | [0065](0065-locked-digests-resolve-names-by-module.md) | LOCKED digests resolve kernel names by module. |
+| [0068](0068-crash-safe-board-integration.md) | Reconcile board integration from pinned Git observations. |

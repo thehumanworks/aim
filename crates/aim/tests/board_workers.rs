@@ -193,6 +193,10 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+fn git_ref_exists(repo: &Path, name: &str) -> bool {
+    std::process::Command::new("git").args(["show-ref", "--verify", "--quiet", name]).current_dir(repo).status().unwrap().success()
+}
+
 fn setup(script: Script) -> (TempDir, PathBuf, PathBuf, Board, Arc<Scripted>) {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
@@ -300,11 +304,318 @@ async fn scripted_two_job_dag_runs_in_worktrees_then_integrates() {
     let second = runner.run_once().await.unwrap();
     assert_eq!((second.succeeded, second.failed), (1, 0));
     accept(&board, &b.id).await;
+    // The disposable checkout releases main so the integrator can own its checkout while
+    // advancing the branch. A user checkout of main takes the explicit apply path below.
+    git(&repo, &["switch", "--detach"]);
     let integrator = Integrator::new(board.clone(), &home, aimx()).unwrap();
     assert_eq!(integrator.integrate(a.id).await.unwrap().state, IntegrationState::Integrated);
     assert_eq!(integrator.integrate(b.id).await.unwrap().state, IntegrationState::Integrated);
     assert_eq!(git(&repo, &["show", "main:a.txt"]), "A");
     assert_eq!(git(&repo, &["show", "main:b.txt"]), "B");
+}
+
+#[tokio::test]
+async fn concurrent_calls_on_one_integrator_advance_both_jobs() {
+    let (_dir, repo, home, board, sessions) = setup(Script::Separate);
+    let a = post(&board, &repo, "A", vec![], Script::Separate).await;
+    let b = post(&board, &repo, "B", vec![], Script::Separate).await;
+    assert_eq!(worker(&home, board.clone(), sessions).run_once().await.unwrap().succeeded, 2);
+    accept(&board, &a.id).await;
+    accept(&board, &b.id).await;
+    git(&repo, &["switch", "--detach"]);
+    let integrator = Integrator::new(board, &home, aimx()).unwrap();
+    let (first, second) = tokio::join!(integrator.integrate(a.id), integrator.integrate(b.id));
+    assert_eq!(first.unwrap().state, IntegrationState::Integrated);
+    assert_eq!(second.unwrap().state, IntegrationState::Integrated);
+    assert_eq!(git(&repo, &["show", "main:a.txt"]), "A");
+    assert_eq!(git(&repo, &["show", "main:b.txt"]), "B");
+}
+
+/// A branch checked out by the user cannot be advanced by the integrator. The saved result
+/// remains reachable until the user explicitly applies it in that checkout.
+#[tokio::test]
+async fn checked_out_target_keeps_rescue_until_explicit_apply() {
+    let (_dir, repo, home, board, sessions) = setup(Script::Separate);
+    let job = post(&board, &repo, "A", vec![], Script::Separate).await;
+    assert_eq!(worker(&home, board.clone(), sessions).run_once().await.unwrap().succeeded, 1);
+    accept(&board, &job.id).await;
+    let before = git(&repo, &["rev-parse", "HEAD"]);
+    let integrator = Integrator::new(board.clone(), &home, aimx()).unwrap();
+    let result = integrator.integrate(job.id.clone()).await.unwrap();
+    assert_eq!(result.state, IntegrationState::Failed);
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), before);
+    assert!(!repo.join("a.txt").exists(), "the user checkout was not updated");
+    let rescue = result.rescue_ref.as_deref().expect("saved rescue ref");
+    assert!(git_ref_exists(&repo, rescue));
+    assert_eq!(git(&repo, &["rev-parse", rescue]), result.result_commit.unwrap());
+
+    // Git refuses a fast-forward that would replace an untracked user file.
+    std::fs::write(repo.join("a.txt"), "user work\n").unwrap();
+    assert!(integrator.apply(job.id.clone()).await.is_err());
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "user work\n");
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), before);
+    assert!(git_ref_exists(&repo, rescue));
+
+    std::fs::remove_file(repo.join("a.txt")).unwrap();
+    let applied = integrator.apply(job.id).await.unwrap();
+    assert_eq!(applied.state, IntegrationState::Integrated);
+    assert_eq!(applied.rescue_ref, None);
+    assert!(!git_ref_exists(&repo, rescue));
+    assert_eq!(git(&repo, &["show", "main:a.txt"]), "A");
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "A\n");
+}
+
+#[tokio::test]
+async fn explicit_disposal_removes_unapplied_rescue() {
+    let (_dir, repo, home, board, sessions) = setup(Script::Separate);
+    let job = post(&board, &repo, "A", vec![], Script::Separate).await;
+    assert_eq!(worker(&home, board.clone(), sessions).run_once().await.unwrap().succeeded, 1);
+    accept(&board, &job.id).await;
+    let before = git(&repo, &["rev-parse", "main"]);
+    let integrator = Integrator::new(board, &home, aimx()).unwrap();
+    let failed = integrator.integrate(job.id.clone()).await.unwrap();
+    assert_eq!(failed.state, IntegrationState::Failed);
+    let rescue = failed.rescue_ref.unwrap();
+    assert!(git_ref_exists(&repo, &rescue));
+    let disposed = integrator.discard_rescue(job.id).await.unwrap();
+    assert_eq!(disposed.state, IntegrationState::Failed);
+    assert_eq!(disposed.rescue_ref, None);
+    assert!(!git_ref_exists(&repo, &rescue));
+    assert_eq!(git(&repo, &["rev-parse", "main"]), before);
+}
+
+/// Child processes stop at each durable boundary: before a result, with a saved result, and
+/// after the target moved. A fresh integrator must reconcile OIDs and prune the old scratch.
+#[tokio::test]
+async fn integration_recovers_after_process_faults() {
+    if let Some(repo) = std::env::var_os("AIM_BOARD_TEST_REPO") {
+        let repo = PathBuf::from(repo);
+        let home = PathBuf::from(std::env::var_os("AIM_BOARD_TEST_HOME").unwrap());
+        let job_id = std::env::var("AIM_BOARD_TEST_JOB").unwrap();
+        let stage = std::env::var("AIM_BOARD_TEST_STAGE").unwrap();
+        let board = Board::open(&home.join("aim.db")).unwrap();
+        let integrator = Integrator::new(board.clone(), &home, aimx()).unwrap();
+        assert!(integrator.integrate(job_id.clone()).await.is_err(), "the injected fault must interrupt integration");
+        let intent = board.integration(job_id).await.unwrap();
+        assert_eq!(intent.state, IntegrationState::Integrating);
+        assert!(intent.scratch_path.is_some(), "startup recovery has a recorded scratch path");
+        if stage == "after_intent" || stage == "after_commit" {
+            assert!(intent.result_commit.is_none());
+        } else {
+            assert!(intent.result_commit.is_some(), "the result was durably recorded");
+        }
+        let observed = git(&repo, &["rev-parse", "main"]);
+        if stage == "after_target" {
+            assert_eq!(Some(observed.as_str()), intent.result_commit.as_deref());
+        } else {
+            assert_eq!(Some(observed.as_str()), intent.target_head.as_deref());
+        }
+        return;
+    }
+
+    for stage in ["after_intent", "after_result", "after_target"] {
+        let (_dir, repo, home, board, sessions) = setup(Script::Separate);
+        let job = post(&board, &repo, "A", vec![], Script::Separate).await;
+        assert_eq!(worker(&home, board.clone(), sessions).run_once().await.unwrap().succeeded, 1);
+        accept(&board, &job.id).await;
+        git(&repo, &["switch", "--detach"]);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "integration_recovers_after_process_faults", "--nocapture"])
+            .env("AIM_BOARD_TEST_REPO", &repo)
+            .env("AIM_BOARD_TEST_HOME", &home)
+            .env("AIM_BOARD_TEST_JOB", &job.id)
+            .env("AIM_BOARD_TEST_STAGE", stage)
+            .env("AIM_BOARD_TEST_FAULT", format!("{}:{stage}", job.id))
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{stage}: {}", String::from_utf8_lossy(&child.stderr));
+
+        let interrupted = board.integration(job.id.clone()).await.unwrap();
+        let abandoned = PathBuf::from(interrupted.scratch_path.unwrap());
+        let integrator = Integrator::new(board.clone(), &home, aimx()).unwrap();
+        let recovered = integrator.integrate(job.id).await.unwrap();
+        assert_eq!(recovered.state, IntegrationState::Integrated, "{stage}");
+        assert_eq!(Some(git(&repo, &["rev-parse", "main"])), recovered.result_commit, "{stage}");
+        assert_eq!(recovered.scratch_path, None, "{stage}");
+        assert_eq!(recovered.rescue_ref, None, "{stage}");
+        assert!(!abandoned.exists(), "{stage}");
+    }
+}
+
+/// A merge commit made before its ledger result is saved is recovered and rescued even if the
+/// source branch moves before the next integrator starts.
+#[tokio::test]
+async fn committed_scratch_result_is_rescued_after_source_moves() {
+    let (dir, repo, home, board, sessions) = setup(Script::Separate);
+    let job = post(&board, &repo, "A", vec![], Script::Separate).await;
+    assert_eq!(worker(&home, board.clone(), sessions).run_once().await.unwrap().succeeded, 1);
+    accept(&board, &job.id).await;
+    git(&repo, &["switch", "--detach"]);
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "integration_recovers_after_process_faults", "--nocapture"])
+        .env("AIM_BOARD_TEST_REPO", &repo)
+        .env("AIM_BOARD_TEST_HOME", &home)
+        .env("AIM_BOARD_TEST_JOB", &job.id)
+        .env("AIM_BOARD_TEST_STAGE", "after_commit")
+        .env("AIM_BOARD_TEST_FAULT", format!("{}:after_commit", job.id))
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stderr));
+    let before = board.integration(job.id.clone()).await.unwrap();
+    assert_eq!(before.state, IntegrationState::Integrating);
+    assert_eq!(before.result_commit, None);
+    let scratch = PathBuf::from(before.scratch_path.unwrap());
+    let source_ref = format!("refs/heads/{}", before.source_branch);
+    let accepted = git(&repo, &["rev-parse", &source_ref]);
+    let tamper = dir.path().join("unreviewed-after-commit");
+    git(&repo, &["worktree", "add", "--detach", tamper.to_str().unwrap(), &accepted]);
+    std::fs::write(tamper.join("unreviewed.txt"), "unreviewed\n").unwrap();
+    git(&tamper, &["add", "unreviewed.txt"]);
+    git(&tamper, &["commit", "-m", "unreviewed"]);
+    let unreviewed = git(&tamper, &["rev-parse", "HEAD"]);
+    git(&repo, &["update-ref", &source_ref, &unreviewed, &accepted]);
+    git(&repo, &["worktree", "remove", "--force", tamper.to_str().unwrap()]);
+
+    let recovered = Integrator::new(board, &home, aimx()).unwrap().integrate(job.id).await.unwrap();
+    assert_eq!(recovered.state, IntegrationState::Failed);
+    let result = recovered.result_commit.expect("recovered merge result");
+    let rescue = recovered.rescue_ref.expect("retained rescue ref");
+    assert_eq!(git(&repo, &["rev-parse", &rescue]), result);
+    assert_eq!(git(&repo, &["show", &format!("{result}:a.txt")]), "A");
+    assert!(!git(&repo, &["ls-tree", "-r", "--name-only", &result]).lines().any(|path| path == "unreviewed.txt"));
+    assert!(!scratch.exists());
+}
+
+/// The source ref moves after the accepted OID is checked. Git must merge the pinned OID,
+/// not resolve the branch name again after the interleaving.
+#[tokio::test]
+async fn source_ref_move_cannot_add_unreviewed_commit_to_merge() {
+    if let Some(repo) = std::env::var_os("AIM_BOARD_RACE_REPO") {
+        let _repo = PathBuf::from(repo);
+        let home = PathBuf::from(std::env::var_os("AIM_BOARD_RACE_HOME").unwrap());
+        let job_id = std::env::var("AIM_BOARD_RACE_JOB").unwrap();
+        let board = Board::open(&home.join("aim.db")).unwrap();
+        let record = Integrator::new(board, &home, aimx()).unwrap().integrate(job_id).await.unwrap();
+        assert_eq!(record.state, IntegrationState::Failed);
+        assert!(record.result_commit.is_some(), "the pinned source was merged before the stale-ref check");
+        assert!(record.rescue_ref.is_some(), "the saved result remains reachable");
+        return;
+    }
+
+    let (dir, repo, home, board, sessions) = setup(Script::Separate);
+    let job = post(&board, &repo, "A", vec![], Script::Separate).await;
+    assert_eq!(worker(&home, board.clone(), sessions).run_once().await.unwrap().succeeded, 1);
+    accept(&board, &job.id).await;
+    git(&repo, &["switch", "--detach"]);
+    let source_branch = board.integration(job.id.clone()).await.unwrap().source_branch;
+    let source_ref = format!("refs/heads/{source_branch}");
+    let accepted = git(&repo, &["rev-parse", &source_ref]);
+    let pause = dir.path().join("pause");
+    std::fs::create_dir(&pause).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "source_ref_move_cannot_add_unreviewed_commit_to_merge", "--nocapture"])
+        .env("AIM_BOARD_RACE_REPO", &repo)
+        .env("AIM_BOARD_RACE_HOME", &home)
+        .env("AIM_BOARD_RACE_JOB", &job.id)
+        .env("AIM_BOARD_TEST_PAUSE_AFTER_SOURCE_CHECK", &pause)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !pause.join("ready").exists() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            let output = child.wait_with_output().unwrap();
+            panic!("integrator exited before source-check pause: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !pause.join("ready").exists() {
+        if child.try_wait().unwrap().is_none() {
+            drop(child.kill());
+        }
+        let output = child.wait_with_output().unwrap();
+        panic!("integrator did not reach source-check pause: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    let tamper = dir.path().join("unreviewed");
+    git(&repo, &["worktree", "add", "--detach", tamper.to_str().unwrap(), &accepted]);
+    std::fs::write(tamper.join("unreviewed.txt"), "never accepted\n").unwrap();
+    git(&tamper, &["add", "unreviewed.txt"]);
+    git(&tamper, &["commit", "-m", "unreviewed"]);
+    let unreviewed = git(&tamper, &["rev-parse", "HEAD"]);
+    git(&repo, &["update-ref", &source_ref, &unreviewed, &accepted]);
+    git(&repo, &["worktree", "remove", "--force", tamper.to_str().unwrap()]);
+    std::fs::write(pause.join("release"), "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let failed = board.integration(job.id).await.unwrap();
+    assert_eq!(failed.state, IntegrationState::Failed);
+    let result = failed.result_commit.unwrap();
+    assert_eq!(git(&repo, &["show", &format!("{result}:a.txt")]), "A");
+    assert!(!git(&repo, &["ls-tree", "-r", "--name-only", &result]).lines().any(|path| path == "unreviewed.txt"));
+    assert!(git_ref_exists(&repo, failed.rescue_ref.as_deref().unwrap()));
+    assert_eq!(git(&repo, &["rev-parse", &source_ref]), unreviewed, "the ref really moved during integration");
+}
+
+/// A user can check out main while the merge is being prepared. The integrator must discover
+/// that Git will not grant its scratch worktree ownership and retain the result for apply.
+#[tokio::test]
+async fn target_checked_out_during_integration_stays_untouched() {
+    if let Some(home) = std::env::var_os("AIM_BOARD_TARGET_RACE_HOME") {
+        let home = PathBuf::from(home);
+        let job_id = std::env::var("AIM_BOARD_TARGET_RACE_JOB").unwrap();
+        let board = Board::open(&home.join("aim.db")).unwrap();
+        let failed = Integrator::new(board, &home, aimx()).unwrap().integrate(job_id).await.unwrap();
+        assert_eq!(failed.state, IntegrationState::Failed);
+        assert!(failed.result_commit.is_some());
+        assert!(failed.rescue_ref.is_some());
+        return;
+    }
+
+    let (dir, repo, home, board, sessions) = setup(Script::Separate);
+    let job = post(&board, &repo, "A", vec![], Script::Separate).await;
+    assert_eq!(worker(&home, board.clone(), sessions).run_once().await.unwrap().succeeded, 1);
+    accept(&board, &job.id).await;
+    let before = git(&repo, &["rev-parse", "main"]);
+    git(&repo, &["switch", "--detach"]);
+    let pause = dir.path().join("pause");
+    std::fs::create_dir(&pause).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "target_checked_out_during_integration_stays_untouched", "--nocapture"])
+        .env("AIM_BOARD_TARGET_RACE_HOME", &home)
+        .env("AIM_BOARD_TARGET_RACE_JOB", &job.id)
+        .env("AIM_BOARD_TEST_PAUSE_AFTER_SOURCE_CHECK", &pause)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !pause.join("ready").exists() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            let output = child.wait_with_output().unwrap();
+            panic!("integrator exited before source-check pause: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !pause.join("ready").exists() {
+        if child.try_wait().unwrap().is_none() {
+            drop(child.kill());
+        }
+        let output = child.wait_with_output().unwrap();
+        panic!("integrator did not reach source-check pause: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    git(&repo, &["switch", "main"]);
+    std::fs::write(pause.join("release"), "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let failed = board.integration(job.id).await.unwrap();
+    assert_eq!(failed.state, IntegrationState::Failed);
+    assert!(git_ref_exists(&repo, failed.rescue_ref.as_deref().unwrap()));
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), before);
+    assert!(!repo.join("a.txt").exists());
+    assert!(git(&repo, &["status", "--porcelain"]).is_empty());
 }
 
 #[tokio::test]
@@ -366,6 +677,7 @@ async fn conflicting_integrations_leave_conflict_files() {
     assert_eq!(runner.run_once().await.unwrap().succeeded, 2);
     accept(&board, &a.id).await;
     accept(&board, &b.id).await;
+    git(&repo, &["switch", "--detach"]);
     let integrator = Integrator::new(board, &home, aimx()).unwrap();
     assert_eq!(integrator.integrate(a.id).await.unwrap().state, IntegrationState::Integrated);
     let conflict = integrator.integrate(b.id).await.unwrap();
@@ -632,6 +944,7 @@ async fn live_board_worker_codex_end_to_end() {
     assert_eq!(summary["succeeded"], 1);
     let worked = began.elapsed();
     accept(&board, &job.id).await;
+    git(&repo, &["switch", "--detach"]);
     let record = Integrator::new(board, &home, aimx()).unwrap().integrate(job.id).await.unwrap();
     assert_eq!(record.state, IntegrationState::Integrated);
     assert!(git(&repo, &["show", "main:maths.py"]).contains("return a + b"));

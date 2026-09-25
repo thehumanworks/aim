@@ -17,6 +17,7 @@ use super::Error;
 type Task = Box<dyn FnOnce(&mut Connection, &broadcast::Sender<BoardEvent>) + Send>;
 const QUEUE_CAPACITY: usize = 256;
 const BOARD_SCHEMA_VERSION: i64 = 1;
+const INTEGRATION_SCHEMA_VERSION: i64 = 1;
 
 /// One board actor with one SQLite connection, sharing the session store's WAL file.
 #[derive(Clone)]
@@ -71,6 +72,9 @@ const SCHEMA: &str = "
     PRAGMA synchronous = FULL;
     PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS board_schema (
+        version INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS board_integration_schema (
         version INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS board_runs (
@@ -192,6 +196,9 @@ const SCHEMA: &str = "
         state TEXT NOT NULL CHECK(state IN ('queued','integrating','integrated','conflict','failed')),
         target_head TEXT,
         source_commit TEXT,
+        scratch_path TEXT,
+        result_commit TEXT,
+        rescue_ref TEXT,
         conflicts_json TEXT NOT NULL DEFAULT '[]',
         artifact_id TEXT,
         created_ms INTEGER NOT NULL,
@@ -206,8 +213,8 @@ const SCHEMA: &str = "
     ) WITHOUT ROWID;
 ";
 
-// Version 1 is additive: the previous binary ignores board_schema and the worker-hold index,
-// and still finds the claim_key column and its unique index after an upgraded store is opened.
+// Integration schema is versioned separately so a FIX15 binary still sees board_schema version 1
+// and can read the expanded rows. The schema lock spans both additive migrations.
 fn migrate(conn: &mut Connection) -> Result<(), Error> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(backend)?;
     let version: Option<i64> =
@@ -229,6 +236,28 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
             tx.execute("INSERT INTO board_schema (version) VALUES (?1)", [BOARD_SCHEMA_VERSION]).map_err(backend)?;
         }
         Some(other) => return Err(Error::Storage(format!("unsupported board schema version {other}"))),
+    }
+    let integration_version: Option<i64> =
+        tx.query_row("SELECT version FROM board_integration_schema LIMIT 1", [], |row| row.get(0)).optional().map_err(backend)?;
+    match integration_version {
+        Some(INTEGRATION_SCHEMA_VERSION) => {}
+        None => {
+            let mut columns = tx.prepare("PRAGMA table_info(board_integrations)").map_err(backend)?;
+            let names =
+                columns.query_map([], |row| row.get::<_, String>(1)).map_err(backend)?.collect::<Result<Vec<_>, _>>().map_err(backend)?;
+            drop(columns);
+            for (name, statement) in [
+                ("scratch_path", "ALTER TABLE board_integrations ADD COLUMN scratch_path TEXT"),
+                ("result_commit", "ALTER TABLE board_integrations ADD COLUMN result_commit TEXT"),
+                ("rescue_ref", "ALTER TABLE board_integrations ADD COLUMN rescue_ref TEXT"),
+            ] {
+                if !names.iter().any(|column| column == name) {
+                    tx.execute_batch(statement).map_err(backend)?;
+                }
+            }
+            tx.execute("INSERT INTO board_integration_schema (version) VALUES (?1)", [INTEGRATION_SCHEMA_VERSION]).map_err(backend)?;
+        }
+        Some(other) => return Err(Error::Storage(format!("unsupported integration schema version {other}"))),
     }
     tx.commit().map_err(backend)
 }
@@ -408,6 +437,37 @@ mod tests {
         assert!(failed.is_err());
         let alive = ledger.transact(|tx| tx.query_row("SELECT 1", [], |row| row.get::<_, i64>(0)).map_err(backend)).await.unwrap();
         assert_eq!(alive, 1);
+    }
+
+    #[test]
+    fn integration_columns_upgrade_existing_board_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".aim/aim.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE board_schema (version INTEGER NOT NULL); \
+             INSERT INTO board_schema VALUES (1); \
+             CREATE TABLE board_integrations ( \
+                 job_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, \
+                 source_branch TEXT NOT NULL, target_branch TEXT NOT NULL, \
+                 state TEXT NOT NULL, target_head TEXT, source_commit TEXT, \
+                 conflicts_json TEXT NOT NULL DEFAULT '[]', artifact_id TEXT, \
+                 created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL \
+             ) WITHOUT ROWID;",
+        )
+        .unwrap();
+        drop(old);
+        Ledger::open(&path).unwrap();
+        let upgraded = Connection::open(path).unwrap();
+        let version: i64 = upgraded.query_row("SELECT version FROM board_schema", [], |row| row.get(0)).unwrap();
+        let integration_version: i64 = upgraded.query_row("SELECT version FROM board_integration_schema", [], |row| row.get(0)).unwrap();
+        assert_eq!((version, integration_version), (1, 1));
+        let mut statement = upgraded.prepare("PRAGMA table_info(board_integrations)").unwrap();
+        let columns = statement.query_map([], |row| row.get::<_, String>(1)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        for column in ["scratch_path", "result_commit", "rescue_ref"] {
+            assert_eq!(columns.iter().filter(|name| *name == column).count(), 1);
+        }
     }
 
     #[tokio::test]

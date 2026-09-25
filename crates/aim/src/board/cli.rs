@@ -21,7 +21,13 @@ use sha2::{Digest as _, Sha256};
 use crate::daemon::client::DaemonClient;
 use crate::daemon::spawn::connect_or_spawn;
 use crate::workers::{Integrator, Runner, RunnerOptions};
-use crate::{board::Board, cli as aim_cli};
+use crate::{
+    board::{
+        Board,
+        integration::{IntegrationRecord, IntegrationState},
+    },
+    cli as aim_cli,
+};
 
 /// `aim board` commands. Claim secrets are stored under `AIM_HOME/run/board-claims` and never printed.
 #[derive(Subcommand)]
@@ -214,6 +220,31 @@ pub enum BoardAction {
         #[arg(long)]
         json: bool,
     },
+    /// Fast-forward a saved result in your checkout; do not switch its branch while this runs.
+    Apply {
+        /// One accepted job to apply, or omit with `--all`.
+        job_id: Option<String>,
+        /// Apply every saved result that can fast-forward in order.
+        #[arg(long)]
+        all: bool,
+        /// Explicit aimx executable.
+        #[arg(long)]
+        aimx: Option<PathBuf>,
+        /// Emit JSON integration records.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly delete an unapplied result's owned rescue ref.
+    DiscardRescue {
+        /// Job whose retained result is being discarded.
+        job_id: String,
+        /// Explicit aimx executable.
+        #[arg(long)]
+        aimx: Option<PathBuf>,
+        /// Emit JSON integration state.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Failure-worktree choice when posting an editing job.
@@ -254,6 +285,24 @@ fn print_job(job: &JobSnapshot, json: bool) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     for artifact in &job.artifacts {
         writeln!(out, "  artifact {}  {}  {} bytes", artifact.id, artifact.media_type, artifact.size).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn needs_apply_command(record: &IntegrationRecord) -> Option<String> {
+    (record.state == IntegrationState::Failed)
+        .then(|| record.rescue_ref.as_ref().map(|rescue| format!("git merge --ff-only {rescue}")))
+        .flatten()
+}
+
+fn print_integration(record: &IntegrationRecord, json: bool) -> Result<(), String> {
+    if json {
+        return print_json(record);
+    }
+    writeln!(std::io::stdout().lock(), "integration {} {:?}", record.job_id, record.state).map_err(|err| err.to_string())?;
+    if let Some(command) = needs_apply_command(record) {
+        writeln!(std::io::stdout().lock(), "  needs apply in the target checkout: {command}").map_err(|err| err.to_string())?;
+        writeln!(std::io::stdout().lock(), "  or run: aim board apply {}", record.job_id).map_err(|err| err.to_string())?;
     }
     Ok(())
 }
@@ -393,8 +442,29 @@ pub async fn run(home: &Path, action: BoardAction) -> Result<i32, String> {
             }
         }
         BoardAction::Show { job_id, json } => {
-            let job = client.board_show(JobRef { job_id }).await.map_err(|err| err.to_string())?;
-            print_job(&job, json)?;
+            let job = client.board_show(JobRef { job_id: job_id.clone() }).await.map_err(|err| err.to_string())?;
+            let board = Board::open(&home.join("aim.db")).map_err(|err| err.to_string())?;
+            let integration = match board.integration(job_id).await {
+                Ok(record) => Some(record),
+                Err(crate::board::Error::NotFound) => None,
+                Err(err) => return Err(err.to_string()),
+            };
+            if json {
+                if let Some(record) = &integration {
+                    print_json(&serde_json::json!({
+                        "job": job,
+                        "integration": record,
+                        "needs_apply": needs_apply_command(record),
+                    }))?;
+                } else {
+                    print_json(&job)?;
+                }
+            } else {
+                print_job(&job, false)?;
+                if let Some(record) = &integration {
+                    print_integration(record, false)?;
+                }
+            }
         }
         BoardAction::Claim { job_id, worker, attempt_id, capacity, lease_seconds, json } => {
             client.board_register_worker(RegisterWorkerParams { worker: worker.clone(), capacity }).await.map_err(|err| err.to_string())?;
@@ -567,14 +637,9 @@ pub async fn run(home: &Path, action: BoardAction) -> Result<i32, String> {
                 }
                 if auto_integrate {
                     let integrator = Integrator::new(board.clone(), home, aimx.clone())?;
-                    let integrated = integrator.integrate_queued().await?;
+                    let integrated = Box::pin(integrator.integrate_queued()).await?;
                     for record in integrated {
-                        if json {
-                            print_json(&record)?;
-                        } else {
-                            writeln!(std::io::stdout().lock(), "integration {} {:?}", record.job_id, record.state)
-                                .map_err(|err| err.to_string())?;
-                        }
+                        print_integration(&record, json)?;
                     }
                 }
                 if once {
@@ -589,12 +654,30 @@ pub async fn run(home: &Path, action: BoardAction) -> Result<i32, String> {
         BoardAction::Integrate { job_id, aimx, json } => {
             let board = Board::open(&home.join("aim.db")).map_err(|err| err.to_string())?;
             let integrator = Integrator::new(board, home, aim_cli::find_aimx(aimx.as_deref()))?;
-            let record = integrator.integrate(job_id).await?;
-            if json {
-                print_json(&record)?;
-            } else {
-                writeln!(std::io::stdout().lock(), "integration {} {:?}", record.job_id, record.state).map_err(|err| err.to_string())?;
+            let record = Box::pin(integrator.integrate(job_id)).await?;
+            print_integration(&record, json)?;
+        }
+        BoardAction::Apply { job_id, all, aimx, json } => {
+            if all == job_id.is_some() {
+                return Err("provide one job ID or --all".into());
             }
+            let board = Board::open(&home.join("aim.db")).map_err(|err| err.to_string())?;
+            let jobs = if let Some(job_id) = job_id {
+                vec![job_id]
+            } else {
+                board.pending_apply_integrations().await.map_err(|err| err.to_string())?.into_iter().map(|record| record.job_id).collect()
+            };
+            let integrator = Integrator::new(board, home, aim_cli::find_aimx(aimx.as_deref()))?;
+            for job_id in jobs {
+                let record = Box::pin(integrator.apply(job_id)).await?;
+                print_integration(&record, json)?;
+            }
+        }
+        BoardAction::DiscardRescue { job_id, aimx, json } => {
+            let board = Board::open(&home.join("aim.db")).map_err(|err| err.to_string())?;
+            let integrator = Integrator::new(board, home, aim_cli::find_aimx(aimx.as_deref()))?;
+            let record = Box::pin(integrator.discard_rescue(job_id)).await?;
+            print_integration(&record, json)?;
         }
     }
     Ok(0)
