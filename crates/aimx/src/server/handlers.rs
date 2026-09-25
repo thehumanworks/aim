@@ -8,16 +8,18 @@ use std::time::Duration;
 
 use aim_kernel::negotiate::{Generations, negotiate};
 use aim_kernel::policy::Limits as PolicyLimits;
+use aim_proto::content::Content;
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{
     BackendSpec, CallScope, EditOutcome, ExecReadParams, ExecReadResult, ExecReleaseParams, ExecResizeParams, ExecSignalParams,
-    ExecSpawnParams, ExecSpawnResult, ExecWriteStdinParams, FsEditParams, FsListParams, FsListResult, FsMkdirParams, FsReadParams,
-    FsReadResult, FsRemoveParams, FsRenameParams, FsStatParams, FsWriteParams, GlobParams, GlobResult, GrepParams, GrepResult,
-    InitializeParams, InitializeResult, Meta, PeerInfo, ToolsCallParams, ToolsListResult, WorkspaceInfo, WorkspaceOpenParams, WriteOutcome,
+    ExecSpawnParams, ExecSpawnResult, ExecWriteStdinParams, FsCancelParams, FsEditParams, FsFinalizeParams, FsListParams, FsListResult,
+    FsMkdirParams, FsReadParams, FsReadResult, FsRemoveParams, FsRenameParams, FsReserveParams, FsReserveResult, FsStatParams,
+    FsWriteParams, GlobParams, GlobResult, GrepParams, GrepResult, InitializeParams, InitializeResult, Meta, PeerInfo, ToolsCallParams,
+    ToolsListResult, WorkspaceInfo, WorkspaceOpenParams, WriteOutcome,
 };
 use aim_proto::harness::{
-    ExecRead, ExecRelease, ExecResize, ExecSignal, ExecSpawn, ExecWriteStdin, FsEdit, FsList, FsMkdir, FsRead, FsRemove, FsRename, FsStat,
-    FsWrite, Glob, Grep, Initialize, ToolsCall, ToolsList, WorkspaceOpen,
+    ExecRead, ExecRelease, ExecResize, ExecSignal, ExecSpawn, ExecWriteStdin, FsCancel, FsEdit, FsFinalize, FsList, FsMkdir, FsRead,
+    FsRemove, FsRename, FsReserve, FsStat, FsWrite, Glob, Grep, Initialize, ToolsCall, ToolsList, WorkspaceOpen,
 };
 use aim_proto::harness::{
     ExecWait, ExecWaitParams, ExecWaitResult, FsCopy, FsCopyParams, FsReadMany, FsReadManyParams, FsReadManyResult, ReadManyEntry,
@@ -30,10 +32,10 @@ use aim_rpc::{RequestCtx, Router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::session::{OpenWorkspace, Session};
+use super::session::{OpenWorkspace, Reservation, Session};
 use super::token::TokenStore;
 use super::{State, lock};
-use crate::authz::confine::normalize;
+use crate::authz::confine::{is_within, normalize};
 use crate::authz::{Access, Grant};
 use crate::tools::{self, ToolCtx};
 use crate::workspace::local::{LocalConfig, LocalWorkspace, OpenRoot};
@@ -107,6 +109,9 @@ pub(super) fn router(state: Arc<State>, id: u64, tokens: Option<Arc<TokenStore>>
     let router = route!(router, FsStat, fs_stat);
     let router = route!(router, FsRead, fs_read);
     let router = route!(router, FsWrite, fs_write);
+    let router = route!(router, FsReserve, fs_reserve);
+    let router = route!(router, FsFinalize, fs_finalize);
+    let router = route!(router, FsCancel, fs_cancel);
     let router = route!(router, FsEdit, fs_edit);
     let router = route!(router, FsList, fs_list);
     let router = route!(router, FsMkdir, fs_mkdir);
@@ -313,6 +318,12 @@ impl Conn {
         if let Some(descriptor) = root_descriptor {
             grant = grant.bind_local_root(descriptor);
         }
+        if let Some(bound) = session.ceiling() {
+            let canonical = grant.ceiling(&bound, self.policy_limits())?;
+            if !canonical.roots.iter().any(|prefix| is_within(prefix, &root) || is_within(&root, prefix)) {
+                return Err(ProtoError::new(ErrorCode::Denied, "workspace is outside the session ceiling roots"));
+            }
+        }
         if let Some(ceiling) = params.ceiling.as_ref() {
             session.bind_ceiling(&grant, ceiling, self.policy_limits())?;
         }
@@ -368,6 +379,103 @@ impl Conn {
                 key: &p.idempotency_key,
             };
             ws.backend.fs().write(request).await
+        })
+        .await
+    }
+
+    async fn fs_reserve(self: Arc<Self>, params: FsReserveParams) -> Outcome<FsReserveResult> {
+        if !params.if_absent {
+            return Err(ProtoError::new(ErrorCode::InvalidParams, "only if_absent reservations are supported"));
+        }
+        let (session, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let path = ws.grant.path(&params.path, Access::Write)?;
+        if !ws.backend.fs().supports_reservations() {
+            return Err(ProtoError::new(ErrorCode::Unavailable, "this workspace cannot reserve files"));
+        }
+        let work_ws = Arc::clone(&ws);
+        let work_session = Arc::clone(&session);
+        let params_work = params.clone();
+        self.idempotent(&ws, &params.idempotency_key, FsReserve::NAME, &params, Some(&session), async move {
+            let id = crate::id::secret_hex().ok_or_else(|| ProtoError::new(ErrorCode::Unavailable, "cannot create a reservation id"))?;
+            let marker = format!("aim-reservation:{id}");
+            let content = Content::from_bytes(marker.into_bytes());
+            let outcome = work_ws
+                .backend
+                .fs()
+                .write(WriteRequest {
+                    path: &path,
+                    content: &content,
+                    precondition: &aim_proto::harness::Precondition::IfAbsent,
+                    create_dirs: true,
+                    key: &params_work.idempotency_key,
+                })
+                .await?;
+            let claim = Reservation {
+                workspace: params_work.workspace.clone(),
+                path: path.clone(),
+                hash: outcome.hash.clone(),
+                backend: Arc::clone(&work_ws.backend),
+                active: true,
+            };
+            if let Err(err) = work_session.add_reservation(id.clone(), claim) {
+                if let Err(cleanup) = work_ws.backend.fs().cancel_if_hash(&path, &outcome.hash).await {
+                    tracing::warn!(%cleanup, "could not release excess file reservation");
+                }
+                return Err(err);
+            }
+            Ok(FsReserveResult { reservation: id })
+        })
+        .await
+    }
+
+    async fn fs_finalize(self: Arc<Self>, params: FsFinalizeParams) -> Outcome<WriteOutcome> {
+        let (session, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let work_session = Arc::clone(&session);
+        let work_ws = Arc::clone(&ws);
+        let params_work = params.clone();
+        self.idempotent(&ws, &params.idempotency_key, FsFinalize::NAME, &params, Some(&session), async move {
+            let reservation = work_session.reservation(&params_work.reservation)?;
+            let mut claim = reservation.lock().await;
+            if !claim.active || claim.workspace != params_work.workspace {
+                return Err(ProtoError::new(ErrorCode::NotFound, "unknown file reservation"));
+            }
+            work_ws.grant.path(&claim.path, Access::Write)?;
+            let outcome = claim
+                .backend
+                .fs()
+                .write(WriteRequest {
+                    path: &claim.path,
+                    content: &params_work.content,
+                    precondition: &aim_proto::harness::Precondition::IfHash { hash: claim.hash.clone() },
+                    create_dirs: false,
+                    key: &params_work.idempotency_key,
+                })
+                .await?;
+            claim.active = false;
+            drop(claim);
+            work_session.remove_reservation(&params_work.reservation);
+            Ok(outcome)
+        })
+        .await
+    }
+
+    async fn fs_cancel(self: Arc<Self>, params: FsCancelParams) -> Outcome<()> {
+        let (session, ws) = self.scoped_workspace(&params.workspace, params.scope.as_ref())?;
+        let work_session = Arc::clone(&session);
+        let work_ws = Arc::clone(&ws);
+        let params_work = params.clone();
+        self.idempotent(&ws, &params.idempotency_key, FsCancel::NAME, &params, Some(&session), async move {
+            let reservation = work_session.reservation(&params_work.reservation)?;
+            let mut claim = reservation.lock().await;
+            if !claim.active || claim.workspace != params_work.workspace {
+                return Err(ProtoError::new(ErrorCode::NotFound, "unknown file reservation"));
+            }
+            work_ws.grant.path(&claim.path, Access::Write)?;
+            claim.backend.fs().cancel_if_hash(&claim.path, &claim.hash).await?;
+            claim.active = false;
+            drop(claim);
+            work_session.remove_reservation(&params_work.reservation);
+            Ok(())
         })
         .await
     }

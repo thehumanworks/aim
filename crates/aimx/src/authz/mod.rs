@@ -28,6 +28,8 @@ pub struct Principal {
     pub roots: Vec<String>,
     /// The principal may only read (no writes, no processes, no mutating tools).
     pub read_only: bool,
+    /// A network bearer's bound session ceiling. Local principals have no extra ceiling.
+    pub ceiling: Option<CallScope>,
 }
 
 impl Principal {
@@ -413,7 +415,7 @@ mod tests {
     use super::*;
 
     fn grant(read_only: bool) -> Grant {
-        let principal = Arc::new(Principal { id: "local:1".into(), roots: vec!["/home/u".into()], read_only });
+        let principal = Arc::new(Principal { id: "local:1".into(), roots: vec!["/home/u".into()], read_only, ceiling: None });
         let protected = Arc::new(ProtectedPaths::defaults("/home/u", Some("# comment\n~/secret\n/home/u/w/locked\nrelative\n")));
         Grant::new(principal, protected, "/home/u/w".into(), Some("/alias/w".into()))
     }
@@ -426,7 +428,7 @@ mod tests {
 
     #[test]
     fn roots_bound_workspaces() {
-        let principal = Principal { id: "p".into(), roots: vec!["/home/u".into()], read_only: false };
+        let principal = Principal { id: "p".into(), roots: vec!["/home/u".into()], read_only: false, ceiling: None };
         assert!(principal.may_open("/home/u"));
         assert!(principal.may_open("/home/u/w"));
         assert!(!principal.may_open("/home/ux"));
@@ -449,7 +451,7 @@ mod tests {
 
     #[test]
     fn tree_operations_cannot_take_protected_children() {
-        let principal = Arc::new(Principal { id: "p".into(), roots: vec!["/home/u".into()], read_only: false });
+        let principal = Arc::new(Principal { id: "p".into(), roots: vec!["/home/u".into()], read_only: false, ceiling: None });
         let protected = Arc::new(ProtectedPaths::defaults("/home/u", None));
         let g = Grant::new(principal, protected, "/home/u".into(), None);
         assert_eq!(g.path(".aim", Access::Tree).unwrap_err().code, ErrorCode::Denied);

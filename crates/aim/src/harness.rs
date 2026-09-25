@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use aim_proto::content::Content;
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{
-    AuthProof, BackendSpec, ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, ExecRead, ExecReadParams, ExecReadResult, FsWrite,
-    FsWriteParams, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, Precondition, ToolsCall, ToolsCallParams,
-    ToolsList, ToolsListParams, WatchEvent, WatchEventParams, WorkspaceInfo, WorkspaceOpen, WorkspaceOpenParams,
+    AuthProof, BackendSpec, ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, ExecRead, ExecReadParams, ExecReadResult, FsCancel,
+    FsCancelParams, FsFinalize, FsFinalizeParams, FsReserve, FsReserveParams, FsWrite, FsWriteParams, GenerationRange, Initialize,
+    InitializeParams, InitializeResult, PeerInfo, Precondition, ToolsCall, ToolsCallParams, ToolsList, ToolsListParams, WatchEvent,
+    WatchEventParams, WorkspaceInfo, WorkspaceOpen, WorkspaceOpenParams,
 };
 use aim_proto::ids::{IdempotencyKey, ResumeToken};
 use aim_proto::rpc::Notification as _;
@@ -44,6 +45,41 @@ fn validate_network_url(raw: &str, cleartext: &str, encrypted: &str) -> Result<(
         return Err(ProtoError::new(ErrorCode::InvalidParams, "cleartext harness URL requires loopback"));
     }
     Ok(())
+}
+
+fn remote_ca_pem() -> Result<Option<Vec<u8>>, ProtoError> {
+    let Some(path) = std::env::var_os("AIM_REMOTE_CA_CERT") else { return Ok(None) };
+    let bytes = std::fs::read(path).map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "remote CA certificate unavailable"))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, "remote CA certificate too large"));
+    }
+    Ok(Some(bytes))
+}
+
+fn ensure_tls_provider() {
+    // The process may link both rustls crypto backends through unrelated dependencies. Select
+    // one only when the embedder has not chosen already, so rustls defaults cannot panic.
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _installed = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
+fn remote_ca_connector() -> Result<Option<tokio_tungstenite::Connector>, ProtoError> {
+    let Some(bytes) = remote_ca_pem()? else { return Ok(None) };
+    let certificates = rustls_pemfile::certs(&mut bytes.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "invalid remote CA certificate"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    let (accepted, _) = roots.add_parsable_certificates(certificates);
+    if accepted == 0 {
+        return Err(ProtoError::new(ErrorCode::InvalidParams, "invalid remote CA certificate"));
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| ProtoError::new(ErrorCode::Unavailable, "remote TLS configuration unavailable"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::new(config))))
 }
 
 /// A notification from the connected harness.
@@ -427,6 +463,9 @@ impl HarnessClient {
     pub async fn connect_ws_resume(url: &str, token: &str, root: &str, resume: Option<ResumeToken>) -> Result<Self, ProtoError> {
         validate_network_url(url, "ws", "wss")?;
         let mut endpoint = reqwest::Url::parse(url).map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "invalid harness URL"))?;
+        if endpoint.scheme() == "wss" {
+            ensure_tls_provider();
+        }
         if endpoint.path() == "/" {
             endpoint.set_path("/rpc");
         }
@@ -434,7 +473,8 @@ impl HarnessClient {
         let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
         config.max_message_size = Some(max);
         config.max_frame_size = Some(max);
-        let (socket, _) = tokio_tungstenite::connect_async_with_config(endpoint.as_str(), Some(config), false)
+        let connector = if endpoint.scheme() == "wss" { remote_ca_connector()? } else { None };
+        let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(endpoint.as_str(), Some(config), false, connector)
             .await
             .map_err(|_| ProtoError::new(ErrorCode::Unavailable, "WebSocket handshake failed"))?;
         let stream = aim_rpc::ws::websocket_duplex(socket, max);
@@ -459,14 +499,23 @@ impl HarnessClient {
     pub async fn connect_http_resume(url: &str, token: &str, root: &str, resume: Option<ResumeToken>) -> Result<Self, ProtoError> {
         validate_network_url(url, "http", "https")?;
         let base = reqwest::Url::parse(url).map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "invalid harness URL"))?;
+        if base.scheme() == "https" {
+            ensure_tls_provider();
+        }
         let rpc = base.join("/rpc").map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "invalid harness URL"))?;
         let events = base.join("/events").map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "invalid harness URL"))?;
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| ProtoError::new(ErrorCode::Unavailable, "HTTP client setup failed"))?;
+            .redirect(reqwest::redirect::Policy::none());
+        if base.scheme() == "https"
+            && let Some(pem) = remote_ca_pem()?
+        {
+            let ca = reqwest::Certificate::from_pem(&pem)
+                .map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "invalid remote CA certificate"))?;
+            builder = builder.add_root_certificate(ca);
+        }
+        let http = builder.build().map_err(|_| ProtoError::new(ErrorCode::Unavailable, "HTTP client setup failed"))?;
         let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
         tokio::spawn(http_bridge(bridge_stream, http, rpc, events, token.to_owned(), uuid::Uuid::new_v4().to_string()));
         let (reader, writer) = tokio::io::split(client_stream);
@@ -564,6 +613,38 @@ impl ToolHost for HarnessClient {
         })
     }
 
+    fn reserve_blob(&self, path: String, key: IdempotencyKey) -> BoxFuture<Result<String, ProtoError>> {
+        let peer = self.peer.clone();
+        let workspace = self.workspace.id.clone();
+        Box::pin(async move {
+            peer.call::<FsReserve>(FsReserveParams { workspace, path, if_absent: true, idempotency_key: key, scope: None })
+                .await
+                .map(|result| result.reservation)
+        })
+    }
+
+    fn finalize_blob(&self, reservation: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        let peer = self.peer.clone();
+        let workspace = self.workspace.id.clone();
+        Box::pin(async move {
+            peer.call::<FsFinalize>(FsFinalizeParams {
+                workspace,
+                reservation,
+                content: Content::from_bytes(bytes),
+                idempotency_key: key,
+                scope: None,
+            })
+            .await
+            .map(|_| ())
+        })
+    }
+
+    fn cancel_blob(&self, reservation: String, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        let peer = self.peer.clone();
+        let workspace = self.workspace.id.clone();
+        Box::pin(async move { peer.call::<FsCancel>(FsCancelParams { workspace, reservation, idempotency_key: key, scope: None }).await })
+    }
+
     fn write_blob(&self, path: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
         let peer = self.peer.clone();
         let workspace = self.workspace.id.clone();
@@ -593,7 +674,14 @@ mod tests {
     use aimx::server::token::{TokenScope, TokenStore};
     use aimx::server::{Server, ServerConfig, local_principal};
 
-    use super::{HarnessClient, append_sse_chunk, validate_network_url};
+    use super::{HarnessClient, append_sse_chunk, ensure_tls_provider, validate_network_url};
+
+    #[test]
+    fn remote_tls_crypto_provider_can_be_reused() {
+        ensure_tls_provider();
+        ensure_tls_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 
     #[test]
     fn remote_urls_require_tls_outside_loopback_and_keep_credentials_out_of_url() {

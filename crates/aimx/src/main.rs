@@ -4,7 +4,7 @@
 //!   (many connections; peers must run as the same OS user).
 //! - `aimx serve --stdio …` serves one connection on stdin/stdout (what SSH bootstrap runs).
 //! - `aimx serve --ws ADDR | --http ADDR` serves authenticated network peers.
-//! - `aimx token create --scope read|write` issues an owner token once.
+//! - `aimx token create --scope read|write` or `--root DIR --ops read,write` issues an owner token once.
 //! - `aimx version` prints the version and the protocol generations.
 //!
 //! Logs go to stderr (never stdout, which carries the protocol in `--stdio` mode); the level comes
@@ -15,6 +15,7 @@ use std::process::ExitCode;
 use std::process::Stdio;
 use std::time::Duration;
 
+use aim_proto::harness::CallScope;
 use aim_rpc::{NoHandler, Peer, PeerConfig};
 use aimx::server::network::{NetworkOptions, NetworkProtocol};
 use aimx::server::token::{TokenScope, TokenStore};
@@ -51,9 +52,18 @@ enum Cmd {
 enum TokenCmd {
     /// Create a token, printing the secret once.
     Create {
-        /// Authority granted in the served workspace roots.
+        /// Legacy authority in the served workspace roots.
         #[arg(long, value_enum)]
-        scope: TokenScopeArg,
+        scope: Option<TokenScopeArg>,
+        /// Absolute normalized prefix permitted by this token (repeatable).
+        #[arg(long = "root", value_name = "DIR")]
+        roots: Vec<String>,
+        /// Comma-separated operations: read, write, exec.
+        #[arg(long, value_delimiter = ',', value_name = "OPS")]
+        ops: Vec<String>,
+        /// Absolute normalized prefix where writes are forbidden (repeatable).
+        #[arg(long = "deny-write", value_name = "DIR")]
+        deny_write: Vec<String>,
         /// Token lifetime, in seconds.
         #[arg(long, default_value_t = 30 * 24 * 60 * 60)]
         ttl_secs: u64,
@@ -321,15 +331,26 @@ async fn main() -> ExitCode {
             version();
             ExitCode::SUCCESS
         }
-        Cmd::Token { command: TokenCmd::Create { scope, ttl_secs } } => {
-            let scope = match scope {
-                TokenScopeArg::Read => TokenScope::Read,
-                TokenScopeArg::Write => TokenScope::Write,
-            };
+        Cmd::Token { command: TokenCmd::Create { scope, roots, ops, deny_write, ttl_secs } } => {
             let result = std::env::var("HOME").map_err(|_| "HOME is not set".to_owned()).and_then(|home| {
-                TokenStore::under_home(std::path::Path::new(&home))
-                    .create(scope, Duration::from_secs(ttl_secs))
-                    .map_err(|err| err.to_string())
+                let store = TokenStore::under_home(std::path::Path::new(&home));
+                let ttl = Duration::from_secs(ttl_secs);
+                if let Some(scope) = scope {
+                    if !roots.is_empty() || !ops.is_empty() || !deny_write.is_empty() {
+                        return Err("--scope cannot be combined with --root, --ops, or --deny-write".to_owned());
+                    }
+                    let legacy = match scope {
+                        TokenScopeArg::Read => TokenScope::Read,
+                        TokenScopeArg::Write => TokenScope::Write,
+                    };
+                    store.create(legacy, ttl).map_err(|err| err.to_string())
+                } else {
+                    if roots.is_empty() || ops.is_empty() {
+                        return Err("use --scope read|write, or provide both --root and --ops".to_owned());
+                    }
+                    let ceiling = CallScope { roots, ops, deny_write, max_processes: None, max_output_bytes: None };
+                    store.create_scoped(ceiling, ttl).map_err(|err| err.to_string())
+                }
             });
             match result {
                 Ok(token) => {
@@ -392,5 +413,36 @@ async fn main() -> ExitCode {
                 Ok(None) | Err(_) => ExitCode::FAILURE,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod token_cli_tests {
+    use super::*;
+
+    #[test]
+    fn token_create_accepts_custom_scope_and_legacy_scope() {
+        let custom = Cli::try_parse_from([
+            "aimx",
+            "token",
+            "create",
+            "--root",
+            "/workspace/one",
+            "--root",
+            "/workspace/two",
+            "--ops",
+            "read,write",
+            "--deny-write",
+            "/workspace/one/locked",
+        ])
+        .unwrap();
+        let Cmd::Token { command: TokenCmd::Create { scope, roots, ops, deny_write, .. } } = custom.command else {
+            panic!("expected token command");
+        };
+        assert!(scope.is_none());
+        assert_eq!(roots, ["/workspace/one", "/workspace/two"]);
+        assert_eq!(ops, ["read", "write"]);
+        assert_eq!(deny_write, ["/workspace/one/locked"]);
+        assert!(Cli::try_parse_from(["aimx", "token", "create", "--scope", "read"]).is_ok());
     }
 }

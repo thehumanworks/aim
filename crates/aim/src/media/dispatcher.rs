@@ -122,14 +122,6 @@ fn optional_string(arguments: &Value, field: &str) -> Result<Option<String>, Pro
     }
 }
 
-fn image_extension(media_type: &str) -> &str {
-    match media_type {
-        "image/jpeg" => "jpg",
-        "image/webp" => "webp",
-        _ => "png",
-    }
-}
-
 fn image_path(arguments: &Value) -> Result<Option<String>, ProtoError> {
     let path = optional_string(arguments, "path")?;
     if path.as_deref().is_some_and(|path| path.contains('\0') || path.ends_with('/') || path.split('/').any(|part| part == "..")) {
@@ -208,34 +200,55 @@ impl ToolHost for Dispatcher {
                 let media = Arc::clone(&self.media);
                 let workspace = Arc::clone(&self.workspace);
                 Box::pin(async move {
+                    // Choose the destination before calling the paid provider. Its media type is
+                    // unknown yet, so an automatic path uses a format-neutral suffix.
+                    let requested = path.unwrap_or_else(|| format!("images/{}.img", uuid::Uuid::new_v4()));
+                    let reserve_key = IdempotencyKey::new(format!("{}/reserve", key.as_str()));
+                    let reservation = match workspace.reserve_blob(requested.clone(), reserve_key).await {
+                        Ok(reservation) => reservation,
+                        Err(error) => return Ok(ToolResult::error(format!("Image destination cannot be reserved: {error}"))),
+                    };
+                    let cancel = || workspace.cancel_blob(reservation.clone(), IdempotencyKey::new(format!("{}/cancel", key.as_str())));
                     let image = match media.generate_image(prompt, size, quality).await {
                         Ok(image) => image,
-                        Err(error) => return Ok(ToolResult::error(error.to_string())),
+                        Err(error) => {
+                            if let Err(cleanup) = cancel().await {
+                                tracing::warn!(%cleanup, "could not cancel image reservation after provider failure");
+                            }
+                            return Ok(ToolResult::error(error.to_string()));
+                        }
                     };
                     if image.bytes.len() > MAX_IMAGE_BYTES {
+                        if let Err(cleanup) = cancel().await {
+                            tracing::warn!(%cleanup, "could not cancel oversized image reservation");
+                        }
                         return Ok(ToolResult::error("Image was generated but is too large for the harness frame; it was not saved"));
                     }
-                    let default_path = || format!("images/{}.{}", uuid::Uuid::new_v4(), image_extension(&image.media_type));
-                    let requested = path.unwrap_or_else(default_path);
-                    let actual = match workspace.write_blob(requested.clone(), image.bytes.clone(), key.clone()).await {
-                        Ok(()) => requested,
-                        Err(error) if error.code == ErrorCode::PreconditionFailed => {
-                            // The generated image is already paid for. Preserve it at a fresh path
-                            // rather than overwriting the model's chosen existing file.
-                            let fallback = default_path();
-                            let fallback_key = IdempotencyKey::new(format!("{}/fallback", key.as_str()));
-                            if let Err(error) = workspace.write_blob(fallback.clone(), image.bytes, fallback_key).await {
-                                return Ok(ToolResult::error(format!("Image was generated but could not be saved: {error}")));
-                            }
-                            fallback
+                    let media_type = image.media_type;
+                    let finalize_key = IdempotencyKey::new(format!("{}/finalize", key.as_str()));
+                    if let Err(error) = workspace.finalize_blob(reservation.clone(), image.bytes, finalize_key).await {
+                        if let Err(cleanup) = cancel().await {
+                            tracing::warn!(%cleanup, "could not cancel image reservation after finalize failure");
                         }
-                        Err(error) => return Ok(ToolResult::error(format!("Image was generated but could not be saved: {error}"))),
-                    };
-                    Ok(ToolResult::text(format!("Generated {} image saved to {actual}. Read the path to inspect it.", image.media_type)))
+                        return Ok(ToolResult::error(format!("Image was generated but could not be saved: {error}")));
+                    }
+                    Ok(ToolResult::text(format!("Generated {media_type} image saved to {requested}. Read the path to inspect it.")))
                 })
             }
             _ => self.workspace.call(name, arguments, key),
         }
+    }
+
+    fn reserve_blob(&self, path: String, key: IdempotencyKey) -> BoxFuture<Result<String, ProtoError>> {
+        self.workspace.reserve_blob(path, key)
+    }
+
+    fn finalize_blob(&self, reservation: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        self.workspace.finalize_blob(reservation, bytes, key)
+    }
+
+    fn cancel_blob(&self, reservation: String, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        self.workspace.cancel_blob(reservation, key)
     }
 
     fn write_blob(&self, path: String, bytes: Vec<u8>, key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
@@ -248,7 +261,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use aim_llm::LlmError;
+    use aim_llm::{LlmError, LlmErrorKind};
     use aim_llm_codex::media::{Citation, Image, SearchAnswer};
     use aim_proto::error::{ErrorCode, ProtoError};
     use aim_proto::ids::IdempotencyKey;
@@ -262,6 +275,8 @@ mod tests {
         shadow_search: bool,
         fail_first_write: bool,
         fail_with: Option<ErrorCode>,
+        fail_finalize_with: Option<ErrorCode>,
+        reserved: Mutex<Option<String>>,
         attempts: AtomicUsize,
         calls: Mutex<Vec<String>>,
         writes: Mutex<Vec<(String, Vec<u8>)>>,
@@ -277,14 +292,29 @@ mod tests {
             Box::pin(async { Ok(ToolResult::text("workspace result")) })
         }
 
-        fn write_blob(&self, path: String, bytes: Vec<u8>, _key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+        fn reserve_blob(&self, path: String, _key: IdempotencyKey) -> BoxFuture<Result<String, ProtoError>> {
             if let Some(code) = self.fail_with {
-                return Box::pin(async move { Err(ProtoError::new(code, "write denied")) });
+                return Box::pin(async move { Err(ProtoError::new(code, "reserve denied")) });
             }
             if self.fail_first_write && self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Box::pin(async { Err(ProtoError::new(ErrorCode::PreconditionFailed, "file exists")) });
             }
-            self.writes.lock().unwrap().push((path, bytes));
+            *self.reserved.lock().unwrap() = Some(path);
+            Box::pin(async { Ok("reservation".into()) })
+        }
+
+        fn finalize_blob(&self, _reservation: String, bytes: Vec<u8>, _key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+            if let Some(code) = self.fail_finalize_with {
+                return Box::pin(async move { Err(ProtoError::new(code, "write denied")) });
+            }
+            if let Some(path) = self.reserved.lock().unwrap().take() {
+                self.writes.lock().unwrap().push((path, bytes));
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cancel_blob(&self, _reservation: String, _key: IdempotencyKey) -> BoxFuture<Result<(), ProtoError>> {
+            *self.reserved.lock().unwrap() = None;
             Box::pin(async { Ok(()) })
         }
     }
@@ -293,11 +323,12 @@ mod tests {
         image_bytes: usize,
         image_calls: Arc<AtomicUsize>,
         cited: bool,
+        fail_image: bool,
     }
 
     impl Default for Service {
         fn default() -> Self {
-            Self { image_bytes: 3, image_calls: Arc::new(AtomicUsize::new(0)), cited: true }
+            Self { image_bytes: 3, image_calls: Arc::new(AtomicUsize::new(0)), cited: true, fail_image: false }
         }
     }
 
@@ -321,6 +352,9 @@ mod tests {
 
         fn generate_image(&self, _prompt: String, _size: Option<String>, _quality: Option<String>) -> BoxFuture<Result<Image, LlmError>> {
             self.image_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_image {
+                return Box::pin(async { Err(LlmError::new(LlmErrorKind::Unavailable, "provider unavailable")) });
+            }
             let bytes = vec![1; self.image_bytes];
             Box::pin(async move { Ok(Image { bytes, media_type: "image/png".into(), usage: None }) })
         }
@@ -378,10 +412,31 @@ mod tests {
         let calls = Arc::clone(&service.image_calls);
         let dispatcher = Dispatcher::with_policy(Arc::clone(&workspace) as Arc<dyn ToolHost>, Arc::new(service), true);
         let result = dispatcher.call("generate_image".into(), json!({"prompt":"sun","path":"art/sun.png"}), key()).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(workspace.writes.lock().unwrap().len(), 1);
-        assert!(!result.is_error);
-        assert!(!serde_json::to_string(&result).unwrap().contains("art/sun.png"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(workspace.writes.lock().unwrap().is_empty());
+        assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn read_only_scope_refuses_before_provider_call() {
+        let workspace = Arc::new(Workspace { fail_with: Some(ErrorCode::Denied), ..Workspace::default() });
+        let service = Service::default();
+        let calls = Arc::clone(&service.image_calls);
+        let dispatcher = Dispatcher::with_policy(Arc::clone(&workspace) as Arc<dyn ToolHost>, Arc::new(service), true);
+        let result = dispatcher.call("generate_image".into(), json!({"prompt":"sun","path":"art/sun.png"}), key()).await.unwrap();
+        assert!(result.is_error);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_failure_cancels_reservation() {
+        let workspace = Arc::new(Workspace::default());
+        let service = Service { fail_image: true, ..Service::default() };
+        let dispatcher = Dispatcher::with_policy(Arc::clone(&workspace) as Arc<dyn ToolHost>, Arc::new(service), true);
+        let result = dispatcher.call("generate_image".into(), json!({"prompt":"sun","path":"art/sun.png"}), key()).await.unwrap();
+        assert!(result.is_error);
+        assert!(workspace.reserved.lock().unwrap().is_none());
+        assert!(workspace.writes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -406,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_failure_tells_model_generation_was_spent() {
-        let workspace = Arc::new(Workspace { fail_with: Some(ErrorCode::Denied), ..Workspace::default() });
+        let workspace = Arc::new(Workspace { fail_finalize_with: Some(ErrorCode::Denied), ..Workspace::default() });
         let service = Service::default();
         let calls = Arc::clone(&service.image_calls);
         let dispatcher = Dispatcher::with_policy(Arc::clone(&workspace) as Arc<dyn ToolHost>, Arc::new(service), true);

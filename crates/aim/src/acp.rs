@@ -229,6 +229,9 @@ impl AcpBackend {
                 let scratch = tempfile::tempdir().map_err(|err| format!("creating local ACP scratch directory: {err}"))?;
                 (root, format!("ssh:{destination}"), Some(scratch), project, Some(remote))
             }
+            Location::Remote { .. } => {
+                return Err("strict ACP MCP relay cannot use a network harness yet".to_owned());
+            }
         };
         let cwd = scratch.as_ref().map_or_else(|| PathBuf::from(&root), |dir| dir.path().to_path_buf());
         let relay = aimx_relay(aimx, &root, &spec.location);
@@ -557,7 +560,7 @@ pub fn with_acp_at(native: BackendFactory, aimx: PathBuf) -> BackendFactory {
             }
             let (backend, root, location) = if spec.provider == "acp:claude-native" {
                 if !matches!(spec.location, Location::Local) {
-                    return Err(unavailable("Claude Code native tools cannot act on an SSH workspace"));
+                    return Err(unavailable("Claude Code native tools cannot act on a remote workspace"));
                 }
                 let root = tokio::fs::canonicalize(&spec.workspace)
                     .await

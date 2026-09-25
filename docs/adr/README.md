@@ -67,3 +67,6 @@ Rules (enforced by `mise run check`):
 | [0048](0048-board-workers-and-integration.md) | Run fenced board attempts in isolated worktrees and integrate accepted evidence serially. |
 | [0050](0050-verified-tool-dedup-and-discovery-decisions.md) | Verify named-agent tool ceilings, mutation replay, and resource-read budgets. |
 | [0051](0051-daemon-web-listener-and-browser-client.md) | Serve an authenticated Leptos browser client from the daemon's bounded WebSocket listener. |
+| [0052](0052-remote-workspace-location.md) | Persist remote harness URLs as workspace locations without credentials. |
+| [0053](0053-network-token-call-scope-ceilings.md) | Bind network bearer scopes to harness sessions. |
+| [0054](0054-reserve-image-destination-before-generation.md) | Reserve image destinations before paid generation. |

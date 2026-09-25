@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::harness::{CallScope, ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, WorkspaceInfo};
+use aim_proto::harness::{CallScope, ContentHash, ExecExited, ExecExitedParams, ExecOutput, ExecOutputParams, WorkspaceInfo};
 use aim_proto::ids::{ProcId, WorkspaceId};
 use aim_rpc::Peer;
 use tokio::sync::watch;
@@ -30,6 +30,15 @@ pub(crate) struct OpenWorkspace {
     pub(crate) backend: Arc<dyn Workspace>,
 }
 
+/// A claimed file owned by one harness session. The marker is removed only if unchanged.
+pub(crate) struct Reservation {
+    pub(crate) workspace: WorkspaceId,
+    pub(crate) path: String,
+    pub(crate) hash: ContentHash,
+    pub(crate) backend: Arc<dyn Workspace>,
+    pub(crate) active: bool,
+}
+
 /// The connection a session is attached to.
 #[derive(Clone, Debug)]
 struct Attachment {
@@ -47,10 +56,12 @@ pub(crate) struct Session {
     attached: watch::Sender<Option<Attachment>>,
     detached_at: Mutex<Option<Instant>>,
     ceiling: Mutex<Option<CallScope>>,
+    reservations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Reservation>>>>,
 }
 
 impl Session {
     fn new(token: String, principal: Arc<Principal>, procs: ProcTable, max_workspaces: usize) -> Self {
+        let ceiling = principal.ceiling.clone();
         Self {
             token,
             principal,
@@ -59,7 +70,8 @@ impl Session {
             procs: Arc::new(procs),
             attached: watch::channel(None).0,
             detached_at: Mutex::new(Some(Instant::now())),
-            ceiling: Mutex::new(None),
+            ceiling: Mutex::new(ceiling),
+            reservations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -149,6 +161,23 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn add_reservation(&self, id: String, reservation: Reservation) -> Outcome<()> {
+        let mut reservations = lock(&self.reservations);
+        if reservations.len() >= 64 {
+            return Err(ProtoError::new(ErrorCode::LimitExceeded, "too many live file reservations"));
+        }
+        reservations.insert(id, Arc::new(tokio::sync::Mutex::new(reservation)));
+        Ok(())
+    }
+
+    pub(crate) fn reservation(&self, id: &str) -> Outcome<Arc<tokio::sync::Mutex<Reservation>>> {
+        lock(&self.reservations).get(id).cloned().ok_or_else(|| ProtoError::new(ErrorCode::NotFound, "unknown file reservation"))
+    }
+
+    pub(crate) fn remove_reservation(&self, id: &str) {
+        lock(&self.reservations).remove(id);
+    }
+
     /// The workspace a process of this session runs in.
     pub(crate) fn proc_workspace(&self, proc: &ProcId) -> Outcome<Arc<OpenWorkspace>> {
         let id = self.procs.workspace(proc).ok_or_else(|| ProtoError::new(ErrorCode::NotFound, format!("unknown process `{proc}`")))?;
@@ -165,6 +194,16 @@ impl Session {
                 tracing::debug!(%err, %proc, "releasing a process at session end failed");
             }
             self.procs.remove(&proc);
+        }
+        let reservations: Vec<_> = lock(&self.reservations).drain().map(|(_, reservation)| reservation).collect();
+        for reservation in reservations {
+            let mut claim = reservation.lock().await;
+            if claim.active {
+                if let Err(err) = claim.backend.fs().cancel_if_hash(&claim.path, &claim.hash).await {
+                    tracing::warn!(%err, "could not clean up abandoned file reservation");
+                }
+                claim.active = false;
+            }
         }
         lock(&self.workspaces).clear();
         self.attached.send_replace(None);
@@ -237,7 +276,7 @@ impl State {
         peer: Peer,
     ) -> Option<(Arc<Session>, Option<Peer>)> {
         let sessions = lock(&self.sessions);
-        let session = sessions.get(token).filter(|s| s.principal.id == principal.id && !s.expired(self.config.resume_ttl))?;
+        let session = sessions.get(token).filter(|s| s.principal.as_ref() == principal && !s.expired(self.config.resume_ttl))?;
         let previous = session.attach(conn, peer);
         Some((Arc::clone(session), previous))
     }
@@ -279,7 +318,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn replacement_attach_outlives_old_detach() {
-        let principal = Arc::new(Principal { id: "test".into(), roots: Vec::new(), read_only: false });
+        let principal = Arc::new(Principal { id: "test".into(), roots: Vec::new(), read_only: false, ceiling: None });
         let procs = ProcTable::new(1, Arc::new(Semaphore::new(1)));
         let session = Arc::new(Session::new("token".into(), principal, procs, 1));
         session.attach(1, peer());

@@ -23,6 +23,8 @@ mod limits;
 #[cfg(test)]
 mod races;
 #[cfg(test)]
+mod reservation;
+#[cfg(test)]
 mod resume;
 #[cfg(test)]
 mod safety;

@@ -76,6 +76,16 @@ pub trait Fs: Send + Sync {
     /// Replaces a file atomically under a precondition.
     fn write<'a>(&'a self, req: WriteRequest<'a>) -> BoxFuture<'a, Outcome<WriteOutcome>>;
 
+    /// Whether this backend can cancel a claimed file only while its marker hash still matches.
+    fn supports_reservations(&self) -> bool {
+        false
+    }
+
+    /// Removes a reservation marker only if the file still has `hash`.
+    fn cancel_if_hash<'a>(&'a self, _path: &'a str, _hash: &'a aim_proto::harness::ContentHash) -> BoxFuture<'a, Outcome<()>> {
+        Box::pin(async { Err(ProtoError::new(ErrorCode::Unavailable, "this backend cannot cancel reservations")) })
+    }
+
     /// Applies exact-substring edits atomically: all or nothing, each edit applied to the result of
     /// the previous one; an edit whose `old` text does not occur exactly once (unless
     /// `replace_all`) fails the whole request with `conflict`.

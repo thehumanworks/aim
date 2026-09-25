@@ -506,6 +506,20 @@ fn remove(base: &Base, mutations: &Mutex<()>, path: &str, recursive: bool) -> Ou
     }
 }
 
+fn cancel_if_hash(base: &Base, mutations: &Mutex<()>, path: &str, hash: &ContentHash) -> Outcome<()> {
+    let loc = base.resolve(path, Follow::NoFinal, Authority::Path(Access::Write))?;
+    base.check_protected(&loc, false)?;
+    let (dir, name) = entry(&loc, path)?;
+    let _serial = lock(mutations);
+    let mut file = open_file(dir, name, path)?;
+    if hash_file(&mut file).map_err(|err| io_error(&err, path))? != *hash {
+        return Err(ProtoError::new(ErrorCode::PreconditionFailed, "reservation marker changed"));
+    }
+    rustix::fs::unlinkat(dir, name, AtFlags::empty()).map_err(|err| os_error(err, path))?;
+    sync_dir(dir);
+    Ok(())
+}
+
 fn rename(base: &Base, mutations: &Mutex<()>, from: &str, to: &str, overwrite: bool) -> Outcome<()> {
     let source = base.resolve(from, Follow::NoFinal, Authority::Path(Access::Tree))?;
     let target = base.resolve(to, Follow::NoFinal, Authority::Path(Access::Tree))?;
@@ -668,6 +682,18 @@ impl Fs for LocalFs {
         let precondition = req.precondition.clone();
         let create_dirs = req.create_dirs;
         Box::pin(blocking(move || write(&base, &mutations, &path, &bytes, &precondition, create_dirs)))
+    }
+
+    fn supports_reservations(&self) -> bool {
+        true
+    }
+
+    fn cancel_if_hash<'a>(&'a self, path: &'a str, hash: &'a ContentHash) -> BoxFuture<'a, Outcome<()>> {
+        let base = Arc::clone(&self.base);
+        let mutations = Arc::clone(&self.mutations);
+        let path = path.to_owned();
+        let hash = hash.clone();
+        Box::pin(blocking(move || cancel_if_hash(&base, &mutations, &path, &hash)))
     }
 
     fn edit<'a>(&'a self, req: EditRequest<'a>) -> BoxFuture<'a, Outcome<EditOutcome>> {

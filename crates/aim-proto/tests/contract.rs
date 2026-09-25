@@ -2,11 +2,25 @@
 //! domain, so this is a proof by enumeration); envelopes and content are checked by round trip.
 
 use aim_proto::content::{Base64Bytes, Content};
+use aim_proto::daemon::Location;
 use aim_proto::error::{ErrorCode, ProtoError};
 use aim_proto::harness::{self, ExactEdit, FsEditParams, Precondition};
 use aim_proto::ids::{IdempotencyKey, WorkspaceId};
 use aim_proto::rpc::{Envelope, ErrorObject, Message, Method, Notification, RequestId};
 use serde_json::json;
+
+#[test]
+fn remote_location_is_additive_and_contains_no_credential() {
+    let remote = Location::Remote { url: "wss://example.test/rpc".to_owned() };
+    let wire = serde_json::to_value(&remote).unwrap();
+    assert_eq!(wire, json!({"kind": "remote", "url": "wss://example.test/rpc"}));
+    assert_eq!(serde_json::from_value::<Location>(wire).unwrap(), remote);
+    assert_eq!(serde_json::from_value::<Location>(json!({"kind": "local"})).unwrap(), Location::Local);
+    assert_eq!(
+        serde_json::from_value::<Location>(json!({"kind": "ssh", "destination": "box"})).unwrap(),
+        Location::Ssh { destination: "box".to_owned() }
+    );
+}
 
 #[test]
 fn error_codes_are_a_bijection_between_numbers_and_names() {

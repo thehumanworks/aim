@@ -33,6 +33,8 @@ pub struct RunOptions {
     pub cwd: PathBuf,
     /// SSH destination for a remote workspace.
     pub ssh: Option<String>,
+    /// URL of an authenticated network aimx workspace.
+    pub remote: Option<String>,
     /// Path of the `aimx` binary.
     pub aimx: Option<PathBuf>,
     /// Keep nothing on disk.
@@ -178,7 +180,10 @@ impl Human {
 /// # Errors
 /// A message for the user when setup fails (workspace, provider, store, session).
 pub async fn run(options: RunOptions, factory: ProviderFactory) -> Result<i32, String> {
-    let root = if options.ssh.is_some() {
+    if options.ssh.is_some() && options.remote.is_some() {
+        return Err("--ssh and --remote are mutually exclusive".to_owned());
+    }
+    let root = if options.ssh.is_some() || options.remote.is_some() {
         options.cwd.clone()
     } else {
         options.cwd.canonicalize().map_err(|e| format!("{}: {e}", options.cwd.display()))?
@@ -196,7 +201,10 @@ pub async fn run(options: RunOptions, factory: ProviderFactory) -> Result<i32, S
 
     let spec = SessionSpec {
         workspace: root.to_string_lossy().into_owned(),
-        location: options.ssh.as_ref().map_or(Location::Local, |destination| Location::Ssh { destination: destination.clone() }),
+        location: options.remote.as_ref().map_or_else(
+            || options.ssh.as_ref().map_or(Location::Local, |destination| Location::Ssh { destination: destination.clone() }),
+            |url| Location::Remote { url: url.clone() },
+        ),
         provider: options.provider.clone(),
         model: options.model.clone(),
         effort: options.effort.clone(),

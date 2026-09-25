@@ -56,6 +56,9 @@ pub struct TuiArgs {
     /// Workspace directory.
     #[arg(short = 'C', long, default_value = ".")]
     pub cwd: PathBuf,
+    /// Network aimx endpoint (bearer from `AIM_REMOTE_TOKEN` or `AIM_REMOTE_TOKEN_FILE`).
+    #[arg(long)]
+    pub remote: Option<String>,
     /// The aimx binary (default: next to aim, else on PATH).
     #[arg(long)]
     pub aimx: Option<PathBuf>,
@@ -78,24 +81,28 @@ pub struct TuiArgs {
 }
 
 impl TuiArgs {
-    /// The workspace root (canonical).
+    /// The workspace root (canonical locally, unchanged for a remote host).
     ///
     /// # Errors
-    /// When the directory does not exist.
+    /// When a local directory does not exist.
     pub fn root(&self) -> Result<PathBuf, String> {
-        self.cwd.canonicalize().map_err(|e| format!("{}: {e}", self.cwd.display()))
+        if self.remote.is_some() {
+            Ok(self.cwd.clone())
+        } else {
+            self.cwd.canonicalize().map_err(|e| format!("{}: {e}", self.cwd.display()))
+        }
     }
 
     /// Options for [`run`] with local completion sources and the history file under `aim_home`.
     ///
     /// # Errors
-    /// When the workspace directory does not exist.
+    /// When a local workspace directory does not exist.
     pub fn options(&self) -> Result<Options, String> {
         let root = self.root()?;
         let home = crate::cli::aim_home();
         let spec = SessionSpec {
             workspace: root.to_string_lossy().into_owned(),
-            location: Location::Local,
+            location: self.remote.as_ref().map_or(Location::Local, |url| Location::Remote { url: url.clone() }),
             provider: self.provider.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
@@ -120,4 +127,22 @@ impl TuiArgs {
 /// When the terminal cannot be used.
 pub async fn run(client: Arc<dyn SessionClient>, options: Options) -> Result<i32, String> {
     shell::run(client, options).await
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use std::path::PathBuf;
+
+    use aim_proto::daemon::Location;
+
+    use super::TuiArgs;
+
+    #[test]
+    fn remote_root_does_not_require_a_local_directory() {
+        let args =
+            TuiArgs { cwd: PathBuf::from("/remote-only/project"), remote: Some("wss://example.test/rpc".to_owned()), ..TuiArgs::default() };
+        let options = args.options().unwrap();
+        assert_eq!(options.spec.workspace, "/remote-only/project");
+        assert_eq!(options.spec.location, Location::Remote { url: "wss://example.test/rpc".to_owned() });
+    }
 }

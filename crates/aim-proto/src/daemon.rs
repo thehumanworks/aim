@@ -67,6 +67,11 @@ pub enum Location {
         /// `ssh` destination.
         destination: String,
     },
+    /// A network aimx harness reached over WebSocket or HTTP. Credentials remain local.
+    Remote {
+        /// The authenticated harness endpoint; never contains a token or URL userinfo.
+        url: String,
+    },
 }
 
 /// Whether a session is kept.
