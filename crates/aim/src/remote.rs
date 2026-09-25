@@ -55,8 +55,8 @@ fn read_token_file(path: &Path) -> Result<String, ProtoError> {
         .open(path)
         .map_err(|_| ProtoError::new(ErrorCode::Denied, "remote bearer file unavailable"))?;
     let metadata = opened.metadata().map_err(|_| ProtoError::new(ErrorCode::Denied, "remote bearer file unavailable"))?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 || metadata.uid() != nix::unistd::geteuid().as_raw() {
-        return Err(ProtoError::new(ErrorCode::Denied, "remote bearer file must be owner-owned mode 0600"));
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(ProtoError::new(ErrorCode::Denied, "remote bearer file must be owner-owned and private (0600 or stricter)"));
     }
     let mut token = String::new();
     opened.take(258).read_to_string(&mut token).map_err(|_| ProtoError::new(ErrorCode::InvalidParams, "invalid remote bearer file"))?;

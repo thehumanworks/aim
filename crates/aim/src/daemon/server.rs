@@ -370,9 +370,12 @@ fn routes(connection: Arc<Connection>) -> GuardedRouter {
             }
             if let Some(lifetime) = token_lifetime {
                 let peer = ctx.peer.clone();
+                // Ends with the connection, not only with the token (REV13b).
                 tokio::spawn(async move {
-                    tokio::time::sleep(lifetime).await;
-                    peer.close();
+                    tokio::select! {
+                        () = tokio::time::sleep(lifetime) => peer.close(),
+                        () = peer.closed() => {}
+                    }
                 });
             }
             Ok(DaemonInitializeResult {

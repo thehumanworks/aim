@@ -270,3 +270,36 @@ fn web_bearer_is_hashed_private_and_expires() {
     std::fs::write(path, serde_json::to_vec(&expired).unwrap()).unwrap();
     assert!(store.authenticate(Some(&aim_proto::harness::AuthProof::Bearer { token })).is_err());
 }
+
+#[tokio::test]
+async fn a_websocket_handshake_with_two_origins_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let assets = dir.path().join("assets");
+    std::fs::create_dir(&assets).unwrap();
+    std::fs::write(assets.join("index.html"), "ok").unwrap();
+    let port = port().await;
+    let options = options(dir.path(), port);
+    let task = tokio::spawn({
+        let home = dir.path().to_path_buf();
+        async move { server::serve_web(&home, Arc::new(ProbeHost), options).await }
+    });
+    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    wait_listening(address).await;
+    let handshake = |origins: &str| {
+        format!(
+            "GET /ws HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{origins}\r\n"
+        )
+    };
+    for (origins, expected) in [
+        ("Origin: http://127.0.0.1:8000\r\n", "HTTP/1.1 101"),
+        ("Origin: http://127.0.0.1:8000\r\nOrigin: http://evil.example\r\n", "HTTP/1.1 403"),
+    ] {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(handshake(origins).as_bytes()).await.unwrap();
+        let mut head = [0_u8; 12];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut head)).await.unwrap().unwrap();
+        assert_eq!(std::str::from_utf8(&head).unwrap(), expected, "origins: {origins:?}");
+    }
+    task.abort();
+}

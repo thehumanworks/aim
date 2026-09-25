@@ -28,6 +28,11 @@ use super::{BoardService, Dedup, SessionClient, WebTokenStore, board_error, erro
 
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+/// The longest a connection may hold an admission slot before it upgrades to `/ws`. Asset
+/// requests need no bearer, so without a cap one keep-alive client could hold a slot forever
+/// and starve the WebSocket upgrade for everyone else (review `REV13b`). An upgraded session is served on
+/// its own task with its own lease and is not affected.
+const MAX_PRE_UPGRADE_CONNECTION: Duration = Duration::from_secs(60);
 const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 /// Admission and serving configuration for a browser-facing daemon listener.
@@ -151,7 +156,11 @@ fn tls_acceptor(cert: &Path, key: &Path) -> io::Result<TlsAcceptor> {
     let mut key_reader = io::BufReader::new(std::fs::File::open(key)?);
     let private = rustls_pemfile::private_key(&mut key_reader)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "TLS private key is missing"))?;
-    let config = rustls::ServerConfig::builder()
+    // An explicit provider: the workspace links both aws-lc-rs and ring, so rustls cannot pick a
+    // process default and `builder()` would panic at startup (REV13b, matching aimx's listener).
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(io::Error::other)?
         .with_no_client_auth()
         .with_single_cert(certs, PrivateKeyDer::clone_key(&private))
         .map_err(io::Error::other)?;
@@ -166,8 +175,14 @@ where
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(16 * 1024);
     let shutdown = state.shutdown.clone();
+    let serving = http
+        .serve_connection(TokioIo::new(stream), service_fn(move |request| handle_request(request, state.clone(), Arc::clone(&lease))))
+        .with_upgrades();
     tokio::select! {
-        result = http.serve_connection(TokioIo::new(stream), service_fn(move |request| handle_request(request, state.clone(), Arc::clone(&lease)))).with_upgrades() => result.map_err(io::Error::other),
+        result = tokio::time::timeout(MAX_PRE_UPGRADE_CONNECTION, serving) => match result {
+            Ok(served) => served.map_err(io::Error::other),
+            Err(_elapsed) => Ok(()),
+        },
         () = shutdown.cancelled() => Ok(()),
     }
 }
@@ -188,7 +203,7 @@ async fn handle_request(
 }
 
 fn upgrade(mut request: Request<Incoming>, state: WebState, lease: Arc<OwnedSemaphorePermit>) -> Response<Full<Bytes>> {
-    if request.method() != Method::GET || !origin_allowed(request.headers().get(ORIGIN), &state.origins) {
+    if request.method() != Method::GET || !origin_allowed(request.headers(), &state.origins) {
         return response(StatusCode::FORBIDDEN, Bytes::new(), "text/plain");
     }
     let Ok(mut answer) = create_response_with_body(&request, || Full::new(Bytes::new())) else {
@@ -213,10 +228,14 @@ fn upgrade(mut request: Request<Incoming>, state: WebState, lease: Arc<OwnedSema
     answer
 }
 
-fn origin_allowed(origin: Option<&hyper::header::HeaderValue>, allowed: &[String]) -> bool {
-    match origin {
-        None => true,
-        Some(origin) => origin.to_str().is_ok_and(|value| allowed.iter().any(|candidate| candidate == value)),
+/// A request with no `Origin` is a non-browser client; a browser's must be listed. More than one
+/// `Origin` header is refused, as aimx's listener does.
+fn origin_allowed(headers: &hyper::HeaderMap, allowed: &[String]) -> bool {
+    let mut origins = headers.get_all(ORIGIN).iter();
+    match (origins.next(), origins.next()) {
+        (None, _) => true,
+        (Some(origin), None) => origin.to_str().is_ok_and(|value| allowed.iter().any(|candidate| candidate == value)),
+        (Some(_), Some(_)) => false,
     }
 }
 
