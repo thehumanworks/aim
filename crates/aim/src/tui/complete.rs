@@ -148,8 +148,8 @@ pub struct Request {
     pub generation: u64,
     /// The token.
     pub context: Context,
-    /// Values the app knows for command arguments: the session's models and efforts (ADR 0074),
-    /// providers, or values seen so far.
+    /// Configured command names for a command trigger; for arguments, the session's models and
+    /// efforts (ADR 0074), providers, or values seen so far.
     pub hints: Vec<Hint>,
 }
 
@@ -356,18 +356,29 @@ impl Source for CommandSource {
         Box::pin(async move {
             match &request.context.trigger {
                 Trigger::Command => {
-                    let names: Vec<String> = COMMANDS.iter().map(|c| c.name.to_owned()).collect();
+                    let names: Vec<String> =
+                        COMMANDS.iter().map(|c| c.name.to_owned()).chain(request.hints.iter().map(|h| h.value.clone())).collect();
                     let mut ranked = rank(&request.context.query, names, false);
                     // Prefix matches first, in table order; then fuzzy matches by score.
                     ranked.sort_by_key(|(name, _)| !name.starts_with(&request.context.query));
                     ranked
                         .into_iter()
-                        .filter_map(|(name, _)| COMMANDS.iter().find(|c| c.name == name))
-                        .map(|c| Candidate {
-                            label: if c.args.is_empty() { format!("/{}", c.name) } else { format!("/{} {}", c.name, c.args) },
-                            insert: if c.args.is_empty() { format!("/{}", c.name) } else { format!("/{} ", c.name) },
-                            detail: c.help.to_owned(),
-                            kind: Kind::Command,
+                        .take(MAX_CANDIDATES)
+                        .filter_map(|(name, _)| {
+                            if let Some(hint) = request.hints.iter().find(|h| h.value == name) {
+                                return Some(Candidate {
+                                    label: format!("/{name}"),
+                                    insert: format!("/{name} "),
+                                    detail: hint.detail.clone(),
+                                    kind: Kind::Command,
+                                });
+                            }
+                            COMMANDS.iter().find(|c| c.name == name).map(|c| Candidate {
+                                label: if c.args.is_empty() { format!("/{}", c.name) } else { format!("/{} {}", c.name, c.args) },
+                                insert: if c.args.is_empty() { format!("/{}", c.name) } else { format!("/{} ", c.name) },
+                                detail: c.help.to_owned(),
+                                kind: Kind::Command,
+                            })
                         })
                         .collect()
                 }

@@ -379,6 +379,10 @@ pub struct App {
     generation: u64,
     quit_armed: bool,
     quitting: bool,
+    /// User-owned slash commands, never sent to the session unless explicitly agent-visible.
+    pub commands: BTreeMap<String, super::settings::CustomCommand>,
+    /// Optional status-line segments, in presentation order.
+    pub status_fields: Vec<super::settings::StatusField>,
     next_prompt: u64,
     /// Prompts and session commands submitted while no session was attached (or one was being
     /// switched to), for the session being opened, in order.
@@ -496,6 +500,8 @@ impl App {
             generation: 0,
             quit_armed: false,
             quitting: false,
+            commands: BTreeMap::new(),
+            status_fields: super::settings::Settings::default().status,
             next_prompt: 1,
             queued: Vec::new(),
             history_file: HistoryFile::Unread,
@@ -1357,6 +1363,20 @@ impl App {
         }
         let mut effects = Vec::new();
         if let Some((name, arg)) = commands::parse(&raw) {
+            if let Some(command) = self.commands.get(name).cloned() {
+                let text = crate::resources::prompts::expand(&command.text, crate::resources::prompts::Dialect::Aim, &[], arg);
+                if text.trim().is_empty() {
+                    self.notice(Level::Error, format!("/{name} expanded to empty text; check its arguments or template"));
+                    return effects;
+                }
+                self.composer.clear();
+                self.close_popup(&mut effects);
+                match command.output {
+                    super::settings::Output::Agent => effects.extend(self.send(text)),
+                    super::settings::Output::User => self.notice(Level::Info, text),
+                }
+                return effects;
+            }
             let Some(command) = commands::find(name) else {
                 self.notice(Level::Error, format!("unknown command /{name} (see /help)"));
                 return Vec::new();
@@ -1455,8 +1475,15 @@ impl App {
                 self.notice(Level::Info, "/dictate arrives in M8");
                 Vec::new()
             }
+            ("status", _) => {
+                let text = commands::status(self.session.as_ref().map(|s| s.provider.as_str()), self.limits.as_ref());
+                self.notice(Level::Info, text);
+                Vec::new()
+            }
             ("help", _) => {
-                self.notice(Level::Info, help_text());
+                let mut help = vec![help_text()];
+                help.extend(self.commands.iter().map(|(name, command)| format!("/{name} — {}", command.description)));
+                self.notice(Level::Info, help.join("\n"));
                 Vec::new()
             }
             ("quit", _) => self.quit(),
@@ -1609,6 +1636,11 @@ impl App {
         match found {
             Some(context) if self.popup.dismissed != Some(context.start) => {
                 let hints = match &context.trigger {
+                    Trigger::Command => self
+                        .commands
+                        .iter()
+                        .map(|(name, command)| Hint { value: name.clone(), detail: command.description.clone() })
+                        .collect(),
                     Trigger::Argument { command } => self.hints(command),
                     _ => Vec::new(),
                 };

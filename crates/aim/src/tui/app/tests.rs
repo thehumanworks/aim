@@ -12,6 +12,94 @@ use super::*;
 use crate::tui::schedule::{Frame, Scheduler};
 use crate::tui::view;
 
+#[test]
+fn custom_commands_route_output_without_reinterpreting_slashes() {
+    use crate::tui::settings::{CustomCommand, Output};
+    for state in [SessionState::Idle, SessionState::Running, SessionState::Closed] {
+        let mut app = attached();
+        app.session.as_mut().unwrap().state = state;
+        app.session.as_mut().unwrap().persistence = Persistence::Persistent;
+        app.config.persist_history = true;
+        app.commands.insert(
+            "local".into(),
+            CustomCommand { description: "local panel".into(), output: Output::User, text: "/quit $ARGUMENTS".into() },
+        );
+        typed(&mut app, "/local private");
+        let effects = app.handle(press(KeyCode::Enter));
+        assert!(effects.iter().all(|e| matches!(e, Effect::CancelCompletion)));
+        assert_eq!(notices(&app), ["/quit private"]);
+        assert!(app.steers.is_empty());
+        assert!(app.queued.is_empty());
+        assert!(app.disk_history.is_empty());
+        assert!(!app.quitting);
+    }
+    let mut app = attached();
+    app.commands.insert(
+        "review".into(),
+        CustomCommand { description: "review".into(), output: Output::Agent, text: "Review $1: $ARGUMENTS".into() },
+    );
+    typed(&mut app, "/review 'two words'");
+    let effects = app.handle(press(KeyCode::Enter));
+    assert!(effects.iter().any(|e| matches!(e, Effect::Prompt { parts, .. } if text_of(parts) == "Review two words: 'two words'")));
+}
+
+#[test]
+fn status_is_user_only_and_does_not_print_native_metadata() {
+    let mut app = attached();
+    app.session.as_mut().unwrap().provider = "codex".into();
+    app.limits = Some(RateLimits {
+        windows: vec![aim_proto::conversation::RateLimitWindow {
+            id: "codex.primary".into(),
+            used_percent: 25.0,
+            window_minutes: Some(300),
+            resets_at: Some(1_790_000_000),
+        }],
+        native: Some(serde_json::json!({"opaque": "never-display-this"})),
+    });
+    typed(&mut app, "/status");
+    let effects = app.handle(press(KeyCode::Enter));
+    assert!(effects.iter().all(|e| matches!(e, Effect::CancelCompletion)));
+    let text = notices(&app).join("\n");
+    assert!(text.contains("25% used"));
+    assert!(text.contains("300 min"));
+    assert!(text.contains("1790000000"));
+    assert!(text.contains("not a live refresh"));
+    assert!(!text.contains("never-display-this"));
+    assert!(app.steers.is_empty());
+    assert!(app.disk_history.is_empty());
+}
+
+#[tokio::test]
+async fn custom_commands_complete_from_the_same_registry() {
+    use crate::tui::complete::{CommandSource, Source as _};
+    use crate::tui::settings::{CustomCommand, Output};
+    let mut app = attached();
+    app.commands
+        .insert("review".into(), CustomCommand { description: "Review changes".into(), output: Output::Agent, text: "$ARGUMENTS".into() });
+    let effects = typed(&mut app, "/rev");
+    let request = effects
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            Effect::Complete(r) => Some(r),
+            _ => None,
+        })
+        .unwrap();
+    let candidates = CommandSource.complete(request).await;
+    assert!(candidates.iter().any(|c| c.insert == "/review " && c.detail == "Review changes"));
+}
+
+#[test]
+fn status_segments_can_be_hidden() {
+    let mut app = attached();
+    let text = view::status(&app, 200).to_string();
+    assert!(text.contains("/w"));
+    app.status_fields.clear();
+    let text = view::status(&app, 200).to_string();
+    assert!(!text.contains("/w"));
+    assert!(text.contains("idle"), "essential session state stays visible");
+}
+
 const ENV: &str = "<environment>\nworkspace: /w\nos: macos\ndate: 2026-09-25\n</environment>";
 
 fn spec(persistence: Persistence) -> SessionSpec {

@@ -657,7 +657,9 @@ never see the scorekeeper. Private and ephemeral sessions never contribute telem
   optional vim/external editor, visible steer/queue outcomes, `/dictate`. A single async completion
   broker (files and dirs via `ignore` + `nucleo`, slash commands with argument completion, skills,
   agents, sessions, programs; later cloud buckets) with cancellation and stale-result fencing
-  ([tui-ux](research/tui-ux.md)).
+  ([tui-ux](research/tui-ux.md)). User-owned command templates (explicit agent/user-only output),
+  `/status` subscription usage, and presentation settings live in `~/.aim/tui.json`
+  ([TUI guide](tui.md), [ADR 0077](adr/0077-configurable-tui-slash-commands.md)).
 - **CLI**: `aim run "…"` (headless, streamed JSON events or text), `--ephemeral`, `aim login
   codex|claude`, `aim sessions`, `aim board`, `aim evolve`, `aim mcp`.
 - **Web**: Leptos (wasm) app served by the daemon, speaking `aim-daemon/1` over WebSocket; renders

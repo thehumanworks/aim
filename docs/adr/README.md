@@ -80,3 +80,4 @@ Rules (enforced by `mise run check`):
 | [0074](0074-session-options-and-tui-session-switches.md) | Sessions advertise what they can switch to; the TUI derives new sessions in the kernel. |
 | [0075](0075-resolve-acp-config-values-to-advertised-values.md) | Resolve requested ACP model and effort values to advertised values by verified tiers; list the values on refusal. |
 | [0076](0076-code-mode-setting-and-acp-relay.md) | Select code mode with `AIM_CODE_MODE`, decide its exposure in the kernel, and serve it to Claude through aim's relay. |
+| [0077](0077-configurable-tui-slash-commands.md) | Configure TUI commands with explicit agent or user-only output and personal status-line segments. |

@@ -492,7 +492,11 @@ pub async fn run(client: Arc<dyn SessionClient>, options: Options) -> Result<i32
     let size = crossterm::terminal::size().map_err(|e| format!("not a terminal: {e}"))?;
     let hyperlinks = hyperlinks();
     let config = AppConfig { spec: options.spec.clone(), hyperlinks, home: env("HOME"), persist_history: options.history.is_some() };
-    let mut app = App::new(Theme::detect(env), config, options.fullscreen);
+    let settings = super::settings::Settings::load(&crate::cli::aim_home().join("tui.json"))?;
+    let theme = if settings.plain { Theme::plain() } else { Theme::detect(env) };
+    let mut app = App::new(theme, config, options.fullscreen || settings.fullscreen);
+    app.commands = settings.commands;
+    app.status_fields = settings.status;
     if let Some(notice) = &options.notice {
         app.warn(notice.clone());
     }

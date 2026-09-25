@@ -27,6 +27,7 @@ mod markdown;
 mod schedule;
 #[cfg(feature = "test-support")]
 pub mod script;
+mod settings;
 mod shell;
 mod surfaces;
 mod text;

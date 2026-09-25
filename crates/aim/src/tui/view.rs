@@ -117,19 +117,27 @@ pub fn status(app: &App, width: usize) -> Line<'static> {
             rest.push(format!("code:{}", code.label()));
         }
     }
-    let t = app.tokens;
-    if t.input > 0 || t.output > 0 {
-        rest.push(format!(
-            "↑{} ({} cached) ↓{} ({} reasoning)",
-            short_count(t.input),
-            short_count(t.cached),
-            short_count(t.output),
-            short_count(t.reasoning)
-        ));
-    }
-    rest.extend(rate_limit(app));
-    if let Some(s) = &app.session {
-        rest.push(short_path(&s.workspace, app.config.home.as_deref()));
+    for field in &app.status_fields {
+        match field {
+            super::settings::StatusField::Tokens => {
+                let t = app.tokens;
+                if t.input > 0 || t.output > 0 {
+                    rest.push(format!(
+                        "↑{} ({} cached) ↓{} ({} reasoning)",
+                        short_count(t.input),
+                        short_count(t.cached),
+                        short_count(t.output),
+                        short_count(t.reasoning)
+                    ));
+                }
+            }
+            super::settings::StatusField::Limits => rest.extend(rate_limit(app)),
+            super::settings::StatusField::Workspace => {
+                if let Some(s) = &app.session {
+                    rest.push(short_path(&s.workspace, app.config.home.as_deref()));
+                }
+            }
+        }
     }
     for segment in rest {
         spans.push(Span::styled(format!(" · {segment}"), theme.status));
