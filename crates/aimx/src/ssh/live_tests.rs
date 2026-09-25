@@ -14,8 +14,9 @@ use aim_proto::harness::{
     FsWriteParams, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams, WorkspaceOpen,
     WorkspaceOpenParams,
 };
-use aim_proto::harness::{CaseMode, Command as RemoteCommand, ExactEdit, Precondition};
+use aim_proto::harness::{CaseMode, Command as RemoteCommand, ExactEdit, ExitStatus, Precondition};
 use aim_proto::ids::IdempotencyKey;
+use aim_proto::ids::ProcId;
 use aim_proto::ids::ResumeToken;
 use aim_proto::ids::WorkspaceId;
 use aim_proto::tool::{ToolContent, ToolResult};
@@ -263,17 +264,148 @@ impl Sshd {
 
 impl Drop for Sshd {
     fn drop(&mut self) {
-        drop(
-            Command::new("ssh")
-                .arg("-F")
-                .arg(&self.config)
-                .arg("-S")
-                .arg(self.dir.path().join("ctl/%C"))
-                .args(["-O", "exit", "aim-test"])
-                .output(),
-        );
+        for control in [self.dir.path().join("ctl"), self.dir.path().join("local_home/.aim/ssh")] {
+            if let Ok(entries) = std::fs::read_dir(control) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().is_some_and(|extension| extension == "lock") {
+                        continue;
+                    }
+                    drop(
+                        Command::new("ssh")
+                            .arg("-F")
+                            .arg(&self.config)
+                            .arg("-S")
+                            .arg(entry.path())
+                            .args(["-O", "exit", "aim-test"])
+                            .output(),
+                    );
+                }
+            }
+        }
         drop(self.child.kill());
         drop(self.child.wait());
+    }
+}
+
+/// A disposable Linux sshd. The Docker daemon is managed by the caller; this fixture owns only
+/// its container, image, keys, SSH config and control socket.
+struct LinuxSshd {
+    dir: TempDir,
+    image: String,
+    container: String,
+    config: PathBuf,
+}
+
+fn docker(args: &[&str]) -> std::process::Output {
+    Command::new("docker").args(args).output().expect("run docker")
+}
+
+fn docker_checked(args: &[&str]) -> String {
+    let output = docker(args);
+    assert!(output.status.success(), "docker {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).expect("docker UTF-8 output").trim().to_owned()
+}
+
+impl LinuxSshd {
+    fn start(distribution: &str) -> Self {
+        let dir = tempfile::Builder::new().prefix("aimlx").tempdir_in("/private/tmp").expect("Linux fixture tempdir");
+        let image = format!("aim-ssh-live-{distribution}-{}", std::process::id());
+        let dockerfile = match distribution {
+            "debian" => {
+                "FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends openssh-server procps perl coreutils && rm -rf /var/lib/apt/lists/* && mkdir -p /run/sshd\n"
+            }
+            "alpine" => "FROM alpine:3.20\nRUN apk add --no-cache openssh-server && mkdir -p /run/sshd\n",
+            other => panic!("unsupported Linux SSH target {other}"),
+        };
+        std::fs::write(dir.path().join("Dockerfile"), dockerfile).expect("Dockerfile");
+        let build_dir = dir.path().to_string_lossy();
+        docker_checked(&["build", "-q", "-t", &image, &build_dir]);
+        let container = docker_checked(&["run", "--rm", "-d", "-p", "127.0.0.1::22", &image, "sleep", "3600"]);
+        assert!(!container.is_empty(), "docker did not return a container id");
+        let config = dir.path().join("ssh_config");
+        let instance = Self { dir, image, container, config };
+        let dir = &instance.dir;
+        let container = &instance.container;
+        let fixture = dir.path().join("fixture");
+        std::fs::create_dir(&fixture).expect("fixture dir");
+        let host = fixture.join("host");
+        let client = dir.path().join("client");
+        for key_path in [&host, &client] {
+            assert!(
+                Command::new("ssh-keygen")
+                    .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                    .arg(key_path)
+                    .status()
+                    .expect("generate temporary SSH key")
+                    .success()
+            );
+        }
+        std::fs::copy(client.with_extension("pub"), fixture.join("authorized_keys")).expect("authorized keys");
+        std::fs::write(
+            fixture.join("sshd_config"),
+            "Port 22\nListenAddress 0.0.0.0\nHostKey /tmp/aim-fixture/host\nAuthorizedKeysFile /tmp/aim-fixture/authorized_keys\nPermitRootLogin yes\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nMaxSessions 10\nPidFile /tmp/aim-sshd.pid\n",
+        )
+        .expect("Linux sshd config");
+        let copy_source = fixture.to_string_lossy();
+        docker_checked(&["cp", &copy_source, &format!("{container}:/tmp/aim-fixture")]);
+        docker_checked(&["exec", container, "/usr/sbin/sshd", "-t", "-f", "/tmp/aim-fixture/sshd_config"]);
+        docker_checked(&["exec", "-d", container, "/usr/sbin/sshd", "-D", "-e", "-f", "/tmp/aim-fixture/sshd_config"]);
+        let address = docker_checked(&["port", container, "22/tcp"]);
+        let port = address.rsplit(':').next().expect("published SSH port");
+        let host_key = std::fs::read_to_string(host.with_extension("pub")).expect("host public key");
+        std::fs::write(dir.path().join("known_hosts"), format!("[127.0.0.1]:{port} {host_key}")).expect("known hosts");
+        std::fs::write(
+            &instance.config,
+            format!(
+                "Host aim-linux\n  HostName 127.0.0.1\n  Port {port}\n  User root\n  IdentityFile {}\n  IdentitiesOnly yes\n  UserKnownHostsFile {}\n  StrictHostKeyChecking yes\n  LogLevel ERROR\n",
+                client.display(),
+                dir.path().join("known_hosts").display()
+            ),
+        )
+        .expect("Linux SSH config");
+        instance
+    }
+
+    fn options(&self) -> SshOptions {
+        let mut options = SshOptions::new("aim-linux");
+        options.config_file = Some(self.config.clone());
+        options.control_dir = Some(self.dir.path().join("ctl"));
+        options
+    }
+
+    async fn connect(&self) -> Connection {
+        for _ in 0..40 {
+            if let Ok(connection) = Connection::connect(self.options(), None).await {
+                return connection;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("Linux sshd did not become reachable");
+    }
+}
+
+impl Drop for LinuxSshd {
+    fn drop(&mut self) {
+        for control in ["ctl", "shortctl"] {
+            if let Ok(entries) = std::fs::read_dir(self.dir.path().join(control)) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().is_some_and(|extension| extension == "lock") {
+                        continue;
+                    }
+                    drop(
+                        Command::new("ssh")
+                            .arg("-F")
+                            .arg(&self.config)
+                            .arg("-S")
+                            .arg(entry.path())
+                            .args(["-O", "exit", "aim-linux"])
+                            .output(),
+                    );
+                }
+            }
+        }
+        drop(docker(&["rm", "-f", &self.container]));
+        drop(docker(&["image", "rm", &self.image]));
     }
 }
 
@@ -309,6 +441,199 @@ async fn run_to_exit(workspace: &AgentlessWorkspace, root: &Path, command: &Remo
     }
     workspace.exec().expect("exec").release(&proc).await.expect("release stalled process");
     panic!("process did not exit");
+}
+
+async fn linux_spawn(workspace: &AgentlessWorkspace, root: &str, script: String, timeout: Option<Duration>) -> ProcId {
+    let command = RemoteCommand::Shell { script };
+    let env = std::collections::BTreeMap::new();
+    workspace
+        .exec()
+        .expect("exec")
+        .spawn(SpawnSpec { command: &command, cwd: root, env: &env, pty: None, stdin: false, timeout, key: &key() })
+        .await
+        .expect("Linux process spawn")
+}
+
+async fn linux_exit(workspace: &AgentlessWorkspace, proc: &ProcId) -> ExitStatus {
+    for _ in 0..30 {
+        if let Some(exit) =
+            workspace.exec().expect("exec").read(proc, 0, 100, Duration::from_millis(200)).await.expect("Linux process read").exit
+        {
+            workspace.exec().expect("exec").release(proc).await.expect("release exited Linux process");
+            return exit;
+        }
+    }
+    panic!("Linux process did not exit");
+}
+
+async fn assert_linux_sleep_stopped(connection: &Connection, workspace: &AgentlessWorkspace, marker: &str) {
+    let pid = workspace.fs().read(marker, None, 100).await.expect("read Linux sleep PID").content.into_bytes();
+    let pid = String::from_utf8(pid).expect("decimal PID");
+    assert!(!pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()));
+    let check = format!("if [ -r /proc/{pid}/stat ]; then awk '{{print $3}}' /proc/{pid}/stat; else printf gone; fi");
+    for _ in 0..40 {
+        let state = connection.run(&check, &[]).await.expect("inspect remote process");
+        if state == b"gone" || state == b"Z\n" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("remote sleep {pid} remained running");
+}
+
+async fn linux_master_recovery(sshd: &LinuxSshd) {
+    let mut short_options = sshd.options();
+    short_options.persist_seconds = 1;
+    short_options.control_dir = Some(sshd.dir.path().join("shortctl"));
+    let short = Connection::connect(short_options, None).await.expect("short-lived Linux master");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!short.check_master().await, "Linux master did not expire");
+    assert_eq!(short.run("printf recovered", &[]).await.expect("recover Linux master"), b"recovered");
+    assert!(short.check_master().await, "Linux recovery bypassed multiplexing");
+}
+
+async fn linux_regressions(distribution: &str) {
+    let sshd = LinuxSshd::start(distribution);
+    let connection = sshd.connect().await;
+    let root = "/tmp/aim-work";
+    connection.run("mkdir -p /tmp/aim-work", &[]).await.expect("create Linux workspace");
+    let workspace = Arc::new(AgentlessWorkspace::open(connection.clone(), root).await.expect("open Linux agentless workspace"));
+
+    // N1: GNU stat must preserve mode when overwriting and editing, including empty files.
+    let file = format!("{root}/script.sh");
+    workspace
+        .fs()
+        .write(WriteRequest {
+            path: &file,
+            content: &Content::Utf8 { text: "old\n".to_owned() },
+            precondition: &Precondition::IfAbsent,
+            create_dirs: false,
+            key: &key(),
+        })
+        .await
+        .expect("create Linux file");
+    connection.run("chmod 755 /tmp/aim-work/script.sh", &[]).await.expect("mark Linux file executable");
+    workspace
+        .fs()
+        .write(WriteRequest {
+            path: &file,
+            content: &Content::Utf8 { text: "before\n".to_owned() },
+            precondition: &Precondition::Any,
+            create_dirs: false,
+            key: &key(),
+        })
+        .await
+        .expect("overwrite Linux file");
+    let edit = [ExactEdit { old: "before".to_owned(), new: "after".to_owned(), replace_all: false }];
+    workspace
+        .fs()
+        .edit(EditRequest { path: &file, edits: &edit, precondition: &Precondition::Any, key: &key() })
+        .await
+        .expect("edit Linux file");
+    assert_eq!(workspace.fs().read(&file, None, 100).await.expect("read Linux edit").content.into_bytes(), b"after\n");
+    assert_eq!(connection.run("stat -c %a /tmp/aim-work/script.sh", &[]).await.expect("Linux mode"), b"755\n");
+    connection.run("touch /tmp/aim-work/empty.txt", &[]).await.expect("empty fixture");
+    let listing =
+        workspace.fs().list(ListRequest { path: root, limit: 100, page_token: None, include_hidden: false }).await.expect("Linux listing");
+    assert!(listing.entries.iter().any(|entry| entry.name == "empty.txt" && entry.kind == aim_proto::harness::EntryKind::File));
+
+    // N2: an expired master must recover through multiplexing on the same connection.
+    linux_master_recovery(&sshd).await;
+
+    // N4: 64 KiB heredocs exceeded Linux MAX_ARG_STRLEN after double embedding and octal expansion.
+    let payload = "x".repeat(64 * 1024);
+    let script = format!("cat > /tmp/aim-work/large.txt <<'AIM_EOF'\n{payload}\nAIM_EOF");
+    let proc = linux_spawn(&workspace, root, script, None).await;
+    assert_eq!(linux_exit(&workspace, &proc).await, ExitStatus::Exited { code: 0 });
+    assert_eq!(workspace.fs().read(&format!("{root}/large.txt"), None, 70_000).await.expect("large script result").content.len(), 65_537);
+
+    // N5 and N6: Alpine has busybox realpath/ps and no perl; exit codes and group kills must work.
+    if distribution == "alpine" {
+        assert!(connection.run("command -v perl", &[]).await.is_err(), "Alpine fixture unexpectedly has perl");
+    }
+    let proc = linux_spawn(&workspace, root, "exit 3".to_owned(), None).await;
+    assert_eq!(linux_exit(&workspace, &proc).await, ExitStatus::Exited { code: 3 });
+    for _ in 0..3 {
+        let proc = linux_spawn(&workspace, root, "sleep 30".to_owned(), None).await;
+        workspace.exec().expect("exec").signal(&proc, aim_proto::harness::Signal::Kill).await.expect("Linux group signal");
+        assert_eq!(linux_exit(&workspace, &proc).await, ExitStatus::Signaled { signal: 9 });
+    }
+
+    let marker = format!("{root}/timed-sleep.pid");
+    let proc =
+        linux_spawn(&workspace, root, format!("sleep 30 & printf '%s' \"$!\" > {marker}; wait"), Some(Duration::from_millis(500))).await;
+    assert_eq!(linux_exit(&workspace, &proc).await, ExitStatus::TimedOut);
+    assert_linux_sleep_stopped(&connection, &workspace, &marker).await;
+
+    // N3: process slots plus transient reads fill sshd's ten-session limit. Concurrent release
+    // must still kill every process, report failures, and leave capacity for the reads.
+    let mut processes = Vec::new();
+    for index in 0..6 {
+        let marker = format!("{root}/sleep-{index}.pid");
+        let script = format!("sleep 30 & printf '%s' \"$!\" > {marker}; wait");
+        let proc = linux_spawn(&workspace, root, script, None).await;
+        processes.push((proc, marker));
+    }
+    for (_, marker) in &processes {
+        for _ in 0..40 {
+            if workspace.fs().read(marker, None, 100).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(workspace.fs().read(marker, None, 100).await.is_ok(), "Linux sleep PID marker missing");
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for (proc, _) in &processes {
+        let workspace = Arc::clone(&workspace);
+        let proc = proc.clone();
+        tasks.spawn(async move { workspace.exec().expect("exec").release(&proc).await.expect("concurrent Linux release") });
+    }
+    for _ in 0..3 {
+        let workspace = Arc::clone(&workspace);
+        tasks.spawn(async move {
+            workspace.fs().stat(root, false).await.expect("concurrent Linux stat");
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.expect("Linux concurrent operation panicked");
+    }
+    for (_, marker) in &processes {
+        assert_linux_sleep_stopped(&connection, &workspace, marker).await;
+    }
+}
+
+fn linux_target_enabled(distribution: &str) -> bool {
+    let Ok(targets) = std::env::var("AIM_SSH_LINUX_TARGETS") else {
+        eprintln!("Linux SSH live target {distribution} skipped: set AIM_SSH_LINUX_TARGETS=debian,alpine");
+        return false;
+    };
+    if !targets.split(',').any(|target| target.trim() == distribution) {
+        eprintln!("Linux SSH live target {distribution} skipped: not selected by AIM_SSH_LINUX_TARGETS");
+        return false;
+    }
+    let available =
+        Command::new("docker").arg("info").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|status| status.success());
+    if !available {
+        eprintln!("Linux SSH live target {distribution} skipped: Docker/colima is unavailable");
+    }
+    available
+}
+
+#[tokio::test]
+#[ignore = "requires Docker/colima; select with AIM_SSH_LINUX_TARGETS=debian"]
+async fn live_ssh_linux_debian_regressions() {
+    if linux_target_enabled("debian") {
+        linux_regressions("debian").await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker/colima; select with AIM_SSH_LINUX_TARGETS=alpine"]
+async fn live_ssh_linux_alpine_regressions() {
+    if linux_target_enabled("alpine") {
+        linux_regressions("alpine").await;
+    }
 }
 
 async fn wait_for_sleep_pid(marker: &Path) -> String {
@@ -563,17 +888,20 @@ async fn live_ssh_expired_master_does_not_fall_back_to_direct_connection() {
     let sshd = Sshd::start(false);
     let mut options = sshd.options();
     options.persist_seconds = 1;
-    let connection = Connection::connect(options, None).await.expect("connect");
+    let mut connection = None;
+    for _ in 0..30 {
+        if let Ok(ready) = Connection::connect(options.clone(), None).await {
+            connection = Some(ready);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let connection = connection.expect("connect");
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!connection.check_master().await, "fixture master should have expired");
-    let result = connection.run("printf ok", &[]).await;
-    assert!(
-        result.is_err() || connection.check_master().await,
-        "a successful channel must use an active master, not silently reconnect directly"
-    );
-    if let Ok(output) = result {
-        assert_eq!(output, b"ok");
-    }
+    let output = connection.run("printf ok", &[]).await.expect("idle connection must restore its master");
+    assert_eq!(output, b"ok");
+    assert!(connection.check_master().await, "the restored channel must use a master");
 }
 
 #[tokio::test]
@@ -777,7 +1105,7 @@ async fn live_ssh_timeout_kills_remote_pipeline_children() {
     let mut timed_out = false;
     for _ in 0..20 {
         let result = workspace.exec().expect("exec").read(&proc, 0, 100, Duration::from_millis(200)).await.expect("read timeout");
-        if matches!(result.exit, Some(aim_proto::harness::ExitStatus::TimedOut)) {
+        if matches!(result.exit, Some(ExitStatus::TimedOut)) {
             timed_out = true;
             break;
         }
@@ -1627,7 +1955,7 @@ async fn exercise_exec_controls(workspace: &AgentlessWorkspace, root: &str) {
     for _ in 0..10 {
         if matches!(
             workspace.exec().expect("exec").read(&proc, 0, 100, Duration::from_millis(200)).await.expect("timeout read").exit,
-            Some(aim_proto::harness::ExitStatus::TimedOut)
+            Some(ExitStatus::TimedOut)
         ) {
             timed_out = true;
             break;

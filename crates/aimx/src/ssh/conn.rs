@@ -11,11 +11,14 @@ use aim_proto::error::{ErrorCode, ProtoError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 const ASKPASS_SOCKET: &str = "AIM_SSH_ASKPASS_SOCKET";
 const ASKPASS_TOKEN: &str = "AIM_SSH_ASKPASS_TOKEN";
 const MAX_CHANNEL_OUTPUT: usize = 64 * 1024 * 1024;
-const MAX_CONTROL_PATH: usize = 100;
+// OpenSSH appends a dot and a random suffix while binding the control socket.
+// Darwin's sockaddr_un limit is the tighter one (a 87-byte path fails there).
+const MAX_CONTROL_PATH: usize = 86;
 
 /// A prompt handler supplied by the embedding user interface.
 pub trait Prompter: Send + Sync {
@@ -56,12 +59,24 @@ impl SshOptions {
 }
 
 /// A checked multiplexed SSH connection.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Connection {
     options: SshOptions,
     control_path: PathBuf,
+    prompter: Option<Arc<dyn Prompter>>,
+    recovery: Arc<Mutex<()>>,
     /// Effective OpenSSH configuration from `ssh -G`.
     pub effective_config: String,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Connection")
+            .field("options", &self.options)
+            .field("control_path", &self.control_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Connection {
@@ -108,11 +123,32 @@ impl Connection {
         if own_path.len() > MAX_CONTROL_PATH {
             return Err(unavailable("SSH control path is too long"));
         }
-        let connection = Self { options, control_path: PathBuf::from(own_path), effective_config };
-        if connection.check_master().await {
-            return Ok(connection);
+        let connection =
+            Self { options, control_path: PathBuf::from(own_path), prompter, recovery: Arc::new(Mutex::new(())), effective_config };
+        connection.ensure_master().await?;
+        Ok(connection)
+    }
+
+    /// Re-establish an expired or lost multiplexing master for this connection.
+    ///
+    /// # Errors
+    /// Returns an error when the master cannot be restarted. Channels never fall back to a
+    /// direct SSH connection.
+    pub async fn ensure_master(&self) -> Result<(), ProtoError> {
+        if self.check_master().await {
+            return Ok(());
         }
-        let lock_path = connection.control_path.with_extension("lock");
+        let _recovery = self.recovery.lock().await;
+        if self.check_master().await {
+            return Ok(());
+        }
+        let own_dir = self.control_path.parent().ok_or_else(|| unavailable("SSH control path has no parent"))?;
+        let directory = std::fs::symlink_metadata(own_dir).map_err(|_| unavailable("cannot inspect SSH control directory"))?;
+        if !directory.file_type().is_dir() || directory.uid() != rustix::process::geteuid().as_raw() {
+            return Err(unavailable("SSH control directory is not private"));
+        }
+        let own_template = own_dir.join("%C");
+        let lock_path = self.control_path.with_extension("lock");
         let lock = tokio::task::spawn_blocking(move || {
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -126,35 +162,35 @@ impl Connection {
         })
         .await
         .map_err(|_| unavailable("SSH master lock task failed"))??;
-        if connection.check_master().await {
+        if self.check_master().await {
             drop(lock);
-            return Ok(connection);
+            return Ok(());
         }
         let mut stale_socket = false;
-        if let Ok(metadata) = std::fs::symlink_metadata(&connection.control_path) {
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.control_path) {
             if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::geteuid().as_raw() {
                 return Err(unavailable("SSH control path is occupied by an untrusted file"));
             }
-            std::fs::remove_file(&connection.control_path).map_err(|_| unavailable("cannot remove stale SSH control socket"))?;
+            std::fs::remove_file(&self.control_path).map_err(|_| unavailable("cannot remove stale SSH control socket"))?;
             stale_socket = true;
         }
-        if let Err(first_error) = connection.start_master(&own_dir, &own_template, prompter.clone()).await {
+        if let Err(first_error) = self.start_master(own_dir, &own_template, self.prompter.clone()).await {
             if !stale_socket {
                 return Err(first_error);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if !connection.check_master().await {
-                if let Ok(metadata) = std::fs::symlink_metadata(&connection.control_path) {
+            if !self.check_master().await {
+                if let Ok(metadata) = std::fs::symlink_metadata(&self.control_path) {
                     if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::geteuid().as_raw() {
                         return Err(unavailable("SSH control path is occupied by an untrusted file"));
                     }
-                    std::fs::remove_file(&connection.control_path).map_err(|_| unavailable("cannot remove stale SSH control socket"))?;
+                    std::fs::remove_file(&self.control_path).map_err(|_| unavailable("cannot remove stale SSH control socket"))?;
                 }
-                connection.start_master(&own_dir, &own_template, prompter).await?;
+                self.start_master(own_dir, &own_template, self.prompter.clone()).await?;
             }
         }
         drop(lock);
-        Ok(connection)
+        Ok(())
     }
 
     async fn start_master(&self, own_dir: &Path, own_template: &Path, prompter: Option<Arc<dyn Prompter>>) -> Result<(), ProtoError> {
@@ -254,6 +290,9 @@ impl Connection {
     /// # Errors
     /// Returns an error when the SSH channel fails.
     pub async fn run_with_status(&self, script: &str, input: &[u8], pty: bool) -> Result<(i32, Vec<u8>), ProtoError> {
+        // In particular, recover after ControlPersist expiry before the remote script can run.
+        // A channel that has started must not be replayed after exit 255: its effects are unknown.
+        self.ensure_master().await?;
         let mut command = self.command(script, pty);
         command
             .stdin(std::process::Stdio::piped())
@@ -650,6 +689,8 @@ mod tests {
         let connection = Connection {
             options: SshOptions::new("example"),
             control_path: "/private/tmp/aim-ssh-test.sock".into(),
+            prompter: None,
+            recovery: Arc::new(tokio::sync::Mutex::new(())),
             effective_config: String::new(),
         };
         let command = connection.command("printf ok", false);
@@ -690,9 +731,34 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert_eq!(connection.run("printf nope", &[]).await.expect_err("no fallback connection").code, ErrorCode::Unavailable);
-        let replacement = sshd.connect().await;
-        assert_eq!(replacement.run("printf restored", &[]).await.expect("recovered channel"), b"restored");
+        assert_eq!(connection.run("printf restored", &[]).await.expect("recovered channel"), b"restored");
+        assert!(connection.check_master().await, "same connection restarted its master");
+    }
+
+    #[tokio::test]
+    #[ignore = "starts a private user-space sshd and waits for ControlPersist expiry"]
+    async fn live_ssh_expired_master_recovers_on_concurrent_channels() {
+        let sshd = TestSshd::start();
+        let mut options = sshd.options();
+        options.persist_seconds = 1;
+        let connection = Connection::connect(options, None).await.expect("connect");
+        for _ in 0..50 {
+            if !connection.check_master().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!connection.check_master().await, "ControlPersist master should expire");
+        let channels = (0..6)
+            .map(|_| {
+                let connection = connection.clone();
+                tokio::spawn(async move { connection.run("printf ok", &[]).await })
+            })
+            .collect::<Vec<_>>();
+        for channel in channels {
+            assert_eq!(channel.await.expect("channel task").expect("recovered channel"), b"ok");
+        }
+        assert!(connection.check_master().await, "recovery uses a live multiplexing master");
     }
 
     #[tokio::test]
