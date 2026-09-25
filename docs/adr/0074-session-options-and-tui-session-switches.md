@@ -77,7 +77,10 @@ seen values (wrong across providers).
    session's configuration generation, which `announce` bumps before it sends `ConfigChanged` and
    the actor bumps at close; a lookup publishes only if its generation is still current, checked
    under the options lock that also orders the bump. An abort alone cannot stop a lookup that has
-   already resolved (REV-T1 B1). The live summary's model follows every announced change and a
+   already resolved (REV-T1 B1). A model change also drops the latest options at the bump, under
+   the transcript lock, so an attach never reads the old model's ladder next to the new model: it
+   gets none and the new ones follow on its stream; a TUI that reattaches and sees another model
+   treats the ladder it kept as stale. The live summary's model follows every announced change and a
    resumed session's summary shows the model it resumed with, so a client attaching later is told
    the model in force.
    Native sessions answer from the catalog W26 fetched at start (codex) or from one bounded
@@ -124,7 +127,11 @@ seen values (wrong across providers).
   ladder's first occurrences in order (`distinct_levels`), then `auto` when taken (REV-T1 N1). The
   exec fns `derive`, `effort_sent` and `effort_candidates` are verified to equal their specs.
 - Generation fence: `crates/aim/src/host.rs::tests::a_lookup_for_an_older_configuration_never_publishes`
-  (a lookup released after a model change; fails without the check). Summary model:
+  (a lookup released after a model change; fails without the check). The actor's wiring (bump,
+  then `ConfigChanged`, then the new lookup, in the session's task) is by inspection: the stale
+  lookup sends `Options` holding the options lock, and `announce` bumps under that lock before it
+  sends `ConfigChanged` (lock-free, through `publish`), so an old generation's `Options` can only
+  precede its `ConfigChanged`. Reattach: `crates/aim/src/tui/app/tests.rs::a_reattach_after_a_missed_model_change_does_not_trust_the_old_ladder`. Summary model:
   `crates/aim/tests/host.rs::attach_reports_the_model_in_force_after_a_change_and_a_resume`; what
   `auto` does: `options_say_what_auto_does_in_an_advised_session`.
 - Contract: `crates/aim-proto/tests/contract.rs::adr_0074_session_options_are_additive`.
