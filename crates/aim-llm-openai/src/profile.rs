@@ -81,7 +81,9 @@ pub struct Quirks {
     /// response when talking to this profile again.
     pub replay_reasoning_details: bool,
     /// Whether the endpoint accepts `image_url` content parts; tool-result images are then sent
-    /// in a user message after the tool results, otherwise replaced by a text placeholder.
+    /// in a user message after the tool results to models whose catalog entry accepts images
+    /// (an unseen model is looked up in the catalog first). Otherwise, and for models the
+    /// catalog does not list, they are replaced by a text placeholder.
     pub tool_result_images: bool,
     /// Fields merged into the top level of every request body, e.g. prompt-cache settings.
     pub extra_body: Option<Map<String, Value>>,

@@ -3,8 +3,10 @@
 
 use aim_llm::{LlmError, LlmErrorKind, ModelProvider, Request, StreamEvent};
 use aim_llm_openai::{OpenAiProvider, Profile};
+use aim_proto::content::Base64Bytes;
 use aim_proto::conversation::{Item, NativeItem, Part, StopReason, Usage};
-use aim_proto::tool::{ToolAnnotations, ToolInput, ToolResult, ToolSpec};
+use aim_proto::tool::{ToolAnnotations, ToolContent, ToolInput, ToolResult, ToolSpec};
+use base64::Engine as _;
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -249,5 +251,61 @@ async fn live_reasoning_tool(profile: Profile, label: &str) -> Outcome {
     let rejected = turn(&provider, forged).await.err().ok_or("a tampered reasoning signature was accepted")?;
     assert_eq!(rejected.kind, LlmErrorKind::InvalidRequest);
     assert!(rejected.message.contains("signature"), "upstream validated the replay: {}", rejected.message);
+    Ok(())
+}
+
+/// A 1×1 PNG.
+const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+/// A turn that answers a `screenshot` call with an image.
+fn screenshot_turn(model: &str) -> Result<Request, Box<dyn std::error::Error>> {
+    let mut next = request(model, "Take a screenshot, then describe it in at most five words.");
+    next.max_output_tokens = Some(256);
+    next.tools.push(ToolSpec {
+        name: "screenshot".into(),
+        description: "Take a screenshot".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        input: ToolInput::Json,
+        annotations: ToolAnnotations::default(),
+    });
+    next.items.push(Item::ToolCall { call_id: "call_1".into(), name: "screenshot".into(), arguments: "{}".into(), native: None });
+    let data = Base64Bytes(base64::engine::general_purpose::STANDARD.decode(PIXEL)?);
+    next.items.push(Item::ToolResult {
+        call_id: "call_1".into(),
+        result: ToolResult { content: vec![ToolContent::Image { media_type: "image/png".into(), data }], ..ToolResult::default() },
+    });
+    Ok(next)
+}
+
+/// REV4-B Minor 5. A provider that never listed its catalog learns image support from it before
+/// it maps a tool-result image: text-only `openai/gpt-oss-20b` gets the placeholder and answers,
+/// vision `openai/gpt-4.1-mini` gets the image. Negative control: the same image forced onto the
+/// text-only model is rejected by `OpenRouter` (404 "No endpoints found that support image input").
+#[tokio::test]
+#[ignore = "requires OpenRouter credentials and paid live inference"]
+async fn live_openrouter_tool_image_gating() -> Outcome {
+    let provider = OpenAiProvider::new(Profile::openrouter())?;
+    for (model, sees_images) in [("openai/gpt-oss-20b", false), ("openai/gpt-4.1-mini", true)] {
+        let start = Instant::now();
+        let (items, usage, _stop) = turn(&provider, screenshot_turn(model)?).await?;
+        metric(&format!("openrouter tool image ({model}, image sent: {sees_images})"), start, &usage);
+        assert!(items.iter().any(|item| matches!(item, Item::Assistant { .. })));
+        let body = provider.request_body(&screenshot_turn(model)?)?.to_string();
+        assert_eq!(body.contains("image_url"), sees_images, "{model}");
+    }
+
+    let mut forced = Profile::openrouter();
+    let mut catalog = OpenAiProvider::new(Profile::openrouter())?.catalog().await?;
+    catalog.retain(|model| model.id == "openai/gpt-oss-20b");
+    for model in &mut catalog {
+        model.images = true;
+    }
+    forced.models = Some(catalog);
+    let rejected = turn(&OpenAiProvider::new(forced)?, screenshot_turn("openai/gpt-oss-20b")?)
+        .await
+        .err()
+        .ok_or("OpenRouter accepted an image for a text-only model")?;
+    assert_eq!(rejected.status, Some(404));
+    assert!(rejected.message.contains("image input"), "{}", rejected.message);
     Ok(())
 }

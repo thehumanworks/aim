@@ -39,7 +39,10 @@ docs/architecture.md §6.5.
   endpoint that cannot report usage says so with `supports_stream_usage = false`.
 - Derive available models and caps from endpoint catalogs when provided; a configured slug
   remains explicit when discovery is absent. A listed model still needs a live turn before
-  aim claims it is usable.
+  aim claims it is usable. A capability the catalog does not state is assumed absent: in
+  particular a model is sent tool-result images only when its catalog entry lists image input.
+  The agent layer does not call `catalog()` today, so the provider fetches it itself the first
+  time a request carries a tool-result image for a model it has not seen.
 
 *Amended 2026-09-25, same day:* the profile settings below record what `crates/aim-llm-openai`
 implements after its first two reviews. The first version named `key_env` (the field is
@@ -65,7 +68,7 @@ implements after its first two reviews. The first version named `key_env` (the f
 | `reasoning_param` | Effort as `reasoning: {effort}` (`open_router`), `reasoning_effort` (`open_ai`) or unsupported (`none`, a request with an effort is `InvalidRequest`). | `open_router` | `open_ai` |
 | `cost_pointer` | JSON pointer into the streamed `usage` object naming the billed USD amount. | `/cost` | `/gateway_cost` |
 | `replay_reasoning_details` | Replay streamed `reasoning_details` on the assistant message of the same response (only this profile's own). | yes | yes |
-| `tool_result_images` | Send tool-result images as `image_url` parts in a user message after the tool results; otherwise a text placeholder. | yes | yes |
+| `tool_result_images` | Send tool-result images as `image_url` parts in a user message after the tool results, to models whose catalog entry accepts images; otherwise a text placeholder. A model the provider has not seen is looked up in the catalog first (one fetch per provider, never with a static `models` list); a model the catalog does not vouch for, or a failed fetch, gets the placeholder. | yes | yes |
 | `extra_body` | Fields merged into the top level of every request body. | `{"cache_control": {"type": "ephemeral"}}` | `{"providerOptions": {"gateway": {"caching": "auto"}}}` |
 | `session_header` | Header carrying `Request.session_id` for cache affinity. | `x-session-id` | `x-session-affinity` |
 | `cache_key_field` | Body field carrying `Request.cache_key` (`prompt_cache_key` for OpenAI direct). | – | – |
@@ -106,7 +109,11 @@ behavior, so the adapter must surface unsupported features instead of approximat
   (`cargo test -p aim-llm-openai -- --ignored live_ --test-threads=1`):
   `live_openrouter_catalog`, `live_openrouter_text_turn`, `live_openrouter_tool_turn`,
   `live_openrouter_reasoning_tool_turn`, `live_ai_gateway_text_turn` (the 16-token boundary and
-  billed `gateway_cost`), `live_ai_gateway_tool_turn`, `live_ai_gateway_reasoning_tool_turn`.
+  billed `gateway_cost`), `live_ai_gateway_tool_turn`, `live_ai_gateway_reasoning_tool_turn`,
+  `live_openrouter_tool_image_gating` (a provider that never listed its catalog sends text-only
+  `openai/gpt-oss-20b` the placeholder and vision `openai/gpt-4.1-mini` the image; the image
+  forced onto the text-only model is rejected with 404 "No endpoints found that support image
+  input").
   The first version of this ADR named them `live_openrouter_chat` and `live_ai_gateway_chat`.
 - Unit and local-HTTP tests in the crate cover explicit wire selection, key-env lookup without
   logging, quirk application, unknown-key rejection, verbatim stream captures of both gateways

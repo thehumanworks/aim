@@ -368,7 +368,8 @@ plan fits the budget; compaction strictly shrinks; token arithmetic cannot overf
     (`x-session-id` / `x-session-affinity`), `cache_key_field` for `Request.cache_key`.
   - Wire capabilities: `supports_parallel_tool_calls`, `supports_stream_usage` (usage is then
     required: a turn without it is a `Protocol` error, never zero usage), `reasoning_param`,
-    `replay_reasoning_details`, `tool_result_images`, `idle_timeout_secs`.
+    `replay_reasoning_details`, `tool_result_images` (only to models whose catalog entry accepts
+    images; an unseen model is looked up once), `idle_timeout_secs`.
   - `headers` holds extra request headers with literal, non-secret values; `models` is a static
     catalog for endpoints without discovery.
 
