@@ -118,6 +118,7 @@ prompt = "Write INDEX.md listing every Markdown file under docs/ with its first 
 # T4b: which AIM_CODE_MODE aim defaults to (ADR 0076). Pre-registered in bench/plans/code-mode.md
 # before any live run; `bench/code_mode.py` applies this rule to the recorded results.
 [code_mode]
+cohort = 2 # 1: lenient graders (7a788e5); 2: exact-entry graders (plan amendment, REV-T4b B1)
 arms = ["aim_openrouter@off", "aim_openrouter@on", "aim_openrouter@only"]
 reference = "aim_openrouter@off"
 repetitions = 3

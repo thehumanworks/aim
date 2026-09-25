@@ -458,6 +458,13 @@ def run_once(harness: str, case: dict, repetition: int, paths: dict[str, Path], 
         return result
 
 
+def source_dirty() -> bool:
+    """Whether the checkout that ran has uncommitted changes, so `source_sha` alone does not name
+    the code (T4b's smoke 2 and 3 ran fixes that were committed afterwards)."""
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, check=True, capture_output=True, text=True)
+    return bool(status.stdout.strip())
+
+
 def keep(target: Path, task_id: str, workspace: Path) -> None:
     """Copy the files the grader reads, when present, for a human to check a grade."""
     for name in graded_files(task_id):
@@ -589,6 +596,7 @@ def main() -> None:
             break
     result = {"tier": args.tier, "manifest_sha256": executable_hash(MANIFEST), "source_sha": args.source_sha or subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip(),
+        "source_dirty": None if args.source_sha else source_dirty(),
         "hardware": {"platform": platform.platform(), "machine": platform.machine(), "python": platform.python_version()},
         "started_unix": started, "finished_unix": time.time(), "binary_sha256": {name: executable_hash(path) for name, path in paths.items()},
         "spend_cap_usd": tier.get("max_spend_usd"), "recorded_spend_usd": round(reported_spend, 6),

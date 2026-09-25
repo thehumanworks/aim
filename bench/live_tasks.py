@@ -113,46 +113,82 @@ TASKS["doc_index"] = {
 OUTPUTS: dict[str, tuple[str, ...]] = {"todo_table": ("REPORT.md", "src/REPORT.md"), "callers": ("CALLERS.md",),
                                        "doc_index": ("INDEX.md", "docs/INDEX.md")}
 
-_REPORT_TEST = """import re, unittest
+# The hidden tests read a report as exact entries (T4b cohort 2, bench/plans/code-mode.md): a path
+# that names the right file, relative to the repository root (or to the directory the prompt
+# names), and the right counts, function or heading for it. Every entry must be right and none may
+# be missing or extra. Markdown decoration (bullets, backticks, bold, table pipes) is ignored.
+_REPORT_TEST = r"""import re, unittest
 EXPECTED = {expected!r}
+def cells(line):
+    return [cell.strip().strip('`*').strip() for cell in line.strip().strip('|').split('|')]
 class TestTask(unittest.TestCase):
     def test_counts(self):
-        rows = [line for line in open('REPORT.md', encoding='utf-8').read().splitlines() if '|' in line]
-        for path, (todo, fixme) in EXPECTED.items():
-            name = re.compile(r'(?<![\\w-])' + re.escape(path.rsplit('/', 1)[-1]) + r'(?![\\w.])')
-            matching = [line for line in rows if name.search(line)]
-            self.assertTrue(matching, path)
-            numbers = [int(value) for value in re.findall(r'\\d+', matching[0][name.search(matching[0]).end():])]
-            self.assertEqual(numbers[:2], [todo, fixme], path)
+        rows = [cells(line) for line in open('REPORT.md', encoding='utf-8').read().splitlines() if line.strip().startswith('|')]
+        header = next((row for row in rows if any('TODO' in cell.upper() for cell in row)), None)
+        self.assertIsNotNone(header, 'a table with a TODO column')
+        todo = next(index for index, cell in enumerate(header) if 'TODO' in cell.upper())
+        fixme = next((index for index, cell in enumerate(header) if 'FIXME' in cell.upper()), None)
+        self.assertIsNotNone(fixme, 'a FIXME column')
+        found = {{}}
+        for row in rows:
+            if row is header or all(set(cell) <= set('-: ') for cell in row):
+                continue
+            name = row[0].removeprefix('./')
+            if not re.search(r'\.\w+$', name):
+                continue  # a total or note row names no file
+            path = name if name.startswith('src/') else 'src/' + name  # relative to src/, as the prompt scopes it
+            self.assertIn(path, EXPECTED, 'not a file under src/: ' + row[0])
+            self.assertNotIn(path, found, 'listed twice: ' + path)
+            self.assertTrue(max(todo, fixme) < len(row) and row[todo].isdigit() and row[fixme].isdigit(), 'counts of ' + path)
+            found[path] = (int(row[todo]), int(row[fixme]))
+        self.assertEqual(found, EXPECTED)
 """
 
-_CALLERS_TEST = """import re, unittest
+_CALLERS_TEST = r"""import re, unittest
 EXPECTED = {expected!r}
+QUALIFIED = {{('app/worker.py', 7): 'Worker'}}  # a method may be named with its class
+ENTRY = re.compile(r'(?:\./)?(?P<path>[\w/-]+(?:\.[\w-]+)*\.py):(?P<line>\d+)\s*[:,\-–—]?\s*(?P<name>[A-Za-z_][\w.]*)(?:\(\))?')
 class TestTask(unittest.TestCase):
     def test_callers(self):
-        lines = open('CALLERS.md', encoding='utf-8').read().splitlines()
-        for path, line, name in EXPECTED:
-            site = f'{{path}}:{{line}}'
-            self.assertTrue(any(site in text and re.search(rf'\\b{{name}}\\b', text) for text in lines), site)
-        wanted = {{f'{{path}}:{{line}}' for path, line, _ in EXPECTED}}
-        for text in lines:
-            for path, line in re.findall(r'([\\w./-]+\\.py):(\\d+)', text):
-                found = f'{{path}}:{{line}}'
-                self.assertTrue(any(found == site or found.endswith('/' + site) for site in wanted),
-                                'not a call of load_config: ' + text)
+        found = set()
+        for text in open('CALLERS.md', encoding='utf-8').read().splitlines():
+            if not re.search(r'\.py:\d+', text):
+                continue  # a heading or a note
+            plain = re.sub(r'^\s*(?:[-*+]|\d+[.)])\s+', '', text.replace('`', '').replace('**', '').replace('|', ' ')).strip()
+            entry = ENTRY.fullmatch(plain)
+            self.assertIsNotNone(entry, 'not "path:line function_name" with a path relative to the root: ' + text)
+            path, line, name = entry['path'], int(entry['line']), entry['name']
+            owner = QUALIFIED.get((path, line))
+            if owner and name.startswith(owner + '.'):
+                name = name[len(owner) + 1:]
+            found.add((path, line, name))
+        self.assertEqual(found, set(EXPECTED))
 """
 
-_INDEX_TEST = """import unittest
+_INDEX_TEST = r"""import re, unittest
 EXPECTED = {expected!r}
 class TestTask(unittest.TestCase):
     def test_index(self):
-        lines = open('INDEX.md', encoding='utf-8').read().splitlines()
-        for path, heading in EXPECTED.items():
-            relative = path.removeprefix('docs/')
-            matching = [line.split(relative, 1)[1] for line in lines if relative in line]
-            self.assertTrue(matching, path)
-            self.assertTrue(any(heading.lower() in rest.lower() for rest in matching), path)
-        self.assertFalse(any('notes.txt' in line for line in lines), 'notes.txt is not Markdown')
+        found = {{}}
+        for text in open('INDEX.md', encoding='utf-8').read().splitlines():
+            bullet = re.match(r'^\s*[-*+]\s+(.*)$', text)
+            if not bullet:
+                continue  # the format is "- path: heading"; other lines are titles or notes
+            entry = bullet.group(1).replace('`', '').replace('**', '')
+            link = re.match(r'^\[([^\]]*)\]\(([^)]*)\)(.*)$', entry)
+            if link:
+                entry = link.group(2) + link.group(3)
+            path, separator, heading = entry.partition(':')
+            self.assertTrue(separator, 'not "- path: heading": ' + text)
+            path = path.strip().removeprefix('./')
+            path = path if path.startswith('docs/') else 'docs/' + path  # relative to docs/, as the prompt scopes it
+            if path == 'docs/INDEX.md':
+                continue  # the index itself
+            self.assertIn(path, EXPECTED, 'not a Markdown file under docs/: ' + text)
+            self.assertNotIn(path, found, 'listed twice: ' + path)
+            found[path] = heading.strip().lstrip('#').strip().strip('"\'').strip()
+        self.assertEqual({{path: heading.lower() for path, heading in found.items()}},
+                         {{path: heading.lower() for path, heading in EXPECTED.items()}})
 """
 
 HIDDEN_TESTS: dict[str, str] = {

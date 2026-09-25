@@ -12,7 +12,7 @@
     },
     {
       "file": "t4b-code-mode-smoke2-openrouter.json",
-      "note": "smoke repeated with --keep-outputs to read the failures",
+      "note": "smoke repeated with --keep-outputs to read the failures; --keep-outputs was in the working tree, committed later in 6b1878f; the recorded source_sha 7a788e5 was HEAD at run time",
       "runs": 9,
       "provider_reported_usd": 0.075318,
       "budget_used_including_transport_reserve_usd": 0.075318,
@@ -20,7 +20,7 @@
     },
     {
       "file": "t4b-code-mode-smoke3-openrouter.json",
-      "note": "doc_index smoke after the grader fix",
+      "note": "doc_index smoke with the report-location grader fix in the working tree, before it was committed as 6b1878f (same content); the recorded source_sha 7a788e5 was HEAD at run time",
       "runs": 3,
       "provider_reported_usd": 0.007126,
       "budget_used_including_transport_reserve_usd": 0.007126,

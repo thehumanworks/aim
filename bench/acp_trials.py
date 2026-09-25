@@ -32,7 +32,7 @@ from collections import Counter
 from pathlib import Path
 
 from live_tasks import grade, prepare
-from run import MANIFEST, ROOT, executable_hash, temporary_workspace
+from run import MANIFEST, ROOT, executable_hash, source_dirty, temporary_workspace
 
 
 def binaries() -> dict[str, Path]:
@@ -187,6 +187,7 @@ def main() -> None:
     result = {"tier": "acp_live", "manifest_sha256": executable_hash(MANIFEST),
               "source_sha": subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True,
                                            text=True).stdout.strip(),
+              "source_dirty": source_dirty(),
               "binary_sha256": {name: executable_hash(path) for name, path in paths.items()},
               "started_unix": started, "finished_unix": time.time(), "subscription_runs": len(runs),
               "runs": runs, "summary": summary(runs, harnesses)}
