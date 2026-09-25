@@ -1189,8 +1189,9 @@ async fn options_are_published_replayed_on_attach_and_follow_the_model() {
         ..ladder_model()
     };
     let hidden = ModelInfo { id: "internal".into(), hidden: true, ..ladder_model() };
+    let m3 = ModelInfo { id: "m3".into(), display_name: "m3".into(), ..ladder_model() };
     let memory = Arc::new(MemoryStore::default());
-    let f = fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, Vec::new(), vec![ladder_model(), m2, hidden]);
+    let f = fixture_full(Arc::clone(&memory) as Arc<dyn SessionStore>, memory, Vec::new(), vec![ladder_model(), m2, hidden, m3]);
     let id = f.host.create(spec(Persistence::Ephemeral)).await.unwrap().meta.id;
     let (first, mut updates) = f.host.attach(id.clone()).await.unwrap();
     // Either the snapshot has them or they follow on the stream, never both.
@@ -1198,7 +1199,7 @@ async fn options_are_published_replayed_on_attach_and_follow_the_model() {
         Some(options) => options,
         None => until(&mut updates, |u| options_of(u).is_some()).await.last().and_then(options_of).cloned().unwrap(),
     };
-    assert_eq!(values(&options.models), ["m1", "m2"], "hidden models are left out");
+    assert_eq!(values(&options.models), ["m1", "m2", "m3"], "hidden models are left out");
     assert_eq!(options.models[1].name.as_deref(), Some("Model Two"));
     assert_eq!(options.models[1].description.as_deref(), Some("1M context"));
     assert_eq!(options.models[0].name, None, "a display name equal to the id adds nothing");
@@ -1214,12 +1215,19 @@ async fn options_are_published_replayed_on_attach_and_follow_the_model() {
     let switched = got.last().and_then(options_of).unwrap();
     assert_eq!(values(&switched.efforts), ["minimal", "high"]);
     assert_eq!(switched.efforts[1].description.as_deref(), Some("default"));
-    assert_eq!(values(&switched.models), ["m1", "m2"]);
+    assert_eq!(values(&switched.models), ["m1", "m2", "m3"]);
     let (again, _) = f.host.attach(id.clone()).await.unwrap();
     assert_eq!(again.options.as_ref(), Some(switched), "the latest options are replayed");
 
+    // A model with the same options still gets them sent: clients learn its ladder is current.
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m1".into()), effort: None }).await.unwrap();
+    until(&mut updates, |u| options_of(u).is_some()).await;
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: Some("m3".into()), effort: None }).await.unwrap();
+    let got = until(&mut updates, |u| options_of(u).is_some()).await;
+    assert_eq!(values(&got.last().and_then(options_of).unwrap().efforts), ["low", "medium", "high"], "m3 shares m1's ladder");
+
     // An effort change keeps the model: nothing new is sent.
-    f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("minimal".into()) }).await.unwrap();
+    f.host.set_config(SessionConfigParams { session: id.clone(), model: None, effort: Some("high".into()) }).await.unwrap();
     let got = until(&mut updates, |u| matches!(u, SessionUpdate::ConfigChanged { .. })).await;
     assert!(got.iter().all(|u| options_of(u).is_none()), "{got:?}");
     f.host.close(id).await.unwrap();

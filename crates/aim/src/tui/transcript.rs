@@ -145,6 +145,16 @@ impl Transcript {
         self.items = 0;
     }
 
+    /// Forgets every entry (`/clear`). The edit serial moves on, never back, so a view that cached
+    /// rows of the old entries drops all of them.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.committed = 0;
+        self.items = 0;
+        self.edits.clear();
+        self.note_edit(0);
+    }
+
     /// Adds a UI entry.
     pub fn push(&mut self, entry: Entry) {
         self.entries.push(entry);

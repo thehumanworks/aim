@@ -132,6 +132,15 @@ pub struct Candidate {
     pub kind: Kind,
 }
 
+/// A value the app knows for a command argument, and what the popup says about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hint {
+    /// The value (what is inserted).
+    pub value: String,
+    /// A short description (empty for none).
+    pub detail: String,
+}
+
 /// A completion request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -139,8 +148,9 @@ pub struct Request {
     pub generation: u64,
     /// The token.
     pub context: Context,
-    /// Values the app knows for command arguments (models and efforts seen, …).
-    pub hints: Vec<String>,
+    /// Values the app knows for command arguments: the session's models and efforts (ADR 0074),
+    /// providers, or values seen so far.
+    pub hints: Vec<Hint>,
 }
 
 /// Produces candidates for one kind of token.
@@ -362,12 +372,26 @@ impl Source for CommandSource {
                         .collect()
                 }
                 Trigger::Argument { .. } => {
-                    let mut hints = request.hints.clone();
-                    hints.dedup();
-                    rank(&request.context.query, hints, false)
+                    let mut hints: Vec<&Hint> = Vec::new();
+                    for hint in &request.hints {
+                        if !hints.iter().any(|h| h.value == hint.value) {
+                            hints.push(hint);
+                        }
+                    }
+                    let query = request.context.query.as_str();
+                    let mut ranked = rank(query, hints.iter().map(|h| h.value.clone()).collect(), false);
+                    // Prefix matches first; otherwise the matcher's order (the source's, for no query).
+                    ranked.sort_by_key(|(value, _)| !value.starts_with(query));
+                    ranked
                         .into_iter()
                         .take(MAX_CANDIDATES)
-                        .map(|(value, _)| Candidate { label: value.clone(), insert: value, detail: String::new(), kind: Kind::Argument })
+                        .filter_map(|(value, _)| hints.iter().find(|h| h.value == value))
+                        .map(|hint| Candidate {
+                            label: hint.value.clone(),
+                            insert: hint.value.clone(),
+                            detail: hint.detail.clone(),
+                            kind: Kind::Argument,
+                        })
                         .collect()
                 }
                 Trigger::File | Trigger::Skill => Vec::new(),
@@ -625,12 +649,20 @@ mod tests {
         let request = |trigger, query: &str| Request {
             generation: 1,
             context: Context { trigger, query: query.into(), start: 0, end: 0 },
-            hints: vec!["gpt-6-sol".into(), "gpt-6-mini".into()],
+            hints: ["gpt-6-sol", "gpt-6-mini", "gpt-6-sol", "o-gpt"]
+                .into_iter()
+                .map(|value| Hint { value: value.into(), detail: format!("about {value}") })
+                .collect(),
         };
         let got = CommandSource.complete(&request(Trigger::Command, "se")).await;
         assert_eq!(got.first().map(|c| c.insert.as_str()), Some("/sessions"));
         let got = CommandSource.complete(&request(Trigger::Argument { command: "model".into() }, "mini")).await;
-        assert_eq!(got.first().map(|c| c.label.as_str()), Some("gpt-6-mini"));
+        assert_eq!(got.first().map(|c| (c.label.as_str(), c.detail.as_str())), Some(("gpt-6-mini", "about gpt-6-mini")));
+        let all = CommandSource.complete(&request(Trigger::Argument { command: "model".into() }, "")).await;
+        let labels: Vec<&str> = all.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["gpt-6-sol", "gpt-6-mini", "o-gpt"], "no query keeps the source's order, each value once");
+        let got = CommandSource.complete(&request(Trigger::Argument { command: "model".into() }, "gpt")).await;
+        assert_eq!(got.last().map(|c| c.label.as_str()), Some("o-gpt"), "prefix matches come first");
     }
 
     #[tokio::test]

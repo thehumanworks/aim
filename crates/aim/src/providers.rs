@@ -81,6 +81,19 @@ pub const GATEWAY_DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5";
 /// Provider ids this build knows.
 pub const KNOWN: &[&str] = &["openrouter", "ai-gateway", "codex", "acp:claude", "acp:claude-native"];
 
+/// One line about a provider of [`KNOWN`], for completion and help (`None` for other ids).
+#[must_use]
+pub fn summary(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "openrouter" => "OpenRouter gateway (OPENROUTER_API_KEY)",
+        "ai-gateway" => "Vercel AI Gateway (AI_GATEWAY_API_KEY)",
+        "codex" => "ChatGPT subscription (aim login, or the Codex CLI's)",
+        "acp:claude" => "Claude Code over ACP, with aim's tools",
+        "acp:claude-native" => "Claude Code over ACP, with its own local tools",
+        _ => return None,
+    })
+}
+
 /// Builds provider `id` and resolves the model (`model`, else the provider's default).
 ///
 /// # Errors

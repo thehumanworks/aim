@@ -908,6 +908,238 @@ fn rev12_a_finished_call_shows_behind_many_running_ones() {
     assert!(text.iter().any(|r| r.contains("quick result")), "{text:#?}");
 }
 
+// ---- ADR 0074: /provider, /clear, and completion from the session's options ----
+
+fn choice(value: &str, name: Option<&str>) -> aim_proto::daemon::ChoiceValue {
+    aim_proto::daemon::ChoiceValue { value: value.into(), name: name.map(Into::into), description: None }
+}
+
+fn options(models: &[&str], efforts: &[&str]) -> SessionUpdate {
+    SessionUpdate::Options {
+        options: SessionOptions {
+            models: models.iter().map(|m| choice(m, Some(&m.to_uppercase()))).collect(),
+            efforts: efforts.iter().map(|e| choice(e, None)).collect(),
+        },
+    }
+}
+
+/// The hints of the completion request `text` raises, as (value, detail).
+fn hints_for(app: &mut App, text: &str) -> Vec<(String, String)> {
+    app.handle(ctrl('u'));
+    let effects = typed(app, text);
+    let request = effects
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            Effect::Complete(request) => Some(request.clone()),
+            _ => None,
+        })
+        .unwrap();
+    app.handle(ctrl('u'));
+    request.hints.into_iter().map(|h| (h.value, h.detail)).collect()
+}
+
+fn values_for(app: &mut App, text: &str) -> Vec<String> {
+    hints_for(app, text).into_iter().map(|(value, _)| value).collect()
+}
+
+fn created(effects: &[Effect]) -> Option<SessionSpec> {
+    effects.iter().find_map(|e| match e {
+        Effect::Create { spec, .. } => Some(spec.clone()),
+        _ => None,
+    })
+}
+
+/// An app attached to `openrouter` session `o1` on an SSH workspace, with a model and an effort.
+fn on_openrouter() -> App {
+    let mut app = new_app(Persistence::Persistent);
+    app.start(Some("o1".into()));
+    let mut summary = persistent_summary("o1");
+    summary.meta.provider = "openrouter".into();
+    summary.meta.model = "openai/gpt-4.1-mini".into();
+    summary.meta.location = "ssh:box".into();
+    summary.meta.workspace = "/srv/app".into();
+    app.handle(Input::Attached { summary, transcript: Vec::new(), surfaces: Vec::new(), resync: false, attempt: app.attempt });
+    let attempt = app.attempt;
+    app.handle(Input::Update {
+        session: "o1".into(),
+        attempt,
+        update: SessionUpdate::ConfigChanged {
+            model: "openai/gpt-4.1-mini".into(),
+            effort: Some("low".into()),
+            effort_source: EffortSource::Explicit,
+        },
+    });
+    app
+}
+
+#[test]
+fn provider_completes_every_known_provider_with_a_line_about_it() {
+    let mut app = attached();
+    let hints = hints_for(&mut app, "/provider ");
+    let values: Vec<&str> = hints.iter().map(|(v, _)| v.as_str()).collect();
+    assert_eq!(values, crate::providers::KNOWN);
+    assert!(hints.iter().all(|(_, detail)| !detail.is_empty()), "{hints:?}");
+    let commands = values_for(&mut app, "/pro");
+    assert!(commands.is_empty(), "command names complete from the table, not from hints");
+}
+
+#[test]
+fn provider_switch_starts_a_session_without_the_old_model_or_effort() {
+    let mut app = on_openrouter();
+    typed(&mut app, "/provider codex");
+    let spec = created(&app.handle(press(KeyCode::Enter))).expect("a new session");
+    assert_eq!(spec.provider, "codex");
+    assert_eq!((spec.model, spec.effort), (None, None), "the provider picks its defaults");
+    assert_eq!((spec.workspace.as_str(), spec.location), ("/srv/app", Location::Ssh { destination: "box".into() }));
+    assert_eq!(spec.persistence, Persistence::Persistent);
+}
+
+#[test]
+fn provider_names_the_current_one_rejects_unknown_ones_and_explains_itself() {
+    let mut app = on_openrouter();
+    let before = app.attempt;
+    typed(&mut app, "/provider openrouter");
+    assert!(created(&app.handle(press(KeyCode::Enter))).is_none());
+    assert!(notices(&app).iter().any(|n| n == "already on provider openrouter"), "{:?}", notices(&app));
+    typed(&mut app, "/provider nope");
+    assert!(created(&app.handle(press(KeyCode::Enter))).is_none());
+    let error = notices(&app).into_iter().find(|n| n.starts_with("unknown provider `nope`")).unwrap();
+    assert!(crate::providers::KNOWN.iter().all(|id| error.contains(id)), "{error}");
+    typed(&mut app, "/provider");
+    app.handle(press(KeyCode::Enter));
+    assert!(notices(&app).iter().any(|n| n.starts_with("provider: openrouter · usage: /provider <id>")), "{:?}", notices(&app));
+    assert_eq!(app.attempt, before, "nothing was created");
+}
+
+#[test]
+fn model_and_effort_typed_during_a_provider_switch_go_to_the_new_session() {
+    let mut app = on_openrouter();
+    typed(&mut app, "/provider codex");
+    app.handle(press(KeyCode::Enter));
+    typed(&mut app, "/model gpt-6-sol");
+    let effects = app.handle(press(KeyCode::Enter));
+    typed(&mut app, "/effort high");
+    let more = app.handle(press(KeyCode::Enter));
+    assert!(config_to(&effects, "o1").is_empty() && config_to(&more, "o1").is_empty(), "not the old session");
+    let mut codex = persistent_summary("c1");
+    codex.meta.provider = "codex".into();
+    let effects = app.handle(Input::Created { attempt: app.attempt, result: Ok(codex.clone()) });
+    assert_eq!(effects, [Effect::Attach { session: "c1".into(), resync: false, attempt: app.attempt }]);
+    let effects =
+        app.handle(Input::Attached { summary: codex, transcript: Vec::new(), surfaces: Vec::new(), resync: false, attempt: app.attempt });
+    let to_new = config_to(&effects, "c1");
+    let asked: Vec<(Option<&str>, Option<&str>)> = to_new.iter().map(|p| (p.model.as_deref(), p.effort.as_deref())).collect();
+    assert_eq!(asked, [(Some("gpt-6-sol"), None), (None, Some("high"))]);
+    assert_eq!(app.session.as_ref().unwrap().effort, None, "no effort of another provider is shown");
+}
+
+#[test]
+fn options_replace_seen_values_and_never_leak_across_providers() {
+    let mut app = on_openrouter();
+    // Before the session says, completion offers what was seen for this provider only.
+    app.handle(Input::Sessions(Ok(Vec::new())));
+    typed(&mut app, "/sessions");
+    app.handle(press(KeyCode::Enter));
+    let mut codex = persistent_summary("c9");
+    codex.meta.provider = "codex".into();
+    codex.meta.model = "gpt-6-sol".into();
+    app.handle(Input::Sessions(Ok(vec![codex])));
+    app.handle(press(KeyCode::Esc));
+    assert_eq!(values_for(&mut app, "/model "), ["openai/gpt-4.1-mini"]);
+    assert_eq!(values_for(&mut app, "/effort "), ["low", "auto"]);
+    // The session's options replace them, with details.
+    update_on(&mut app, "o1", options(&["openai/gpt-4.1-mini", "anthropic/claude-sonnet-5"], &["low", "medium", "high"]));
+    let models = hints_for(&mut app, "/model ");
+    assert_eq!(models[1], ("anthropic/claude-sonnet-5".to_owned(), "ANTHROPIC/CLAUDE-SONNET-5".to_owned()));
+    assert_eq!(values_for(&mut app, "/effort "), ["low", "medium", "high", "auto"]);
+    // Switching providers: nothing of openrouter's is offered, codex's seen model is.
+    typed(&mut app, "/provider codex");
+    app.handle(press(KeyCode::Enter));
+    assert_eq!(values_for(&mut app, "/model "), ["gpt-6-sol"], "while the codex session opens");
+    assert_eq!(values_for(&mut app, "/effort "), ["auto"]);
+    let mut summary = persistent_summary("c1");
+    summary.meta.provider = "codex".into();
+    summary.meta.model = "gpt-6-sol".into();
+    app.handle(Input::Created { attempt: app.attempt, result: Ok(summary.clone()) });
+    app.handle(Input::Attached { summary, transcript: Vec::new(), surfaces: Vec::new(), resync: false, attempt: app.attempt });
+    assert!(app.session.as_ref().unwrap().options.is_none(), "the old session's options do not linger");
+    update_on(&mut app, "c1", options(&["gpt-6-sol", "gpt-6-mini"], &["low", "xhigh"]));
+    assert_eq!(values_for(&mut app, "/model "), ["gpt-6-sol", "gpt-6-mini"]);
+    assert_eq!(values_for(&mut app, "/effort "), ["low", "xhigh", "auto"]);
+}
+
+fn update_on(app: &mut App, session: &str, update: SessionUpdate) -> Vec<Effect> {
+    let attempt = app.attempt;
+    app.handle(Input::Update { session: session.into(), attempt, update })
+}
+
+#[test]
+fn an_effort_off_the_known_ladder_is_refused_before_it_is_sent() {
+    let mut app = attached();
+    update(&mut app, options(&["m1", "m2"], &["low", "high"]));
+    typed(&mut app, "/effort ultra");
+    let effects = app.handle(press(KeyCode::Enter));
+    assert!(config_to(&effects, "s1").is_empty(), "{effects:?}");
+    assert!(notices(&app).iter().any(|n| n == "effort `ultra` is not offered by m1 (offers: low, high, auto)"), "{:?}", notices(&app));
+    assert_eq!(app.composer.text(), "/effort ultra", "kept for editing");
+    app.handle(ctrl('u'));
+    for level in ["high", "auto"] {
+        typed(&mut app, &format!("/effort {level}"));
+        assert_eq!(config_to(&app.handle(press(KeyCode::Enter)), "s1").len(), 1, "{level} is sent");
+    }
+    // Another model: its ladder is not known until the session sends it, so the session decides.
+    update(&mut app, SessionUpdate::ConfigChanged { model: "m2".into(), effort: None, effort_source: EffortSource::Auto });
+    typed(&mut app, "/effort ultra");
+    assert_eq!(config_to(&app.handle(press(KeyCode::Enter)), "s1").len(), 1);
+    update(&mut app, options(&["m1", "m2"], &["minimal"]));
+    assert_eq!(values_for(&mut app, "/effort "), ["minimal", "auto"]);
+}
+
+#[test]
+fn clear_empties_the_chat_and_starts_a_session_like_new() {
+    let mut app = attached();
+    update(&mut app, SessionUpdate::ItemAdded { item: user("old question") });
+    update(&mut app, SessionUpdate::Usage { usage: Usage { input_tokens: 5, ..Usage::default() } });
+    assert!(!app.transcript.entries().is_empty());
+    typed(&mut app, "/new");
+    let new = created(&app.handle(press(KeyCode::Enter))).unwrap();
+    assert!(!app.transcript.entries().is_empty(), "/new keeps the chat above");
+    app.handle(Input::Created { attempt: app.attempt, result: Ok(summary("s1", SessionState::Idle)) });
+    app.handle(Input::Attached {
+        summary: summary("s1", SessionState::Idle),
+        transcript: vec![user("old question")],
+        surfaces: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
+    let serial = app.transcript.edit_serial();
+    typed(&mut app, "/clear");
+    let effects = app.handle(press(KeyCode::Enter));
+    let clear = effects.iter().position(|e| *e == Effect::ClearScreen).unwrap();
+    let create = effects.iter().position(|e| matches!(e, Effect::Create { .. })).unwrap();
+    assert!(clear < create, "the screen is cleared before the session starts: {effects:?}");
+    assert_eq!(created(&effects), Some(new), "the same session /new starts");
+    assert!(app.transcript.entries().is_empty());
+    assert_eq!((app.transcript.committed(), app.transcript.items_seen()), (0, 0));
+    assert!(app.transcript.edit_serial() > serial, "a cached view drops every row");
+    assert_eq!(app.tokens, Tokens::default());
+    let effects = app.handle(Input::Created { attempt: app.attempt, result: Ok(summary("s2", SessionState::Idle)) });
+    assert_eq!(effects, [Effect::Attach { session: "s2".into(), resync: false, attempt: app.attempt }]);
+    app.handle(Input::Attached {
+        summary: summary("s2", SessionState::Idle),
+        transcript: Vec::new(),
+        surfaces: Vec::new(),
+        resync: false,
+        attempt: app.attempt,
+    });
+    assert_eq!(notices(&app).len(), 1, "only the new session's line: {:?}", notices(&app));
+    assert!(!app.transcript.entries().iter().any(|e| matches!(e, Entry::User { .. })));
+    let help = help_text();
+    assert!(help.contains("/clear — clear the chat and the screen"), "{help}");
+    assert!(help.contains("/new — start a new session here; the chat so far stays above"), "{help}");
+}
+
 // ---- UI surfaces (ADR 0064) ----
 
 mod surfaces {

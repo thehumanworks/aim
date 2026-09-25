@@ -876,14 +876,15 @@ async fn publish(live: &Live, recorder: &mut Recorder, broken: &mut Option<Strin
     let _unwatched = live.updates.send(update);
 }
 
-/// Publishes what a session's backend says it can switch to (ADR 0074), unless nothing changed.
-/// Under the transcript lock, like items and surfaces: `attach` sees it in its snapshot or on its
-/// stream. It is not recorded.
-async fn publish_options(live: Arc<Live>, lookup: BackendFuture<'static, Option<SessionOptions>>) {
+/// Publishes what a session's backend says it can switch to (ADR 0074), unless nothing changed
+/// and nothing is `forced` (after a model change clients expect the new model's options, even
+/// equal ones). Under the transcript lock, like items and surfaces: `attach` sees it in its
+/// snapshot or on its stream. It is not recorded.
+async fn publish_options(live: Arc<Live>, lookup: BackendFuture<'static, Option<SessionOptions>>, forced: bool) {
     let Some(options) = lookup.await else { return };
     let _ordered = lock(&live.transcript);
     let mut current = lock(&live.options);
-    if current.as_ref() == Some(&options) {
+    if !forced && current.as_ref() == Some(&options) {
         return;
     }
     *current = Some(options.clone());
@@ -902,7 +903,7 @@ fn in_force_of(update: &SessionUpdate) -> Option<InForce> {
 impl Actor {
     async fn run(mut self, mut control: mpsc::UnboundedReceiver<Control>) {
         // Never on the create path: the options arrive when the backend knows them (ADR 0074).
-        self.refresh_options();
+        self.refresh_options(false);
         let mut pending_config: Option<(Option<String>, Option<String>)> = None;
         while let Some(message) = control.recv().await {
             match message {
@@ -940,12 +941,13 @@ impl Actor {
     }
 
     /// Asks the backend again what the session can switch to (the model, or an agent's options,
-    /// changed), dropping a lookup for an older configuration.
-    fn refresh_options(&mut self) {
+    /// changed), dropping a lookup for an older configuration. `forced` sends the answer even when
+    /// it did not change (the model did).
+    fn refresh_options(&mut self, forced: bool) {
         if let Some(lookup) = self.options.take() {
             lookup.abort();
         }
-        self.options = Some(tokio::spawn(publish_options(Arc::clone(&self.live), self.backend.options())));
+        self.options = Some(tokio::spawn(publish_options(Arc::clone(&self.live), self.backend.options(), forced)));
     }
 
     /// Applies a change accepted during the turn that just ended and reports its outcome:
@@ -1007,8 +1009,9 @@ impl Actor {
         if let Some(why) = &self.broken {
             return Err(why.clone());
         }
+        let model_changed = self.announced.as_ref().is_none_or(|before| before.model != in_force.model);
         self.announced = Some(in_force);
-        self.refresh_options();
+        self.refresh_options(model_changed);
         Ok(())
     }
 

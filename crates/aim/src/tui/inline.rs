@@ -114,6 +114,11 @@ pub fn encode_buffer(buf: &Buffer) -> Vec<Encoded> {
     rows
 }
 
+/// Clears the terminal for `/clear`: cursor home, the visible screen (`ED 2`), then the scrollback
+/// (`ED 3`, an xterm extension most terminals and tmux honour; others keep their scrollback). The
+/// only place the writer touches scrollback, and only because the user asked (ADR 0074).
+pub const CLEAR_ALL: &str = "\x1b[H\x1b[2J\x1b[3J";
+
 /// Clears from the cursor's row down. Not a bare `ED 0`: when the block's top sits at the screen's
 /// top-left (after a reflow scrolled it there), tmux's `scroll-on-clear` takes `ED 0` for a full
 /// clear and copies the screen, block included, into scrollback. Clearing the row with `EL 2`, then
@@ -186,6 +191,16 @@ impl Inline {
 
     /// The next paint redraws the whole block (after the alternate screen, for instance).
     pub fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    /// The terminal was cleared (`/clear`, [`CLEAR_ALL`]): nothing of the block is on it any more
+    /// and the cursor is at the top-left, so the next paint starts there.
+    pub fn reset(&mut self) {
+        self.rows.clear();
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.narrowed_from = None;
         self.dirty = true;
     }
 
