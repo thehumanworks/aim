@@ -236,17 +236,26 @@ impl AgentlessWorkspace {
         Ok(Meta { kind, size, mtime_ms: None, hash })
     }
 
-    async fn read_file(&self, path: &str, range: Option<ByteRange>, max_bytes: u64) -> Outcome<FsReadResult> {
+    async fn read_file(&self, path: &str, range: Option<ByteRange>, max_bytes: u64, hash: bool) -> Outcome<FsReadResult> {
         let target = self.safe(path, false).await?;
         let start = range.map_or(0, |range| range.start);
         let count = range.map_or(max_bytes, |range| range.len.min(max_bytes));
-        let body = if start == 0 && count == u64::MAX {
+        let body = if !hash {
+            // POSIX dd with bs=1 limits the remote file reads exactly, even when a pipe's
+            // producer would otherwise read ahead of head -c.
+            format!("dd if=\"$p\" bs=1 skip={start} count={count} 2>/dev/null")
+        } else if start == 0 && count == u64::MAX {
             "cat -- \"$p\"".to_owned()
         } else {
             format!("tail -c +{} -- \"$p\" | head -c {count}", start.saturating_add(1))
         };
+        let header = if hash {
+            "if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < \"$p\"); elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < \"$p\"); else exit 127; fi; printf '%s\\n%s\\n' \"$n\" \"${h%% *}\""
+        } else {
+            "printf '%s\\n' \"$n\""
+        };
         let script = format!(
-            "p={}; [ -f \"$p\" ] || exit 43; n=$(wc -c < \"$p\") || exit; if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < \"$p\"); elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < \"$p\"); else exit 127; fi; printf '%s\\n%s\\n' \"$n\" \"${{h%% *}}\"; {body}",
+            "p={}; [ -f \"$p\" ] || exit 43; n=$(stat -c %s \"$p\" 2>/dev/null || stat -f %z \"$p\" 2>/dev/null) || exit; {header}; {body}",
             quote(&target)
         );
         let (status, output) = self.run_status(&script, &[]).await?;
@@ -258,28 +267,37 @@ impl AgentlessWorkspace {
         }
         let first =
             output.iter().position(|byte| *byte == b'\n').ok_or_else(|| error(ErrorCode::Unavailable, "invalid remote read header"))?;
-        let second = output
-            .iter()
-            .enumerate()
-            .skip(first + 1)
-            .find_map(|(index, byte)| (*byte == b'\n').then_some(index))
-            .ok_or_else(|| error(ErrorCode::Unavailable, "invalid remote read header"))?;
+        let second = if hash {
+            output
+                .iter()
+                .enumerate()
+                .skip(first + 1)
+                .find_map(|(index, byte)| (*byte == b'\n').then_some(index))
+                .ok_or_else(|| error(ErrorCode::Unavailable, "invalid remote read header"))?
+        } else {
+            first
+        };
         let size = std::str::from_utf8(output.get(..first).unwrap_or_default())
             .map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?
             .trim()
             .parse::<u64>()
             .map_err(|_| error(ErrorCode::Unavailable, "invalid remote size"))?;
-        let digest = std::str::from_utf8(output.get(first + 1..second).unwrap_or_default())
-            .map_err(|_| error(ErrorCode::Unavailable, "invalid remote hash"))?;
-        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(error(ErrorCode::Unavailable, "invalid remote hash"));
-        }
+        let digest = if hash {
+            let digest = std::str::from_utf8(output.get(first + 1..second).unwrap_or_default())
+                .map_err(|_| error(ErrorCode::Unavailable, "invalid remote hash"))?;
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(error(ErrorCode::Unavailable, "invalid remote hash"));
+            }
+            Some(ContentHash(format!("sha256:{digest}")))
+        } else {
+            None
+        };
         let content = output.get(second + 1..).unwrap_or_default().to_vec();
         let requested = range.map_or(size.saturating_sub(start), |range| range.len);
         Ok(FsReadResult {
             content: Content::from_bytes(content),
             size,
-            hash: ContentHash(format!("sha256:{digest}")),
+            hash: digest,
             truncated: requested > count && start.saturating_add(count) < size,
         })
     }
@@ -450,8 +468,8 @@ impl Fs for AgentlessWorkspace {
     fn stat<'a>(&'a self, path: &'a str, hash: bool) -> BoxFuture<'a, Outcome<Meta>> {
         Box::pin(async move { self.meta(path, hash).await })
     }
-    fn read<'a>(&'a self, path: &'a str, range: Option<ByteRange>, max_bytes: u64) -> BoxFuture<'a, Outcome<FsReadResult>> {
-        Box::pin(async move { self.read_file(path, range, max_bytes).await })
+    fn read<'a>(&'a self, path: &'a str, range: Option<ByteRange>, max_bytes: u64, hash: bool) -> BoxFuture<'a, Outcome<FsReadResult>> {
+        Box::pin(async move { self.read_file(path, range, max_bytes, hash).await })
     }
     fn write<'a>(&'a self, req: WriteRequest<'a>) -> BoxFuture<'a, Outcome<WriteOutcome>> {
         Box::pin(async move { self.write_file(req).await })
@@ -459,12 +477,13 @@ impl Fs for AgentlessWorkspace {
     fn edit<'a>(&'a self, req: EditRequest<'a>) -> BoxFuture<'a, Outcome<EditOutcome>> {
         Box::pin(async move {
             let _mutation = self.mutations.lock().await;
-            let read = self.read_file(req.path, None, u64::MAX).await?;
+            let read = self.read_file(req.path, None, u64::MAX, true).await?;
+            let read_hash = read.hash.ok_or_else(|| error(ErrorCode::Unavailable, "remote read omitted hash"))?;
             let applied = crate::edit::apply_edits(&read.content.into_bytes(), req.edits).map_err(ProtoError::from)?;
             let content = Content::from_bytes(applied.content);
             match req.precondition {
                 Precondition::IfAbsent => return Err(error(ErrorCode::PreconditionFailed, "edit target exists")),
-                Precondition::IfHash { hash } if hash != &read.hash => {
+                Precondition::IfHash { hash } if hash != &read_hash => {
                     return Err(error(ErrorCode::PreconditionFailed, "remote file changed"));
                 }
                 Precondition::Any | Precondition::IfHash { .. } => {}
@@ -473,7 +492,7 @@ impl Fs for AgentlessWorkspace {
                 .write_file_locked(WriteRequest {
                     path: req.path,
                     content: &content,
-                    precondition: &Precondition::IfHash { hash: read.hash },
+                    precondition: &Precondition::IfHash { hash: read_hash },
                     create_dirs: false,
                     key: req.key,
                 })

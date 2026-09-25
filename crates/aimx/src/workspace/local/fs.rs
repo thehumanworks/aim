@@ -15,7 +15,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read as _, SeekFrom, Write as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -81,6 +81,13 @@ fn hash_file(file: &mut File) -> io::Result<ContentHash> {
         hasher.update(block.get(..n).unwrap_or_default());
     }
     Ok(content_hash(hasher))
+}
+
+fn bounded_bytes(file: &mut (impl io::Read + io::Seek), start: u64, count: u64) -> io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(start))?;
+    let mut out = Vec::new();
+    file.take(count).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 fn entry_kind(file_type: FileType) -> EntryKind {
@@ -192,7 +199,7 @@ fn stat(base: &Base, path: &str, hash: bool) -> Outcome<Meta> {
     Ok(Meta { kind, size: size_of(&stat), mtime_ms: mtime_ms(&stat), hash })
 }
 
-fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64) -> Outcome<FsReadResult> {
+fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64, hash: bool) -> Outcome<FsReadResult> {
     let loc = base.resolve(path, Follow::Final)?;
     if loc.target_dir().is_some() {
         return Err(is_a_directory(path));
@@ -200,6 +207,14 @@ fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64) -> Ou
     let (dir, name) = entry(&loc, path)?;
     let mut file = open_file(dir, name, path)?;
     let (start, wanted) = range.map_or((0, u64::MAX), |r| (r.start, r.len));
+    if !hash {
+        let size = file.metadata().map_err(|err| io_error(&err, path))?.len();
+        let count = wanted.min(max_bytes).min(size.saturating_sub(start));
+        let out = bounded_bytes(&mut file, start, count).map_err(|err| io_error(&err, path))?;
+        let requested = wanted.min(size.saturating_sub(start));
+        let truncated = (out.len() as u64) < requested;
+        return Ok(FsReadResult { content: Content::from_bytes(out), size, hash: None, truncated });
+    }
     let end = start.saturating_add(wanted.min(max_bytes));
     let mut out = Vec::new();
     let mut hasher = Sha256::new();
@@ -225,7 +240,7 @@ fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64) -> Ou
     let size = pos;
     let requested = wanted.min(size.saturating_sub(start));
     let truncated = (out.len() as u64) < requested;
-    Ok(FsReadResult { content: Content::from_bytes(out), size, hash: content_hash(hasher), truncated })
+    Ok(FsReadResult { content: Content::from_bytes(out), size, hash: Some(content_hash(hasher)), truncated })
 }
 
 fn check_precondition(dir: &OwnedFd, name: &OsStr, exists: bool, precondition: &Precondition, display: &str) -> Outcome<()> {
@@ -631,10 +646,10 @@ impl Fs for LocalFs {
         Box::pin(blocking(move || stat(&base, &path, hash)))
     }
 
-    fn read<'a>(&'a self, path: &'a str, range: Option<ByteRange>, max_bytes: u64) -> BoxFuture<'a, Outcome<FsReadResult>> {
+    fn read<'a>(&'a self, path: &'a str, range: Option<ByteRange>, max_bytes: u64, hash: bool) -> BoxFuture<'a, Outcome<FsReadResult>> {
         let base = Arc::clone(&self.base);
         let path = path.to_owned();
-        Box::pin(blocking(move || read(&base, &path, range, max_bytes)))
+        Box::pin(blocking(move || read(&base, &path, range, max_bytes, hash)))
     }
 
     fn write<'a>(&'a self, req: WriteRequest<'a>) -> BoxFuture<'a, Outcome<WriteOutcome>> {
@@ -691,5 +706,51 @@ impl Fs for LocalFs {
         let mutations = Arc::clone(&self.mutations);
         let (from, to) = (from.to_owned(), to.to_owned());
         Box::pin(blocking(move || rename(&base, &mutations, &from, &to, overwrite)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Read, Seek, SeekFrom};
+
+    use super::bounded_bytes;
+
+    struct CountedReader {
+        len: u64,
+        pos: u64,
+        bytes_read: u64,
+    }
+
+    impl Read for CountedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let count = usize::try_from(self.len.saturating_sub(self.pos).min(buf.len() as u64)).unwrap_or(0);
+            buf.get_mut(..count).unwrap_or_default().fill(b'x');
+            self.pos += count as u64;
+            self.bytes_read += count as u64;
+            Ok(count)
+        }
+    }
+
+    impl Seek for CountedReader {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            match pos {
+                SeekFrom::Start(offset) => {
+                    self.pos = offset;
+                    Ok(offset)
+                }
+                _ => Err(io::Error::other("unexpected seek")),
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_read_stops_at_limit() {
+        let mut source = CountedReader { len: 1 << 30, pos: 0, bytes_read: 0 };
+        assert_eq!(bounded_bytes(&mut source, 1 << 20, 17).unwrap(), vec![b'x'; 17]);
+        assert_eq!(source.bytes_read, 17);
+        assert_eq!(source.pos, (1 << 20) + 17);
+
+        assert!(bounded_bytes(&mut source, 1 << 20, 0).unwrap().is_empty());
+        assert_eq!(source.bytes_read, 17);
     }
 }

@@ -30,7 +30,11 @@ async fn write(
 }
 
 async fn read(client: &Client, ws: &WorkspaceId, path: &str) -> aim_proto::harness::FsReadResult {
-    client.peer.call::<FsRead>(FsReadParams { workspace: ws.clone(), path: path.into(), range: None }).await.unwrap()
+    client
+        .peer
+        .call::<FsRead>(FsReadParams { workspace: ws.clone(), path: path.into(), range: None, scope: None, hash: true })
+        .await
+        .unwrap()
 }
 
 fn edit(old: &str, new: &str) -> ExactEdit {
@@ -50,21 +54,27 @@ async fn write_read_stat_roundtrip() {
 
     let got = read(&client, &ws, "dir/a.txt").await;
     assert_eq!(content_string(got.content), "hello\n");
-    assert_eq!(got.hash, created.hash);
+    assert_eq!(got.hash, Some(created.hash.clone()));
     assert_eq!(got.size, 6);
     assert!(!got.truncated);
 
     // Absolute paths under the root (as the client spells it) work too.
     let absolute = env.path("dir/a.txt").to_str().unwrap().to_owned();
-    assert_eq!(read(&client, &ws, &absolute).await.hash, created.hash);
+    assert_eq!(read(&client, &ws, &absolute).await.hash, Some(created.hash.clone()));
 
     let range = client
         .peer
-        .call::<FsRead>(FsReadParams { workspace: ws.clone(), path: "dir/a.txt".into(), range: Some(ByteRange { start: 1, len: 3 }) })
+        .call::<FsRead>(FsReadParams {
+            workspace: ws.clone(),
+            path: "dir/a.txt".into(),
+            range: Some(ByteRange { start: 1, len: 3 }),
+            scope: None,
+            hash: true,
+        })
         .await
         .unwrap();
     assert_eq!(content_string(range.content), "ell");
-    assert_eq!(range.hash, created.hash, "the hash always covers the whole file");
+    assert_eq!(range.hash, Some(created.hash.clone()), "the hash always covers the whole file");
 
     let meta = client.peer.call::<FsStat>(FsStatParams { workspace: ws.clone(), path: "dir/a.txt".into(), hash: true }).await.unwrap();
     assert_eq!(meta.kind, EntryKind::File);
@@ -78,9 +88,17 @@ async fn write_read_stat_roundtrip() {
     let replaced = write(&client, &ws, "dir/a.txt", "bye", Precondition::Any).await.unwrap();
     assert!(!replaced.created);
 
-    let missing = client.peer.call::<FsRead>(FsReadParams { workspace: ws.clone(), path: "nope".into(), range: None }).await.unwrap_err();
+    let missing = client
+        .peer
+        .call::<FsRead>(FsReadParams { workspace: ws.clone(), path: "nope".into(), range: None, scope: None, hash: true })
+        .await
+        .unwrap_err();
     assert_eq!(missing.code, ErrorCode::NotFound);
-    let is_dir = client.peer.call::<FsRead>(FsReadParams { workspace: ws, path: "dir".into(), range: None }).await.unwrap_err();
+    let is_dir = client
+        .peer
+        .call::<FsRead>(FsReadParams { workspace: ws, path: "dir".into(), range: None, scope: None, hash: true })
+        .await
+        .unwrap_err();
     assert_eq!(is_dir.code, ErrorCode::Conflict);
 }
 
@@ -337,6 +355,8 @@ async fn read_many_reports_per_file() {
         workspace: ws,
         paths: vec!["a".into(), "missing".into(), "../outside".into(), "b".into()],
         max_bytes_per_file: Some(3),
+        scope: None,
+        prefix_only: false,
     };
     let result = client.peer.call::<FsReadMany>(params).await.unwrap();
     let summary: Vec<String> = result
@@ -348,4 +368,51 @@ async fn read_many_reports_per_file() {
         })
         .collect();
     assert_eq!(summary, ["a=alp…", "missing!not_found", "../outside!denied", "b=bet…"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prefix_reads_report_size_without_hashing_the_rest() {
+    use aim_proto::harness::{FsReadMany, FsReadManyParams, ReadManyEntry};
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let env = env().await;
+    let (client, _, ws) = session(&env).await;
+    let mut file = std::fs::File::create(env.path("huge")).unwrap();
+    file.set_len(1 << 30).unwrap();
+    file.seek(SeekFrom::Start(1 << 20)).unwrap();
+    file.write_all(b"prefix").unwrap();
+    drop(file);
+
+    let result = client
+        .peer
+        .call::<FsRead>(FsReadParams {
+            workspace: ws.clone(),
+            path: "huge".into(),
+            range: Some(ByteRange { start: 1 << 20, len: 17 }),
+            scope: None,
+            hash: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.content.into_bytes(), [b"prefix".as_slice(), &[0; 11]].concat());
+    assert_eq!(result.size, 1 << 30);
+    assert!(result.hash.is_none());
+    assert!(!result.truncated);
+
+    let result = client
+        .peer
+        .call::<FsReadMany>(FsReadManyParams {
+            workspace: ws,
+            paths: vec!["huge".into()],
+            max_bytes_per_file: Some(7),
+            scope: None,
+            prefix_only: true,
+        })
+        .await
+        .unwrap();
+    let Some(ReadManyEntry::Ok { read, .. }) = result.entries.into_iter().next() else { panic!("expected read result") };
+    assert_eq!(read.content.len(), 7);
+    assert_eq!(read.size, 1 << 30);
+    assert!(read.hash.is_none());
+    assert!(read.truncated);
 }

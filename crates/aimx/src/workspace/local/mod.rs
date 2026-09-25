@@ -188,7 +188,7 @@ mod root_race_tests {
         if let Ok(workspace) = opened {
             assert_eq!(workspace.root(), canonical);
             let path = format!("{canonical}/secret");
-            match workspace.fs().read(&path, None, 1024).await {
+            match workspace.fs().read(&path, None, 1024, true).await {
                 Ok(read) => assert_eq!(read.content.into_bytes(), b"inside", "the held root descriptor reached the outside sentinel"),
                 Err(err) => assert!(matches!(err.code, ErrorCode::Denied | ErrorCode::NotFound | ErrorCode::Conflict)),
             }

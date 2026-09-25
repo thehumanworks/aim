@@ -467,7 +467,7 @@ async fn linux_exit(workspace: &AgentlessWorkspace, proc: &ProcId) -> ExitStatus
 }
 
 async fn assert_linux_sleep_stopped(connection: &Connection, workspace: &AgentlessWorkspace, marker: &str) {
-    let pid = workspace.fs().read(marker, None, 100).await.expect("read Linux sleep PID").content.into_bytes();
+    let pid = workspace.fs().read(marker, None, 100, true).await.expect("read Linux sleep PID").content.into_bytes();
     let pid = String::from_utf8(pid).expect("decimal PID");
     assert!(!pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()));
     let check = format!("if [ -r /proc/{pid}/stat ]; then awk '{{print $3}}' /proc/{pid}/stat; else printf gone; fi");
@@ -530,7 +530,7 @@ async fn linux_regressions(distribution: &str) {
         .edit(EditRequest { path: &file, edits: &edit, precondition: &Precondition::Any, key: &key() })
         .await
         .expect("edit Linux file");
-    assert_eq!(workspace.fs().read(&file, None, 100).await.expect("read Linux edit").content.into_bytes(), b"after\n");
+    assert_eq!(workspace.fs().read(&file, None, 100, true).await.expect("read Linux edit").content.into_bytes(), b"after\n");
     assert_eq!(connection.run("stat -c %a /tmp/aim-work/script.sh", &[]).await.expect("Linux mode"), b"755\n");
     connection.run("touch /tmp/aim-work/empty.txt", &[]).await.expect("empty fixture");
     let listing =
@@ -545,7 +545,10 @@ async fn linux_regressions(distribution: &str) {
     let script = format!("cat > /tmp/aim-work/large.txt <<'AIM_EOF'\n{payload}\nAIM_EOF");
     let proc = linux_spawn(&workspace, root, script, None).await;
     assert_eq!(linux_exit(&workspace, &proc).await, ExitStatus::Exited { code: 0 });
-    assert_eq!(workspace.fs().read(&format!("{root}/large.txt"), None, 70_000).await.expect("large script result").content.len(), 65_537);
+    assert_eq!(
+        workspace.fs().read(&format!("{root}/large.txt"), None, 70_000, true).await.expect("large script result").content.len(),
+        65_537
+    );
 
     // N5 and N6: Alpine has busybox realpath/ps and no perl; exit codes and group kills must work.
     if distribution == "alpine" {
@@ -576,12 +579,12 @@ async fn linux_regressions(distribution: &str) {
     }
     for (_, marker) in &processes {
         for _ in 0..40 {
-            if workspace.fs().read(marker, None, 100).await.is_ok() {
+            if workspace.fs().read(marker, None, 100, true).await.is_ok() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(workspace.fs().read(marker, None, 100).await.is_ok(), "Linux sleep PID marker missing");
+        assert!(workspace.fs().read(marker, None, 100, true).await.is_ok(), "Linux sleep PID marker missing");
     }
     let mut tasks = tokio::task::JoinSet::new();
     for (proc, _) in &processes {
@@ -749,7 +752,7 @@ async fn live_ssh_transport_failure_is_unavailable_and_conflicts_are_conflicts()
     let workspace = open_agentless(&sshd, &root).await;
     assert_eq!(workspace.fs().mkdir(&file.to_string_lossy(), &key()).await.expect_err("mkdir over file").code, ErrorCode::Conflict);
     assert_eq!(workspace.fs().remove(&full.to_string_lossy(), false, &key()).await.expect_err("nonempty rmdir").code, ErrorCode::Conflict);
-    assert_eq!(workspace.fs().read(&full.to_string_lossy(), None, 10).await.expect_err("read directory").code, ErrorCode::Conflict);
+    assert_eq!(workspace.fs().read(&full.to_string_lossy(), None, 10, true).await.expect_err("read directory").code, ErrorCode::Conflict);
     let connection = sshd.connect().await;
     drop(
         Command::new("ssh")
@@ -770,7 +773,7 @@ async fn live_ssh_transport_failure_is_unavailable_and_conflicts_are_conflicts()
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let path = file.to_string_lossy();
-    assert_eq!(workspace.fs().read(&path, None, 10).await.expect_err("offline read").code, ErrorCode::Unavailable);
+    assert_eq!(workspace.fs().read(&path, None, 10, true).await.expect_err("offline read").code, ErrorCode::Unavailable);
     assert_eq!(workspace.fs().stat(&path, false).await.expect_err("offline stat").code, ErrorCode::Unavailable);
     let new_path = root.join("new.txt").to_string_lossy().into_owned();
     let content = Content::Utf8 { text: "new".to_owned() };
@@ -1164,7 +1167,7 @@ async fn live_ssh_large_read_and_listing_have_bounded_localhost_latency() {
     }
     let workspace = open_agentless(&sshd, &root).await;
     let started = Instant::now();
-    let read = workspace.fs().read(&large.to_string_lossy(), None, 4 << 20).await.expect("large read");
+    let read = workspace.fs().read(&large.to_string_lossy(), None, 4 << 20, true).await.expect("large read");
     let read_duration = started.elapsed();
     assert_eq!(read.content.len(), 4 << 20);
     let started = Instant::now();
@@ -1201,7 +1204,7 @@ async fn live_ssh_hashes_filenames_with_backslashes_via_stdin() {
         })
         .await
         .expect("write unusual filename");
-    let read = workspace.fs().read(&path, None, 100).await.expect("read unusual filename");
+    let read = workspace.fs().read(&path, None, 100, true).await.expect("read unusual filename");
     assert_eq!(read.content.into_bytes(), b"before");
     let edit = [ExactEdit { old: "before".to_owned(), new: "after".to_owned(), replace_all: false }];
     workspace
@@ -1750,15 +1753,20 @@ async fn exercise_agentless(sshd: &Sshd, connection: Connection) {
     assert!(write.created);
     assert_eq!(std::fs::read_to_string(local_root.join("sample.txt")).expect("local sentinel"), "local sentinel");
     assert!(timed("stat", workspace.fs().stat(&file, true)).await.expect("stat").hash.is_some());
-    let read = timed("read", workspace.fs().read(&file, None, 100)).await.expect("read");
+    let read = timed("read", workspace.fs().read(&file, None, 100, true)).await.expect("read");
     assert_eq!(read.content, content);
+    let prefix = workspace.fs().read(&file, None, 4, false).await.expect("prefix read");
+    assert_eq!(prefix.content.into_bytes(), b"firs");
+    assert_eq!(prefix.size, content.len() as u64);
+    assert!(prefix.hash.is_none());
+    assert!(prefix.truncated);
     let edit = ExactEdit { old: "before".to_owned(), new: "after".to_owned(), replace_all: false };
     timed(
         "edit",
         workspace.fs().edit(EditRequest {
             path: &file,
             edits: &[edit],
-            precondition: &Precondition::IfHash { hash: read.hash },
+            precondition: &Precondition::IfHash { hash: read.hash.expect("requested hash") },
             key: &key(),
         }),
     )
@@ -1840,12 +1848,13 @@ async fn exercise_edge_cases(workspace: &AgentlessWorkspace, remote_root: &Path,
         })
         .await
         .expect("binary write");
-    let range = workspace.fs().read(&binary_path, Some(aim_proto::harness::ByteRange { start: 1, len: 2 }), 2).await.expect("range read");
+    let range =
+        workspace.fs().read(&binary_path, Some(aim_proto::harness::ByteRange { start: 1, len: 2 }), 2, true).await.expect("range read");
     assert_eq!(range.content.into_bytes(), vec![255, 65]);
     let inside = remote_root.join("inside-link");
     std::os::unix::fs::symlink(&binary_path, &inside).expect("inside symlink fixture");
     assert_eq!(
-        workspace.fs().read(&inside.to_string_lossy(), None, 10).await.expect("read inside symlink").content.into_bytes(),
+        workspace.fs().read(&inside.to_string_lossy(), None, 10, true).await.expect("read inside symlink").content.into_bytes(),
         binary.clone().into_bytes()
     );
     let stale = Precondition::IfHash { hash: aim_proto::harness::ContentHash(format!("sha256:{}", "0".repeat(64))) };

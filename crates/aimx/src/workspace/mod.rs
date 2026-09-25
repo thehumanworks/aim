@@ -60,9 +60,9 @@ pub trait Fs: Send + Sync {
     /// Metadata of one entry (symlinks are not followed).
     fn stat<'a>(&'a self, path: &'a str, hash: bool) -> BoxFuture<'a, Outcome<Meta>>;
 
-    /// Reads a file or a byte range of it, returning at most `max_bytes` (the result says whether
-    /// it was truncated) plus the hash of the whole file.
-    fn read<'a>(&'a self, path: &'a str, range: Option<ByteRange>, max_bytes: u64) -> BoxFuture<'a, Outcome<FsReadResult>>;
+    /// Reads a file or a byte range of it, returning at most `max_bytes`. When `hash` is true,
+    /// computes the whole-file hash; otherwise the backend must stop reading at the byte limit.
+    fn read<'a>(&'a self, path: &'a str, range: Option<ByteRange>, max_bytes: u64, hash: bool) -> BoxFuture<'a, Outcome<FsReadResult>>;
 
     /// Replaces a file atomically under a precondition.
     fn write<'a>(&'a self, req: WriteRequest<'a>) -> BoxFuture<'a, Outcome<WriteOutcome>>;
