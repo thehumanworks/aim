@@ -167,3 +167,93 @@ text(first(a) + " | " + first(b));"#;
     assert_eq!(direct["isError"], true, "only: a workspace tool is not callable directly: {direct}");
     only.close().await;
 }
+
+/// A small repository with four TODO comments (and a FIXME that is not one).
+fn todo_repository() -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("repository");
+    for (path, text) in [
+        ("src/main.rs", "fn main() {\n    // TODO: parse command-line flags instead of hardcoding the port\n    server::start(8080);\n}\n"),
+        (
+            "src/net/server.rs",
+            "pub fn start(port: u16) {\n    // TODO: add TLS support\n    println!(\"{port}\");\n    // TODO(alice): handle graceful shutdown on SIGTERM\n}\n",
+        ),
+        ("src/net/retry.rs", "pub fn retry(n: u32) -> u32 {\n    // FIXME: not exponential backoff yet\n    n.min(5)\n}\n"),
+        ("docs/notes.md", "# Notes\n\n- TODO: document the configuration file format\n"),
+    ] {
+        let file = root.path().join(path);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("directory");
+        std::fs::write(file, text).expect("fixture");
+    }
+    root
+}
+
+const TODO_PROMPT: &str = "Find all TODO comments across the files in this repository and summarize them.";
+
+/// Runs `aim run --json` as a process with `AIM_CODE_MODE=mode`; returns its session updates.
+fn aim_run(mode: &str, args: &[&str], home: Option<&Path>) -> Vec<Value> {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_aim"));
+    command.arg("run").args(args).arg("--json").arg(TODO_PROMPT).env("AIM_CODE_MODE", mode).env("AIM_CODERUN", worker());
+    if let Some(home) = home {
+        command.env("AIM_HOME", home);
+    }
+    let output = command.output().expect("aim runs");
+    assert!(output.status.success(), "aim run failed: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| serde_json::from_str(line).ok()).collect()
+}
+
+/// The top-level tool calls, the model requests, and the final answer of a run.
+fn digest(updates: &[Value]) -> (Vec<String>, usize, String) {
+    let field = |update: &Value, name: &str| update.get(name).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let tools = updates
+        .iter()
+        .filter(|update| field(update, "type") == "tool_started" && update.get("parent").is_none_or(Value::is_null))
+        .map(|update| field(update, "name"))
+        .collect();
+    let requests = updates.iter().filter(|update| field(update, "type") == "request_started").count();
+    let answer = updates
+        .iter()
+        .filter(|update| field(update, "type") == "item_added")
+        .filter_map(|update| update.get("item"))
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("assistant"))
+        .flat_map(|item| item.get("parts").and_then(Value::as_array).cloned().unwrap_or_default())
+        .filter_map(|part| part.get("text").and_then(Value::as_str).map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (tools, requests, answer)
+}
+
+fn names_every_todo(answer: &str) -> bool {
+    ["configuration file", "command-line", "TLS", "SIGTERM"].iter().all(|todo| answer.contains(todo))
+}
+
+/// ADR 0076 live: with `only`, an OpenRouter model finds and summarizes the TODOs through
+/// `run_code` alone.
+#[test]
+#[ignore = "live: calls OpenRouter (needs OPENROUTER_API_KEY)"]
+fn live_openrouter_code_mode_only_summarizes_todos_through_run_code() {
+    let repository = todo_repository();
+    let root = repository.path().to_string_lossy().into_owned();
+    let updates = aim_run("only", &["--ephemeral", "-p", "openrouter", "-m", "openai/gpt-4.1-mini", "-C", &root], None);
+    let (tools, requests, answer) = digest(&updates);
+    println!("[live_openrouter_code_mode_only] requests {requests}, top-level tools {tools:?}");
+    assert!(tools.iter().any(|tool| tool == "run_code"), "{tools:?}");
+    assert!(tools.iter().all(|tool| ["run_code", "save_program", "run_program", "list_programs"].contains(&tool.as_str())), "{tools:?}");
+    assert!(names_every_todo(&answer), "{answer}");
+}
+
+/// ADR 0076 live: a strict `acp:claude` session in `only` starts through aim's relay (its
+/// conformance challenge reads through `run_code`) and Claude works through `run_code`.
+#[test]
+#[ignore = "live: runs Claude Code through claude-agent-acp and aim's code-mode relay"]
+fn live_acp_claude_code_mode_only_works_through_the_relay() {
+    let repository = todo_repository();
+    let root = repository.path().to_string_lossy().into_owned();
+    let home = tempfile::tempdir().expect("aim home");
+    // The store creates a private (0700) home that does not exist yet.
+    let updates = aim_run("only", &["-p", "acp:claude", "-m", "sonnet", "-C", &root], Some(&home.path().join("aim")));
+    let (tools, _, answer) = digest(&updates);
+    println!("[live_acp_claude_code_mode_only] tools {tools:?}");
+    assert!(tools.iter().any(|tool| tool == "mcp__aim__run_code"), "{tools:?}");
+    assert!(tools.iter().all(|tool| tool.starts_with("mcp__aim__")), "strict authority: {tools:?}");
+    assert!(names_every_todo(&answer), "{answer}");
+}
