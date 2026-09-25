@@ -130,13 +130,29 @@ impl Connection {
             drop(lock);
             return Ok(connection);
         }
+        let mut stale_socket = false;
         if let Ok(metadata) = std::fs::symlink_metadata(&connection.control_path) {
             if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::geteuid().as_raw() {
                 return Err(unavailable("SSH control path is occupied by an untrusted file"));
             }
             std::fs::remove_file(&connection.control_path).map_err(|_| unavailable("cannot remove stale SSH control socket"))?;
+            stale_socket = true;
         }
-        connection.start_master(&own_dir, &own_template, prompter).await?;
+        if let Err(first_error) = connection.start_master(&own_dir, &own_template, prompter.clone()).await {
+            if !stale_socket {
+                return Err(first_error);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !connection.check_master().await {
+                if let Ok(metadata) = std::fs::symlink_metadata(&connection.control_path) {
+                    if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::geteuid().as_raw() {
+                        return Err(unavailable("SSH control path is occupied by an untrusted file"));
+                    }
+                    std::fs::remove_file(&connection.control_path).map_err(|_| unavailable("cannot remove stale SSH control socket"))?;
+                }
+                connection.start_master(&own_dir, &own_template, prompter).await?;
+            }
+        }
         drop(lock);
         Ok(connection)
     }
