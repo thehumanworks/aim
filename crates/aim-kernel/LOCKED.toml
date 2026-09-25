@@ -4,121 +4,126 @@
 # then `mise run locked:update`.
 
 [[locked]]
-decision = "job::accepted"
-adr = "0048"
-sha256 = "9bcd5c8e6fbaa5292d3a2bd5e22be1585bdd14495ece39bdaffcad505ccdc0d7"
-
-[[locked]]
-decision = "negotiate::agreed"
-adr = "0005"
-sha256 = "7b09700a52ae6b8b126a036d515d00a5a38012025a731040b46dff167774e425"
-
-[[locked]]
-decision = "job::attempt_live"
-adr = "0048"
-sha256 = "7e4b1b2b01200080dbfb81132454d9d6ab65cf43c9c8ea601adf620fa68dc988"
-
-[[locked]]
-decision = "dedup::begin_decision"
-adr = "0050"
-sha256 = "e60ab42ace9937eb33cd533d0aca0437a1e65a65c4fe390008204bfe90f8de2d"
-
-[[locked]]
-decision = "discovery::budget_wf"
-adr = "0050"
-sha256 = "90a1146b758b36757d9f3d044cd808baf4a7ddfbcb210a19d315ce13cc063d76"
-
-[[locked]]
-decision = "discovery::charged"
-adr = "0050"
-sha256 = "6433d26f1082345ecf52591c376e97fcd8fb106ff9570eaea21cbaf2d6186c7d"
-
-[[locked]]
-decision = "job::claim_is_current"
-adr = "0048"
-sha256 = "8b711f3800839822d4d028de4aba977c49ab777134dc483608168ed93c2a5cc8"
-
-[[locked]]
-decision = "path::confined"
-adr = "0008"
-sha256 = "8a559150598f4595a7ee9fd6a2c835a758a37f8641e5442ad9d729c4c26ea456"
-
-[[locked]]
-decision = "compaction::cut_ok"
-adr = "0025"
-sha256 = "7ea77f5ce46dc0ba5713501029c62ac29f497d4697cc9ff0ca4617aebc543cb0"
-
-[[locked]]
-decision = "dedup::dedup_next"
-adr = "0050"
-sha256 = "844a94b90b62e09adeae5d3952e1647cad1a7bd871967435c022da96e58559ea"
-
-[[locked]]
-decision = "policy::effective_ok"
-adr = "0027"
-sha256 = "61f9bd7b83a55b6ec478c9161287b38aede21202d9d6c4cb059b422e1acf78df"
-
-[[locked]]
-decision = "dedup::eviction_phase"
-adr = "0050"
-sha256 = "515a5e34191e50f0d14c3bd2d6943ac34cc91bcb821347943085d73fcfb34f21"
-
-[[locked]]
-decision = "dedup::finish_phase"
-adr = "0050"
-sha256 = "a9a761ade0c8ad95d7f914a358ab0dc7cff63aff537849aa11e58438a892a4cb"
-
-[[locked]]
-decision = "job::fresh"
-adr = "0048"
-sha256 = "b021d3b3d086ce15a9b5066f476869d5cce10bcd613e8157ef4e6800fa4bb020"
-
-[[locked]]
-decision = "job::holds_capacity"
-adr = "0048"
-sha256 = "29c9a0314cb488bdd4e464b2696b7466dbe7c8adca93c9cd4b522264375dcb31"
-
-[[locked]]
-decision = "policy::intersection_ok"
-adr = "0027"
-sha256 = "da31db0dd67b1aebb510ad6c371910fa4a3d3aa91c4531aa5559c45e1488203e"
-
-[[locked]]
-decision = "policy::narrows"
-adr = "0027"
-sha256 = "0645e649ab83d3f7ca3ac03bf94229a69f1de7629eb7e6e778bd3cf5454691cd"
-
-[[locked]]
-decision = "effort::next_spec"
-adr = "0013"
-sha256 = "90ea533be4c75a5d47937213d82584194f7822432f9cf8deeae655d5b5e13de8"
-
-[[locked]]
-decision = "policy::permits"
-adr = "0027"
-sha256 = "02ff049196e212714de9e4499158bdc8001682389faf312e96e743576695d5d9"
-
-[[locked]]
-decision = "compaction::plan_ok"
-adr = "0025"
-sha256 = "e2a78dbf038d98aa155d8e80f6d803b7f82a18922041c12a35bed2e5cb313b64"
-
-[[locked]]
-decision = "discovery::reservable"
-adr = "0050"
-sha256 = "160e96c68f81f7da6d290b27a2cc3f419994ce049892c263bfdb4300ed922713"
-
-[[locked]]
 decision = "agent_tools::tool_intersection_ok"
 adr = "0050"
-sha256 = "853bf7da4d4b0ad4a9891f6abcfdd8a653519baae8df8958e69b1b519e397d76"
+sha256 = "2cc4d51bdcb78914099cd6c128a07de6f5e75a393b57aa35255e47c85f6011d1"
 
 [[locked]]
 decision = "agent_tools::tool_permits"
 adr = "0050"
-sha256 = "336fdd4677cc8e5dd3d7fe3c6c38162e35c71bfc66db5ad7471e694fe74bc7c2"
+sha256 = "1db6a666fac9ac73e0d274754131a6786d3268efddf07fc9b1ff1695db52b6c4"
 
 [[locked]]
 decision = "agent_tools::unrestricted"
 adr = "0050"
-sha256 = "2653c875c66542afe9bab5ca13b375b680b7e521b4dcca5b8c7f07c67dcebb49"
+sha256 = "12136c5d2f2ceb46380ae845ba4e207aba9dc28d22e6ea26089f8ed45a708dcc"
+
+[[locked]]
+decision = "compaction::cut_ok"
+adr = "0025"
+sha256 = "b5fd42f60b49b4f29dd25a8d5eb39510bb4bad09b481787d5f173fe14d1f8618"
+
+[[locked]]
+decision = "compaction::plan_ok"
+adr = "0025"
+sha256 = "b4182c549e14f5e68e726efcf7d4e7f1a31cbba6bf476efc6ddb1e6038ca6bd0"
+
+[[locked]]
+decision = "dedup::begin_decision"
+adr = "0050"
+sha256 = "77e938f6ec64051ed04a3de4f2dc3b5016fad068c96094b0ad861e653bf4a739"
+
+[[locked]]
+decision = "dedup::dedup_next"
+adr = "0050"
+sha256 = "a82862c9f0d6876cd98918b175a8bafb643f5b84ebf7db70343b19a2b8021725"
+
+[[locked]]
+decision = "dedup::eviction_phase"
+adr = "0050"
+sha256 = "06697421fa8772e0bb1264ec1c7e57acf540ff5462a5e81a241ad4f44657c6a6"
+
+[[locked]]
+decision = "dedup::finish_phase"
+adr = "0050"
+sha256 = "d1e863368fe5a3f1a4bf79b4fd6416a4294dd3eeea27ec72089d4e6d8589a16b"
+
+[[locked]]
+decision = "discovery::budget_wf"
+adr = "0050"
+sha256 = "c48cc8b429f4701f0e3981f3132401430a3b0643db1e0af6bed9a404ac543514"
+
+[[locked]]
+decision = "discovery::charged"
+adr = "0050"
+sha256 = "10dc578bc6a491fc0167380cd14ec4f7feb61dbcac5cb831fdf566c23190f0cc"
+
+[[locked]]
+decision = "discovery::reservable"
+adr = "0050"
+sha256 = "80784a872a338ec5c613f4e5e6d236a9e49a0495fe67fd3e5b0c213a7b65e54f"
+
+[[locked]]
+decision = "effort::next_spec"
+adr = "0013"
+sha256 = "5269118c3ff9b9fa8370e434f94ad5eea21618210b69cbc80592abeca3d56478"
+
+[[locked]]
+decision = "job::accepted"
+adr = "0048"
+sha256 = "46cf2e99cb9854550a9a9edd15dd1c0b19079590c76dfd676a39ed59f11eee23"
+
+[[locked]]
+decision = "job::attempt_live"
+adr = "0048"
+sha256 = "6b11e8dd90eae7919f25638eb77e47e595bf7c1baa796aa892af3c0eec97c627"
+
+[[locked]]
+decision = "job::claim_is_current"
+adr = "0048"
+sha256 = "8f1ced8f5a18f7e38f8135534963d36ca88ac89f1fe73d5e9368acf87a2a3076"
+
+[[locked]]
+decision = "job::fresh"
+adr = "0048"
+sha256 = "b1ef0b64db96ae31e7d3f14c01492aadc716d7fa8ee805c40e94fcab8970b31b"
+
+[[locked]]
+decision = "job::holds_capacity"
+adr = "0048"
+sha256 = "34eb545b56c85d3f39f6009066470c0d9f48102b5e00cd1826ce8f4473e4f961"
+
+[[locked]]
+decision = "job::wf"
+adr = "0048"
+sha256 = "d1be5db6714dd2cdc63608b82762f2591e22f58444264feb2bd96cb3a75324ad"
+
+[[locked]]
+decision = "negotiate::agreed"
+adr = "0005"
+sha256 = "f30159988bd201eb6b95442aaf8b0d02952ebef04923b5e3d827c7de5f05e6b0"
+
+[[locked]]
+decision = "path::confined"
+adr = "0008"
+sha256 = "5b492a4b10b81060472a2895da98b5b78098db72663dce775856e8f2ff11499d"
+
+[[locked]]
+decision = "policy::effective_ok"
+adr = "0027"
+sha256 = "9ef5c0847862c5507bd68391f9c6d0a29a2a9eb539d2377994cb6c52209da572"
+
+[[locked]]
+decision = "policy::intersection_ok"
+adr = "0027"
+sha256 = "dbdce1e1180592e6c8c2546168b869f1f2e768e06ac7289af2d1108f71a4e395"
+
+[[locked]]
+decision = "policy::narrows"
+adr = "0027"
+sha256 = "0cf6530c7bfd5b09d9fe3924ae974fecc2740144d232def7463fcf0c0e3d7e6f"
+
+[[locked]]
+decision = "policy::permits"
+adr = "0027"
+sha256 = "b436aff31886153d90bee2b8030c747e55bf419bda0683240df74576f30927ee"

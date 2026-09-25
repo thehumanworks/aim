@@ -77,10 +77,11 @@ fn item_text(lines: &[&str], start: usize) -> String {
     out
 }
 
-/// Collects spec fns, structs and enums declared in `file`, keyed by name.
-pub fn items(file: &SourceFile) -> BTreeMap<String, Item> {
+/// Collects spec fns, structs and enums declared in `file`, in source order. A module may declare
+/// a name more than once (the same method name on different types), so names can repeat.
+pub fn items(file: &SourceFile) -> Vec<(String, Item)> {
     let lines: Vec<&str> = file.text.lines().collect();
-    let mut found = BTreeMap::new();
+    let mut found = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         let (kind, name) = if trimmed.contains("spec fn ") && !trimmed.starts_with("//") {
@@ -105,9 +106,56 @@ pub fn items(file: &SourceFile) -> BTreeMap<String, Item> {
             .into_iter()
             .rev()
             .collect();
-        found.insert(name, Item { kind, text: item_text(&lines, i), doc });
+        found.push((name, Item { kind, text: item_text(&lines, i), doc }));
     }
     found
+}
+
+/// Names that `file` imports from other kernel modules (`use crate::module::{A, B};` or
+/// `use crate::module::A;`), mapped to the module they come from.
+pub fn imports(file: &SourceFile) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    let mut rest = file.text.as_str();
+    while let Some(start) = rest.find("use crate::") {
+        let Some(tail) = rest.get(start + "use crate::".len()..) else { break };
+        let end = tail.find(';').unwrap_or(tail.len());
+        let (stmt, after) = tail.split_at(end);
+        rest = after;
+        let Some((module, names)) = stmt.split_once("::") else { continue };
+        for name in tokens(names) {
+            if name != "self" {
+                map.insert(name.to_owned(), module.trim().to_owned());
+            }
+        }
+    }
+    map
+}
+
+/// Identifier-like tokens in `text`, each with the identifier directly before it when the two
+/// are joined by `::` (`job::Event` yields `(Some("job"), "Event")`).
+pub fn paths(text: &str) -> Vec<(Option<&str>, &str)> {
+    let mut out = Vec::new();
+    let mut previous: Option<(&str, usize)> = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some(&(start, c)) = chars.peek() {
+        if !(c.is_alphanumeric() || c == '_') {
+            chars.next();
+            continue;
+        }
+        let mut end = start;
+        while let Some(&(i, c)) = chars.peek() {
+            if !(c.is_alphanumeric() || c == '_') {
+                break;
+            }
+            end = i + c.len_utf8();
+            chars.next();
+        }
+        let Some(ident) = text.get(start..end) else { continue };
+        let qualifier = previous.filter(|&(_, prev_end)| text.get(prev_end..start).is_some_and(|gap| gap.trim() == "::")).map(|(q, _)| q);
+        out.push((qualifier, ident));
+        previous = Some((ident, end));
+    }
+    out
 }
 
 /// Whitespace-insensitive normal form used for digests (formatting never changes a decision).

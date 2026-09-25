@@ -70,3 +70,4 @@ Rules (enforced by `mise run check`):
 | [0052](0052-remote-workspace-location.md) | Persist remote harness URLs as workspace locations without credentials. |
 | [0053](0053-network-token-call-scope-ceilings.md) | Bind network bearer scopes to harness sessions. |
 | [0054](0054-reserve-image-destination-before-generation.md) | Reserve image destinations before paid generation. |
+| [0065](0065-locked-digests-resolve-names-by-module.md) | LOCKED digests resolve kernel names by module. |
