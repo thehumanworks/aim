@@ -687,7 +687,7 @@ async fn live_skill_mention_via_aim_run_openrouter() {
     let home = tempfile::tempdir().unwrap();
     let started = std::time::Instant::now();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_aim"))
-        .args(["run", "-p", "openrouter", "--ephemeral", "--aimx"])
+        .args(["run", "-p", "openrouter", "--ephemeral", "--json", "--aimx"])
         .arg(&aimx)
         .arg("-C")
         .arg(repo.path())
@@ -696,12 +696,37 @@ async fn live_skill_mention_via_aim_run_openrouter() {
         .output()
         .unwrap();
     let elapsed = started.elapsed();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("live_aim_run stdout:\n{stdout}\nstderr (last line): {}", stderr.lines().last().unwrap_or_default());
-    eprintln!("live_aim_run_ms={}", elapsed.as_millis());
-    assert!(output.status.success(), "aim run failed: {stderr}");
-    let lines: Vec<&str> = stdout.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    assert!(output.status.success(), "aim run failed: {}", String::from_utf8_lossy(&output.stderr));
+    let updates: Vec<SessionUpdate> =
+        String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+    // The recorded user turn carries the skill; the answer follows it.
+    let user_parts: Vec<String> = updates
+        .iter()
+        .filter_map(|u| match u {
+            SessionUpdate::ItemAdded { item: Item::User { parts } } => {
+                Some(texts(parts).into_iter().map(str::to_owned).collect::<Vec<_>>())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(user_parts.iter().any(|p| p.starts_with("<skill name=\"haiku\" path=\".agents/skills/haiku/SKILL.md\">")), "{user_parts:?}");
+    let answer: String = updates
+        .iter()
+        .filter_map(|u| match u {
+            SessionUpdate::TextDelta { delta } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    let usage: Vec<&Usage> = updates
+        .iter()
+        .filter_map(|u| match u {
+            SessionUpdate::Usage { usage } => Some(usage),
+            _ => None,
+        })
+        .collect();
+    eprintln!("live_aim_run answer:\n{answer}\nusage: {usage:?}\nlive_aim_run_ms={}", elapsed.as_millis());
+    let lines: Vec<&str> = answer.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     assert_eq!(lines.len(), 3, "a haiku has three lines: {lines:?}");
     // The same repository's prefix, as the session built it.
     let prefix = live_prefix(&aimx, repo.path(), None).await;
