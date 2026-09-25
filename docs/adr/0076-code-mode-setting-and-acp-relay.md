@@ -268,27 +268,40 @@ first. T4b pre-registered the benchmark before any live run (`bench/plans/code-m
 **The tasks.** The live tier's six fix-a-function tasks, and three new fan-out tasks that end in
 a report: count TODO/FIXME per file over ten files (`todo_table`), list every call site of
 `load_config` among eleven modules with decoys (`callers`), and index the first heading of ten
-Markdown files (`doc_index`). Hidden tests grade the reports.
+Markdown files (`doc_index`). Hidden tests grade the reports as exact entries.
 
-**Primary cohort** (decides): `openai/gpt-4.1-mini` on OpenRouter, three repetitions of all nine
-tasks per arm, arm order rotated (`bench/results/t4b-code-mode-openrouter-r{1,2,3}.json`):
+**Two cohorts.** Cohort 1's graders matched basenames and substrings, so they accepted some wrong
+reports (codex review REV-T4b B1). A dated amendment to the plan registered cohort 2 with
+exact-entry graders before any of its runs (`b31a152`, manifest `[code_mode] cohort = 2`), and
+the primary protocol ran again. Re-grading every kept cohort 1 report with the fixed graders
+changed no verdict (`bench/results/t4b-cohort1-regrade.json`). Cohort 2 decides.
+
+**Primary cohort 2** (decides): `openai/gpt-4.1-mini` on OpenRouter, three repetitions of all nine
+tasks per arm, arm order rotated, on `33d1205`
+(`bench/results/t4b-code-mode-c2-openrouter-r{1,2,3}.json`):
 
 | Arm | Pass | Requests (scripting / existing) | ITE per passed (scripting / existing / all) | USD per passed | p50 wall |
 |---|---|---|---|---|---|
-| `off` | 23/27 | 6.22 / 6.83 | 13,113 / 5,770 / 7,367 | $0.0034 | 12.4 s |
-| `on` | 23/27 | 7.22 / 6.89 | 16,026 / 5,091 / 7,468 | $0.0035 | 13.5 s |
-| `only` | 15/27 | 12.0 / 13.39 | 218,307 / 21,982 / 35,071 | $0.0157 | 27.9 s |
+| `off` | 23/27 | 5.56 / 6.78 | 13,355 / 5,633 / 7,312 | $0.0034 | 11.1 s |
+| `on` | 24/27 | 7.33 / 6.78 | 15,553 / 4,979 / 7,622 | $0.0035 | 12.1 s |
+| `only` | 16/27 | 11.56 / 15.50 | 126,621 / 22,000 / 35,077 | $0.0156 | 33.5 s |
 
-- **`on` fails (b):** on the scripting tasks it took 16% *more* requests and 22% more ITE per
+- **`on` fails (b):** on the scripting tasks it took 32% *more* requests and 17% more ITE per
   passed task than `off`. gpt-4.1-mini called `run_code` in 1 of 27 `on` runs.
-- **`only` fails (a), (b) and (c):** 8 fewer passes, twice the requests, 4.8 times the ITE. Of
-  its 292 `run_code` calls, 97 failed (54 `ReferenceError`s, mostly `require`); it made 109
+- **`only` fails (a), (b) and (c):** 7 fewer passes, twice the requests, 4.8 times the ITE. Of
+  its 321 `run_code` calls, 121 failed (56 `ReferenceError`s, mostly `require`); it made 147
   program-tool calls (`list_programs` against an empty store) and hit the 24-request cap 5 times.
 - **What the rule does not reward:** `on` spent 12% less ITE than `off` on the existing tasks.
   That is its smaller prefix (ADR 0056's compact direct set and shorter `Read`/`Bash`/`LS`
   descriptions), not code: no existing-task `on` run called `run_code`.
 
-**Secondary cohorts** (the three scripting tasks, two repetitions each):
+**Primary cohort 1** (lenient graders, on `6b1878f`; `t4b-code-mode-openrouter-r{1,2,3}.json`)
+agreed: `off` 23/27 and 7,367 ITE per passed task, `on` 23/27 and 7,468 with 16% more requests
+and 22% more ITE on the scripting tasks, `only` 15/27 and 35,071.
+
+**Secondary cohorts** (cohort 1 only, the three scripting tasks, two repetitions each; their
+subscription caps did not allow a rerun. The codex reports re-grade unchanged; Claude's pass
+counts are the lenient graders'. Their request, call and ITE numbers do not depend on grading):
 
 | Arm | Pass | Requests | Direct / nested calls | ITE per passed | p50 wall |
 |---|---|---|---|---|---|
