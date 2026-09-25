@@ -9,10 +9,12 @@
 //! - [`host`] — hosting live sessions (the daemon's core; also used in process).
 //! - [`providers`] — model providers by id.
 //! - [`acp`] — Claude Code (and other ACP agents) as a session backend.
+//! - [`daemon`] — the local daemon server, client and auto-spawn.
 pub mod acp;
 pub mod agent;
 pub mod cli;
 pub mod context;
+pub mod daemon;
 pub mod harness;
 pub mod host;
 pub mod providers;

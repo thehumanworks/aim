@@ -2,16 +2,22 @@
 //!
 //! - `aim run [PROMPT]` — one headless turn in the current workspace (milestone M2a).
 //! - `aim sessions` — recent sessions.
+//! - `aim daemon` — serve local sessions over `aim-daemon/1`.
 #![expect(clippy::print_stderr, reason = "the CLI reports errors on stderr")]
+#![expect(clippy::print_stdout, reason = "daemon status reports to stdout")]
 
 use std::io::Read as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use aim::cli::{self, RunOptions};
+use aim::daemon::{client::DaemonClient, server, socket_path};
+use aim::host::{HostConfig, SessionClient, SessionHost};
 use aim::store::{SessionStore, SqliteStore};
 use aim_llm::ModelProvider;
+use aim_proto::daemon::SessionListParams;
 use clap::{Parser, Subcommand};
 
 /// aim — Agent I am.
@@ -59,6 +65,26 @@ enum Command {
         #[arg(short, long, default_value_t = 20)]
         limit: u32,
     },
+    /// Serve or inspect the local session daemon.
+    Daemon {
+        /// Unix socket path (default: `$AIM_HOME/run/daemon.sock`).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Stop after this many seconds without connections or running turns.
+        #[arg(long)]
+        idle_exit: Option<u64>,
+        /// Inspect or stop the daemon.
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Show the generation, process id and session count.
+    Status,
+    /// Send SIGTERM to the running daemon.
+    Stop,
 }
 
 fn provider(name: &str, model: Option<&str>) -> Result<(Arc<dyn ModelProvider>, String), String> {
@@ -92,6 +118,57 @@ async fn main_async(args: Args) -> Result<i32, String> {
                 eprintln!("{}  {}  {}/{}  {}", s.id, s.created_ms, s.provider, s.model, s.workspace);
             }
             Ok(0)
+        }
+        Command::Daemon { socket, idle_exit, action } => {
+            let home = cli::aim_home();
+            let socket = socket.unwrap_or_else(|| socket_path(&home));
+            match action {
+                Some(DaemonAction::Status) => {
+                    let client = DaemonClient::connect(&socket).await.map_err(|e| e.to_string())?;
+                    let sessions = client.list(SessionListParams::default()).await.map_err(|e| e.to_string())?;
+                    println!(
+                        "generation={} pid={} sessions={}",
+                        client.initialize_result().generation,
+                        client.initialize_result().pid,
+                        sessions.len()
+                    );
+                    Ok(0)
+                }
+                Some(DaemonAction::Stop) => {
+                    let client = DaemonClient::connect(&socket).await.map_err(|e| e.to_string())?;
+                    let pid = client.initialize_result().pid;
+                    let recorded = std::fs::read_to_string(home.join("run/daemon.pid")).map_err(|e| e.to_string())?;
+                    if recorded.trim() != pid.to_string() {
+                        return Err("daemon pid file differs from the connected process".into());
+                    }
+                    let status =
+                        std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).status().map_err(|e| e.to_string())?;
+                    if !status.success() {
+                        return Err(format!("kill exited with {status}"));
+                    }
+                    Ok(0)
+                }
+                None => {
+                    let logs = home.join("logs");
+                    std::fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
+                    std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+                    let file =
+                        std::fs::OpenOptions::new().create(true).append(true).open(logs.join("daemon.log")).map_err(|e| e.to_string())?;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+                    let (writer, _guard) = tracing_appender::non_blocking(file);
+                    let _ignored = tracing_subscriber::fmt().with_writer(writer).with_ansi(false).try_init();
+                    let store = Arc::new(SqliteStore::open(&home.join("aim.db")).map_err(|e| e.to_string())?);
+                    let host = SessionHost::new(HostConfig {
+                        store,
+                        backends: aim::providers::backends(cli::find_aimx(None), 64),
+                        update_capacity: 1024,
+                    });
+                    match server::serve(&home, &socket, idle_exit.map(std::time::Duration::from_secs), Arc::new(host)).await {
+                        Ok(()) | Err(aim_proto::error::ProtoError { code: aim_proto::error::ErrorCode::Conflict, .. }) => Ok(0),
+                        Err(err) => Err(err.to_string()),
+                    }
+                }
+            }
         }
     }
 }
