@@ -27,6 +27,8 @@ mod resume;
 #[cfg(test)]
 mod safety;
 #[cfg(test)]
+mod scope;
+#[cfg(test)]
 mod search;
 #[cfg(test)]
 mod tools;
