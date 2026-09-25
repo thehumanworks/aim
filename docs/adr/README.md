@@ -71,4 +71,5 @@ Rules (enforced by `mise run check`):
 | [0053](0053-network-token-call-scope-ceilings.md) | Bind network bearer scopes to harness sessions. |
 | [0054](0054-reserve-image-destination-before-generation.md) | Reserve image destinations before paid generation. |
 | [0061](0061-pinned-gate-validator-manifest.md) | Embed the protected set and independent validators in the pinned gate build. |
+| [0062](0062-gate-receipts-ledger-and-runtime.md) | Pin gate evidence and activate only an exact trial artifact. |
 | [0065](0065-locked-digests-resolve-names-by-module.md) | LOCKED digests resolve kernel names by module. |
