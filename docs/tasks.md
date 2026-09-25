@@ -97,3 +97,8 @@ client still builds.
   adapter's five models. Lead decisions sent back: case-fold effort/model in the shell registry
   (so ACP resolution of `Low` works), offer `auto` only where the backend accepts it (ACP refuses),
   fix the stale reattach model if small. Codex REV-T1 started on `7bcd18b`.
+- 2026-09-25 — Codex REV-T1 (auth.json hash unchanged): MERGE AFTER FIXES. B1: an options lookup can
+  publish after a newer ConfigChanged (aborted task not awaited; no generation fence) — stale
+  effort ladder in stream and snapshot. N1: `switch` spec does not pin candidate order. Queued to
+  the T1 worker with its follow-ups. Protocol compatibility, `/provider` reset, `/clear` and the
+  kernel (318 verified) confirmed.
