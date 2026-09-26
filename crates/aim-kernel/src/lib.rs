@@ -40,5 +40,6 @@ pub mod model_match;
 pub mod negotiate;
 pub mod path;
 pub mod policy;
+pub mod slash;
 pub mod switch;
 pub mod turn;

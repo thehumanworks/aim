@@ -13,6 +13,20 @@ use serde_json::json;
 
 use crate::CodexProvider;
 
+/// Fresh account usage requires no model turn and never exposes account metadata.
+#[tokio::test]
+#[ignore = "calls the real ChatGPT account usage service"]
+async fn live_codex_account_limits() -> Result<(), LlmError> {
+    let provider = CodexProvider::new()?;
+    for _ in 0..2 {
+        let limits = provider.account_limits().await?;
+        assert!(!limits.windows.is_empty(), "authenticated account returned no usage windows");
+        assert!(limits.native.is_none());
+        assert!(limits.windows.iter().all(|w| w.used_percent.is_finite()));
+    }
+    Ok(())
+}
+
 fn request(text: &str) -> Request {
     Request {
         model: "gpt-6-luna".into(),
