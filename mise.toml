@@ -40,6 +40,11 @@ filter_bins = ["verus", "cargo-verus"]
 [tools."github:verus-lang/verusfmt"]
 version = "0.7.3"
 
+# Cargo-backed mise tools build in TMPDIR. /tmp is a small tmpfs on some developer
+# machines; use the user cache on the larger home filesystem instead.
+[env]
+TMPDIR = "{{env.HOME}}/.cache"
+
 [settings]
 lockfile = true
 
