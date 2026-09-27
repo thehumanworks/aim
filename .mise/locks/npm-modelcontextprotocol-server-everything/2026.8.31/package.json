@@ -1,0 +1,7 @@
+{
+  "name": "mise-npm-install",
+  "private": true,
+  "dependencies": {
+    "@modelcontextprotocol/server-everything": "2026.8.31"
+  }
+}

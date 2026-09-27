@@ -12,7 +12,9 @@ rust = { version = "1.98.1", components = "rustfmt,clippy", targets = "wasm32-un
 # `[tools]` — below a `[tools."…"]` table they would silently become that tool's options.
 node = "26.8.1"
 python = "3.14.7"
-lightpanda = "0.4.1"
+# Browser smoke-test binary: the registry vfox plugin rejects the pinned version.
+# Install the release asset directly and expose its platform-suffixed binary as `lightpanda`.
+"github:lightpanda-io/browser" = { version = "0.4.1", matching = "lightpanda-", bin = "lightpanda" }
 "npm:@agentclientprotocol/claude-agent-acp" = "0.81.2"
 # Live MCP interop fixture, run only by W19's ignored smoke test.
 "npm:@modelcontextprotocol/server-everything" = "2026.8.31"
@@ -39,6 +41,11 @@ filter_bins = ["verus", "cargo-verus"]
 # rustfmt does not format inside `verus! {}`; verusfmt does (kernel only).
 [tools."github:verus-lang/verusfmt"]
 version = "0.7.3"
+
+# Cargo-backed mise tools build in TMPDIR. /tmp is a small tmpfs on some developer
+# machines; use the user cache on the larger home filesystem instead.
+[env]
+TMPDIR = "{{env.HOME}}/.cache"
 
 [settings]
 lockfile = true
