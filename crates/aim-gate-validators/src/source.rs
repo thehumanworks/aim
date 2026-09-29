@@ -8,12 +8,19 @@ use std::path::{Path, PathBuf};
 
 /// One Rust source file of the kernel.
 pub struct SourceFile {
+    /// Absolute path to the source file.
     pub path: PathBuf,
+    /// Module name derived from its file stem.
     pub module: String,
+    /// Complete source text.
     pub text: String,
 }
 
 /// Loads every `.rs` file directly under `dir`, sorted by name.
+///
+/// # Errors
+///
+/// Returns a path-qualified error if the directory or any source file cannot be read.
 pub fn load_dir(dir: &Path) -> Result<Vec<SourceFile>, String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut files = Vec::new();
@@ -32,13 +39,17 @@ pub fn load_dir(dir: &Path) -> Result<Vec<SourceFile>, String> {
 /// Kind of a named kernel item that a decision can depend on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ItemKind {
+    /// A Verus spec function.
     SpecFn,
+    /// A struct or enum used by a spec.
     Type,
 }
 
 /// A named item (spec fn, struct or enum) with its full source text.
 pub struct Item {
+    /// Kind of the named item.
     pub kind: ItemKind,
+    /// Full item source text.
     pub text: String,
     /// Doc-comment lines directly above the item.
     pub doc: Vec<String>,
