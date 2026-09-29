@@ -6,7 +6,7 @@
 # with that rustc. Bump both in one commit, then refresh `mise.lock`.
 
 [tools]
-rust = { version = "1.98.1", components = "rustfmt,clippy", targets = "wasm32-unknown-unknown" }
+rust = { version = "1.98.1", components = "rustfmt,clippy", targets = "wasm32-unknown-unknown,wasm32-wasip2" }
 # Claude Code over ACP (docs/adr/0012): the adapter is pinned exactly and gated by aim's live
 # capability probe at every bump. Node runs it (`#!/usr/bin/env node`). These must stay under
 # `[tools]` — below a `[tools."…"]` table they would silently become that tool's options.
@@ -177,6 +177,10 @@ description = "Issue one browser bearer for the web UI and print it once"
 depends = ["build"]
 run = "target/release/aim daemon token create"
 
+[tasks."plugins:examples"]
+description = "Rebuild the checked-in WASIp2 example components and verify their hashes"
+run = "plugins/examples/build.sh --verify"
+
 [tasks."locked:update"]
 description = "Re-record LOCKED spec digests after a maintainer-approved decision change (with its ADR)"
 run = "cargo xtask locked --update"
@@ -184,7 +188,7 @@ run = "cargo xtask locked --update"
 [tasks."bench:wire"]
 description = "Offline ADR 0024 wire cohort: pinned peers, scripted proxy, no credentials"
 run = [
-  "CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo build -p aim -p aimx -p aim-coderun --bins --locked",
+  "CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo build -p aim -p aimx -p aim-coderun -p aim-plugind --bins --locked",
   "python3 -B -m unittest discover -s bench -p 'test_*.py'",
   "python3 -B bench/run.py wire --out bench/history/latest-wire.json",
 ]
@@ -192,6 +196,6 @@ run = [
 [tasks."bench:live"]
 description = "Manual paid coding cohort with manifest spend and subscription-run caps"
 run = [
-  "CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo build -p aim -p aimx -p aim-coderun --bins --locked",
+  "CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo build -p aim -p aimx -p aim-coderun -p aim-plugind --bins --locked",
   "python3 -B bench/run.py live --out bench/history/latest-live.json",
 ]

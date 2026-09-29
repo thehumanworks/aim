@@ -1,0 +1,28 @@
+[package]
+name = "aim-plugind"
+description = "Crash-isolated WebAssembly component plugin worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "aim-plugind"
+path = "src/main.rs"
+
+[dependencies]
+aim-plugin = { path = "../aim-plugin" }
+aim-proto = { path = "../aim-proto" }
+aim-rpc = { path = "../aim-rpc" }
+serde_json = "1"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "io-std", "io-util", "process", "sync", "time"] }
+wasmtime = { version = "=48.0.3", default-features = false, features = ["component-model", "cranelift", "pooling-allocator", "runtime", "async"] }
+wasmtime-wasi = { version = "=48.0.3", default-features = false, features = ["p2"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

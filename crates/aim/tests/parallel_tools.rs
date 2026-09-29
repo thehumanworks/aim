@@ -100,7 +100,7 @@ async fn two_calls_in_one_response_run_concurrently_through_aimx() {
             .into(),
         ),
     });
-    let services = NativeServices { media: None, decider: None, tools: Vec::new(), code: None };
+    let services = NativeServices { media: None, decider: None, tools: Vec::new(), plugins: None, code: None };
     let host = SessionHost::new(HostConfig {
         store: Arc::new(MemoryStore::default()),
         backends: native_backends_with(

@@ -197,6 +197,10 @@ pub struct NativeServices {
     /// factory decides for the session and may offer none; they are composed after the workspace's
     /// and media tools (which keep their names) and before the agent's allowlist.
     pub tools: Vec<ToolsFactory>,
+    /// Component plugin tools. The factory receives project files through the workspace and a
+    /// delegate already narrowed by the session's agent allowlist. Guest `tools.call` can only
+    /// reach this delegate, while the plugin's own grants narrow it further (ADR 0057).
+    pub plugins: Option<PluginToolsFactory>,
     /// Code mode (ADR 0018, 0076): the `aim-coderun` worker. Sessions get `run_code` (or codex's
     /// `exec`/`wait`, when the catalog asks for it) and the saved-program tools over their final,
     /// allowlist-narrowed tools, unless an agent's allowlist excludes `run_code`; the mode decides
@@ -220,6 +224,11 @@ pub struct CodeConfig {
 /// Offers a session extra tools, or none (see [`NativeServices::tools`]).
 pub type ToolsFactory = Arc<dyn Fn(&SessionSpec) -> BoxFuture<Option<Arc<dyn ToolHost>>> + Send + Sync>;
 
+/// Offers component tools after ordinary tools are composed. The delegate excludes tools denied
+/// by the agent's allowlist; `project` is the workspace-backed resource source, if any.
+pub type PluginToolsFactory =
+    Arc<dyn Fn(&SessionSpec, Option<Arc<dyn Files>>, Arc<dyn ToolHost>) -> BoxFuture<Option<Arc<dyn ToolHost>>> + Send + Sync>;
+
 /// The native loop: a provider from `providers` and tools from a workspace `workspaces`
 /// connects, with aim's instructions, the session's resources (the project's through the
 /// workspace, the user's from `~/.aim`) and this machine's services ([`native_backends_with`]).
@@ -241,6 +250,7 @@ pub fn native_backends(providers: ProviderFactory, workspaces: WorkspaceFactory,
 ///   session applies its recorded agent again and never widens the ceiling it recorded;
 /// - `$skill` mentions in prompts inject the skill into the user turn ([`WithSkills`]).
 #[must_use]
+#[expect(clippy::too_many_lines, reason = "session backend composition keeps the ordered resource and authority steps visible")]
 pub fn native_backends_with(
     providers: ProviderFactory,
     workspaces: WorkspaceFactory,
@@ -334,6 +344,14 @@ pub fn native_backends_with(
             let mut tools_spec = spec.clone();
             tools_spec.workspace = root.clone();
             tools = with_extra_tools(tools, &services.tools, &tools_spec).await;
+            tools = with_plugin_tools(
+                tools,
+                services.plugins.as_ref(),
+                &tools_spec,
+                project.clone(),
+                agent.as_ref().map(|(def, policy)| (def, policy)),
+            )
+            .await;
             let (mut tools, record) = match &agent {
                 Some((agent, policy)) => (narrowed(tools, agent, policy), Some(policy.record(&agent.meta.name))),
                 None => (tools, None),
@@ -405,6 +423,24 @@ fn code_exposure<'a>(
     let platform = code.is_some() || cfg!(target_os = "macos");
     let exposure = mode::decide_for_session(session, daemon, code.is_some(), platform, permitted);
     (mode::to_setting(exposure.mode), code.filter(|_| exposure.code).map(|code| (code, exposure)))
+}
+
+async fn with_plugin_tools(
+    tools: Arc<dyn ToolHost>,
+    factory: Option<&PluginToolsFactory>,
+    spec: &SessionSpec,
+    project: Option<Arc<dyn Files>>,
+    agent: Option<(&resources::agents::AgentDef, &ToolPolicy)>,
+) -> Arc<dyn ToolHost> {
+    let Some(factory) = factory else { return tools };
+    let delegate = match agent {
+        Some((definition, policy)) => narrowed(Arc::clone(&tools), definition, policy),
+        None => Arc::clone(&tools),
+    };
+    match factory(spec, project, delegate).await {
+        Some(extra) => Arc::new(crate::agent::tools::Compose::new(tools, vec![extra])),
+        None => tools,
+    }
 }
 
 /// Adds code mode and the saved-program tools over `tools`, the session's final (narrowed) set,

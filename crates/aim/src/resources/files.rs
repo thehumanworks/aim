@@ -20,7 +20,9 @@ use std::pin::Pin;
 
 use aim_proto::content::Content;
 use aim_proto::error::{ErrorCode, ProtoError};
-use aim_proto::harness::{DirEntry, EntryKind, FsList, FsListParams, FsReadMany, FsReadManyParams, ReadManyEntry};
+use aim_proto::harness::{
+    ByteRange, DirEntry, EntryKind, FsList, FsListParams, FsRead, FsReadMany, FsReadManyParams, FsReadParams, ReadManyEntry,
+};
 use aim_proto::ids::WorkspaceId;
 use aim_rpc::Peer;
 use sha2::{Digest as _, Sha256};
@@ -31,6 +33,9 @@ pub type FilesFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Most paths one `fs.read_many` names: with 64 KiB files that stays within aimx's 2 MiB reply
 /// budget (`limit_exceeded` past it).
 pub const READ_BATCH: usize = 32;
+/// Largest binary project resource accepted by the plugin loader. The default aimx read cap is
+/// also 2 MiB, so a single RPC can return the whole component or fail closed.
+pub const MAX_BINARY_BYTES: u64 = 2 * 1024 * 1024;
 
 /// A file's text as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +73,14 @@ pub trait Files: Send + Sync {
 
     /// Reads `paths`, each up to `max_bytes`; one outcome per path, in order.
     fn read_many(&self, paths: Vec<String>, max_bytes: u64) -> FilesFuture<'_, Vec<Read>>;
+
+    /// Reads one complete binary file, at most `max_bytes` (and at most [`MAX_BINARY_BYTES`]).
+    /// A missing file returns `Ok(None)`; a truncated read is an error, never a valid component.
+    /// Project implementations must route this through their workspace so SSH and remote roots
+    /// retain the same authority and path confinement as text resources.
+    fn read_binary<'a>(&'a self, _path: &'a str, _max_bytes: u64) -> FilesFuture<'a, Result<Option<Vec<u8>>, String>> {
+        Box::pin(async { Err("binary reads are unavailable for this file source".to_owned()) })
+    }
 
     /// How `path` is shown to people and models: workspace-relative for a project (what the
     /// workspace tools accept), absolute on this machine for the user's files.
@@ -160,6 +173,24 @@ impl Files for HarnessFiles {
         })
     }
 
+    fn read_binary<'a>(&'a self, path: &'a str, max_bytes: u64) -> FilesFuture<'a, Result<Option<Vec<u8>>, String>> {
+        Box::pin(async move {
+            check_binary_limit(max_bytes)?;
+            let params = FsReadParams {
+                workspace: self.workspace.clone(),
+                path: path.to_owned(),
+                range: Some(ByteRange { start: 0, len: max_bytes }),
+                scope: None,
+                hash: false,
+            };
+            match self.peer.call::<FsRead>(params).await {
+                Ok(read) => complete_binary(read.content.into_bytes(), read.size, read.truncated, max_bytes).map(Some),
+                Err(ProtoError { code: ErrorCode::NotFound, .. }) => Ok(None),
+                Err(err) => Err(format!("{}: {}", err.code, err.message)),
+            }
+        })
+    }
+
     fn display(&self, path: &str) -> String {
         path.to_owned()
     }
@@ -179,6 +210,20 @@ fn read_of(entry: ReadManyEntry) -> Read {
         ReadManyEntry::Error { code, .. } if code == ErrorCode::NotFound.name() => Read::Missing,
         ReadManyEntry::Error { code, message, .. } => Read::Failed(format!("{code}: {message}")),
     }
+}
+
+fn check_binary_limit(max_bytes: u64) -> Result<(), String> {
+    if max_bytes == 0 || max_bytes > MAX_BINARY_BYTES {
+        return Err(format!("binary read limit must be 1..={MAX_BINARY_BYTES} bytes"));
+    }
+    Ok(())
+}
+
+fn complete_binary(bytes: Vec<u8>, size: u64, truncated: bool, max_bytes: u64) -> Result<Vec<u8>, String> {
+    if truncated || size > max_bytes || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != size {
+        return Err("binary file exceeds read limit or was truncated".to_owned());
+    }
+    Ok(bytes)
 }
 
 /// Files under a local directory (the user's `~/.aim`).
@@ -309,13 +354,21 @@ impl Files for LocalFiles {
 #[derive(Clone, Debug, Default)]
 pub struct MemoryFiles {
     files: BTreeMap<String, String>,
+    binary_files: BTreeMap<String, Vec<u8>>,
 }
 
 impl MemoryFiles {
     /// Files at relative paths (`a/b.md`), with their text.
     #[must_use]
     pub fn new<P: Into<String>, T: Into<String>>(files: impl IntoIterator<Item = (P, T)>) -> Self {
-        Self { files: files.into_iter().map(|(p, t)| (p.into(), t.into())).collect() }
+        Self { files: files.into_iter().map(|(p, t)| (p.into(), t.into())).collect(), binary_files: BTreeMap::new() }
+    }
+
+    /// Adds a binary file to a fixture, preserving bytes that are not UTF-8.
+    #[must_use]
+    pub fn with_binary(mut self, path: impl Into<String>, bytes: Vec<u8>) -> Self {
+        self.binary_files.insert(path.into(), bytes);
+        self
     }
 }
 
@@ -323,11 +376,16 @@ impl Files for MemoryFiles {
     fn list<'a>(&'a self, dir: &'a str, limit: u32) -> FilesFuture<'a, Result<Option<Vec<DirEntry>>, String>> {
         let prefix = if dir.is_empty() { String::new() } else { format!("{}/", dir.trim_end_matches('/')) };
         let mut entries: Vec<DirEntry> = Vec::new();
-        for (path, text) in &self.files {
+        for (path, size) in self
+            .files
+            .iter()
+            .map(|(path, text)| (path, text.len()))
+            .chain(self.binary_files.iter().map(|(path, bytes)| (path, bytes.len())))
+        {
             let Some(rest) = path.strip_prefix(&prefix) else { continue };
             let (name, kind, size) = match rest.split_once('/') {
                 Some((name, _)) => (name, EntryKind::Dir, 0),
-                None => (rest, EntryKind::File, u64::try_from(text.len()).unwrap_or(u64::MAX)),
+                None => (rest, EntryKind::File, u64::try_from(size).unwrap_or(u64::MAX)),
             };
             if !entries.iter().any(|e| e.name == name) {
                 entries.push(DirEntry { name: name.to_owned(), kind, size });
@@ -354,6 +412,21 @@ impl Files for MemoryFiles {
         Box::pin(async move { reads })
     }
 
+    fn read_binary<'a>(&'a self, path: &'a str, max_bytes: u64) -> FilesFuture<'a, Result<Option<Vec<u8>>, String>> {
+        let result = check_binary_limit(max_bytes).and_then(|()| {
+            self.binary_files
+                .get(path)
+                .cloned()
+                .or_else(|| self.files.get(path).map(|text| text.as_bytes().to_vec()))
+                .map(|bytes| {
+                    let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    complete_binary(bytes, size, false, max_bytes)
+                })
+                .transpose()
+        });
+        Box::pin(async move { result })
+    }
+
     fn display(&self, path: &str) -> String {
         path.to_owned()
     }
@@ -370,6 +443,18 @@ mod tests {
     #[test]
     fn hashes_like_aimx() {
         assert_eq!(sha256(b""), "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    #[tokio::test]
+    async fn binary_reads_are_complete_bounded_and_preserve_non_utf8() {
+        let files = MemoryFiles::default().with_binary(".agents/plugins/example.wasm", vec![0, 0xff, 1]);
+        let entries = files.list(".agents/plugins", 8).await.unwrap().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(files.read_binary(".agents/plugins/example.wasm", 3).await.unwrap(), Some(vec![0, 0xff, 1]));
+        assert_eq!(files.read_binary(".agents/plugins/missing.wasm", 3).await.unwrap(), None);
+        assert!(files.read_binary(".agents/plugins/example.wasm", 2).await.is_err());
+        assert!(files.read_binary(".agents/plugins/example.wasm", MAX_BINARY_BYTES + 1).await.is_err());
+        assert!(complete_binary(vec![1, 2], 3, true, 3).is_err());
     }
 
     fn entry(read: FsReadResult) -> ReadManyEntry {
