@@ -5,6 +5,8 @@
 #[cfg(test)]
 mod aliases;
 #[cfg(test)]
+mod authority;
+#[cfg(test)]
 mod binary;
 #[cfg(test)]
 mod common;

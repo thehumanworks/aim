@@ -197,7 +197,9 @@ pub struct CallScope {
     /// Maximum concurrent processes, when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_processes: Option<u32>,
-    /// Maximum retained output bytes, when set.
+    /// Most output bytes one response, or one pushed `exec.output` batch, carries under this
+    /// authority, when set. Process output is kept in chunks of at most this size (never below
+    /// 1 KiB); a chunk is never split (ADR 0067).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_bytes: Option<u64>,
 }

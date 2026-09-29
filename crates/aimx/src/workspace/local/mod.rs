@@ -428,6 +428,8 @@ struct Base {
 #[derive(Clone, Copy)]
 enum Authority {
     Path(Access),
+    /// Read and write (an exact edit matches, and so reveals, the content it changes).
+    Edit,
     Exec,
 }
 
@@ -455,6 +457,10 @@ impl Base {
                 Authority::Path(access) => {
                     grant.path(&resolved_path, access)?;
                 }
+                Authority::Edit => {
+                    grant.path(&resolved_path, Access::Write)?;
+                    grant.path(&resolved_path, Access::Read)?;
+                }
                 Authority::Exec => {
                     grant.exec_path(&resolved_path)?;
                 }
@@ -466,6 +472,12 @@ impl Base {
     /// The real path a resolution arrived at.
     fn real(&self, loc: &Loc) -> PathBuf {
         loc.real_path(&self.root.path)
+    }
+
+    /// Whether this view's authority may read the resolved target (an unscoped view: the
+    /// principal, who may always read), so an error may carry what only a reader may learn.
+    fn may_read(&self, loc: &Loc) -> bool {
+        self.grant.as_ref().is_none_or(|grant| path_string(&self.real(loc)).is_ok_and(|path| grant.may_read(&path)))
     }
 
     /// Refuses a mutation of a resolved target that is (or lies inside, or for `tree` operations

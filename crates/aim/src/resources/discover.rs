@@ -92,11 +92,25 @@ struct Planned {
 #[derive(Debug)]
 struct Admission {
     budget: Budget,
+    /// The per-file cap every read asks for ([`Bounds::max_file_bytes`]).
+    cap: u64,
+}
+
+/// The bytes a read returned (REV14 F10). An untruncated read returned exactly its text. A
+/// truncated one returned the per-file `cap` it asked for (at most the file's size), including an
+/// incomplete trailing character that its text no longer holds; if the harness returned less (its
+/// own `fs.read_many` budget), this charges more, never less, than was returned.
+fn returned_bytes(file: &FileText, cap: u64) -> u64 {
+    let text = u64::try_from(file.text.len()).unwrap_or(u64::MAX);
+    if file.truncated { text.max(cap.min(file.size)) } else { text }
 }
 
 impl Admission {
     fn new(bounds: &Bounds) -> Self {
-        Self { budget: Budget::new(u64::try_from(bounds.max_files).unwrap_or(u64::MAX), bounds.max_total_bytes, bounds.max_file_bytes) }
+        Self {
+            budget: Budget::new(u64::try_from(bounds.max_files).unwrap_or(u64::MAX), bounds.max_total_bytes, bounds.max_file_bytes),
+            cap: bounds.max_file_bytes,
+        }
     }
 
     /// How many of `wanted` files (at most `batch`) the next read may name; reserves their bytes.
@@ -108,7 +122,7 @@ impl Admission {
     /// Settles one admitted file's reservation once it was read.
     fn settle(&mut self, read: &Read) {
         let charge = match read {
-            Read::Ok(file) => ReadCharge::Bytes(u64::try_from(file.text.len()).unwrap_or(u64::MAX)),
+            Read::Ok(file) => ReadCharge::Bytes(returned_bytes(file, self.cap)),
             Read::Missing => ReadCharge::Missing,
             Read::Failed(_) => ReadCharge::Failed,
         };
@@ -429,5 +443,26 @@ fn parse(item: &Planned, file: &FileText, origin: &Origin, found: &mut Found) {
         (Kind::Prompt, _) => found.prompts.extend(prompts::parse(file, &item.name, origin, diagnostics)),
         (Kind::Rule, _) => found.rules.extend(instructions::parse_rule(file, &item.name, origin, diagnostics)),
         (Kind::Instructions | Kind::Memory, _) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileText, returned_bytes};
+
+    fn file(text: &str, size: u64, truncated: bool) -> FileText {
+        FileText { text: text.to_owned(), hash: "sha256:0".to_owned(), size, truncated }
+    }
+
+    /// REV14 F10: a truncated read is charged the bytes returned, including the up to three bytes
+    /// of a cut character its text dropped.
+    #[test]
+    fn a_read_is_charged_the_bytes_it_returned() {
+        assert_eq!(returned_bytes(&file("abc", 3, false), 8), 3);
+        // Eight bytes returned, the last two the start of a three-byte character.
+        assert_eq!(returned_bytes(&file("abcdef", 100, true), 8), 8);
+        assert_eq!(returned_bytes(&file("abcdefgh", 100, true), 8), 8);
+        // Never less than the text itself.
+        assert_eq!(returned_bytes(&file("abcdefghij", 100, true), 8), 10);
     }
 }

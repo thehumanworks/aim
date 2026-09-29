@@ -214,6 +214,8 @@ pub(super) async fn edit(ctx: &ToolCtx, arguments: Value) -> Outcome<ToolResult>
         return Ok(ToolResult::error("old_string and new_string are identical"));
     }
     let path = ctx.grant.path(&args.file_path, Access::Write)?;
+    // The match result reveals content, so an edit needs read authority too (REV14 F5).
+    ctx.grant.path(&args.file_path, Access::Read)?;
     let display = ctx.grant.display(&path).to_owned();
     let key = ctx.derived_key("edit");
     let edits = [ExactEdit { old: args.old_string, new: args.new_string, replace_all: args.replace_all }];

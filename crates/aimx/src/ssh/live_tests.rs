@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use aim_proto::content::Content;
 use aim_proto::error::ErrorCode;
 use aim_proto::harness::{
-    BackendSpec, CallScope, ExecRead, ExecReadParams, ExecRelease, ExecReleaseParams, ExecSpawn, ExecSpawnParams, FsRead, FsReadParams,
-    FsWrite, FsWriteParams, GenerationRange, Initialize, InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams,
-    WorkspaceOpen, WorkspaceOpenParams,
+    BackendSpec, CallScope, ExecRead, ExecReadParams, ExecRelease, ExecReleaseParams, ExecSpawn, ExecSpawnParams, FsCancel, FsCancelParams,
+    FsFinalize, FsFinalizeParams, FsRead, FsReadParams, FsReserve, FsReserveParams, FsWrite, FsWriteParams, GenerationRange, Initialize,
+    InitializeParams, InitializeResult, PeerInfo, ToolsCall, ToolsCallParams, WorkspaceOpen, WorkspaceOpenParams,
 };
 use aim_proto::harness::{CaseMode, Command as RemoteCommand, ExactEdit, ExitStatus, Precondition};
 use aim_proto::ids::IdempotencyKey;
@@ -1718,6 +1718,77 @@ async fn live_ssh_agentless_stdio_fallback() {
     exercise_tools(&sshd, &peer, &workspace.id, &root, &local).await;
     peer.close();
     child.kill().await.expect("stop fallback");
+}
+
+/// `REV13a` M6: agentless SSH supports file reservations again (so `generate_image` works there):
+/// reserve, finalize, cancel, and a cancel that leaves a changed marker alone, through the real
+/// `aimx serve --stdio --ssh --bootstrap never` over a private sshd.
+#[tokio::test]
+#[ignore = "runs the aimx binary through a private user-space sshd"]
+async fn live_ssh_agentless_reservations() {
+    let sshd = Sshd::start(false);
+    let root = sshd.remote_root("reservations");
+    let (peer, mut child) = spawn_forward(&sshd, &root, "never");
+    initialize(&peer, None).await;
+    let workspace = peer
+        .call::<WorkspaceOpen>(WorkspaceOpenParams {
+            ceiling: None,
+            root: root.to_string_lossy().into_owned(),
+            backend: BackendSpec::Local,
+        })
+        .await
+        .expect("agentless workspace")
+        .id;
+    let started = Instant::now();
+    let next = std::sync::atomic::AtomicU64::new(0);
+    let key = || IdempotencyKey::new(format!("reservation-{}", next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let reserve = |name: &str| {
+        let params = FsReserveParams {
+            workspace: workspace.clone(),
+            path: root.join(name).to_string_lossy().into_owned(),
+            if_absent: true,
+            idempotency_key: key(),
+            scope: None,
+        };
+        let peer = peer.clone();
+        async move { peer.call::<FsReserve>(params).await.map(|reserved| reserved.reservation) }
+    };
+    let cancel = |reservation: String| {
+        let params = FsCancelParams { workspace: workspace.clone(), reservation, idempotency_key: key(), scope: None };
+        let peer = peer.clone();
+        async move { peer.call::<FsCancel>(params).await }
+    };
+    let marker = |name: &str| std::fs::read_to_string(root.join(name)).is_ok_and(|text| text.starts_with("aim-reservation:"));
+
+    let finalized = reserve("art/final.png").await.expect("agentless reserve");
+    assert!(marker("art/final.png"), "the marker is on the remote host before any provider call");
+    std::fs::write(root.join("existing.png"), "original").expect("existing file");
+    assert_eq!(reserve("existing.png").await.expect_err("existing file").code, ErrorCode::PreconditionFailed);
+    let written = peer
+        .call::<FsFinalize>(FsFinalizeParams {
+            workspace: workspace.clone(),
+            reservation: finalized,
+            content: Content::from_bytes(b"\x89PNG-bytes".to_vec()),
+            idempotency_key: key(),
+            scope: None,
+        })
+        .await
+        .expect("agentless finalize");
+    assert_eq!(written.size, 10);
+    assert_eq!(std::fs::read(root.join("art/final.png")).expect("final image"), b"\x89PNG-bytes");
+
+    let cancelled = reserve("art/cancelled.png").await.expect("second reserve");
+    cancel(cancelled).await.expect("agentless cancel");
+    assert!(!root.join("art/cancelled.png").exists());
+
+    let changed = reserve("art/changed.png").await.expect("third reserve");
+    std::fs::write(root.join("art/changed.png"), "someone else's bytes").expect("replace marker");
+    assert_eq!(cancel(changed.clone()).await.expect_err("changed marker").code, ErrorCode::PreconditionFailed);
+    assert_eq!(std::fs::read_to_string(root.join("art/changed.png")).expect("kept"), "someone else's bytes");
+    assert_eq!(cancel(changed).await.expect_err("released").code, ErrorCode::NotFound, "a lost marker ends its reservation");
+    eprintln!("live_ssh_agentless_reservations elapsed_ms={}", started.elapsed().as_millis());
+    peer.close();
+    child.kill().await.expect("stop agentless harness");
 }
 
 #[tokio::test]

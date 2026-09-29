@@ -126,6 +126,58 @@ pub enum Access {
     Tree,
 }
 
+/// The authority something long-lived (a process, a file reservation) was created under: the
+/// effective scope of the creating call (ADR 0067). A later call on it must stay within it.
+#[derive(Clone, Debug, Default)]
+pub struct Bound(Option<Arc<Scope>>);
+
+/// Whether a later call whose effective scope is `current` may act on something created under
+/// `bound` (ADR 0067). Pure decision, a kernel candidate:
+///
+/// - nothing bound (`None`: created under the principal's own authority, which every grant of the
+///   same principal narrows) — permitted;
+/// - both known — permitted exactly when `current` narrows `bound` (`policy::Scope::narrows`: no
+///   path, operation or limit beyond it), so a later call can never widen the creating authority;
+/// - a bound scope but an unscoped current call — refused (fail closed; the server never builds
+///   one, every served call carries an effective scope).
+#[must_use]
+pub fn may_act_within(bound: Option<&Scope>, current: Option<&Scope>) -> bool {
+    match (bound, current) {
+        (None, _) => true,
+        (Some(bound), Some(current)) => current.narrows(bound),
+        (Some(_), None) => false,
+    }
+}
+
+/// Why a tree operation (remove, move, copy destination) is refused, see [`tree_guard`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TreeRefusal {
+    /// The target is the workspace root.
+    Root,
+    /// The target is, lies inside, or contains a protected path.
+    Protected,
+    /// The target contains a write-denied scope prefix.
+    DeniedPrefix,
+}
+
+/// The lexical guard of a tree operation on the normalized absolute `path` (ADR 0027 leaves it to
+/// the host; a kernel candidate): it may not be the workspace `root`, may not be, lie inside or
+/// contain a `protected` path, and may not contain a write-denied prefix of the effective scope
+/// (`tree_denies`; a prefix *containing* `path` is already refused by the scope's `Write` check).
+/// Paths compare by whole segments ([`is_within`]).
+#[must_use]
+pub fn tree_guard(path: &str, root: &str, protected: &ProtectedPaths, tree_denies: &[String]) -> Option<TreeRefusal> {
+    if path == root {
+        Some(TreeRefusal::Root)
+    } else if protected.guards_tree(path) {
+        Some(TreeRefusal::Protected)
+    } else if tree_denies.iter().any(|denied| is_within(denied, path)) {
+        Some(TreeRefusal::DeniedPrefix)
+    } else {
+        None
+    }
+}
+
 /// A principal's authority over one open workspace.
 #[derive(Clone, Debug)]
 pub struct Grant {
@@ -190,14 +242,15 @@ impl Grant {
             }
             Access::Tree => {
                 self.mutation()?;
-                if path == self.root {
-                    return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be removed or moved"));
-                }
-                if self.protected.guards_tree(&path) {
-                    return Err(protected(&path));
-                }
-                if self.tree_denies.iter().any(|denied| is_within(denied, &path)) {
-                    return Err(ProtoError::new(ErrorCode::Denied, format!("`{path}` contains a write-denied scope prefix")));
+                match tree_guard(&path, &self.root, &self.protected, &self.tree_denies) {
+                    None => {}
+                    Some(TreeRefusal::Root) => {
+                        return Err(ProtoError::new(ErrorCode::Denied, "the workspace root cannot be removed or moved"));
+                    }
+                    Some(TreeRefusal::Protected) => return Err(protected(&path)),
+                    Some(TreeRefusal::DeniedPrefix) => {
+                        return Err(ProtoError::new(ErrorCode::Denied, format!("`{path}` contains a write-denied scope prefix")));
+                    }
                 }
             }
         }
@@ -320,6 +373,34 @@ impl Grant {
         Ok(())
     }
 
+    /// The authority this grant binds to a process or reservation it creates (ADR 0067).
+    #[must_use]
+    pub fn bound(&self) -> Bound {
+        Bound(self.effective.clone())
+    }
+
+    /// Checks that a call under this grant may act on something created under `bound`: its
+    /// effective scope must narrow the bound one ([`may_act_within`]).
+    ///
+    /// # Errors
+    /// `denied` when this call's authority is wider than (or disjoint from) the creating one.
+    pub fn within(&self, bound: &Bound) -> Result<(), ProtoError> {
+        if may_act_within(bound.0.as_deref(), self.effective.as_deref()) {
+            Ok(())
+        } else {
+            Err(ProtoError::new(
+                ErrorCode::Denied,
+                "this call's authority is not within the authority the process or reservation was created under; pass that scope or a narrower one",
+            ))
+        }
+    }
+
+    /// Whether this grant may read the (already confined) absolute `path`.
+    #[must_use]
+    pub fn may_read(&self, path: &str) -> bool {
+        self.path(path, Access::Read).is_ok()
+    }
+
     /// The effective process/output caps after all supplied ceilings are intersected.
     #[must_use]
     pub(crate) fn limits(&self) -> Option<PolicyLimits> {
@@ -348,6 +429,37 @@ fn kernel_root(path: &str) -> Result<Root, ProtoError> {
     Root::new(segments).ok_or_else(|| ProtoError::new(ErrorCode::InvalidParams, format!("invalid scope path `{path}`")))
 }
 
+/// Canonicalizes one scope path (a kernel candidate, with [`inherit_limits`]): `/` stays `/`; an
+/// absolute path is kept; a relative one is joined to the canonical `workspace` root. `None` for a
+/// path that is not normalized: an empty, `.` or `..` segment, a NUL byte, or a trailing `/`.
+#[must_use]
+pub fn canonical_scope_path(raw: &str, workspace: &str) -> Option<String> {
+    if raw == "/" {
+        return Some("/".to_owned());
+    }
+    let body = raw.strip_prefix('/').unwrap_or(raw);
+    if body.split('/').any(|part| part.is_empty() || part == "." || part == ".." || part.contains('\0')) {
+        return None;
+    }
+    Some(if raw.starts_with('/') {
+        raw.to_owned()
+    } else if workspace == "/" {
+        format!("/{raw}")
+    } else {
+        format!("{workspace}/{raw}")
+    })
+}
+
+/// A requested scope's limits: each omitted limit inherits its parent's value (ADR 0046: a missing
+/// limit adds no extra limit). Whether the result narrows the parent is `Scope::narrows`' job.
+#[must_use]
+pub fn inherit_limits(requested: &CallScope, inherited: PolicyLimits) -> PolicyLimits {
+    PolicyLimits {
+        max_processes: requested.max_processes.unwrap_or(inherited.max_processes),
+        max_output_bytes: requested.max_output_bytes.unwrap_or(inherited.max_output_bytes),
+    }
+}
+
 /// A normalized absolute scope, plus its verified policy representation.
 fn parse_scope(
     requested: &CallScope,
@@ -356,20 +468,8 @@ fn parse_scope(
     inherited_denies: &[String],
 ) -> Result<(CallScope, Scope), ProtoError> {
     let canonical_path = |raw: &str| -> Result<String, ProtoError> {
-        if raw == "/" {
-            return Ok("/".to_owned());
-        }
-        let body = raw.strip_prefix('/').unwrap_or(raw);
-        if body.split('/').any(|part| part.is_empty() || part == "." || part == ".." || part.contains('\0')) {
-            return Err(ProtoError::new(ErrorCode::InvalidParams, format!("scope path `{raw}` is not normalized")));
-        }
-        Ok(if raw.starts_with('/') {
-            raw.to_owned()
-        } else if workspace == "/" {
-            format!("/{raw}")
-        } else {
-            format!("{workspace}/{raw}")
-        })
+        canonical_scope_path(raw, workspace)
+            .ok_or_else(|| ProtoError::new(ErrorCode::InvalidParams, format!("scope path `{raw}` is not normalized")))
     };
     let roots = requested.roots.iter().map(|path| canonical_path(path)).collect::<Result<Vec<_>, _>>()?;
     let deny_write = requested.deny_write.iter().map(|path| canonical_path(path)).collect::<Result<Vec<_>, _>>()?;
@@ -384,10 +484,7 @@ fn parse_scope(
             _ => return Err(ProtoError::new(ErrorCode::InvalidParams, format!("unknown scope operation `{op}`"))),
         }
     }
-    let limits = PolicyLimits {
-        max_processes: requested.max_processes.unwrap_or(inherited.max_processes),
-        max_output_bytes: requested.max_output_bytes.unwrap_or(inherited.max_output_bytes),
-    };
+    let limits = inherit_limits(requested, inherited);
     let mut effective_denies = deny_write.clone();
     effective_denies.extend(inherited_denies.iter().cloned());
     let scope = Scope::new(
@@ -457,6 +554,55 @@ mod tests {
         assert_eq!(g.path(".aim", Access::Tree).unwrap_err().code, ErrorCode::Denied);
         assert!(g.path(".aim/other", Access::Tree).is_ok());
         assert_eq!(g.path(".aim/gate/x", Access::Write).unwrap_err().code, ErrorCode::Denied);
+    }
+
+    fn scope(roots: &[&str], ops: OpSet, max_processes: u32) -> Scope {
+        let roots = roots.iter().map(|root| kernel_root(root).unwrap()).collect();
+        Scope::new(roots, ops, Vec::new(), PolicyLimits { max_processes, max_output_bytes: 1024 })
+    }
+
+    #[test]
+    fn later_calls_act_only_within_the_bound_authority() {
+        let wide = scope(&["/w"], OpSet::all(), 8);
+        let narrow = scope(&["/w/sub"], OpSet::new(true, false, true), 8);
+        let disjoint = scope(&["/elsewhere"], OpSet::all(), 8);
+        let fewer = scope(&["/w"], OpSet::all(), 2);
+        assert!(may_act_within(None, None));
+        assert!(may_act_within(None, Some(&wide)));
+        assert!(may_act_within(Some(&wide), Some(&wide)));
+        assert!(may_act_within(Some(&wide), Some(&narrow)));
+        assert!(may_act_within(Some(&wide), Some(&fewer)));
+        assert!(!may_act_within(Some(&narrow), Some(&wide)), "a later call may not widen");
+        assert!(!may_act_within(Some(&fewer), Some(&wide)), "nor raise a limit");
+        assert!(!may_act_within(Some(&wide), Some(&disjoint)));
+        assert!(!may_act_within(Some(&wide), None), "an unscoped call against a bound scope fails closed");
+    }
+
+    #[test]
+    fn tree_guard_refuses_root_protected_and_denied_descendants() {
+        let protected = ProtectedPaths::new(["/w/.aim/gate".to_owned()]);
+        let denies = vec!["/w/keep/inner".to_owned()];
+        assert_eq!(tree_guard("/w", "/w", &protected, &denies), Some(TreeRefusal::Root));
+        assert_eq!(tree_guard("/w/.aim", "/w", &protected, &denies), Some(TreeRefusal::Protected));
+        assert_eq!(tree_guard("/w/.aim/gate/x", "/w", &protected, &denies), Some(TreeRefusal::Protected));
+        assert_eq!(tree_guard("/w/keep", "/w", &protected, &denies), Some(TreeRefusal::DeniedPrefix));
+        assert_eq!(tree_guard("/w/keepsake", "/w", &protected, &denies), None, "segments, not string prefixes");
+        assert_eq!(tree_guard("/w/other", "/w", &protected, &denies), None);
+    }
+
+    #[test]
+    fn scope_paths_and_limits_canonicalize() {
+        assert_eq!(canonical_scope_path("/", "/w").as_deref(), Some("/"));
+        assert_eq!(canonical_scope_path("/abs/x", "/w").as_deref(), Some("/abs/x"));
+        assert_eq!(canonical_scope_path("rel/x", "/w").as_deref(), Some("/w/rel/x"));
+        assert_eq!(canonical_scope_path("rel", "/").as_deref(), Some("/rel"));
+        for bad in ["", "a//b", "a/./b", "../x", "a/", "a\u{0}b"] {
+            assert_eq!(canonical_scope_path(bad, "/w"), None, "{bad:?}");
+        }
+        let inherited = PolicyLimits { max_processes: 7, max_output_bytes: 99 };
+        let requested =
+            CallScope { roots: Vec::new(), ops: Vec::new(), deny_write: Vec::new(), max_processes: Some(3), max_output_bytes: None };
+        assert_eq!(inherit_limits(&requested, inherited), PolicyLimits { max_processes: 3, max_output_bytes: 99 });
     }
 
     #[test]

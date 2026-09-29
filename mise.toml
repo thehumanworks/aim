@@ -50,6 +50,11 @@ TMPDIR = "{{env.HOME}}/.cache"
 [settings]
 lockfile = true
 
+[settings.npm]
+package_manager = "aube"
+shell_out = false
+bun = false
+
 [tasks.check]
 description = "Quality gate: fmt, clippy (-D warnings), tests, repository invariants"
 run = [

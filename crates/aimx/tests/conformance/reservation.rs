@@ -160,3 +160,167 @@ async fn abandoned_reservation_is_cleaned_after_resume_window() {
     .await
     .unwrap();
 }
+
+/// A spawned `aimx serve --stdio` whose home (and so reservation journal) is `home`.
+struct Served {
+    child: tokio::process::Child,
+    client: crate::common::Client,
+    ws: aim_proto::ids::WorkspaceId,
+}
+
+async fn serve(home: &std::path::Path, root: &std::path::Path) -> Served {
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_aimx"))
+        .args(["serve", "--stdio", "--root"])
+        .arg(root)
+        .env("HOME", home)
+        .env("AIMX_LOG", "off")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let client = crate::common::client_over(child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    crate::common::initialize(&client, None).await;
+    let ws = crate::common::open(&client, root).await;
+    Served { child, client, ws }
+}
+
+async fn reserve_at(served: &Served, path: &str) -> String {
+    served
+        .client
+        .peer
+        .call::<FsReserve>(FsReserveParams {
+            workspace: served.ws.clone(),
+            path: path.into(),
+            if_absent: true,
+            idempotency_key: key(),
+            scope: None,
+        })
+        .await
+        .unwrap()
+        .reservation
+}
+
+/// Journal entries, not counting the admission `.lock` file.
+fn journal_entries(home: &std::path::Path) -> usize {
+    std::fs::read_dir(home.join(".aim/aimx/reservations"))
+        .map_or(0, |dir| dir.flatten().filter(|entry| entry.file_name() != ".lock").count())
+}
+
+fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let root = dir.path().join("ws");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    (dir, home, root)
+}
+
+/// `REV13a` M5: the marker of an aimx killed before its session ended is removed at the next open
+/// of its root, through the durable journal (ADR 0067).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_servers_marker_is_swept_at_the_next_open() {
+    let (_dir, home, root) = fixture();
+    let mut first = serve(&home, &root).await;
+    reserve_at(&first, "art/killed.png").await;
+    assert!(root.join("art/killed.png").exists());
+    assert_eq!(journal_entries(&home), 1);
+    let journal = home.join(".aim/aimx/reservations");
+    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&journal).unwrap().permissions()) & 0o777, 0o700);
+    first.child.kill().await.unwrap();
+    assert!(root.join("art/killed.png").exists(), "a killed server cannot clean up");
+    let second = serve(&home, &root).await;
+    assert!(!root.join("art/killed.png").exists(), "the next open sweeps the abandoned marker");
+    assert_eq!(journal_entries(&home), 0);
+    second.client.peer.close();
+}
+
+/// A live reservation of a concurrent aimx is never swept; it finalizes normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_concurrent_servers_live_reservation_is_not_swept() {
+    let (_dir, home, root) = fixture();
+    let first = serve(&home, &root).await;
+    let reservation = reserve_at(&first, "art/live.png").await;
+    let second = serve(&home, &root).await;
+    assert!(root.join("art/live.png").exists(), "a live reservation keeps its marker");
+    first
+        .client
+        .peer
+        .call::<FsFinalize>(FsFinalizeParams {
+            workspace: first.ws.clone(),
+            reservation,
+            content: Content::from_bytes(b"image".to_vec()),
+            idempotency_key: key(),
+            scope: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.join("art/live.png")).unwrap(), b"image");
+    assert_eq!(journal_entries(&home), 0);
+    second.client.peer.close();
+    first.client.peer.close();
+}
+
+/// `REV13a` M5: closing the connection lets `aimx serve --stdio` end its session, which cancels
+/// its unused markers before the process exits.
+#[tokio::test(flavor = "multi_thread")]
+async fn stdio_eof_cancels_unused_markers_before_exit() {
+    let (_dir, home, root) = fixture();
+    let mut served = serve(&home, &root).await;
+    reserve_at(&served, "art/unused.png").await;
+    served.client.peer.close();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), served.child.wait()).await.unwrap().unwrap();
+    assert!(status.success());
+    assert!(!root.join("art/unused.png").exists());
+    assert_eq!(journal_entries(&home), 0);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes).iter().fold(String::new(), |mut out, byte| {
+        use std::fmt::Write as _;
+        write!(out, "{byte:02x}").unwrap();
+        out
+    })
+}
+
+/// Opens a workspace whose server journals in `journal`, after planting a well-formed, unlocked
+/// entry there that names an ordinary file of the workspace with its correct hash; whether the
+/// sweep deleted that file.
+async fn forged_entry_deletes_ordinary_file(journal: std::path::PathBuf, storage: std::path::PathBuf) -> bool {
+    let env = env_with(|config, root| {
+        let root = root.canonicalize().unwrap();
+        let victim = root.join("ordinary.txt");
+        let bytes = b"ordinary known file, never reserved";
+        std::fs::write(&victim, bytes).unwrap();
+        let root_text = root.to_str().unwrap();
+        let tag = sha256_hex(root_text.as_bytes()).get(..16).unwrap().to_owned();
+        let record = serde_json::json!({"version": 1, "root": root_text, "path": victim.to_str().unwrap(), "hash": format!("sha256:{}", sha256_hex(bytes))});
+        std::fs::write(storage.join(format!("{tag}-forged.json")), serde_json::to_vec(&record).unwrap()).unwrap();
+        config.reservation_journal = Some(journal);
+    })
+    .await;
+    let (client, _, _) = session(&env).await;
+    client.peer.close();
+    !env.path("ordinary.txt").exists()
+}
+
+/// REV19 B1 (the review's RPC probe as a regression test): the sweep never trusts a journal
+/// reached through a symlink, so a forged entry there cannot delete an ordinary file. The control
+/// run shows the same entry in the journal's own (trusted) storage is honored.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlinked_journal_is_never_swept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tmp.path().canonicalize().unwrap();
+    let untrusted = tmp.join("untrusted");
+    std::fs::create_dir(&untrusted).unwrap();
+    std::os::unix::fs::symlink(&untrusted, tmp.join("journal")).unwrap();
+    assert!(!forged_entry_deletes_ordinary_file(tmp.join("journal"), untrusted.clone()).await, "a symlinked journal was swept");
+    assert_eq!(std::fs::read_dir(&untrusted).unwrap().count(), 1, "nothing was deleted from rejected storage");
+
+    let trusted = tmp.join("trusted");
+    std::fs::create_dir(&trusted).unwrap();
+    std::fs::set_permissions(&trusted, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    assert!(forged_entry_deletes_ordinary_file(trusted.clone(), trusted).await, "control: trusted storage is swept");
+}

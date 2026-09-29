@@ -251,7 +251,14 @@ fn read(base: &Base, path: &str, range: Option<ByteRange>, max_bytes: u64, hash:
     Ok(FsReadResult { content: Content::from_bytes(out), size, hash: Some(content_hash(hasher)), truncated })
 }
 
-fn check_precondition(dir: &OwnedFd, name: &OsStr, exists: bool, precondition: &Precondition, display: &str) -> Outcome<()> {
+/// A `precondition_failed` for content that changed; the current whole-file hash is disclosed
+/// only to a caller who may read the file (REV14 F5, ADR 0067).
+fn changed(display: &str, current: &ContentHash, reveal: bool) -> ProtoError {
+    let err = ProtoError::new(ErrorCode::PreconditionFailed, format!("`{display}` changed since it was read"));
+    if reveal { err.with_detail(serde_json::json!({ "current": current.0 })) } else { err }
+}
+
+fn check_precondition(dir: &OwnedFd, name: &OsStr, exists: bool, precondition: &Precondition, display: &str, reveal: bool) -> Outcome<()> {
     match precondition {
         Precondition::IfAbsent if exists => Err(ProtoError::new(ErrorCode::PreconditionFailed, format!("`{display}` already exists"))),
         Precondition::Any | Precondition::IfAbsent => Ok(()),
@@ -260,12 +267,7 @@ fn check_precondition(dir: &OwnedFd, name: &OsStr, exists: bool, precondition: &
         }
         Precondition::IfHash { hash } => {
             let current = hash_file(&mut open_file(dir, name, display)?).map_err(|err| io_error(&err, display))?;
-            if current == *hash {
-                Ok(())
-            } else {
-                Err(ProtoError::new(ErrorCode::PreconditionFailed, format!("`{display}` changed since it was read"))
-                    .with_detail(serde_json::json!({ "current": current.0 })))
-            }
+            if current == *hash { Ok(()) } else { Err(changed(display, &current, reveal)) }
         }
     }
 }
@@ -323,6 +325,7 @@ fn write(
 ) -> Outcome<WriteOutcome> {
     let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Write))?;
     base.check_protected(&loc, false)?;
+    let reveal = base.may_read(&loc);
     let Some(name) = loc.name.as_deref().filter(|_| loc.opened.is_none()) else {
         return Err(is_a_directory(path));
     };
@@ -331,7 +334,7 @@ fn write(
     let dir = if loc.missing.is_empty() {
         loc.dir().map_err(|err| io_error(&err, path))?
     } else {
-        check_precondition(loc.dir().map_err(|err| io_error(&err, path))?, name, false, precondition, path)?;
+        check_precondition(loc.dir().map_err(|err| io_error(&err, path))?, name, false, precondition, path, reveal)?;
         if !create_dirs {
             return Err(ProtoError::new(ErrorCode::NotFound, format!("the directory of `{path}` does not exist")));
         }
@@ -342,14 +345,14 @@ fn write(
     if current.as_ref().is_some_and(|stat| kind(stat) == FileType::Directory) {
         return Err(is_a_directory(path));
     }
-    check_precondition(dir, name, current.is_some(), precondition, path)?;
+    check_precondition(dir, name, current.is_some(), precondition, path, reveal)?;
     let exclusive = matches!(precondition, Precondition::IfAbsent);
     atomic_replace(dir, name, bytes, current.as_ref().map(mode_of), exclusive, path)?;
     Ok(WriteOutcome { hash: hash_bytes(bytes), size: bytes.len() as u64, created: current.is_none() })
 }
 
 fn edit(base: &Base, mutations: &Mutex<()>, path: &str, edits: &[ExactEdit], precondition: &Precondition) -> Outcome<EditOutcome> {
-    let loc = base.resolve(path, Follow::Final, Authority::Path(Access::Write))?;
+    let loc = base.resolve(path, Follow::Final, Authority::Edit)?;
     base.check_protected(&loc, false)?;
     if loc.target_dir().is_some() {
         return Err(is_a_directory(path));
@@ -367,8 +370,7 @@ fn edit(base: &Base, mutations: &Mutex<()>, path: &str, edits: &[ExactEdit], pre
         Precondition::IfHash { hash } => {
             let current = hash_bytes(&before);
             if current != *hash {
-                return Err(ProtoError::new(ErrorCode::PreconditionFailed, format!("`{path}` changed since it was read"))
-                    .with_detail(serde_json::json!({ "current": current.0 })));
+                return Err(changed(path, &current, true));
             }
         }
     }

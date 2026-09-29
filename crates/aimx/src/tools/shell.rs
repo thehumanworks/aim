@@ -166,7 +166,7 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Result<Outcome<Tool
                 Ok(proc) => proc,
                 Err(err) => return model_error(err),
             };
-            ctx.procs.insert_at(proc.clone(), ctx.workspace_id.clone(), ctx.grant.root().to_owned(), slot);
+            ctx.procs.insert_at(proc.clone(), ctx.workspace_id.clone(), ctx.grant.root().to_owned(), &ctx.grant, slot);
             if ctx.cancelled.is_cancelled() {
                 release_cancelled(ctx, exec, &proc).await;
                 return Err(ProtoError::new(ErrorCode::Cancelled, "Bash request cancelled"));
@@ -180,7 +180,7 @@ pub(super) async fn bash(ctx: &ToolCtx, arguments: Value) -> Result<Outcome<Tool
             Ok(proc) => proc,
             Err(err) => return model_error(err),
         };
-        ctx.procs.insert_at(proc.clone(), ctx.workspace_id.clone(), ctx.grant.root().to_owned(), slot);
+        ctx.procs.insert_at(proc.clone(), ctx.workspace_id.clone(), ctx.grant.root().to_owned(), &ctx.grant, slot);
         let mut output = HeadTail::new();
         let mut cursor = 0u64;
         let mut dropped = false;
@@ -245,8 +245,7 @@ pub(super) async fn bash_output(ctx: &ToolCtx, arguments: Value) -> Outcome<Tool
     let Some(proc) = owned(ctx, &args.id) else {
         return Ok(ToolResult::error(format!("no background command with id {}", args.id)));
     };
-    let cwd = ctx.procs.cwd(&proc).unwrap_or_else(|| ctx.grant.root().to_owned());
-    ctx.grant.exec_path(&cwd)?;
+    ctx.procs.authorize(&proc, &ctx.grant)?;
     let exec = exec_of(ctx)?;
     let cursor = ctx.procs.cursor(&proc).unwrap_or(0);
     let read = match exec.read(&proc, cursor, ((HEAD_BYTES + TAIL_BYTES) as u64).min(ctx.max_read_bytes), Duration::ZERO).await {
@@ -285,16 +284,22 @@ pub(super) async fn kill_shell(ctx: &ToolCtx, arguments: Value) -> Outcome<ToolR
     let Some(proc) = owned(ctx, &args.id) else {
         return Ok(ToolResult::error(format!("no background command with id {}", args.id)));
     };
-    let cwd = ctx.procs.cwd(&proc).unwrap_or_else(|| ctx.grant.root().to_owned());
-    ctx.grant.exec_path(&cwd)?;
+    ctx.procs.authorize(&proc, &ctx.grant)?;
     let exec = exec_of(ctx)?;
     if let Err(err) = exec.signal(&proc, Signal::Kill).await {
         tracing::debug!(%err, "signalling a background command failed");
     }
-    ctx.procs.remove(&proc);
     match exec.release(&proc).await {
-        Ok(()) => Ok(ToolResult::text(format!("Killed {proc}"))),
-        Err(err) => model_error(err),
+        Ok(()) => {
+            ctx.procs.remove(&proc);
+            Ok(ToolResult::text(format!("Killed {proc}")))
+        }
+        Err(err) => {
+            if err.code == ErrorCode::NotFound {
+                ctx.procs.remove(&proc);
+            }
+            model_error(err)
+        }
     }
 }
 

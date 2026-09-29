@@ -478,6 +478,50 @@ mod tests {
         assert!(!policy.permits("read"));
     }
 
+    /// REV14 F11: names are exact bytes, so canonically equivalent spellings (NFC `é`, NFD `e` +
+    /// U+0301) and case variants stay distinct tools; every policy over a small Unicode universe
+    /// round-trips through its ids and its session record; and `permits`, `is_unrestricted` and
+    /// `intersect` agree with a plain set model on every name.
+    #[test]
+    fn unicode_names_are_exact_and_policies_round_trip() {
+        const UNIVERSE: [&str; 4] = ["\u{e9}", "e\u{301}", "E\u{301}", "\u{3bb}"];
+        let subsets: Vec<BTreeSet<String>> = (0..16_u8)
+            .map(|bits| {
+                UNIVERSE.iter().enumerate().filter(|(index, _)| bits & (1 << index) != 0).map(|(_, name)| (*name).to_owned()).collect()
+            })
+            .collect();
+        let mut policies = Vec::new();
+        for deny in &subsets {
+            policies.push(ToolPolicy { allow: None, deny: deny.clone() });
+            for allow in &subsets {
+                policies.push(ToolPolicy { allow: Some(allow.clone()), deny: deny.clone() });
+            }
+        }
+        let model =
+            |policy: &ToolPolicy, name: &str| policy.allow.as_ref().is_none_or(|allow| allow.contains(name)) && !policy.deny.contains(name);
+        for policy in &policies {
+            let ids = ToolIds::new(&[policy], None);
+            assert_eq!(ids.encode(policy).and_then(|encoded| ids.decode(encoded)).as_ref(), Some(policy), "ids round-trip");
+            assert_eq!(&ToolPolicy::recorded(&policy.record("agent")), policy, "the session record round-trips");
+            assert_eq!(policy.is_unrestricted(), policy.allow.is_none() && policy.deny.is_empty());
+            for name in UNIVERSE {
+                assert_eq!(policy.permits(name), model(policy, name), "{policy:?} on {name:?}");
+            }
+        }
+        for a in &policies {
+            for b in policies.iter().step_by(5) {
+                let both = a.intersect(b);
+                for name in UNIVERSE {
+                    assert_eq!(both.permits(name), model(a, name) && model(b, name), "{a:?} ∩ {b:?} on {name:?}");
+                }
+            }
+        }
+        let nfc = ToolPolicy { allow: Some(BTreeSet::from(["\u{e9}".to_owned()])), deny: BTreeSet::new() };
+        assert!(nfc.permits("\u{e9}"));
+        assert!(!nfc.permits("e\u{301}"), "an NFD spelling is another tool");
+        assert!(!nfc.permits("\u{c9}"), "and so is another case");
+    }
+
     fn file(text: &str) -> FileText {
         FileText { text: text.into(), hash: "sha256:0".into(), size: text.len() as u64, truncated: false }
     }

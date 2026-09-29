@@ -19,7 +19,7 @@ use aim_proto::harness::CallScope;
 use aim_rpc::{NoHandler, Peer, PeerConfig};
 use aimx::server::network::{NetworkOptions, NetworkProtocol};
 use aimx::server::token::{TokenScope, TokenStore};
-use aimx::server::{Server, ServerConfig, default_protected, local_principal};
+use aimx::server::{Server, ServerConfig, default_protected, local_principal, reservation_journal_dir};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -224,7 +224,10 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     let principal = local_principal(&roots, args.read_only).map_err(|err| format!("invalid --root: {err}"))?;
     let mut protected = default_protected(&home);
     protected = protected.with([format!("{home}/.aim/tokens.json"), format!("{home}/.aim/tokens.lock")]);
-    let config = ServerConfig::new(principal, protected);
+    let mut config = ServerConfig::new(principal, protected);
+    // Markers of reservations this server cannot end (it is killed first) are swept at the next
+    // open of their root by any aimx of this user (ADR 0067).
+    config.reservation_journal = Some(reservation_journal_dir(&home));
     tracing::info!(principal = %config.principal.id, roots = ?config.principal.roots, read_only = config.principal.read_only, "starting aimx");
     let server = Server::new(config);
     if let Some((address, protocol)) =
