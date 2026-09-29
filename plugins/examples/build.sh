@@ -22,17 +22,17 @@ import sys
 examples = Path(sys.argv[1])
 target = Path(sys.argv[2])
 mode = sys.argv[3]
-names = (
-    "aim_example_delegate_read.wasm",
-    "aim_example_kv_counter.wasm",
-    "aim_example_runaway.wasm",
+components = (
+    ("aim_example_delegate_read.wasm", "delegate_read"),
+    ("aim_example_kv_counter.wasm", "kv_counter"),
+    ("aim_example_runaway.wasm", "runaway"),
 )
 build = examples / "build"
 build.mkdir(exist_ok=True)
 
 if mode == "--update":
-    for name in names:
-        (build / name).write_bytes((target / "wasm32-wasip2/release" / name).read_bytes())
+    for name, directory in components:
+        (examples / directory / "plugin.wasm").write_bytes((target / "wasm32-wasip2/release" / name).read_bytes())
 
 expected = {}
 for line in (build / "SHA256SUMS").read_text().splitlines() if (build / "SHA256SUMS").exists() else ():
@@ -40,9 +40,9 @@ for line in (build / "SHA256SUMS").read_text().splitlines() if (build / "SHA256S
     expected[name.strip()] = digest
 
 lines = []
-for name in names:
+for name, directory in components:
     compiled = (target / "wasm32-wasip2/release" / name).read_bytes()
-    checked = (build / name).read_bytes()
+    checked = (examples / directory / "plugin.wasm").read_bytes()
     if compiled != checked:
         raise SystemExit(f"{name}: checked-in component differs from rebuilt component")
     digest = sha256(checked).hexdigest()

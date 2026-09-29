@@ -32,12 +32,7 @@ fn examples() -> PathBuf {
 fn source(name: &str, project: bool) -> PluginSource {
     let base = examples();
     let manifest_text = std::fs::read_to_string(base.join(name).join("aim-plugin.toml")).unwrap();
-    let path = match name {
-        "kv_counter" => "aim_example_kv_counter.wasm",
-        "runaway" => "aim_example_runaway.wasm",
-        _ => "aim_example_delegate_read.wasm",
-    };
-    let component = std::fs::read(base.join("build").join(path)).unwrap();
+    let component = std::fs::read(base.join(name).join("plugin.wasm")).unwrap();
     PluginSource { manifest_text, component, project }
 }
 

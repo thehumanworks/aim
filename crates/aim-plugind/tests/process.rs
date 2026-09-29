@@ -24,14 +24,10 @@ struct Worker {
 
 fn source(name: &str) -> PluginSource {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/examples");
-    let component = match name {
-        "kv_counter" => "aim_example_kv_counter.wasm",
-        "runaway" => "aim_example_runaway.wasm",
-        _ => "aim_example_delegate_read.wasm",
-    };
+    let component = base.join(name).join("plugin.wasm");
     PluginSource {
         manifest_text: std::fs::read_to_string(base.join(name).join("aim-plugin.toml")).unwrap(),
-        component: std::fs::read(base.join("build").join(component)).unwrap(),
+        component: std::fs::read(component).unwrap(),
         project: false,
     }
 }

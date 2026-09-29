@@ -324,7 +324,15 @@ fn plugin_component_path(manifest_dir: &Path, component: &str, installed: bool) 
     if installed && component != "plugin.wasm" {
         return Err("installed plugin component must be plugin.wasm".into());
     }
-    let path = manifest_dir.join(component);
+    let relative = Path::new(component);
+    if relative.as_os_str().is_empty() || !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+        return Err("plugin component must be a relative path within its manifest directory".into());
+    }
+    let directory = manifest_dir.canonicalize().map_err(|err| format!("{}: {err}", manifest_dir.display()))?;
+    let path = directory.join(relative).canonicalize().map_err(|err| format!("{}: {err}", relative.display()))?;
+    if !path.starts_with(&directory) {
+        return Err("plugin component must be within its manifest directory".into());
+    }
     let metadata = std::fs::metadata(&path).map_err(|err| format!("{}: {err}", path.display()))?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_PLUGIN_COMPONENT_BYTES {
         return Err(format!("{} must be a regular 1..=16 MiB component", path.display()));
@@ -505,7 +513,35 @@ async fn plugin_command(home: &Path, action: PluginAction) -> Result<i32, String
 
 #[cfg(test)]
 mod plugin_tests {
-    use super::{PluginAction, PluginProject, TrustStore, installed_plugin, plugin_command};
+    use super::{PluginAction, PluginProject, TrustStore, installed_plugin, plugin_command, plugin_install};
+
+    #[test]
+    fn install_rejects_component_outside_manifest_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let outside = root.path().join("outside.wasm");
+        std::fs::write(&outside, b"private bytes").unwrap();
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/examples/kv_counter/aim-plugin.toml");
+        let original = std::fs::read_to_string(manifest).unwrap();
+        let write_manifest = |component: &str| {
+            std::fs::write(
+                source.join("aim-plugin.toml"),
+                original.replace("component = \"plugin.wasm\"", &format!("component = \"{component}\"")),
+            )
+            .unwrap();
+        };
+
+        for component in [outside.to_str().unwrap(), "../outside.wasm"] {
+            write_manifest(component);
+            assert!(plugin_install(root.path(), &source).is_err(), "accepted escaping component {component}");
+        }
+
+        std::os::unix::fs::symlink(&outside, source.join("plugin.wasm")).unwrap();
+        write_manifest("plugin.wasm");
+        assert!(plugin_install(root.path(), &source).is_err(), "accepted symlink outside manifest directory");
+        assert!(!root.path().join("plugins").exists(), "rejected source must not create an installed plugin");
+    }
 
     #[tokio::test]
     async fn cli_installs_grants_only_requested_capabilities_and_revokes() {

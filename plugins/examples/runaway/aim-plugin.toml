@@ -1,7 +1,7 @@
 name = "runaway"
 version = "0.1.0"
 api = "0.1"
-component = "../build/aim_example_runaway.wasm"
+component = "plugin.wasm"
 capabilities = ["tools.provide"]
 
 [[tools]]

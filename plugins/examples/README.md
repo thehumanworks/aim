@@ -12,7 +12,7 @@ component on its first call. The manifest's capability list is a **request**, no
 - `runaway` is a **test fixture** whose `call-tool` spins forever. Host tests use it to prove that
   fuel or epoch limits terminate a guest call. Do not install it as a normal plugin.
 
-`build/*.wasm` are checked-in WebAssembly **components**, not precompiled wasmtime images. This
+Each example's adjacent `plugin.wasm` is a checked-in WebAssembly **component**, not a precompiled wasmtime image. This
 keeps routine native checks from rebuilding the guest toolchain. To reproduce them with the pinned
 Rust and `wasm32-wasip2` target, run `mise run plugins:examples` from the repository root. That
 task invokes `build.sh --verify`; it rebuilds all components and checks their bytes and SHA-256

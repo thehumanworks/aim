@@ -55,14 +55,9 @@ fn worker_binary() -> PathBuf {
 
 fn example(name: &str) -> PluginSource {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/examples");
-    let component = match name {
-        "runaway" => "aim_example_runaway.wasm",
-        "delegate_read" => "aim_example_delegate_read.wasm",
-        _ => "aim_example_kv_counter.wasm",
-    };
     PluginSource {
         manifest_text: std::fs::read_to_string(root.join(name).join("aim-plugin.toml")).unwrap(),
-        component: std::fs::read(root.join("build").join(component)).unwrap(),
+        component: std::fs::read(root.join(name).join("plugin.wasm")).unwrap(),
         project: false,
     }
 }
